@@ -3,20 +3,33 @@
     windows_subsystem = "windows"
 )]
 
+mod capture;
+mod crypto;
+mod host;
 mod rustdesk_proto;
 mod settings;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod software_ui;
 mod transport;
 mod video;
+mod vp9_mf;
+#[cfg(feature = "live-vpx-system")]
+mod vpx_system;
 
 use std::{
+    collections::HashMap,
+    fs,
+    path::PathBuf,
     sync::mpsc::{self, Receiver},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use eframe::egui::{self, ColorImage, TextureHandle};
+use host::{HostEvent, HostService, HostState};
 use rustdesk_proto::ControlKey;
-use settings::{generate_numeric_token, AppConfig, CoordinateMode};
+use settings as settings_mod;
+use settings_mod::{generate_numeric_token, AppConfig, CodecPreference, CoordinateMode};
 use transport::{
     ConnectionRequest, ConnectionState, RemoteDisplay, SessionCommand, SessionEvent,
     TransportClient,
@@ -36,11 +49,250 @@ fn main() -> eframe::Result<()> {
         std::process::exit(exit_code);
     }
 
+    let renderer_mode = std::env::var("EVERTYDESK_RENDERER")
+        .unwrap_or_else(|_| "auto".to_owned())
+        .to_ascii_lowercase();
+
+    #[cfg(target_os = "linux")]
+    if renderer_mode == "auto" && std::env::var_os("EVERTYDESK_LINUX_AUTOSTART_CHILD").is_none() {
+        return run_linux_auto_gui();
+    }
+
+    match renderer_mode.as_str() {
+        "glow" | "opengl" => return run_gui(eframe::Renderer::Glow),
+        "wgpu" | "vulkan" => return run_gui(eframe::Renderer::Wgpu),
+        // Pure-CPU framebuffer UI (minifb) — no OpenGL/GLX/Vulkan at all.
+        // The reliable choice for VMs where GLX is broken (e.g. Astra Linux
+        // on SVGA3D: "GLXBadContextTag"). Use: EVERTYDESK_RENDERER=software
+        "software" | "minifb" | "cpu" | "softbuffer" => {
+            run_software_ui_or_headless();
+            return Ok(());
+            #[cfg(all(target_os = "linux", any()))]
+            {
+                eprintln!("[EvertyDesk] Software (CPU) UI backend — no OpenGL.");
+                if let Err(err) = software_ui::run_software_ui() {
+                    eprintln!("[EvertyDesk] Software UI failed: {err}");
+                    run_headless_host();
+                }
+                return Ok(());
+            }
+            #[cfg(all(not(target_os = "linux"), any()))]
+            {
+                eprintln!("[EvertyDesk] Software UI backend is Linux-only; using WGPU.");
+                return run_gui(eframe::Renderer::Wgpu);
+            }
+        }
+        "host" | "headless" => {
+            run_headless_host();
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    match run_gui(eframe::Renderer::Wgpu) {
+        Ok(()) => Ok(()),
+        Err(wgpu_error) => {
+            eprintln!("[EvertyDesk] WGPU renderer failed: {wgpu_error:?}");
+            #[cfg(target_os = "linux")]
+            {
+                eprintln!(
+                    "[EvertyDesk] On Linux, OpenGL fallback must be launched by the safe wrapper."
+                );
+                eprintln!(
+                    "[EvertyDesk] Run ./scripts/run-linux-safe.sh or install with ./scripts/install-linux-user.sh.\n"
+                );
+                run_headless_host();
+                Ok(())
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                eprintln!("[EvertyDesk] Trying OpenGL/Glow renderer...");
+                match run_gui(eframe::Renderer::Glow) {
+                    Ok(()) => Ok(()),
+                    Err(glow_error) => {
+                        eprintln!("[EvertyDesk] Glow renderer failed: {glow_error:?}");
+                        let msg = format!("{wgpu_error:?}\n{glow_error:?}");
+                        if msg.contains("NoSuitableAdapterFound")
+                            || msg.contains("NoSuitable")
+                            || msg.contains("glutin")
+                            || msg.contains("OpenGL")
+                        {
+                            eprintln!("\n[EvertyDesk] Нет подходящего графического режима.");
+                            eprintln!(
+                            "[EvertyDesk] Запускаю в режиме без GUI (--host). Для окна нужен X11/Wayland + OpenGL/Vulkan.\n"
+                        );
+                            run_software_ui_or_headless();
+                            Ok(())
+                        } else {
+                            Err(glow_error)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn run_software_ui_or_headless() {
+    eprintln!("[EvertyDesk] Trying CPU software UI backend (no OpenGL/Vulkan)...");
+    match software_ui::run_software_ui() {
+        Ok(()) => {}
+        Err(err) => {
+            eprintln!("[EvertyDesk] Software UI failed: {err}");
+            eprintln!("[EvertyDesk] Starting headless host mode.");
+            run_headless_host();
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn run_software_ui_or_headless() {
+    eprintln!("[EvertyDesk] Software UI backend is unavailable on this platform.");
+    run_headless_host();
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_auto_gui() -> eframe::Result<()> {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            eprintln!("[EvertyDesk] Cannot locate current executable: {err}");
+            run_headless_host();
+            return Ok(());
+        }
+    };
+
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let mut attempts: Vec<LinuxGuiAttempt> = Vec::new();
+
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        attempts.push(LinuxGuiAttempt {
+            title: "Wayland OpenGL software",
+            renderer: "glow",
+            envs: &[
+                ("WINIT_UNIX_BACKEND", "wayland"),
+                ("EVERTYDESK_SOFTWARE", "1"),
+                ("LIBGL_ALWAYS_SOFTWARE", "1"),
+                ("MESA_LOADER_DRIVER_OVERRIDE", "llvmpipe"),
+            ],
+        });
+    }
+
+    if std::env::var_os("DISPLAY").is_some() {
+        attempts.push(LinuxGuiAttempt {
+            title: "X11 OpenGL default",
+            renderer: "glow",
+            envs: &[("WINIT_UNIX_BACKEND", "x11"), ("LIBGL_DRI3_DISABLE", "1")],
+        });
+        attempts.push(LinuxGuiAttempt {
+            title: "X11 OpenGL software",
+            renderer: "glow",
+            envs: &[
+                ("WINIT_UNIX_BACKEND", "x11"),
+                ("EVERTYDESK_SOFTWARE", "1"),
+                ("LIBGL_ALWAYS_SOFTWARE", "1"),
+                ("LIBGL_DRI3_DISABLE", "1"),
+                ("MESA_LOADER_DRIVER_OVERRIDE", "llvmpipe"),
+                ("GALLIUM_DRIVER", "llvmpipe"),
+                ("MESA_GL_VERSION_OVERRIDE", "3.3"),
+                ("MESA_GLSL_VERSION_OVERRIDE", "330"),
+            ],
+        });
+        attempts.push(LinuxGuiAttempt {
+            title: "X11 indirect GLX",
+            renderer: "glow",
+            envs: &[
+                ("WINIT_UNIX_BACKEND", "x11"),
+                ("LIBGL_ALWAYS_INDIRECT", "1"),
+                ("LIBGL_DRI3_DISABLE", "1"),
+            ],
+        });
+    }
+
+    attempts.push(LinuxGuiAttempt {
+        title: "WGPU auto",
+        renderer: "wgpu",
+        envs: &[],
+    });
+
+    // Pure-CPU framebuffer (minifb) — no OpenGL/GLX/Vulkan. Guaranteed to work
+    // on VMs with broken GLX (Astra/SVGA3D "GLXBadContextTag"). Tried as a
+    // child so a crash in earlier GL attempts can't take us down with it.
+    attempts.push(LinuxGuiAttempt {
+        title: "CPU software framebuffer (minifb)",
+        renderer: "software",
+        envs: &[],
+    });
+
+    eprintln!("[EvertyDesk] Linux GUI autostart: checking available renderer...");
+    for attempt in attempts {
+        eprintln!("[EvertyDesk] Trying {}...", attempt.title);
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(&args)
+            .env("EVERTYDESK_LINUX_AUTOSTART_CHILD", "1")
+            .env("EVERTYDESK_RENDERER", attempt.renderer)
+            .env("RUST_BACKTRACE", "0")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        for (name, value) in attempt.envs {
+            cmd.env(name, value);
+        }
+
+        match cmd.status() {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => {
+                eprintln!("[EvertyDesk] {} failed: {status}", attempt.title);
+            }
+            Err(err) => {
+                eprintln!("[EvertyDesk] {} failed to start: {err}", attempt.title);
+            }
+        }
+    }
+
+    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        eprintln!("[EvertyDesk] No desktop session detected. Starting headless host mode.");
+        run_headless_host();
+        return Ok(());
+    }
+
+    eprintln!("[EvertyDesk] No GUI renderer worked on this Linux desktop.");
+    eprintln!("[EvertyDesk] This system rejected both OpenGL/GLX and WGPU/Vulkan.");
+    eprintln!("[EvertyDesk] Starting CPU software UI backend...");
+    if let Err(err) = software_ui::run_software_ui() {
+        eprintln!("[EvertyDesk] Software UI failed: {err}");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxGuiAttempt {
+    title: &'static str,
+    renderer: &'static str,
+    envs: &'static [(&'static str, &'static str)],
+}
+
+fn run_gui(renderer: eframe::Renderer) -> eframe::Result<()> {
+    // Try all available GPU backends, including software rasterizers
+    // (WARP on Windows, lavapipe/llvmpipe on Linux).
+    let wgpu_opts = eframe::egui_wgpu::WgpuConfiguration {
+        // Enables DX12/DX11/Vulkan/GL/Metal — WARP on Windows falls under DX11
+        supported_backends: eframe::egui_wgpu::wgpu::Backends::all(),
+        ..Default::default()
+    };
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_NAME)
             .with_inner_size([500.0, 350.0])
             .with_min_inner_size([420.0, 300.0]),
+        hardware_acceleration: if std::env::var_os("EVERTYDESK_SOFTWARE").is_some() {
+            eframe::HardwareAcceleration::Off
+        } else {
+            eframe::HardwareAcceleration::Preferred
+        },
+        wgpu_options: wgpu_opts,
+        renderer,
         ..Default::default()
     };
 
@@ -50,9 +302,53 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| {
             cc.egui_ctx.set_pixels_per_point(1.0);
             configure_style(&cc.egui_ctx);
+            eprintln!(
+                "[EvertyDesk] Build codecs: {}",
+                crate::video::build_codec_label()
+            );
             Box::new(EvertyDeskApp::new())
         }),
     )
+}
+
+/// Headless host loop — same as `--host` CLI mode, used as auto-fallback
+/// when the GUI cannot initialize (no GPU adapter on the server).
+fn run_headless_host() {
+    let config = AppConfig::load_or_create();
+    eprintln!(
+        "[cli] Headless host mode. local_id={} server={}",
+        config.local_id, config.server.id_server
+    );
+    let svc = host::HostService::start(config);
+    loop {
+        thread::sleep(Duration::from_millis(100));
+        while let Some(ev) = svc.try_recv() {
+            match &ev {
+                host::HostEvent::Log(msg) => eprintln!("[host] {msg}"),
+                host::HostEvent::StateChanged(s) => eprintln!("[state] {s:?}"),
+                host::HostEvent::Registered { request_pk } => {
+                    eprintln!("[host] Registered request_pk={request_pk}")
+                }
+                host::HostEvent::IncomingRequest { peer_id, .. } => {
+                    eprintln!("[host] Incoming from {peer_id}")
+                }
+                host::HostEvent::SessionStarted { peer_id } => {
+                    eprintln!("[host] Session started: {peer_id}")
+                }
+                host::HostEvent::SessionEnded { peer_id, reason } => {
+                    eprintln!("[host] Session ended: {peer_id} {reason}")
+                }
+            }
+        }
+    }
+}
+
+fn egui_software_backend_active() -> bool {
+    std::env::var_os("EVERTYDESK_EGUI_SOFTWARE").is_some()
+}
+
+fn commercial_ui_enabled() -> bool {
+    std::env::var_os("EVERTYDESK_CLASSIC_UI").is_none()
 }
 
 fn run_cli_connect() -> Option<i32> {
@@ -85,6 +381,75 @@ fn run_cli_connect() -> Option<i32> {
         };
     }
 
+    if command == "--host" {
+        // Headless host mode: start the host service, stream all events to
+        // stderr.  Useful for diagnosing registration issues without the GUI.
+        //
+        // Optional flags (after --host):
+        //   --bind-port PORT   Bind UDP socket to PORT instead of random.
+        //                      Use the port the EvertyDesk service was using
+        //                      (e.g. 63624) after stopping the service.
+        //   --use-everty-keys  Read the installed EvertyDesk's Ed25519 key
+        //                      pair and use it for hbbs RegisterPk.
+        let mut config = AppConfig::load_or_create();
+        // Parse extra flags
+        let extra_args: Vec<String> = args.collect();
+        for extra_arg in &extra_args {
+            match extra_arg.as_str() {
+                "--use-everty-keys" => {
+                    if let Some(pk) = load_everty_public_key() {
+                        eprintln!("[cli] Loaded real Ed25519 public key from EvertyDesk config");
+                        config.host_pk = pk;
+                    } else {
+                        eprintln!("[cli] Warning: could not load EvertyDesk key pair");
+                    }
+                }
+                s if s.starts_with("--bind-port") => {
+                    // --bind-port PORT  or  --bind-port=PORT
+                    let port_str = if let Some(p) = s.strip_prefix("--bind-port=") {
+                        p.to_owned()
+                    } else {
+                        // try next element in extra_args (not supported easily, use = form)
+                        String::new()
+                    };
+                    if let Ok(p) = port_str.parse::<u16>() {
+                        eprintln!("[cli] UDP bind port: {p}");
+                        config.udp_bind_port = p;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let config = config; // freeze
+        eprintln!("[cli] Starting host service (headless). Press Ctrl-C to stop.");
+        eprintln!(
+            "[cli] local_id={} server={}",
+            config.local_id, config.server.id_server
+        );
+        let svc = host::HostService::start(config);
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            while let Some(ev) = svc.try_recv() {
+                match &ev {
+                    host::HostEvent::Log(msg) => eprintln!("[host] {msg}"),
+                    host::HostEvent::StateChanged(s) => eprintln!("[state] {:?}", s),
+                    host::HostEvent::Registered { request_pk } => {
+                        eprintln!("[host] Registered request_pk={request_pk}")
+                    }
+                    host::HostEvent::IncomingRequest { peer_id, .. } => {
+                        eprintln!("[host] Incoming from {peer_id}")
+                    }
+                    host::HostEvent::SessionStarted { peer_id } => {
+                        eprintln!("[host] Session started: {peer_id}")
+                    }
+                    host::HostEvent::SessionEnded { peer_id, reason } => {
+                        eprintln!("[host] Session ended: {peer_id} {reason}")
+                    }
+                }
+            }
+        }
+    }
+
     if command != "--connect" {
         return None;
     }
@@ -97,6 +462,10 @@ fn run_cli_connect() -> Option<i32> {
     }
 
     let config = AppConfig::load_or_create();
+    if is_own_remote_id(&remote_id, &config.local_id) {
+        eprintln!("Error: remote ID equals this computer ID ({remote_id})");
+        return Some(2);
+    }
     let request = ConnectionRequest {
         remote_id,
         password,
@@ -138,28 +507,74 @@ struct EvertyDeskApp {
     remote_fullscreen: bool,
     progress: u8,
     events: Vec<String>,
+    session_log: Vec<String>,
     remote_texture: Option<TextureHandle>,
     pending_image: Option<ColorImage>,
+    last_frame_rgba: Vec<u8>,
     remote_size: [usize; 2],
     text_to_send: String,
+    clipboard_status: Option<String>,
+    screenshot_status: Option<String>,
+    log_status: Option<String>,
+    report_status: Option<String>,
     remote_input_focused: bool,
     last_mouse_pos: Option<(i32, i32)>,
     remote_displays: Vec<RemoteDisplay>,
     selected_display: i32,
     auto_refresh: bool,
     refresh_millis: u64,
+    video_fps: i32,
     fit_to_window: bool,
     coordinate_mode: CoordinateMode,
     screenshot_count: u64,
+    live_frame_count: u64,
+    screenshot_frame_count: u64,
     screenshot_pending: bool,
     last_screenshot_at: Option<Instant>,
     last_screenshot_sid: String,
+    last_frame_codec: String,
     input_events_sent: u64,
     last_move_refresh_at: Option<Instant>,
     fps_last_at: Instant,
     fps_last_count: u64,
     display_fps: f32,
+    frame_bytes: usize,
+    frame_queue_ms: u64,
+    frame_decode_ms: u64,
+    frame_dropped: usize,
+    last_stream_tune_at: Option<Instant>,
+    png_fallback_started_at: Option<Instant>,
+    /// When the last live (VP9/H264) frame was received.
+    /// Used to suppress PNG screenshot frames while live video is active.
+    last_live_frame_at: Option<Instant>,
+    stream_health: String,
     wheel_accum: egui::Vec2,
+    /// Cache of remote cursor images by cursor ID (RGBA + hotspot).
+    cursor_cache: HashMap<u64, (egui::ColorImage, i32, i32)>,
+    /// Pending cursor image to be loaded into a texture in the next frame.
+    pending_cursor: Option<(egui::ColorImage, i32, i32)>,
+    /// Currently active cursor texture + hotspot offset.
+    cursor_texture: Option<(egui::TextureHandle, i32, i32)>,
+    /// Last known cursor position in remote-screen coordinates.
+    cursor_pos: Option<egui::Pos2>,
+    /// Last measured round-trip latency (ms) from TestDelay.
+    latency_ms: Option<u32>,
+
+    // ── Host service ──────────────────────────────────────────────────────────
+    /// Background host service (None = stopped).
+    host_service: Option<HostService>,
+    /// Last known host-service state.
+    host_state: HostState,
+    /// Log lines received from the host service.
+    host_log: Vec<String>,
+    /// Pending incoming connection (peer_id) waiting for Accept/Reject.
+    host_pending_peer: Option<String>,
+
+    // ── Settings window ───────────────────────────────────────────────────────
+    /// Whether the settings panel is visible.
+    show_settings: bool,
+    /// Editable copy of config while the settings window is open.
+    settings_draft: Option<AppConfig>,
 }
 
 enum WorkerEvent {
@@ -169,6 +584,61 @@ enum WorkerEvent {
         remote_id: String,
         result: Result<bool, String>,
     },
+}
+
+fn forward_session_events(
+    session_rx: Receiver<SessionEvent>,
+    ui_events: mpsc::Sender<WorkerEvent>,
+) {
+    while let Ok(first) = session_rx.recv() {
+        let mut latest_frame = None;
+        let mut terminal = false;
+        forward_or_coalesce_session_event(first, &ui_events, &mut latest_frame, &mut terminal);
+
+        loop {
+            match session_rx.try_recv() {
+                Ok(event) => {
+                    forward_or_coalesce_session_event(
+                        event,
+                        &ui_events,
+                        &mut latest_frame,
+                        &mut terminal,
+                    );
+                    if terminal {
+                        break;
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    terminal = true;
+                    break;
+                }
+            }
+        }
+
+        if let Some(frame) = latest_frame {
+            if !terminal {
+                let _ = ui_events.send(WorkerEvent::Session(frame));
+            }
+        }
+        if terminal {
+            break;
+        }
+    }
+}
+
+fn forward_or_coalesce_session_event(
+    event: SessionEvent,
+    ui_events: &mpsc::Sender<WorkerEvent>,
+    latest_frame: &mut Option<SessionEvent>,
+    terminal: &mut bool,
+) {
+    if matches!(event, SessionEvent::Frame { .. }) {
+        *latest_frame = Some(event);
+        return;
+    }
+    *terminal = matches!(event, SessionEvent::Closed | SessionEvent::Failed(_));
+    let _ = ui_events.send(WorkerEvent::Session(event));
 }
 
 impl EvertyDeskApp {
@@ -200,33 +670,66 @@ impl EvertyDeskApp {
             remote_fullscreen: false,
             progress: 0,
             events: vec!["App started".to_owned()],
+            session_log: vec!["App started".to_owned()],
             remote_texture: None,
             pending_image: None,
+            last_frame_rgba: Vec::new(),
             remote_size: [0, 0],
             text_to_send: String::new(),
+            clipboard_status: None,
+            screenshot_status: None,
+            log_status: None,
+            report_status: None,
             remote_input_focused: false,
             last_mouse_pos: None,
             remote_displays: Vec::new(),
             selected_display: 0,
             auto_refresh,
             refresh_millis,
+            video_fps: 30,
             fit_to_window,
             coordinate_mode,
             screenshot_count: 0,
+            live_frame_count: 0,
+            screenshot_frame_count: 0,
             screenshot_pending: false,
             last_screenshot_at: None,
             last_screenshot_sid: String::new(),
+            last_frame_codec: "none".to_owned(),
             input_events_sent: 0,
             last_move_refresh_at: None,
             fps_last_at: Instant::now(),
             fps_last_count: 0,
             display_fps: 0.0,
+            frame_bytes: 0,
+            frame_queue_ms: 0,
+            frame_decode_ms: 0,
+            frame_dropped: 0,
+            last_stream_tune_at: None,
+            png_fallback_started_at: None,
+            last_live_frame_at: None,
+            stream_health: "ожидание кадра".to_owned(),
             wheel_accum: egui::Vec2::ZERO,
+            cursor_cache: HashMap::new(),
+            pending_cursor: None,
+            cursor_texture: None,
+            cursor_pos: None,
+            latency_ms: None,
+            host_service: None,
+            host_state: HostState::Idle,
+            host_log: Vec::new(),
+            host_pending_peer: None,
+            show_settings: false,
+            settings_draft: None,
         }
     }
 
     fn connect(&mut self) {
         let normalized_remote_id = normalize_remote_id(&self.remote_id);
+        if is_own_remote_id(&normalized_remote_id, &self.config.local_id) {
+            self.set_error("Нельзя подключиться к своему же ID. Откройте EvertyDesk на другом ПК и введите его ID.");
+            return;
+        }
         let request = ConnectionRequest {
             remote_id: normalized_remote_id.clone(),
             password: self.password.clone(),
@@ -251,11 +754,29 @@ impl EvertyDeskApp {
         self.save_ui_config();
         self.remote_texture = None;
         self.remote_size = [0, 0];
+        self.last_frame_rgba.clear();
+        self.clipboard_status = None;
+        self.screenshot_status = None;
+        self.log_status = None;
+        self.report_status = None;
+        self.session_log.clear();
+        self.log(format!("Session started for {}", self.remote_id));
         self.remote_displays.clear();
         self.screenshot_count = 0;
+        self.live_frame_count = 0;
+        self.screenshot_frame_count = 0;
         self.screenshot_pending = false;
         self.last_screenshot_at = None;
         self.last_screenshot_sid.clear();
+        self.last_frame_codec = "none".to_owned();
+        self.frame_bytes = 0;
+        self.frame_queue_ms = 0;
+        self.frame_decode_ms = 0;
+        self.frame_dropped = 0;
+        self.last_stream_tune_at = None;
+        self.png_fallback_started_at = None;
+        self.last_live_frame_at = None;
+        self.stream_health = "ожидание кадра".to_owned();
         self.input_events_sent = 0;
         self.last_move_refresh_at = None;
         self.fps_last_at = Instant::now();
@@ -277,13 +798,7 @@ impl EvertyDeskApp {
             thread::spawn(move || {
                 TransportClient::run_session(request, command_rx, session_tx);
             });
-            while let Ok(event) = session_rx.recv() {
-                let terminal = matches!(event, SessionEvent::Closed | SessionEvent::Failed(_));
-                let _ = ui_events.send(WorkerEvent::Session(event));
-                if terminal {
-                    break;
-                }
-            }
+            forward_session_events(session_rx, ui_events);
         });
         self.worker = Some(rx);
     }
@@ -293,9 +808,14 @@ impl EvertyDeskApp {
             return;
         };
 
+        let mut latest_frame = None;
         loop {
             match rx.try_recv() {
                 Ok(WorkerEvent::Session(event)) => {
+                    if matches!(event, SessionEvent::Frame { .. }) {
+                        latest_frame = Some(event);
+                        continue;
+                    }
                     let terminal = matches!(event, SessionEvent::Failed(_) | SessionEvent::Closed);
                     self.handle_session_event(event);
                     if terminal {
@@ -339,10 +859,16 @@ impl EvertyDeskApp {
                     }
                 }
                 Err(mpsc::TryRecvError::Empty) => {
+                    if let Some(frame) = latest_frame {
+                        self.handle_session_event(frame);
+                    }
                     self.worker = Some(rx);
                     return;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    if let Some(frame) = latest_frame {
+                        self.handle_session_event(frame);
+                    }
                     self.busy = false;
                     self.host_check_busy = false;
                     self.remote_check_busy = false;
@@ -381,23 +907,62 @@ impl EvertyDeskApp {
             }
             SessionEvent::Frame {
                 sid,
+                codec,
                 width,
                 height,
                 rgba,
             } => {
+                if codec == "PNG" {
+                    // Discard PNG screenshot frames while live video (VP9/H264) is
+                    // actively streaming — they only cause codec badge flicker and
+                    // would replace a fresher VP9 frame with an older screenshot.
+                    // RustDesk never mixes live video with screenshot mode.
+                    let live_active = self
+                        .last_live_frame_at
+                        .map(|t| t.elapsed() < Duration::from_secs(2))
+                        .unwrap_or(false);
+                    if live_active {
+                        return;
+                    }
+                    self.screenshot_frame_count += 1;
+                    if self.png_fallback_started_at.is_none() {
+                        self.png_fallback_started_at = Some(Instant::now());
+                    }
+                } else {
+                    self.live_frame_count += 1;
+                    self.last_live_frame_at = Some(Instant::now());
+                    self.png_fallback_started_at = None;
+                }
+                self.last_frame_rgba = rgba.clone();
                 let image = ColorImage::from_rgba_unmultiplied([width, height], &rgba);
                 self.remote_size = image.size;
                 self.pending_image = Some(image);
                 self.last_screenshot_sid = sid;
+                self.last_frame_codec = codec;
                 self.last_screenshot_at = Some(Instant::now());
                 if self.screenshot_count <= 1 || self.screenshot_count % 20 == 0 {
-                    self.log(format!("Frame received: {}", self.last_screenshot_sid));
+                    self.log(format!(
+                        "Frame received: {} ({})",
+                        self.last_screenshot_sid, self.last_frame_codec
+                    ));
                 }
             }
             SessionEvent::ScreenshotStats { received, pending } => {
                 self.screenshot_count = received;
                 self.screenshot_pending = pending;
                 self.update_fps(received);
+            }
+            SessionEvent::FrameMetrics {
+                bytes,
+                queue_ms,
+                decode_ms,
+                dropped,
+            } => {
+                self.frame_bytes = bytes;
+                self.frame_queue_ms = queue_ms;
+                self.frame_decode_ms = decode_ms;
+                self.frame_dropped = dropped;
+                self.auto_tune_stream();
             }
             SessionEvent::Displays(displays) => {
                 self.remote_displays = displays;
@@ -423,6 +988,32 @@ impl EvertyDeskApp {
                     }
                 }
                 self.log(format!("Displays detected: {}", self.remote_displays.len()));
+            }
+            SessionEvent::CursorData {
+                id,
+                hotx,
+                hoty,
+                width,
+                height,
+                rgba,
+            } => {
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [width as usize, height as usize],
+                    &rgba,
+                );
+                self.cursor_cache.insert(id, (image.clone(), hotx, hoty));
+                self.pending_cursor = Some((image, hotx, hoty));
+            }
+            SessionEvent::CursorId { id } => {
+                if let Some((image, hotx, hoty)) = self.cursor_cache.get(&id).cloned() {
+                    self.pending_cursor = Some((image, hotx, hoty));
+                }
+            }
+            SessionEvent::CursorPosition { x, y } => {
+                self.cursor_pos = Some(egui::pos2(x as f32, y as f32));
+            }
+            SessionEvent::Latency(ms) => {
+                self.latency_ms = Some(ms);
             }
             SessionEvent::Info(message) => self.log(message),
             SessionEvent::Failed(err) => {
@@ -469,12 +1060,34 @@ impl EvertyDeskApp {
         self.connected = false;
         self.remote_viewer_open = false;
         self.remote_fullscreen = false;
+        self.remote_texture = None;
+        self.pending_image = None;
+        self.last_frame_rgba.clear();
         self.remote_input_focused = false;
         self.screenshot_pending = false;
         self.last_mouse_pos = None;
         self.last_move_refresh_at = None;
         self.wheel_accum = egui::Vec2::ZERO;
         self.progress = 0;
+        self.live_frame_count = 0;
+        self.screenshot_frame_count = 0;
+        self.last_frame_codec = "none".to_owned();
+        self.frame_bytes = 0;
+        self.frame_queue_ms = 0;
+        self.frame_decode_ms = 0;
+        self.frame_dropped = 0;
+        self.last_stream_tune_at = None;
+        self.png_fallback_started_at = None;
+        self.last_live_frame_at = None;
+        self.stream_health = "отключено".to_owned();
+        self.screenshot_status = None;
+        self.log_status = None;
+        self.report_status = None;
+        self.cursor_cache.clear();
+        self.pending_cursor = None;
+        self.cursor_texture = None;
+        self.cursor_pos = None;
+        self.latency_ms = None;
         self.status = status.to_owned();
         self.log(status.to_owned());
     }
@@ -503,6 +1116,65 @@ impl EvertyDeskApp {
         }
     }
 
+    fn auto_tune_stream(&mut self) {
+        let cooldown_ready = self
+            .last_stream_tune_at
+            .map(|instant| instant.elapsed() >= Duration::from_secs(3))
+            .unwrap_or(true);
+
+        if self.last_frame_codec == "PNG" {
+            let fallback_ms = self
+                .png_fallback_started_at
+                .map(|instant| instant.elapsed().as_millis() as u64)
+                .unwrap_or_default();
+            self.stream_health = if fallback_ms >= 2_000 {
+                "PNG fallback: запрашиваем live video".to_owned()
+            } else {
+                "PNG fallback".to_owned()
+            };
+            if fallback_ms >= 2_000 && cooldown_ready {
+                self.last_stream_tune_at = Some(Instant::now());
+                self.send_command(SessionCommand::RefreshVideo);
+                self.log("Auto tune: PNG fallback persists; requested live video".to_owned());
+            }
+            return;
+        }
+
+        if self.last_frame_codec == "none" {
+            self.stream_health = "ожидание кадра".to_owned();
+            return;
+        }
+
+        let queue_lag = self.frame_queue_ms >= 450 || self.frame_dropped >= 3;
+        let decode_lag = self.frame_decode_ms >= 45;
+        if queue_lag || decode_lag {
+            self.stream_health = if queue_lag {
+                "очередь кадров: догоняем поток".to_owned()
+            } else {
+                "декодер перегружен".to_owned()
+            };
+            if cooldown_ready {
+                self.last_stream_tune_at = Some(Instant::now());
+                let next_fps = match self.video_fps {
+                    fps if fps > 20 => 20,
+                    fps if fps > 15 => 15,
+                    fps => fps,
+                };
+                if next_fps != self.video_fps {
+                    self.video_fps = next_fps;
+                    self.send_command(SessionCommand::SetVideoFps { fps: next_fps });
+                    self.log(format!("Auto tune: video fps lowered to {next_fps}"));
+                } else {
+                    self.send_command(SessionCommand::RefreshVideo);
+                    self.log("Auto tune: requested fresh live video stream".to_owned());
+                }
+            }
+            return;
+        }
+
+        self.stream_health = "live поток стабилен".to_owned();
+    }
+
     fn save_ui_config(&mut self) {
         self.config.ui.last_remote_id = self.remote_id.clone();
         remember_remote_id(&mut self.config.ui.recent_remote_ids, &self.remote_id);
@@ -521,7 +1193,9 @@ impl EvertyDeskApp {
     }
 
     fn log(&mut self, message: String) {
-        self.events.push(message);
+        let line = format!("{}  {message}", unix_timestamp_secs());
+        self.session_log.push(line.clone());
+        self.events.push(line);
         if self.events.len() > 80 {
             self.events.remove(0);
         }
@@ -530,21 +1204,54 @@ impl EvertyDeskApp {
 
 impl eframe::App for EvertyDeskApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.update_egui(ctx);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.shutdown();
+    }
+}
+
+impl EvertyDeskApp {
+    fn update_egui(&mut self, ctx: &egui::Context) {
         self.poll_worker();
+        self.poll_host_service();
         if let Some(image) = self.pending_image.take() {
             if let Some(texture) = self.remote_texture.as_mut() {
-                texture.set(image, egui::TextureOptions::NEAREST);
+                texture.set(image, egui::TextureOptions::LINEAR);
             } else {
                 self.remote_texture =
-                    Some(ctx.load_texture("remote-screen", image, egui::TextureOptions::NEAREST));
+                    Some(ctx.load_texture("remote-screen", image, egui::TextureOptions::LINEAR));
             }
             ctx.request_repaint();
         }
-        if self.busy || self.connected || self.host_check_busy || self.remote_check_busy {
+        if let Some((image, hotx, hoty)) = self.pending_cursor.take() {
+            let texture = ctx.load_texture("remote-cursor", image, egui::TextureOptions::LINEAR);
+            self.cursor_texture = Some((texture, hotx, hoty));
+        }
+        if self.busy
+            || self.connected
+            || self.host_check_busy
+            || self.remote_check_busy
+            || self.host_state.is_online()
+        {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
+
+        let software_backend = egui_software_backend_active();
+        if software_backend && self.connected && self.remote_viewer_open {
+            self.remote_viewer_inline(ctx);
+            if self.show_settings {
+                self.settings_window(ctx);
+            }
+            return;
+        }
+
         if self.connected && self.remote_viewer_open {
             self.remote_viewer_window(ctx);
+        }
+        if self.show_settings {
+            self.settings_window(ctx);
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -552,6 +1259,12 @@ impl eframe::App for EvertyDeskApp {
             ui.horizontal(|ui| {
                 ui.heading(APP_NAME);
                 ui.label(format!("v{APP_VERSION}"));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("⚙").on_hover_text("Настройки").clicked() {
+                        self.settings_draft = Some(self.config.clone());
+                        self.show_settings = !self.show_settings;
+                    }
+                });
             });
             ui.add_space(14.0);
             ui.horizontal(|ui| {
@@ -573,15 +1286,20 @@ impl eframe::App for EvertyDeskApp {
         }
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    fn shutdown(&mut self) {
+        if let Some(svc) = &self.host_service {
+            svc.stop();
+        }
         if self.connected || self.busy {
             self.disconnect_session("Application closed");
         }
     }
-}
 
-impl EvertyDeskApp {
     fn connect_ui(&mut self, ui: &mut egui::Ui) {
+        if commercial_ui_enabled() {
+            self.connect_ui_commercial(ui);
+            return;
+        }
         ui.add_space(6.0);
         ui.label("ID удаленного ПК");
         let remote_id_response = ui.add_enabled(
@@ -671,62 +1389,630 @@ impl EvertyDeskApp {
         if self.connected && !self.remote_viewer_open {
             ui.label("Окно экрана закрыто. Нажмите Экран, чтобы открыть его снова.");
         }
+
+        if !self.events.is_empty() {
+            ui.add_space(8.0);
+            ui.separator();
+            ui.collapsing("Лог событий", |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("📋 Копировать лог")
+                        .on_hover_text("Скопировать весь лог в буфер обмена")
+                        .clicked()
+                    {
+                        let all = self.events.join("\n");
+                        ui.output_mut(|o| o.copied_text = all);
+                        self.log_status = Some("Лог скопирован в буфер обмена".to_owned());
+                    }
+                    if ui
+                        .button("🗑 Очистить")
+                        .on_hover_text("Очистить лог")
+                        .clicked()
+                    {
+                        self.events.clear();
+                    }
+                });
+                if let Some(status) = &self.log_status {
+                    ui.label(
+                        egui::RichText::new(status)
+                            .size(10.5)
+                            .color(egui::Color32::from_rgb(0x43, 0xA8, 0x47)),
+                    );
+                }
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .max_height(140.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for event in self.events.iter().rev().take(30) {
+                            ui.label(egui::RichText::new(event).monospace().size(10.5));
+                        }
+                    });
+            });
+        }
+    }
+
+    // ── Host UI ───────────────────────────────────────────────────────────────
+
+    fn connect_ui_commercial(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new("Remote control")
+                        .size(22.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(232, 236, 241)),
+                );
+                ui.label(
+                    egui::RichText::new("Fast RustDesk-compatible access through desk.everty.ru")
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(145, 154, 166)),
+                );
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (state, color) = if self.connected {
+                    ("Connected", egui::Color32::from_rgb(66, 190, 112))
+                } else if self.busy {
+                    ("Connecting", egui::Color32::from_rgb(235, 180, 75))
+                } else {
+                    ("Ready", egui::Color32::from_rgb(120, 132, 148))
+                };
+                ui.label(
+                    egui::RichText::new(format!("● {state}"))
+                        .strong()
+                        .color(color),
+                );
+            });
+        });
+
+        ui.add_space(14.0);
+        egui::Frame::none()
+            .fill(egui::Color32::from_rgb(23, 28, 34))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 54, 64)))
+            .rounding(egui::Rounding::same(8.0))
+            .inner_margin(egui::Margin::same(16.0))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("Partner ID")
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(155, 164, 176)),
+                );
+                let remote_id_response = ui.add_enabled(
+                    !self.connected && !self.busy,
+                    egui::TextEdit::singleline(&mut self.remote_id)
+                        .hint_text("123 456 789")
+                        .desired_width(f32::INFINITY)
+                        .font(egui::TextStyle::Heading),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Password")
+                            .size(12.0)
+                            .color(egui::Color32::from_rgb(155, 164, 176)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.checkbox(&mut self.show_password, "show");
+                    });
+                });
+                let password_response = ui.add_enabled(
+                    !self.connected && !self.busy,
+                    egui::TextEdit::singleline(&mut self.password)
+                        .password(!self.show_password)
+                        .hint_text("Optional for remote approval")
+                        .desired_width(f32::INFINITY),
+                );
+                if remote_id_response.changed() || password_response.changed() {
+                    self.last_error = None;
+                    if !self.connected && !self.busy {
+                        self.status = "Ready".to_owned();
+                        self.progress = 0;
+                    }
+                }
+
+                ui.add_space(16.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            !self.busy && !self.connected,
+                            egui::Button::new(
+                                egui::RichText::new(if self.busy {
+                                    "Connecting..."
+                                } else {
+                                    "Connect"
+                                })
+                                .strong(),
+                            )
+                            .min_size(egui::vec2(150.0, 36.0))
+                            .fill(egui::Color32::from_rgb(38, 116, 236)),
+                        )
+                        .clicked()
+                    {
+                        self.connect();
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.busy && !self.connected && !self.remote_check_busy,
+                            egui::Button::new("Check ID").min_size(egui::vec2(110.0, 36.0)),
+                        )
+                        .clicked()
+                    {
+                        self.check_remote_online();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.connected || self.busy,
+                            egui::Button::new("Disconnect").min_size(egui::vec2(120.0, 36.0)),
+                        )
+                        .clicked()
+                    {
+                        self.disconnect_session("Disconnected");
+                    }
+                    if ui
+                        .add_enabled(
+                            self.connected && !self.remote_viewer_open,
+                            egui::Button::new("Open screen").min_size(egui::vec2(120.0, 36.0)),
+                        )
+                        .clicked()
+                    {
+                        self.remote_viewer_open = true;
+                        self.status = "Remote screen opened".to_owned();
+                        self.send_command(SessionCommand::SetAutoRefresh {
+                            enabled: self.auto_refresh,
+                            millis: self.refresh_millis,
+                        });
+                        self.send_command(SessionCommand::Screenshot);
+                    }
+                });
+            });
+
+        ui.add_space(12.0);
+        if self.progress > 0 || self.busy || self.connected || self.remote_check_busy {
+            ui.add(
+                egui::ProgressBar::new(self.progress as f32 / 100.0)
+                    .desired_width(f32::INFINITY)
+                    .text(format!("{}%", self.progress)),
+            );
+            ui.add_space(6.0);
+        }
+        let status_color = if self.last_error.is_some() {
+            egui::Color32::from_rgb(238, 95, 95)
+        } else if self.connected {
+            egui::Color32::from_rgb(66, 190, 112)
+        } else {
+            egui::Color32::from_rgb(170, 178, 188)
+        };
+        ui.label(
+            egui::RichText::new(self.visible_status())
+                .size(13.0)
+                .color(status_color),
+        );
+
+        ui.add_space(12.0);
+        egui::CollapsingHeader::new("Connection details")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Copy log").clicked() {
+                        ui.output_mut(|o| o.copied_text = self.events.join("\n"));
+                        self.log_status = Some("Log copied".to_owned());
+                    }
+                    if ui.button("Clear").clicked() {
+                        self.events.clear();
+                    }
+                });
+                egui::ScrollArea::vertical()
+                    .max_height(130.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for event in self.events.iter().rev().take(30) {
+                            ui.label(
+                                egui::RichText::new(event)
+                                    .monospace()
+                                    .size(10.5)
+                                    .color(egui::Color32::from_rgb(150, 158, 168)),
+                            );
+                        }
+                    });
+            });
     }
 
     fn host_ui(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(6.0);
-        ui.label("Ваш ID");
-        ui.horizontal(|ui| {
-            ui.monospace(&self.config.local_id);
-            if ui.button("Копировать").clicked() {
-                ui.output_mut(|output| output.copied_text = self.config.local_id.clone());
-            }
-        });
-
+        if commercial_ui_enabled() {
+            self.host_ui_commercial(ui);
+            return;
+        }
         ui.add_space(8.0);
-        ui.label("Пароль для входящего подключения");
-        ui.horizontal(|ui| {
-            let password_text = if self.show_host_password {
-                self.config.local_password.clone()
-            } else {
-                "•".repeat(self.config.local_password.len())
-            };
-            ui.monospace(password_text);
-            if ui.button("Копировать").clicked() {
-                ui.output_mut(|output| output.copied_text = self.config.local_password.clone());
-            }
-            if ui.button("Обновить").clicked() {
-                self.config.local_password = generate_numeric_token(6);
-                self.config.save();
-            }
-        });
-        ui.checkbox(&mut self.show_host_password, "Показать пароль");
+
+        // ── ID + Password block ───────────────────────────────────────────────
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::same(12.0))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+
+                // "Ваш ID"
+                ui.label(
+                    egui::RichText::new("Ваш ID")
+                        .size(11.5)
+                        .color(egui::Color32::GRAY),
+                );
+                ui.horizontal(|ui| {
+                    // Large monospace ID — like RustDesk
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format_peer_id(&self.config.local_id))
+                                .monospace()
+                                .size(26.0)
+                                .strong(),
+                        )
+                        .wrap(false),
+                    );
+                    if ui.button("⎘").on_hover_text("Копировать ID").clicked() {
+                        ui.output_mut(|o| o.copied_text = self.config.local_id.clone());
+                    }
+                });
+
+                ui.add_space(8.0);
+
+                // Password
+                ui.label(
+                    egui::RichText::new("Пароль")
+                        .size(11.5)
+                        .color(egui::Color32::GRAY),
+                );
+                ui.horizontal(|ui| {
+                    let pw_text = if self.show_host_password {
+                        self.config.local_password.clone()
+                    } else {
+                        "•".repeat(self.config.local_password.len())
+                    };
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(pw_text).monospace().size(20.0))
+                            .wrap(false),
+                    );
+                    if ui.button("⎘").on_hover_text("Копировать пароль").clicked()
+                    {
+                        ui.output_mut(|o| o.copied_text = self.config.local_password.clone());
+                    }
+                    if ui.button("↺").on_hover_text("Новый пароль").clicked() {
+                        self.config.local_password = generate_numeric_token(6);
+                        self.config.save();
+                    }
+                    ui.checkbox(&mut self.show_host_password, "Показать");
+                });
+            });
 
         ui.add_space(10.0);
-        ui.colored_label(
-            egui::Color32::from_rgb(230, 190, 95),
-            "Host Mode: входящие подключения пока в разработке.",
-        );
-        ui.label("Следующий этап: регистрация этого ПК на ID server и прием relay-сессии.");
-        ui.add_space(8.0);
+
+        // ── Status + Start/Stop ───────────────────────────────────────────────
         ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    !self.host_check_busy && !self.busy && !self.connected,
-                    egui::Button::new("Проверить сервер").min_size(egui::vec2(150.0, 30.0)),
+            // Coloured status indicator
+            let (r, g, b) = self.host_state.color();
+            let dot_color = egui::Color32::from_rgb(r, g, b);
+            ui.colored_label(dot_color, "●");
+            ui.label(self.host_state.label());
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let service_running = self.host_service.is_some();
+                if service_running {
+                    if ui
+                        .add(egui::Button::new("⏹ Остановить").min_size(egui::vec2(130.0, 28.0)))
+                        .clicked()
+                    {
+                        self.stop_host_service();
+                    }
+                } else {
+                    if ui
+                        .add(egui::Button::new("▶ Запустить").min_size(egui::vec2(130.0, 28.0)))
+                        .clicked()
+                    {
+                        self.start_host_service();
+                    }
+                }
+            });
+        });
+
+        // Pending incoming connection
+        if let Some(peer_id) = self.host_pending_peer.clone() {
+            ui.add_space(8.0);
+            egui::Frame::group(ui.style())
+                .fill(egui::Color32::from_rgba_premultiplied(60, 110, 180, 40))
+                .inner_margin(egui::Margin::same(10.0))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("📡 Входящий запрос от: {peer_id}")).strong(),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new("✓ Принять")
+                                    .min_size(egui::vec2(100.0, 28.0))
+                                    .fill(egui::Color32::from_rgb(40, 160, 80)),
+                            )
+                            .clicked()
+                        {
+                            // TODO: full relay session acceptance
+                            self.host_pending_peer = None;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new("✗ Отклонить")
+                                    .min_size(egui::vec2(100.0, 28.0))
+                                    .fill(egui::Color32::from_rgb(200, 60, 60)),
+                            )
+                            .clicked()
+                        {
+                            self.host_pending_peer = None;
+                        }
+                    });
+                });
+        }
+
+        // Host log
+        if !self.host_log.is_empty() {
+            ui.add_space(8.0);
+            ui.separator();
+            ui.collapsing("Лог хост-сервиса", |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("📋 Копировать лог")
+                        .on_hover_text("Скопировать весь лог хоста в буфер обмена")
+                        .clicked()
+                    {
+                        let all = self.host_log.join("\n");
+                        ui.output_mut(|o| o.copied_text = all);
+                        self.host_status = "Лог хоста скопирован в буфер обмена".to_owned();
+                    }
+                    if ui
+                        .button("🗑 Очистить")
+                        .on_hover_text("Очистить лог хоста")
+                        .clicked()
+                    {
+                        self.host_log.clear();
+                    }
+                });
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .max_height(120.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for line in self.host_log.iter().rev().take(25) {
+                            ui.label(egui::RichText::new(line).monospace().size(10.5));
+                        }
+                    });
+            });
+        }
+    }
+
+    fn host_ui_commercial(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new("This device")
+                        .size(22.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(232, 236, 241)),
+                );
+                ui.label(
+                    egui::RichText::new("Share this ID and password for direct unattended access")
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(145, 154, 166)),
+                );
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (r, g, b) = self.host_state.color();
+                ui.label(
+                    egui::RichText::new(format!("● {}", self.host_state.label()))
+                        .strong()
+                        .color(egui::Color32::from_rgb(r, g, b)),
+                );
+            });
+        });
+
+        ui.add_space(14.0);
+        egui::Frame::none()
+            .fill(egui::Color32::from_rgb(23, 28, 34))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 54, 64)))
+            .rounding(egui::Rounding::same(8.0))
+            .inner_margin(egui::Margin::same(16.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("Your ID")
+                                .size(12.0)
+                                .color(egui::Color32::from_rgb(155, 164, 176)),
+                        );
+                        ui.label(
+                            egui::RichText::new(format_peer_id(&self.config.local_id))
+                                .monospace()
+                                .size(30.0)
+                                .strong()
+                                .color(egui::Color32::from_rgb(245, 247, 250)),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Copy ID").clicked() {
+                            ui.output_mut(|o| o.copied_text = self.config.local_id.clone());
+                        }
+                    });
+                });
+
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(12.0);
+
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("Access password")
+                                .size(12.0)
+                                .color(egui::Color32::from_rgb(155, 164, 176)),
+                        );
+                        let pw_text = if self.show_host_password {
+                            self.config.local_password.clone()
+                        } else {
+                            "•".repeat(self.config.local_password.len())
+                        };
+                        ui.label(
+                            egui::RichText::new(pw_text)
+                                .monospace()
+                                .size(22.0)
+                                .color(egui::Color32::from_rgb(245, 247, 250)),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.checkbox(&mut self.show_host_password, "show");
+                        if ui.button("New").clicked() {
+                            self.config.local_password = generate_numeric_token(6);
+                            self.config.save();
+                        }
+                        if ui.button("Copy").clicked() {
+                            ui.output_mut(|o| o.copied_text = self.config.local_password.clone());
+                        }
+                    });
+                });
+            });
+
+        ui.add_space(12.0);
+        ui.horizontal_wrapped(|ui| {
+            let service_running = self.host_service.is_some();
+            if service_running {
+                if ui
+                    .add(
+                        egui::Button::new("Stop sharing")
+                            .min_size(egui::vec2(140.0, 34.0))
+                            .fill(egui::Color32::from_rgb(75, 82, 94)),
+                    )
+                    .clicked()
+                {
+                    self.stop_host_service();
+                }
+            } else if ui
+                .add(
+                    egui::Button::new(egui::RichText::new("Start sharing").strong())
+                        .min_size(egui::vec2(140.0, 34.0))
+                        .fill(egui::Color32::from_rgb(38, 116, 236)),
                 )
                 .clicked()
             {
-                self.check_host_server();
+                self.start_host_service();
             }
-            if self.host_check_busy {
-                ui.spinner();
-                ui.label("Проверка...");
-            }
+            ui.label(
+                egui::RichText::new(&self.host_status)
+                    .size(12.0)
+                    .color(egui::Color32::from_rgb(160, 170, 182)),
+            );
         });
-        ui.colored_label(egui::Color32::from_rgb(230, 190, 95), &self.host_status);
+
+        ui.add_space(10.0);
+        egui::CollapsingHeader::new("Host diagnostics")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Copy log").clicked() {
+                        ui.output_mut(|o| o.copied_text = self.host_log.join("\n"));
+                        self.host_status = "Host log copied".to_owned();
+                    }
+                    if ui.button("Clear").clicked() {
+                        self.host_log.clear();
+                    }
+                });
+                egui::ScrollArea::vertical()
+                    .max_height(140.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for line in self.host_log.iter().rev().take(30) {
+                            ui.label(
+                                egui::RichText::new(line)
+                                    .monospace()
+                                    .size(10.5)
+                                    .color(egui::Color32::from_rgb(150, 158, 168)),
+                            );
+                        }
+                    });
+            });
     }
 
+    fn start_host_service(&mut self) {
+        if self.host_service.is_some() {
+            return;
+        }
+        self.host_log
+            .push(format!("[{}] Запуск хост-сервиса...", timestamp_hms()));
+        self.host_state = HostState::Connecting;
+        self.host_service = Some(HostService::start(self.config.clone()));
+    }
+
+    fn stop_host_service(&mut self) {
+        if let Some(svc) = self.host_service.take() {
+            svc.stop();
+            self.host_log
+                .push(format!("[{}] Хост-сервис остановлен.", timestamp_hms()));
+        }
+        self.host_state = HostState::Idle;
+        self.host_pending_peer = None;
+    }
+
+    fn poll_host_service(&mut self) {
+        let Some(svc) = &self.host_service else {
+            return;
+        };
+        // Drain all events from the host background thread.
+        let mut events_buf: Vec<HostEvent> = Vec::new();
+        while let Some(ev) = svc.try_recv() {
+            events_buf.push(ev);
+        }
+        for ev in events_buf {
+            self.handle_host_event(ev);
+        }
+    }
+
+    fn handle_host_event(&mut self, ev: HostEvent) {
+        match ev {
+            HostEvent::StateChanged(state) => {
+                self.host_state = state;
+            }
+            HostEvent::Registered { .. } => {
+                self.host_log.push(format!(
+                    "[{}] Зарегистрировано на ID сервере ✓",
+                    timestamp_hms()
+                ));
+            }
+            HostEvent::IncomingRequest { peer_id, .. } => {
+                self.host_log.push(format!(
+                    "[{}] Входящий запрос от {peer_id}",
+                    timestamp_hms()
+                ));
+                self.host_pending_peer = None;
+                self.host_status = format!("Incoming connection: authenticating {peer_id}");
+            }
+            HostEvent::SessionStarted { peer_id } => {
+                self.host_log
+                    .push(format!("[{}] Сессия с {peer_id} начата", timestamp_hms()));
+                self.host_pending_peer = None;
+                self.host_status = format!("Connected: {peer_id}");
+            }
+            HostEvent::SessionEnded { peer_id, reason } => {
+                self.host_log.push(format!(
+                    "[{}] Сессия с {peer_id} завершена {reason}",
+                    timestamp_hms(),
+                ));
+            }
+            HostEvent::Log(msg) => {
+                self.host_log.push(format!("[{}] {msg}", timestamp_hms()));
+                if self.host_log.len() > 200 {
+                    self.host_log.drain(0..50);
+                }
+            }
+        }
+    }
+
+    // ── Check host server (legacy) ────────────────────────────────────────────
+    #[allow(dead_code)]
     fn check_host_server(&mut self) {
         if self.host_check_busy || self.busy {
             return;
@@ -743,6 +2029,172 @@ impl EvertyDeskApp {
         self.worker = Some(rx);
     }
 
+    // ── Settings window ───────────────────────────────────────────────────────
+
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_settings;
+        egui::Window::new("⚙  Настройки")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                let draft = match self.settings_draft.as_mut() {
+                    Some(d) => d,
+                    None => return,
+                };
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    // ── Сеть ─────────────────────────────────────────────────
+                    egui::CollapsingHeader::new("🌐  Сеть")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            egui::Grid::new("net_grid")
+                                .num_columns(2)
+                                .spacing([8.0, 6.0])
+                                .show(ui, |ui| {
+                                    ui.label("ID сервер");
+                                    ui.text_edit_singleline(&mut draft.server.id_server);
+                                    ui.end_row();
+                                    ui.label("Relay сервер");
+                                    ui.text_edit_singleline(&mut draft.server.relay_server);
+                                    ui.end_row();
+                                    ui.label("Публичный ключ");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut draft.server.public_key)
+                                            .font(egui::TextStyle::Monospace),
+                                    );
+                                    ui.end_row();
+                                    ui.label("API URL");
+                                    ui.text_edit_singleline(&mut draft.server.api_url);
+                                    ui.end_row();
+                                });
+                        });
+
+                    ui.add_space(6.0);
+
+                    // ── Безопасность ──────────────────────────────────────────
+                    egui::CollapsingHeader::new("🔒  Безопасность")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.checkbox(
+                                &mut draft.security.require_confirmation,
+                                "Подтверждать каждое входящее подключение",
+                            );
+                            ui.checkbox(
+                                &mut draft.security.allow_keyboard_mouse,
+                                "Разрешить управление клавиатурой и мышью",
+                            );
+                            ui.checkbox(
+                                &mut draft.security.allow_clipboard,
+                                "Разрешить доступ к буферу обмена",
+                            );
+                        });
+
+                    ui.add_space(6.0);
+
+                    // ── Дисплей ───────────────────────────────────────────────
+                    egui::CollapsingHeader::new("🖥  Дисплей")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            egui::Grid::new("disp_grid")
+                                .num_columns(2)
+                                .spacing([8.0, 6.0])
+                                .show(ui, |ui| {
+                                    ui.label("Кодек");
+                                    ui.horizontal(|ui| {
+                                        for codec in [
+                                            CodecPreference::Auto,
+                                            CodecPreference::H264,
+                                            CodecPreference::Vp9,
+                                        ] {
+                                            ui.selectable_value(
+                                                &mut draft.display.codec,
+                                                codec,
+                                                codec.label(),
+                                            );
+                                        }
+                                    });
+                                    ui.end_row();
+                                    ui.label("Целевой FPS");
+                                    ui.horizontal(|ui| {
+                                        for fps in [15u32, 20, 30] {
+                                            ui.selectable_value(
+                                                &mut draft.display.target_fps,
+                                                fps,
+                                                fps.to_string(),
+                                            );
+                                        }
+                                    });
+                                    ui.end_row();
+                                });
+                        });
+
+                    ui.add_space(6.0);
+
+                    // ── О программе ───────────────────────────────────────────
+                    egui::CollapsingHeader::new("ℹ  О программе")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.label(format!("{APP_NAME} v{APP_VERSION}"));
+                            ui.label("RustDesk-совместимый клиент удалённого доступа.");
+                            ui.label(format!("Конфиг: {}", settings_mod::config_path().display()));
+                        });
+                });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::Button::new("💾 Сохранить").min_size(egui::vec2(110.0, 28.0)))
+                        .clicked()
+                    {
+                        let new_cfg = self.settings_draft.take().unwrap();
+                        // If server changed, reconfigure the host service.
+                        if new_cfg.server.id_server != self.config.server.id_server
+                            || new_cfg.server.relay_server != self.config.server.relay_server
+                            || new_cfg.server.public_key != self.config.server.public_key
+                        {
+                            if let Some(svc) = &self.host_service {
+                                svc.reconfigure(new_cfg.clone());
+                            }
+                        }
+                        self.config = new_cfg;
+                        self.config.save();
+                        self.show_settings = false;
+                    }
+                    if ui.button("Закрыть").clicked() {
+                        self.settings_draft = None;
+                        self.show_settings = false;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .button("Сбросить")
+                            .on_hover_text("Вернуть настройки по умолчанию")
+                            .clicked()
+                        {
+                            *self.settings_draft.as_mut().unwrap() = AppConfig {
+                                server: settings_mod::ServerConfig::default(),
+                                security: settings_mod::SecurityConfig::default(),
+                                display: settings_mod::DisplayConfig::default(),
+                                local_id: self.config.local_id.clone(),
+                                local_password: self.config.local_password.clone(),
+                                ui: self.config.ui.clone(),
+                                udp_bind_port: 0,
+                                host_pk: Vec::new(),
+                                host_sign_pk: self.config.host_sign_pk.clone(),
+                                host_sign_sk: self.config.host_sign_sk.clone(),
+                            };
+                        }
+                    });
+                });
+            });
+        // Window was closed via the X button.
+        if !open {
+            self.settings_draft = None;
+            self.show_settings = false;
+        }
+    }
+
     fn check_remote_online(&mut self) {
         if self.remote_check_busy || self.busy || self.connected {
             return;
@@ -750,6 +2202,10 @@ impl EvertyDeskApp {
         let remote_id = normalize_remote_id(&self.remote_id);
         if remote_id.is_empty() {
             self.set_error("Введите ID удаленного ПК");
+            return;
+        }
+        if is_own_remote_id(&remote_id, &self.config.local_id) {
+            self.set_error("Это ID этого компьютера. Для подключения нужен ID другого ПК.");
             return;
         }
         self.remote_id = remote_id.clone();
@@ -768,11 +2224,310 @@ impl EvertyDeskApp {
         self.worker = Some(rx);
     }
 
+    fn remote_viewer_inline(&mut self, ctx: &egui::Context) {
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.remote_input_focused = false;
+            self.last_mouse_pos = None;
+            self.wheel_accum = egui::Vec2::ZERO;
+        }
+
+        egui::TopBottomPanel::top("software-remote-toolbar").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .button("Back")
+                    .on_hover_text("Close remote screen")
+                    .clicked()
+                {
+                    self.remote_viewer_open = false;
+                    self.remote_input_focused = false;
+                    self.last_mouse_pos = None;
+                    self.wheel_accum = egui::Vec2::ZERO;
+                    self.status = "Remote screen closed".to_owned();
+                    self.send_command(SessionCommand::SetAutoRefresh {
+                        enabled: false,
+                        millis: self.refresh_millis,
+                    });
+                }
+
+                if ui.button("Disconnect").clicked() {
+                    self.disconnect_session("Disconnected");
+                }
+
+                if !self.remote_displays.is_empty() {
+                    ui.separator();
+                    let selected_text = self
+                        .remote_displays
+                        .iter()
+                        .find(|d| d.index == self.selected_display)
+                        .map(display_label)
+                        .unwrap_or_else(|| format!("Display {}", self.selected_display + 1));
+                    egui::ComboBox::from_id_source("software-remote-display")
+                        .selected_text(selected_text)
+                        .show_ui(ui, |ui| {
+                            let displays = self.remote_displays.clone();
+                            for display in displays {
+                                let label = display_label(&display);
+                                if ui
+                                    .selectable_value(
+                                        &mut self.selected_display,
+                                        display.index,
+                                        label,
+                                    )
+                                    .clicked()
+                                {
+                                    self.remote_texture = None;
+                                    self.remote_size = [0, 0];
+                                    self.send_command(SessionCommand::SetDisplay(display));
+                                }
+                            }
+                        });
+                }
+
+                ui.separator();
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.text_to_send)
+                        .hint_text("Text -> Enter")
+                        .desired_width(180.0),
+                );
+                if ui
+                    .add_enabled(!self.text_to_send.is_empty(), egui::Button::new("Send"))
+                    .clicked()
+                    || (ui.ctx().input(|i| i.key_pressed(egui::Key::Enter))
+                        && !self.remote_input_focused
+                        && !self.text_to_send.is_empty())
+                {
+                    let text = std::mem::take(&mut self.text_to_send);
+                    self.send_command(SessionCommand::KeyText(text));
+                    self.request_visual_refresh_after_input();
+                }
+
+                if ui.button("Paste").clicked() {
+                    self.paste_local_clipboard_to_remote();
+                }
+                if ui
+                    .button("PNG")
+                    .on_hover_text("Save current frame")
+                    .clicked()
+                {
+                    self.save_current_frame_png();
+                }
+                if ui.button("Refresh").clicked() {
+                    self.send_command(SessionCommand::RefreshVideo);
+                    self.send_command(SessionCommand::Screenshot);
+                }
+                if ui.checkbox(&mut self.fit_to_window, "Fit").changed() {
+                    self.save_ui_config();
+                }
+
+                ui.menu_button("More", |ui| {
+                    if ui
+                        .checkbox(&mut self.auto_refresh, "Auto refresh")
+                        .changed()
+                    {
+                        self.save_ui_config();
+                        self.send_command(SessionCommand::SetAutoRefresh {
+                            enabled: self.auto_refresh,
+                            millis: self.refresh_millis,
+                        });
+                    }
+                    let mut refresh_ms = self.refresh_millis as f32;
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut refresh_ms, 50.0..=2000.0)
+                                .text("ms/frame")
+                                .clamp_to_range(true),
+                        )
+                        .changed()
+                    {
+                        self.refresh_millis = refresh_ms.round() as u64;
+                        self.save_ui_config();
+                        self.send_command(SessionCommand::SetAutoRefresh {
+                            enabled: self.auto_refresh,
+                            millis: self.refresh_millis,
+                        });
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Video fps");
+                        for fps in [15, 20, 30] {
+                            if ui
+                                .selectable_label(self.video_fps == fps, fps.to_string())
+                                .clicked()
+                            {
+                                self.video_fps = fps;
+                                self.send_command(SessionCommand::SetVideoFps { fps });
+                            }
+                        }
+                    });
+                    if ui.button("Ctrl+Alt+Del").clicked() {
+                        self.send_command(SessionCommand::KeyControl(ControlKey::CtrlAltDel));
+                        self.request_visual_refresh_after_input();
+                        ui.close_menu();
+                    }
+                    if ui.button("Lock screen").clicked() {
+                        self.send_command(SessionCommand::KeyControl(ControlKey::LockScreen));
+                        self.request_visual_refresh_after_input();
+                        ui.close_menu();
+                    }
+                    if ui.button("Save log").clicked() {
+                        self.save_session_log_file();
+                        ui.close_menu();
+                    }
+                    if ui.button("Support report").clicked() {
+                        self.save_support_report();
+                        ui.close_menu();
+                    }
+                });
+            });
+        });
+
+        egui::TopBottomPanel::bottom("software-remote-statusbar").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if self.remote_size[0] > 0 {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{}x{}",
+                            self.remote_size[0], self.remote_size[1]
+                        ))
+                        .monospace()
+                        .size(11.0),
+                    );
+                    ui.separator();
+                }
+
+                let fps_color = if self.display_fps >= 20.0 {
+                    egui::Color32::from_rgb(80, 200, 100)
+                } else if self.display_fps >= 8.0 {
+                    egui::Color32::from_rgb(220, 180, 60)
+                } else {
+                    egui::Color32::from_rgb(220, 80, 80)
+                };
+                ui.label(
+                    egui::RichText::new(format!("{:.1} fps", self.display_fps))
+                        .monospace()
+                        .size(11.0)
+                        .color(fps_color),
+                );
+                ui.separator();
+
+                let (codec_label, codec_color) = match self.last_frame_codec.as_str() {
+                    "H264" | "VP9" => (
+                        self.last_frame_codec.as_str(),
+                        egui::Color32::from_rgb(80, 220, 110),
+                    ),
+                    "PNG" => ("PNG", egui::Color32::from_rgb(220, 180, 60)),
+                    _ => ("no frame", egui::Color32::GRAY),
+                };
+                ui.label(
+                    egui::RichText::new(codec_label)
+                        .strong()
+                        .size(12.5)
+                        .color(codec_color),
+                );
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(crate::video::build_codec_label())
+                        .monospace()
+                        .size(11.0)
+                        .color(egui::Color32::from_rgb(145, 160, 175)),
+                );
+
+                if let Some(ms) = self.latency_ms {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!("{ms} ms"))
+                            .monospace()
+                            .size(11.0),
+                    );
+                }
+                if self.frame_bytes > 0 {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} KB q:{}ms dec:{}ms",
+                            self.frame_bytes / 1024,
+                            self.frame_queue_ms,
+                            self.frame_decode_ms
+                        ))
+                        .monospace()
+                        .size(11.0),
+                    );
+                }
+                if self.frame_dropped > 0 {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!("drop {}", self.frame_dropped))
+                            .monospace()
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(220, 110, 80)),
+                    );
+                }
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(&self.stream_health)
+                        .size(11.0)
+                        .color(stream_health_color(&self.stream_health)),
+                );
+
+                for status in [
+                    self.clipboard_status.as_deref(),
+                    self.screenshot_status.as_deref(),
+                    self.log_status.as_deref(),
+                    self.report_status.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(status)
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(150, 160, 170)),
+                    );
+                }
+
+                ui.separator();
+                if self.remote_input_focused {
+                    ui.label(
+                        egui::RichText::new("input captured [Esc]")
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(45, 160, 230)),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new("hover/click remote screen for input")
+                            .size(11.0)
+                            .color(egui::Color32::GRAY),
+                    );
+                }
+                if self.screenshot_pending {
+                    ui.spinner();
+                }
+            });
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            self.remote_screen_ui(ui);
+        });
+    }
+
     fn remote_viewer_window(&mut self, ctx: &egui::Context) {
-        let title = if self.remote_id.trim().is_empty() {
-            "EvertyDesk Lite - Remote desktop".to_owned()
-        } else {
-            format!("EvertyDesk Lite - {}", self.remote_id.trim())
+        let title = {
+            let id = if self.remote_id.trim().is_empty() {
+                "удалённый ПК".to_owned()
+            } else {
+                self.remote_id.trim().to_owned()
+            };
+            let fps_part = if self.display_fps > 0.1 {
+                format!("  {:.0} fps", self.display_fps)
+            } else {
+                String::new()
+            };
+            let lat_part = self
+                .latency_ms
+                .map(|ms| format!("  {ms}ms"))
+                .unwrap_or_default();
+            format!("EvertyDesk — {id}{fps_part}{lat_part}")
         };
         let viewport_id = egui::ViewportId::from_hash_of("evertydesk-lite-remote-viewer");
         let builder = egui::ViewportBuilder::default()
@@ -799,32 +2554,17 @@ impl EvertyDeskApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.remote_fullscreen));
             }
 
+            // ── Toolbar ────────────────────────────────────────────────────────────
             egui::TopBottomPanel::top("remote-toolbar").show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button("Обновить").clicked() {
-                        self.send_command(SessionCommand::Screenshot);
-                    }
-                    if ui.checkbox(&mut self.fit_to_window, "По размеру").changed() {
-                        self.save_ui_config();
-                    }
-                    let fullscreen_label = if self.remote_fullscreen {
-                        "РћРєРЅРѕ"
-                    } else {
-                        "Р’Рѕ РІРµСЃСЊ СЌРєСЂР°РЅ"
-                    };
-                    if ui.button(fullscreen_label).clicked() {
-                        self.remote_fullscreen = !self.remote_fullscreen;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(
-                            self.remote_fullscreen,
-                        ));
-                    }
+                    // Display selector
                     if !self.remote_displays.is_empty() {
                         let selected_text = self
                             .remote_displays
                             .iter()
-                            .find(|display| display.index == self.selected_display)
+                            .find(|d| d.index == self.selected_display)
                             .map(display_label)
-                            .unwrap_or_else(|| format!("Display {}", self.selected_display + 1));
+                            .unwrap_or_else(|| format!("Дисплей {}", self.selected_display + 1));
                         egui::ComboBox::from_id_source("remote-display")
                             .selected_text(selected_text)
                             .show_ui(ui, |ui| {
@@ -846,39 +2586,52 @@ impl EvertyDeskApp {
                                 }
                             });
                     }
-                    if ui.button("Enter").clicked() {
-                        self.send_command(SessionCommand::KeyEnter);
-                        self.send_command(SessionCommand::Screenshot);
-                    }
+
+                    ui.separator();
+
+                    // Quick text send
                     ui.add(
                         egui::TextEdit::singleline(&mut self.text_to_send)
-                            .hint_text("Текст")
-                            .desired_width(180.0),
+                            .hint_text("Текст → Enter")
+                            .desired_width(160.0),
                     );
-                    if ui
-                        .add_enabled(
-                            !self.text_to_send.is_empty(),
-                            egui::Button::new("Отправить"),
-                        )
-                        .clicked()
+                    let send_text =
+                        ui.add_enabled(!self.text_to_send.is_empty(), egui::Button::new("⏎"));
+                    if send_text.clicked()
+                        || (ui.ctx().input(|i| i.key_pressed(egui::Key::Enter))
+                            && !self.remote_input_focused
+                            && !self.text_to_send.is_empty())
                     {
                         let text = std::mem::take(&mut self.text_to_send);
                         self.send_command(SessionCommand::KeyText(text));
-                        self.send_command(SessionCommand::Screenshot);
+                        self.request_visual_refresh_after_input();
                     }
-                    if ui
-                        .add_enabled(self.remote_input_focused, egui::Button::new("Отпустить"))
-                        .clicked()
+                    if ui.button("⧉").on_hover_text("Вставить из буфера").clicked()
                     {
-                        self.remote_input_focused = false;
-                        self.last_mouse_pos = None;
-                        self.wheel_accum = egui::Vec2::ZERO;
+                        self.paste_local_clipboard_to_remote();
                     }
+                    if ui.button("▣").on_hover_text("Сохранить кадр PNG").clicked() {
+                        self.save_current_frame_png();
+                    }
+
                     ui.separator();
-                    ui.label(remote_status_text(self));
-                    ui.menu_button("Еще", |ui| {
+
+                    if ui.button("🗗").on_hover_text("Полный экран (F11)").clicked() {
+                        self.remote_fullscreen = !self.remote_fullscreen;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(
+                            self.remote_fullscreen,
+                        ));
+                    }
+                    if ui.checkbox(&mut self.fit_to_window, "Вписать").changed() {
+                        self.save_ui_config();
+                    }
+
+                    ui.separator();
+
+                    // "More" menu — advanced / rarely used settings
+                    ui.menu_button("⋯", |ui| {
                         if ui
-                            .checkbox(&mut self.auto_refresh, "Auto refresh")
+                            .checkbox(&mut self.auto_refresh, "Авто-обновление")
                             .changed()
                         {
                             self.save_ui_config();
@@ -891,7 +2644,7 @@ impl EvertyDeskApp {
                         if ui
                             .add(
                                 egui::Slider::new(&mut refresh_ms, 50.0..=2000.0)
-                                    .text("refresh ms")
+                                    .text("мс / кадр")
                                     .clamp_to_range(true),
                             )
                             .changed()
@@ -902,6 +2655,39 @@ impl EvertyDeskApp {
                                 enabled: self.auto_refresh,
                                 millis: self.refresh_millis,
                             });
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("Video fps");
+                            for fps in [15, 20, 30] {
+                                if ui
+                                    .selectable_label(self.video_fps == fps, fps.to_string())
+                                    .clicked()
+                                {
+                                    self.video_fps = fps;
+                                    self.send_command(SessionCommand::SetVideoFps { fps });
+                                }
+                            }
+                        });
+                        if ui.button("↺ Обновить поток").clicked() {
+                            self.send_command(SessionCommand::RefreshVideo);
+                            ui.close_menu();
+                        }
+                        if ui.button("Вставить буфер").clicked() {
+                            self.paste_local_clipboard_to_remote();
+                            ui.close_menu();
+                        }
+                        if ui.button("Сохранить кадр PNG").clicked() {
+                            self.save_current_frame_png();
+                            ui.close_menu();
+                        }
+                        if ui.button("Сохранить лог").clicked() {
+                            self.save_session_log_file();
+                            ui.close_menu();
+                        }
+                        if ui.button("Собрать отчёт").clicked() {
+                            self.save_support_report();
+                            ui.close_menu();
                         }
                         ui.separator();
                         egui::ComboBox::from_id_source("coordinate-mode")
@@ -925,25 +2711,197 @@ impl EvertyDeskApp {
                                     }
                                 }
                             });
-                        if let Some((x, y)) = self.last_mouse_pos {
-                            ui.label(format!("Mouse: {x},{y}"));
-                        }
-                        ui.label(format!("Input events: {}", self.input_events_sent));
-                        if let Some(age) = self.last_screenshot_age_ms() {
-                            ui.label(format!("Frame age: {age} ms"));
-                        }
                         ui.separator();
                         if ui.button("Ctrl+Alt+Del").clicked() {
                             self.send_command(SessionCommand::KeyControl(ControlKey::CtrlAltDel));
-                            self.send_command(SessionCommand::Screenshot);
+                            self.request_visual_refresh_after_input();
                             ui.close_menu();
                         }
-                        if ui.button("Lock remote").clicked() {
+                        if ui.button("🔒 Заблокировать экран").clicked() {
                             self.send_command(SessionCommand::KeyControl(ControlKey::LockScreen));
-                            self.send_command(SessionCommand::Screenshot);
+                            self.request_visual_refresh_after_input();
                             ui.close_menu();
                         }
+                        ui.separator();
+                        if let Some((x, y)) = self.last_mouse_pos {
+                            ui.label(format!("Мышь: {x}, {y}"));
+                        }
+                        if let Some(age) = self.last_screenshot_age_ms() {
+                            ui.label(format!("Возраст кадра: {age} мс"));
+                        }
+                        ui.label(format!("Отправлено событий: {}", self.input_events_sent));
                     });
+                });
+            });
+
+            // ── Status bar (bottom) ─────────────────────────────────────────────────
+            egui::TopBottomPanel::bottom("remote-statusbar").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    // Resolution
+                    if self.remote_size[0] > 0 {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{}×{}",
+                                self.remote_size[0], self.remote_size[1]
+                            ))
+                            .monospace()
+                            .size(11.0),
+                        );
+                        ui.separator();
+                    }
+                    // FPS
+                    let fps_color = if self.display_fps >= 20.0 {
+                        egui::Color32::from_rgb(80, 200, 100)
+                    } else if self.display_fps >= 8.0 {
+                        egui::Color32::from_rgb(220, 180, 60)
+                    } else {
+                        egui::Color32::from_rgb(220, 80, 80)
+                    };
+                    ui.label(
+                        egui::RichText::new(format!("{:.1} fps", self.display_fps))
+                            .monospace()
+                            .size(11.0)
+                            .color(fps_color),
+                    );
+                    ui.separator();
+                    // Codec badge: color shows quality:
+                    //   H264 green  = live video, low latency
+                    //   PNG  amber  = screenshot mode, higher latency
+                    //   none gray   = no frames yet
+                    let (codec_label, codec_color, codec_tip) = match self.last_frame_codec.as_str()
+                    {
+                        "H264" => (
+                            "H264",
+                            egui::Color32::from_rgb(80, 220, 110),
+                            "Live H264 video, lowest latency",
+                        ),
+                        "VP9" => (
+                            "VP9",
+                            egui::Color32::from_rgb(80, 220, 110),
+                            "Live VP9 video in the live-vpx build",
+                        ),
+                        "PNG" => (
+                            "PNG",
+                            egui::Color32::from_rgb(220, 180, 60),
+                            "Screenshot fallback, higher latency",
+                        ),
+                        _ => ("no frame", egui::Color32::GRAY, "No frames received yet"),
+                    };
+                    ui.label(
+                        egui::RichText::new(codec_label)
+                            .strong()
+                            .size(12.5)
+                            .color(codec_color),
+                    )
+                    .on_hover_text(codec_tip);
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(crate::video::build_codec_label())
+                            .monospace()
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(145, 160, 175)),
+                    )
+                    .on_hover_text("Codecs compiled into this EvertyDesk Lite build");
+                    ui.separator();
+                    // Latency
+                    if let Some(ms) = self.latency_ms {
+                        let lat_color = if ms < 50 {
+                            egui::Color32::from_rgb(80, 200, 100)
+                        } else if ms < 150 {
+                            egui::Color32::from_rgb(220, 180, 60)
+                        } else {
+                            egui::Color32::from_rgb(220, 80, 80)
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("{ms} ms"))
+                                .monospace()
+                                .size(11.0)
+                                .color(lat_color),
+                        );
+                        ui.separator();
+                    }
+                    if self.frame_bytes > 0 {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} KB  q:{}ms  dec:{}ms",
+                                self.frame_bytes / 1024,
+                                self.frame_queue_ms,
+                                self.frame_decode_ms
+                            ))
+                            .monospace()
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(150, 160, 170)),
+                        )
+                        .on_hover_text("Размер кадра, ожидание в очереди и время декодирования");
+                        ui.separator();
+                    }
+                    if self.frame_dropped > 0 {
+                        ui.label(
+                            egui::RichText::new(format!("drop {}", self.frame_dropped))
+                                .monospace()
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(220, 110, 80)),
+                        )
+                        .on_hover_text("Сколько старых кадров было сброшено, чтобы догнать поток");
+                        ui.separator();
+                    }
+                    ui.label(
+                        egui::RichText::new(&self.stream_health)
+                            .size(11.0)
+                            .color(stream_health_color(&self.stream_health)),
+                    )
+                    .on_hover_text("Автоматическая оценка состояния видеопотока");
+                    ui.separator();
+                    if let Some(status) = &self.clipboard_status {
+                        ui.label(
+                            egui::RichText::new(status)
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(150, 160, 170)),
+                        );
+                        ui.separator();
+                    }
+                    if let Some(status) = &self.screenshot_status {
+                        ui.label(
+                            egui::RichText::new(status)
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(150, 160, 170)),
+                        );
+                        ui.separator();
+                    }
+                    if let Some(status) = &self.log_status {
+                        ui.label(
+                            egui::RichText::new(status)
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(150, 160, 170)),
+                        );
+                        ui.separator();
+                    }
+                    if let Some(status) = &self.report_status {
+                        ui.label(
+                            egui::RichText::new(status)
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(150, 160, 170)),
+                        );
+                        ui.separator();
+                    }
+                    // Input focus indicator
+                    if self.remote_input_focused {
+                        ui.label(
+                            egui::RichText::new("⌨ ввод захвачен  [Esc = отпустить]")
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(45, 160, 230)),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new("наведите мышь → ввод")
+                                .size(11.0)
+                                .color(egui::Color32::GRAY),
+                        );
+                    }
+                    // Pending indicator
+                    if self.screenshot_pending {
+                        ui.spinner();
+                    }
                 });
             });
 
@@ -960,7 +2918,8 @@ impl EvertyDeskApp {
                 egui::vec2(available, ui.available_height().max(360.0)),
                 |ui| {
                     ui.centered_and_justified(|ui| {
-                        ui.label("Waiting for remote screenshot");
+                        ui.spinner();
+                        ui.label("Ожидание первого кадра…");
                     });
                 },
             );
@@ -978,19 +2937,108 @@ impl EvertyDeskApp {
             1.0
         };
         let size = egui::vec2(w as f32 * scale, h as f32 * scale);
+
+        // Auto-capture keyboard when pointer hovers inside the remote screen.
+        // Release when pointer leaves the screen area.
+        let pointer_in_screen = ui
+            .ctx()
+            .input(|i| i.pointer.hover_pos())
+            .map(|p| {
+                // Approximate rect check: allocate enough to know where the image will land.
+                // We'll refine after the response is known.
+                let _ = p;
+                true
+            })
+            .unwrap_or(false);
+        let _ = pointer_in_screen; // refined below after response
+
+        // During live VP9 streaming the Windows VP9 encoder (Desktop Duplication)
+        // embeds cursor pixels directly in the captured frame, so the separate
+        // cursor overlay is redundant.  Additionally, CursorId switch messages
+        // currently fail to parse (proto wire-type mismatch in RustDesk 1.4.6),
+        // which leaves the overlay stuck on the first shape (I-beam).
+        // → Hide the overlay while VP9 is active; show the normal OS cursor.
+        let live_vp9_active = self
+            .last_live_frame_at
+            .map(|t| t.elapsed() < Duration::from_secs(2))
+            .unwrap_or(false);
+
+        let hover_cursor = if self.cursor_texture.is_some() && !live_vp9_active {
+            egui::CursorIcon::None
+        } else {
+            egui::CursorIcon::Default
+        };
         let response = ui
             .add(
                 egui::Image::new(&texture)
                     .fit_to_exact_size(size)
                     .sense(egui::Sense::click_and_drag()),
             )
-            .on_hover_cursor(egui::CursorIcon::Crosshair);
+            .on_hover_cursor(hover_cursor);
+
+        // Auto-focus keyboard input when pointer is inside remote screen.
+        if self.connected {
+            let hovering = response.hovered()
+                || response
+                    .ctx
+                    .input(|i| i.pointer.hover_pos())
+                    .map(|p| response.rect.contains(p))
+                    .unwrap_or(false);
+            if hovering && !self.remote_input_focused {
+                self.remote_input_focused = true;
+            }
+            // Release keyboard focus when pointer leaves the screen entirely.
+            if !hovering && !response.is_pointer_button_down_on() {
+                // Only release if we're not in the middle of a drag
+                if !ui.ctx().input(|i| i.pointer.any_down()) {
+                    self.remote_input_focused = false;
+                }
+            }
+        }
+
+        // Draw a colored focus border around the remote screen when keyboard is captured.
+        if self.remote_input_focused {
+            let border_color = egui::Color32::from_rgb(45, 160, 230);
+            ui.painter()
+                .rect_stroke(response.rect, 0.0, egui::Stroke::new(2.0, border_color));
+        }
+
+        // Draw remote cursor overlay on top of the video (PNG / screenshot mode only).
+        // Skipped during live VP9 — see live_vp9_active comment above.
+        if !live_vp9_active {
+            if let Some((cursor_tex, hotx, hoty)) = &self.cursor_texture {
+                let cursor_px = cursor_tex.size_vec2();
+                let draw_pos = if let Some(rpos) = self.cursor_pos {
+                    egui::pos2(
+                        response.rect.min.x + (rpos.x / w as f32) * size.x - *hotx as f32 * scale,
+                        response.rect.min.y + (rpos.y / h as f32) * size.y - *hoty as f32 * scale,
+                    )
+                } else if let Some(local) = response.hover_pos() {
+                    egui::pos2(
+                        local.x - *hotx as f32 * scale,
+                        local.y - *hoty as f32 * scale,
+                    )
+                } else {
+                    return;
+                };
+                let cursor_rect = egui::Rect::from_min_size(draw_pos, cursor_px * scale);
+                ui.painter().image(
+                    cursor_tex.id(),
+                    cursor_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+        } // end !live_vp9_active
+
         if response.double_clicked() {
             self.remote_fullscreen = !self.remote_fullscreen;
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.remote_fullscreen));
         }
+
         if self.connected {
+            // Mouse movement
             let pointer_pos = response
                 .interact_pointer_pos()
                 .or_else(|| response.hover_pos());
@@ -1006,9 +3054,10 @@ impl EvertyDeskApp {
                 }
             }
 
-            if response.hovered() || self.remote_input_focused {
+            // Mouse clicks & scroll
+            {
                 let events = ui.input(|input| input.events.clone());
-                for event in events {
+                for event in &events {
                     match event {
                         egui::Event::PointerButton {
                             pos,
@@ -1016,51 +3065,48 @@ impl EvertyDeskApp {
                             pressed,
                             ..
                         } => {
-                            let inside = response.rect.contains(pos);
-                            if pressed && !inside {
+                            let inside = response.rect.contains(*pos);
+                            if *pressed && !inside {
                                 continue;
                             }
                             let (x, y) = if inside {
-                                let local = pos - response.rect.min;
+                                let local = *pos - response.rect.min;
                                 self.remote_point_from_local(local.x / scale, local.y / scale)
                             } else {
                                 self.last_mouse_pos.unwrap_or((0, 0))
                             };
-                            if inside {
-                                self.remote_input_focused = true;
-                            }
                             match (button, pressed) {
                                 (egui::PointerButton::Primary, true) => {
                                     self.send_command(SessionCommand::MouseDown { x, y });
-                                    self.send_command(SessionCommand::Screenshot);
+                                    self.request_visual_refresh_after_input();
                                 }
                                 (egui::PointerButton::Primary, false) => {
                                     self.send_command(SessionCommand::MouseUp { x, y });
-                                    self.send_command(SessionCommand::Screenshot);
+                                    self.request_visual_refresh_after_input();
                                 }
                                 (egui::PointerButton::Secondary, true) => {
                                     self.send_command(SessionCommand::MouseRightDown { x, y });
-                                    self.send_command(SessionCommand::Screenshot);
+                                    self.request_visual_refresh_after_input();
                                 }
                                 (egui::PointerButton::Secondary, false) => {
                                     self.send_command(SessionCommand::MouseRightUp { x, y });
-                                    self.send_command(SessionCommand::Screenshot);
+                                    self.request_visual_refresh_after_input();
                                 }
                                 (egui::PointerButton::Middle, true) => {
                                     self.send_command(SessionCommand::MouseMiddleDown { x, y });
-                                    self.send_command(SessionCommand::Screenshot);
+                                    self.request_visual_refresh_after_input();
                                 }
                                 (egui::PointerButton::Middle, false) => {
                                     self.send_command(SessionCommand::MouseMiddleUp { x, y });
-                                    self.send_command(SessionCommand::Screenshot);
+                                    self.request_visual_refresh_after_input();
                                 }
                                 _ => {}
                             }
                         }
                         egui::Event::MouseWheel { unit, delta, .. } => {
-                            if let Some((x, y)) = self.wheel_delta(unit, delta) {
+                            if let Some((x, y)) = self.wheel_delta(*unit, *delta) {
                                 self.send_command(SessionCommand::MouseWheel { x, y });
-                                self.send_command(SessionCommand::Screenshot);
+                                self.request_visual_refresh_after_input();
                             }
                         }
                         _ => {}
@@ -1068,6 +3114,7 @@ impl EvertyDeskApp {
                 }
             }
 
+            // Keyboard (active when pointer is over screen, no UI widget has focus)
             if self.remote_input_focused && !ui.ctx().wants_keyboard_input() {
                 self.handle_remote_keyboard(ui.ctx());
             }
@@ -1078,19 +3125,36 @@ impl EvertyDeskApp {
         let events = ctx.input(|input| input.events.clone());
         for event in events {
             match event {
+                // Paste from local clipboard → send to remote as text
+                egui::Event::Paste(text) if !text.is_empty() => {
+                    self.send_command(SessionCommand::KeyText(text));
+                    self.request_visual_refresh_after_input();
+                }
+                // Printable characters from the OS input method (handles all layouts/IME)
                 egui::Event::Text(text) if !text.is_empty() => {
                     self.send_command(SessionCommand::KeyText(text));
-                    self.send_command(SessionCommand::Screenshot);
+                    self.request_visual_refresh_after_input();
                 }
                 egui::Event::Key {
                     key,
                     pressed: true,
-                    repeat: false,
+                    repeat,
                     modifiers,
                     ..
                 } => {
+                    // Ctrl+Escape releases keyboard capture
                     if key == egui::Key::Escape && modifiers.ctrl {
                         self.remote_input_focused = false;
+                        continue;
+                    }
+                    // Escape alone also releases (press Ctrl to send real Escape to remote)
+                    if key == egui::Key::Escape && !has_command_modifier(modifiers) {
+                        self.remote_input_focused = false;
+                        continue;
+                    }
+                    // Allow key-repeat only for navigation/edit keys (arrows, backspace, delete,
+                    // page-up/down, home, end). Other keys skip repeat to avoid duplicates.
+                    if repeat && !key_allows_repeat(key) {
                         continue;
                     }
                     let remote_modifiers = egui_modifiers_to_control_keys(modifiers);
@@ -1100,13 +3164,13 @@ impl EvertyDeskApp {
                             text,
                             modifiers: remote_modifiers,
                         });
-                        self.send_command(SessionCommand::Screenshot);
+                        self.request_visual_refresh_after_input();
                     } else if let Some(control_key) = egui_key_to_control_key(key) {
                         self.send_command(SessionCommand::KeyControlWithModifiers {
                             key: control_key,
                             modifiers: remote_modifiers,
                         });
-                        self.send_command(SessionCommand::Screenshot);
+                        self.request_visual_refresh_after_input();
                     }
                 }
                 _ => {}
@@ -1138,6 +3202,9 @@ impl EvertyDeskApp {
     }
 
     fn should_refresh_after_move(&mut self) -> bool {
+        // Throttle move-triggered refreshes to once per 60 ms regardless of auto_refresh.
+        // auto_refresh already fires every ~80 ms, so this adds at most one extra request
+        // between auto-refresh ticks, keeping the view fresh while dragging.
         if self.screenshot_pending {
             return false;
         }
@@ -1150,6 +3217,115 @@ impl EvertyDeskApp {
             self.last_move_refresh_at = Some(now);
         }
         should_refresh
+    }
+
+    fn request_visual_refresh_after_input(&mut self) {
+        // Always request a fresh screenshot after user input so the screen reflects
+        // the action immediately — don't wait for the periodic auto-refresh timer.
+        // Skip only if a request is already in flight to avoid flooding the server.
+        if !self.screenshot_pending {
+            self.send_command(SessionCommand::Screenshot);
+        }
+    }
+
+    fn paste_local_clipboard_to_remote(&mut self) {
+        match read_local_clipboard_text() {
+            Ok(text) if text.trim().is_empty() => {
+                self.clipboard_status = Some("буфер пуст".to_owned());
+            }
+            Ok(text) => {
+                let chars = text.chars().count();
+                self.send_command(SessionCommand::KeyText(text));
+                self.request_visual_refresh_after_input();
+                self.clipboard_status = Some(format!("буфер отправлен: {chars} симв."));
+                self.log(format!("Clipboard sent to remote: {chars} chars"));
+            }
+            Err(err) => {
+                self.clipboard_status = Some("буфер недоступен".to_owned());
+                self.log(format!("Clipboard read failed: {err}"));
+            }
+        }
+    }
+
+    fn save_current_frame_png(&mut self) {
+        if self.last_frame_rgba.is_empty() || self.remote_size[0] == 0 || self.remote_size[1] == 0 {
+            self.screenshot_status = Some("нет кадра для сохранения".to_owned());
+            return;
+        }
+
+        match save_rgba_png(
+            &self.remote_id,
+            self.remote_size[0],
+            self.remote_size[1],
+            &self.last_frame_rgba,
+        ) {
+            Ok(path) => {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("screenshot.png");
+                self.screenshot_status = Some(format!("сохранено: {name}"));
+                self.log(format!("Screenshot saved: {}", path.display()));
+            }
+            Err(err) => {
+                self.screenshot_status = Some("сохранение не удалось".to_owned());
+                self.log(format!("Screenshot save failed: {err}"));
+            }
+        }
+    }
+
+    fn save_session_log_file(&mut self) {
+        match save_session_log(&self.remote_id, &self.session_log) {
+            Ok(path) => {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("session.log");
+                self.log_status = Some(format!("лог сохранён: {name}"));
+                self.log(format!("Session log saved: {}", path.display()));
+            }
+            Err(err) => {
+                self.log_status = Some("лог не сохранён".to_owned());
+                self.log(format!("Session log save failed: {err}"));
+            }
+        }
+    }
+
+    fn save_support_report(&mut self) {
+        let report = SupportReport {
+            remote_id: self.remote_id.clone(),
+            connected: self.connected,
+            codec: self.last_frame_codec.clone(),
+            fps: self.display_fps,
+            latency_ms: self.latency_ms,
+            frame_size: self.remote_size,
+            frame_bytes: self.frame_bytes,
+            queue_ms: self.frame_queue_ms,
+            decode_ms: self.frame_decode_ms,
+            dropped: self.frame_dropped,
+            stream_health: self.stream_health.clone(),
+            screenshot_count: self.screenshot_count,
+            live_frame_count: self.live_frame_count,
+            screenshot_frame_count: self.screenshot_frame_count,
+            input_events_sent: self.input_events_sent,
+            last_frame_rgba: self.last_frame_rgba.clone(),
+            session_log: self.session_log.clone(),
+        };
+
+        match save_support_report_bundle(report) {
+            Ok(dir) => {
+                let name = dir
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("report");
+                self.report_status = Some(format!("отчёт собран: {name}"));
+                self.log(format!("Support report saved: {}", dir.display()));
+            }
+            Err(err) => {
+                self.report_status = Some("отчёт не собран".to_owned());
+                self.log(format!("Support report save failed: {err}"));
+            }
+        }
     }
 
     fn remote_point_from_local(&self, x: f32, y: f32) -> (i32, i32) {
@@ -1226,17 +3402,220 @@ fn coordinate_mode_label(mode: CoordinateMode) -> &'static str {
     }
 }
 
-fn remote_status_text(app: &EvertyDeskApp) -> String {
-    let input = if app.remote_input_focused {
-        "ввод"
+fn stream_health_color(text: &str) -> egui::Color32 {
+    if text.contains("стабилен") {
+        egui::Color32::from_rgb(80, 200, 100)
+    } else if text.contains("ожидание") || text.contains("PNG fallback") {
+        egui::Color32::from_rgb(220, 180, 60)
     } else {
-        "кликните экран"
-    };
-    let pending = if app.screenshot_pending { " ..." } else { "" };
-    format!(
-        "{}x{} {:.1} fps frame {} {input}{pending}",
-        app.remote_size[0], app.remote_size[1], app.display_fps, app.screenshot_count
+        egui::Color32::from_rgb(220, 110, 80)
+    }
+}
+
+struct SupportReport {
+    remote_id: String,
+    connected: bool,
+    codec: String,
+    fps: f32,
+    latency_ms: Option<u32>,
+    frame_size: [usize; 2],
+    frame_bytes: usize,
+    queue_ms: u64,
+    decode_ms: u64,
+    dropped: usize,
+    stream_health: String,
+    screenshot_count: u64,
+    live_frame_count: u64,
+    screenshot_frame_count: u64,
+    input_events_sent: u64,
+    last_frame_rgba: Vec<u8>,
+    session_log: Vec<String>,
+}
+
+fn read_local_clipboard_text() -> Result<String, String> {
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|err| format!("Clipboard init failed: {err}"))?;
+    clipboard
+        .get_text()
+        .map_err(|err| format!("Clipboard text read failed: {err}"))
+}
+
+fn save_rgba_png(
+    remote_id: &str,
+    width: usize,
+    height: usize,
+    rgba: &[u8],
+) -> Result<PathBuf, String> {
+    let expected = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| "Frame size overflow".to_owned())?;
+    if rgba.len() != expected {
+        return Err(format!(
+            "Frame buffer size mismatch: got {}, expected {expected}",
+            rgba.len()
+        ));
+    }
+
+    let dir = PathBuf::from("screenshots");
+    fs::create_dir_all(&dir).map_err(|err| format!("Create screenshots dir failed: {err}"))?;
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("System time error: {err}"))?
+        .as_secs();
+    let id = sanitize_filename(remote_id);
+    let path = dir.join(format!("evertydesk-{id}-{timestamp}.png"));
+    image::save_buffer_with_format(
+        &path,
+        rgba,
+        width as u32,
+        height as u32,
+        image::ColorType::Rgba8,
+        image::ImageFormat::Png,
     )
+    .map_err(|err| format!("PNG save failed: {err}"))?;
+    Ok(path)
+}
+
+fn save_session_log(remote_id: &str, lines: &[String]) -> Result<PathBuf, String> {
+    let dir = PathBuf::from("logs");
+    fs::create_dir_all(&dir).map_err(|err| format!("Create logs dir failed: {err}"))?;
+    let timestamp = unix_timestamp_secs();
+    let id = sanitize_filename(remote_id);
+    let path = dir.join(format!("evertydesk-{id}-{timestamp}.log"));
+    let mut body = String::new();
+    body.push_str("EvertyDesk Lite session log\n");
+    body.push_str(&format!("remote_id={remote_id}\n"));
+    body.push_str(&format!("created_at_unix={timestamp}\n\n"));
+    for line in lines {
+        body.push_str(line);
+        body.push('\n');
+    }
+    fs::write(&path, body).map_err(|err| format!("Write log failed: {err}"))?;
+    Ok(path)
+}
+
+fn save_support_report_bundle(report: SupportReport) -> Result<PathBuf, String> {
+    let timestamp = unix_timestamp_secs();
+    let id = sanitize_filename(&report.remote_id);
+    let dir = PathBuf::from("reports").join(format!("evertydesk-{id}-{timestamp}"));
+    fs::create_dir_all(&dir).map_err(|err| format!("Create report dir failed: {err}"))?;
+
+    let summary_path = dir.join("summary.txt");
+    fs::write(&summary_path, support_report_summary(&report, timestamp))
+        .map_err(|err| format!("Write report summary failed: {err}"))?;
+
+    let log_path = dir.join("session.log");
+    let mut log_body = String::new();
+    log_body.push_str("EvertyDesk Lite session log\n\n");
+    for line in &report.session_log {
+        log_body.push_str(line);
+        log_body.push('\n');
+    }
+    fs::write(&log_path, log_body).map_err(|err| format!("Write report log failed: {err}"))?;
+
+    if !report.last_frame_rgba.is_empty() && report.frame_size[0] > 0 && report.frame_size[1] > 0 {
+        let shot_path = dir.join("screen.png");
+        image::save_buffer_with_format(
+            &shot_path,
+            &report.last_frame_rgba,
+            report.frame_size[0] as u32,
+            report.frame_size[1] as u32,
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .map_err(|err| format!("Write report screen failed: {err}"))?;
+    }
+
+    Ok(dir)
+}
+
+fn support_report_summary(report: &SupportReport, timestamp: u64) -> String {
+    let latency = report
+        .latency_ms
+        .map(|ms| ms.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    format!(
+        "EvertyDesk Lite support report\n\
+         created_at_unix={timestamp}\n\
+         remote_id={}\n\
+         connected={}\n\
+         codec={}\n\
+         fps={:.1}\n\
+         latency_ms={latency}\n\
+         frame={}x{}\n\
+         frame_bytes={}\n\
+         queue_ms={}\n\
+         decode_ms={}\n\
+         dropped={}\n\
+         stream_health={}\n\
+         screenshot_count={}\n\
+         live_frame_count={}\n\
+         screenshot_frame_count={}\n\
+         input_events_sent={}\n",
+        report.remote_id,
+        report.connected,
+        report.codec,
+        report.fps,
+        report.frame_size[0],
+        report.frame_size[1],
+        report.frame_bytes,
+        report.queue_ms,
+        report.decode_ms,
+        report.dropped,
+        report.stream_health,
+        report.screenshot_count,
+        report.live_frame_count,
+        report.screenshot_frame_count,
+        report.input_events_sent
+    )
+}
+
+fn unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+/// "HH:MM:SS" wall-clock for log lines.
+fn timestamp_hms() -> String {
+    let secs = unix_timestamp_secs();
+    format!(
+        "{:02}:{:02}:{:02}",
+        (secs / 3600) % 24,
+        (secs / 60) % 60,
+        secs % 60
+    )
+}
+
+/// Format 9-digit peer ID as "XXX XXX XXX" (like RustDesk).
+fn format_peer_id(id: &str) -> String {
+    let digits: String = id.chars().filter(|c| c.is_ascii_digit()).collect();
+    match digits.len() {
+        9 => format!("{} {} {}", &digits[0..3], &digits[3..6], &digits[6..9]),
+        _ => id.to_owned(),
+    }
+}
+
+fn sanitize_filename(value: &str) -> String {
+    let cleaned: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('_');
+    if trimmed.is_empty() {
+        "remote".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
 }
 
 fn egui_key_to_control_key(key: egui::Key) -> Option<ControlKey> {
@@ -1270,6 +3649,24 @@ fn egui_key_to_control_key(key: egui::Key) -> Option<ControlKey> {
         egui::Key::F12 => ControlKey::F12,
         _ => return None,
     })
+}
+
+/// Keys that should fire repeatedly when held down (navigation, delete, etc.)
+fn key_allows_repeat(key: egui::Key) -> bool {
+    matches!(
+        key,
+        egui::Key::ArrowDown
+            | egui::Key::ArrowLeft
+            | egui::Key::ArrowRight
+            | egui::Key::ArrowUp
+            | egui::Key::Backspace
+            | egui::Key::Delete
+            | egui::Key::PageDown
+            | egui::Key::PageUp
+            | egui::Key::Home
+            | egui::Key::End
+            | egui::Key::Tab
+    )
 }
 
 fn egui_key_to_text(key: egui::Key) -> Option<String> {
@@ -1353,10 +3750,118 @@ fn configure_style(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
+/// Try to read the 32-byte Ed25519 public key from the installed EvertyDesk
+/// (or RustDesk) client config.  Returns `None` if the config is not found
+/// or cannot be parsed.
+///
+/// Priority:
+/// 1. `%APPDATA%\EvertyDesk\config\Evertydesk.toml`
+/// 2. `%APPDATA%\RustDesk\config\RustDesk.toml`
+fn load_everty_public_key() -> Option<Vec<u8>> {
+    let appdata = std::env::var_os("APPDATA")?;
+    let appdata = std::path::PathBuf::from(appdata);
+
+    let candidates = [
+        appdata
+            .join("EvertyDesk")
+            .join("config")
+            .join("Evertydesk.toml"),
+        appdata
+            .join("RustDesk")
+            .join("config")
+            .join("RustDesk.toml"),
+    ];
+
+    for path in &candidates {
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            // key_pair in TOML is two arrays of integers.
+            // key_pair[1] is the 32-byte public key.
+            if let Some(pk) = parse_key_pair_public_key(&raw) {
+                eprintln!("[cli] Loaded key from {}", path.display());
+                return Some(pk);
+            }
+        }
+    }
+    None
+}
+
+/// Parses the `key_pair` from a RustDesk/EvertyDesk TOML config string and
+/// returns the 32-byte public key (the second inner array).
+fn parse_key_pair_public_key(toml_text: &str) -> Option<Vec<u8>> {
+    // The key_pair field is written as two arrays-of-integers.
+    // We use a simple regex-free approach: find each bracketed number list.
+    let kp_start = toml_text.find("key_pair")?;
+    let text = &toml_text[kp_start..];
+
+    // Find all outer `[` brackets (each sub-array)
+    let mut arrays: Vec<Vec<u8>> = Vec::new();
+    let mut depth = 0i32;
+    let mut cur: Vec<u8> = Vec::new();
+    let mut num_buf = String::new();
+
+    for ch in text.chars() {
+        match ch {
+            '[' => {
+                depth += 1;
+                if depth == 2 {
+                    cur.clear();
+                }
+            }
+            ']' => {
+                if depth == 2 {
+                    // flush last number
+                    if !num_buf.is_empty() {
+                        if let Ok(n) = num_buf.trim().parse::<u8>() {
+                            cur.push(n);
+                        }
+                        num_buf.clear();
+                    }
+                    arrays.push(cur.clone());
+                }
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            ',' if depth == 2 => {
+                if !num_buf.is_empty() {
+                    if let Ok(n) = num_buf.trim().parse::<u8>() {
+                        cur.push(n);
+                    }
+                    num_buf.clear();
+                }
+            }
+            c if (c.is_ascii_digit() || c == '-') && depth == 2 => {
+                num_buf.push(c);
+            }
+            _ if depth == 2 => {
+                // whitespace/newline — ignore
+                if !num_buf.is_empty() {
+                    if let Ok(n) = num_buf.trim().parse::<u8>() {
+                        cur.push(n);
+                    }
+                    num_buf.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // key_pair = [ [64 bytes private+pub], [32 bytes public] ]
+    // We want the second array (index 1), length must be 32.
+    arrays.into_iter().find(|a| a.len() == 32)
+}
+
 fn normalize_remote_id(id: &str) -> String {
     id.chars()
         .filter(|ch| !ch.is_whitespace() && *ch != '-' && *ch != '_')
         .collect()
+}
+
+fn is_own_remote_id(remote_id: &str, local_id: &str) -> bool {
+    let remote_id = normalize_remote_id(remote_id);
+    let local_id = normalize_remote_id(local_id);
+    !remote_id.is_empty() && remote_id == local_id
 }
 
 fn remember_remote_id(recent: &mut Vec<String>, id: &str) {

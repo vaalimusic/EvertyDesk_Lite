@@ -44,14 +44,50 @@ pub struct PunchHoleResponse {
 pub struct RelayResponse {
     #[prost(bytes, tag = "1")]
     pub socket_addr: Vec<u8>,
+    #[prost(string, tag = "2")]
+    pub uuid: String,
     #[prost(string, tag = "3")]
     pub relay_server: String,
+    /// Host identifies itself to the rendezvous (oneof id/pk in real proto;
+    /// we only ever send `id`, so a plain string at tag 4 is wire-compatible).
+    #[prost(string, tag = "4")]
+    pub id: String,
     #[prost(string, tag = "6")]
     pub refuse_reason: String,
     #[prost(string, tag = "7")]
     pub version: String,
     #[prost(int32, tag = "9")]
     pub feedback: i32,
+}
+
+/// Server → Host: a peer wants to connect. Host decides direct-punch vs relay.
+#[derive(Clone, PartialEq, Message)]
+pub struct PunchHole {
+    #[prost(bytes, tag = "1")]
+    pub socket_addr: Vec<u8>,
+    #[prost(string, tag = "2")]
+    pub relay_server: String,
+    #[prost(enumeration = "NatType", tag = "3")]
+    pub nat_type: i32,
+    #[prost(int32, tag = "4")]
+    pub udp_port: i32,
+    #[prost(bool, tag = "5")]
+    pub force_relay: bool,
+    #[prost(int32, tag = "6")]
+    pub upnp_port: i32,
+    #[prost(bytes, tag = "7")]
+    pub socket_addr_v6: Vec<u8>,
+}
+
+/// Server → Host: a peer on the same LAN wants the host's local address.
+#[derive(Clone, PartialEq, Message)]
+pub struct FetchLocalAddr {
+    #[prost(bytes, tag = "1")]
+    pub socket_addr: Vec<u8>,
+    #[prost(string, tag = "2")]
+    pub relay_server: String,
+    #[prost(bytes, tag = "3")]
+    pub socket_addr_v6: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -88,9 +124,60 @@ pub struct OnlineResponse {
     pub states: Vec<u8>,
 }
 
+/// Sent by the host to the ID server to appear "online" and accept connections.
+#[derive(Clone, PartialEq, Message)]
+pub struct RegisterPeer {
+    #[prost(string, tag = "1")]
+    pub id: String,
+    #[prost(int32, tag = "2")]
+    pub serial: i32,
+}
+
+/// ID server reply to RegisterPeer.
+#[derive(Clone, PartialEq, Message)]
+pub struct RegisterPeerResponse {
+    /// If true the server also needs our public key (first-time registration).
+    #[prost(bool, tag = "1")]
+    pub request_pk: bool,
+}
+
+/// Host → ID server: register public key (sent once when request_pk == true).
+#[derive(Clone, PartialEq, Message)]
+pub struct RegisterPk {
+    #[prost(string, tag = "1")]
+    pub id: String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub uuid: Vec<u8>,
+    /// 32-byte public key (Ed25519 or similar).
+    #[prost(bytes = "vec", tag = "3")]
+    pub pk: Vec<u8>,
+    #[prost(bytes = "vec", tag = "4")]
+    pub old_pk: Vec<u8>,
+}
+
+/// ID server → Host: public key registration result.
+#[derive(Clone, PartialEq, Message)]
+pub struct RegisterPkResponse {
+    /// 0 = OK, 1 = UUID_MISMATCH, 2 = NOT_SUPPORT, 3 = SERVER_ERROR, 4 = INVALID_ID_FORMAT
+    #[prost(int32, tag = "1")]
+    pub result: i32,
+}
+
+/// KeyExchange — secure TCP/relay handshake with the rendezvous server.
+/// Server sends keys[0] = its Ed25519-signed box public key; client replies
+/// with keys = [our box public key, sealed symmetric key].
+#[derive(Clone, PartialEq, Message)]
+pub struct KeyExchange {
+    #[prost(bytes = "vec", repeated, tag = "1")]
+    pub keys: Vec<Vec<u8>>,
+}
+
 #[derive(Clone, PartialEq, Message)]
 pub struct RendezvousMessage {
-    #[prost(oneof = "rendezvous_message::Union", tags = "8, 11, 18, 19, 23, 24")]
+    #[prost(
+        oneof = "rendezvous_message::Union",
+        tags = "6, 7, 15, 16, 8, 9, 11, 12, 18, 19, 23, 24, 25"
+    )]
     pub union: Option<rendezvous_message::Union>,
 }
 
@@ -98,16 +185,35 @@ pub mod rendezvous_message {
     use prost::Oneof;
 
     use super::{
-        OnlineRequest, OnlineResponse, PunchHoleRequest, PunchHoleResponse, RelayResponse,
-        RequestRelay,
+        FetchLocalAddr, KeyExchange, OnlineRequest, OnlineResponse, PunchHole, PunchHoleRequest,
+        PunchHoleResponse, RegisterPeer, RegisterPeerResponse, RegisterPk, RegisterPkResponse,
+        RelayResponse, RequestRelay,
     };
 
     #[derive(Clone, PartialEq, Oneof)]
     pub enum Union {
+        /// Host → ID server: register / heartbeat. (real RustDesk tag 6)
+        #[prost(message, tag = "6")]
+        RegisterPeer(RegisterPeer),
+        /// ID server → Host: registration ack (request_pk = needs key). (tag 7)
+        #[prost(message, tag = "7")]
+        RegisterPeerResponse(RegisterPeerResponse),
+        /// Host → ID server: first-time public key upload. (real tag 15)
+        #[prost(message, tag = "15")]
+        RegisterPk(RegisterPk),
+        /// ID server → Host: public key registration result. (real tag 16)
+        #[prost(message, tag = "16")]
+        RegisterPkResponse(RegisterPkResponse),
         #[prost(message, tag = "8")]
         PunchHoleRequest(PunchHoleRequest),
+        /// ID server → Host: incoming peer wants to connect.
+        #[prost(message, tag = "9")]
+        PunchHole(PunchHole),
         #[prost(message, tag = "11")]
         PunchHoleResponse(PunchHoleResponse),
+        /// ID server → Host: LAN peer requests local address.
+        #[prost(message, tag = "12")]
+        FetchLocalAddr(FetchLocalAddr),
         #[prost(message, tag = "18")]
         RequestRelay(RequestRelay),
         #[prost(message, tag = "19")]
@@ -116,6 +222,9 @@ pub mod rendezvous_message {
         OnlineRequest(OnlineRequest),
         #[prost(message, tag = "24")]
         OnlineResponse(OnlineResponse),
+        /// Secure handshake key exchange. (real tag 25)
+        #[prost(message, tag = "25")]
+        KeyExchange(KeyExchange),
     }
 }
 
@@ -179,6 +288,8 @@ pub struct LoginRequest {
 pub struct OptionMessage {
     #[prost(message, optional, tag = "10")]
     pub supported_decoding: Option<SupportedDecoding>,
+    #[prost(int32, tag = "11")]
+    pub custom_fps: i32,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -243,6 +354,16 @@ pub struct Hash {
 pub struct SignedId {
     #[prost(bytes, tag = "1")]
     pub id: Vec<u8>,
+}
+
+/// Inner payload that gets Ed25519-signed and placed inside `SignedId.id`.
+/// `pk` is the host's *ephemeral box* public key for this connection.
+#[derive(Clone, PartialEq, Message)]
+pub struct IdPk {
+    #[prost(string, tag = "1")]
+    pub id: String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub pk: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -327,11 +448,40 @@ pub mod login_response {
     }
 }
 
+/// Cursor image data sent by the server when the cursor shape changes.
+/// colors = zstd-compressed RGBA bytes (width * height * 4 uncompressed).
+#[derive(Clone, PartialEq, Message)]
+pub struct CursorData {
+    #[prost(uint64, tag = "1")]
+    pub id: u64,
+    #[prost(sint32, tag = "2")]
+    pub hotx: i32,
+    #[prost(sint32, tag = "3")]
+    pub hoty: i32,
+    #[prost(int32, tag = "4")]
+    pub width: i32,
+    #[prost(int32, tag = "5")]
+    pub height: i32,
+    #[prost(bytes, tag = "6")]
+    pub colors: Vec<u8>,
+    #[prost(bytes, tag = "7")]
+    pub mask: Vec<u8>,
+}
+
+/// Cursor screen-coordinate position update.
+#[derive(Clone, PartialEq, Message)]
+pub struct CursorPosition {
+    #[prost(sint32, tag = "1")]
+    pub x: i32,
+    #[prost(sint32, tag = "2")]
+    pub y: i32,
+}
+
 #[derive(Clone, PartialEq, Message)]
 pub struct PeerMessage {
     #[prost(
         oneof = "peer_message::Union",
-        tags = "3, 4, 5, 6, 7, 8, 9, 10, 15, 19, 25, 29, 30"
+        tags = "3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 19, 25, 29, 30"
     )]
     pub union: Option<peer_message::Union>,
 }
@@ -340,8 +490,9 @@ pub mod peer_message {
     use prost::Oneof;
 
     use super::{
-        Hash, KeyEvent, LoginRequest, LoginResponse, Misc, MouseEvent, PeerInfo, PublicKey,
-        ScreenshotRequest, ScreenshotResponse, SignedId, TestDelay, VideoFrame,
+        CursorData, CursorPosition, Hash, KeyEvent, LoginRequest, LoginResponse, Misc, MouseEvent,
+        PeerInfo, PublicKey, ScreenshotRequest, ScreenshotResponse, SignedId, TestDelay,
+        VideoFrame,
     };
 
     #[derive(Clone, PartialEq, Oneof)]
@@ -362,6 +513,15 @@ pub mod peer_message {
         Hash(Hash),
         #[prost(message, tag = "10")]
         MouseEvent(MouseEvent),
+        /// Server sends full cursor RGBA image when shape changes.
+        #[prost(message, tag = "12")]
+        CursorData(CursorData),
+        /// Server sends cursor ID to reuse a previously sent cursor shape.
+        #[prost(uint64, tag = "13")]
+        CursorId(u64),
+        /// Server sends cursor position update.
+        #[prost(message, tag = "14")]
+        CursorPosition(CursorPosition),
         #[prost(message, tag = "15")]
         KeyEvent(KeyEvent),
         #[prost(message, tag = "19")]
@@ -493,7 +653,7 @@ pub struct TestDelay {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct Misc {
-    #[prost(oneof = "misc::Union", tags = "5, 10, 12, 31, 35")]
+    #[prost(oneof = "misc::Union", tags = "5, 7, 10, 12, 31, 35")]
     pub union: Option<misc::Union>,
 }
 
@@ -506,6 +666,8 @@ pub mod misc {
     pub enum Union {
         #[prost(message, tag = "5")]
         SwitchDisplay(SwitchDisplay),
+        #[prost(message, tag = "7")]
+        Option(super::OptionMessage),
         #[prost(bool, tag = "10")]
         RefreshVideo(bool),
         #[prost(bool, tag = "12")]

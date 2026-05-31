@@ -22,3 +22,6 @@ config.json
 
 # Optional local experiments
 /engine/
+/screenshots/
+/logs/
+/reports/
