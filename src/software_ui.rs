@@ -375,12 +375,15 @@ fn collect_pointer_button(
 }
 
 fn current_modifiers(window: &Window) -> Modifiers {
+    let ctrl = window.is_key_down(MiniKey::LeftCtrl) || window.is_key_down(MiniKey::RightCtrl);
+    let super_key =
+        window.is_key_down(MiniKey::LeftSuper) || window.is_key_down(MiniKey::RightSuper);
     Modifiers {
         alt: window.is_key_down(MiniKey::LeftAlt) || window.is_key_down(MiniKey::RightAlt),
-        ctrl: window.is_key_down(MiniKey::LeftCtrl) || window.is_key_down(MiniKey::RightCtrl),
+        ctrl,
         shift: window.is_key_down(MiniKey::LeftShift) || window.is_key_down(MiniKey::RightShift),
-        mac_cmd: false,
-        command: window.is_key_down(MiniKey::LeftCtrl) || window.is_key_down(MiniKey::RightCtrl),
+        mac_cmd: super_key,
+        command: ctrl,
     }
 }
 

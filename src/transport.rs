@@ -141,6 +141,10 @@ pub enum SessionCommand {
     },
     KeyText(String),
     KeyControl(ControlKey),
+    KeyControlState {
+        key: ControlKey,
+        down: bool,
+    },
     KeyTextWithModifiers {
         text: String,
         modifiers: Vec<ControlKey>,
@@ -415,6 +419,10 @@ impl TransportClient {
                     SessionCommand::KeyControl(key) => {
                         flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
                         let _ = send_control_key(&mut relay, key);
+                    }
+                    SessionCommand::KeyControlState { key, down } => {
+                        flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
+                        let _ = send_control_key_state(&mut relay, key, down);
                     }
                     SessionCommand::KeyTextWithModifiers { text, modifiers } => {
                         flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
@@ -2221,6 +2229,25 @@ fn send_text_with_modifiers(
 
 fn send_control_key(relay: &mut TcpStream, key: ControlKey) -> Result<(), String> {
     send_control_key_with_modifiers(relay, key, &[])
+}
+
+fn send_control_key_state(
+    relay: &mut TcpStream,
+    key: ControlKey,
+    down: bool,
+) -> Result<(), String> {
+    let message = PeerMessage {
+        union: Some(peer_message::Union::KeyEvent(KeyEvent {
+            down,
+            press: false,
+            union: Some(crate::rustdesk_proto::key_event::Union::ControlKey(
+                key as i32,
+            )),
+            modifiers: Vec::new(),
+            mode: KeyboardMode::Legacy as i32,
+        })),
+    };
+    send_framed(relay, &encode_peer_message(&message))
 }
 
 fn send_control_key_with_modifiers(

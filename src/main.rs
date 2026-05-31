@@ -519,6 +519,7 @@ struct EvertyDeskApp {
     log_status: Option<String>,
     report_status: Option<String>,
     remote_input_focused: bool,
+    remote_modifiers_down: RemoteModifierState,
     last_mouse_pos: Option<(i32, i32)>,
     remote_displays: Vec<RemoteDisplay>,
     selected_display: i32,
@@ -585,6 +586,32 @@ enum WorkerEvent {
         remote_id: String,
         result: Result<bool, String>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RemoteModifierState {
+    alt: bool,
+    shift: bool,
+    ctrl: bool,
+    meta: bool,
+}
+
+impl RemoteModifierState {
+    fn from_egui(modifiers: egui::Modifiers) -> Self {
+        Self {
+            alt: modifiers.alt,
+            shift: modifiers.shift,
+            ctrl: modifiers.ctrl,
+            meta: modifiers.mac_cmd,
+        }
+    }
+
+    fn for_each(self, mut f: impl FnMut(ControlKey, bool)) {
+        f(ControlKey::Control, self.ctrl);
+        f(ControlKey::Alt, self.alt);
+        f(ControlKey::Shift, self.shift);
+        f(ControlKey::Meta, self.meta);
+    }
 }
 
 fn forward_session_events(
@@ -683,6 +710,7 @@ impl EvertyDeskApp {
             log_status: None,
             report_status: None,
             remote_input_focused: false,
+            remote_modifiers_down: RemoteModifierState::default(),
             last_mouse_pos: None,
             remote_displays: Vec::new(),
             selected_display: 0,
@@ -789,6 +817,7 @@ impl EvertyDeskApp {
         self.wheel_accum = egui::Vec2::ZERO;
         self.selected_display = 0;
         self.remote_input_focused = false;
+        self.remote_modifiers_down = RemoteModifierState::default();
         self.progress = 1;
         self.status = format!("Подключение к {}", request.remote_id);
         self.log(self.status.clone());
@@ -1027,6 +1056,7 @@ impl EvertyDeskApp {
                 self.remote_fullscreen = false;
                 self.session_tx = None;
                 self.connection_state = ConnectionState::Failed(err.clone());
+                self.remote_modifiers_down = RemoteModifierState::default();
                 self.last_error = Some(err.clone());
                 self.status = friendly_error(&err);
                 self.log(format!("Error: {err}"));
@@ -1038,6 +1068,7 @@ impl EvertyDeskApp {
                 self.remote_fullscreen = false;
                 self.session_tx = None;
                 self.remote_input_focused = false;
+                self.remote_modifiers_down = RemoteModifierState::default();
                 self.screenshot_pending = false;
                 self.status = "Отключено".to_owned();
                 self.log(self.status.clone());
@@ -1057,6 +1088,7 @@ impl EvertyDeskApp {
     }
 
     fn disconnect_session(&mut self, status: &str) {
+        self.release_remote_modifiers();
         if let Some(tx) = self.session_tx.take() {
             let _ = tx.send(SessionCommand::Close);
         }
@@ -1068,6 +1100,7 @@ impl EvertyDeskApp {
         self.pending_image = None;
         self.last_frame_rgba.clear();
         self.remote_input_focused = false;
+        self.remote_modifiers_down = RemoteModifierState::default();
         self.screenshot_pending = false;
         self.last_mouse_pos = None;
         self.last_move_refresh_at = None;
@@ -2241,6 +2274,7 @@ impl EvertyDeskApp {
     fn remote_viewer_inline(&mut self, ctx: &egui::Context) {
         if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.remote_input_focused = false;
+            self.release_remote_modifiers();
             self.last_mouse_pos = None;
             self.wheel_accum = egui::Vec2::ZERO;
         }
@@ -2254,6 +2288,7 @@ impl EvertyDeskApp {
                 {
                     self.remote_viewer_open = false;
                     self.remote_input_focused = false;
+                    self.release_remote_modifiers();
                     self.last_mouse_pos = None;
                     self.wheel_accum = egui::Vec2::ZERO;
                     self.status = "Remote screen closed".to_owned();
@@ -2553,6 +2588,7 @@ impl EvertyDeskApp {
             if ctx.input(|input| input.viewport().close_requested()) {
                 self.remote_viewer_open = false;
                 self.remote_input_focused = false;
+                self.release_remote_modifiers();
                 self.last_mouse_pos = None;
                 self.wheel_accum = egui::Vec2::ZERO;
                 self.status = "Окно экрана закрыто".to_owned();
@@ -3009,6 +3045,9 @@ impl EvertyDeskApp {
                 }
             }
         }
+        if !self.remote_input_focused {
+            self.release_remote_modifiers();
+        }
 
         // Draw a colored focus border around the remote screen when keyboard is captured.
         if self.remote_input_focused {
@@ -3044,12 +3083,6 @@ impl EvertyDeskApp {
                 );
             }
         } // end !live_vp9_active
-
-        if response.double_clicked() {
-            self.remote_fullscreen = !self.remote_fullscreen;
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.remote_fullscreen));
-        }
 
         if self.connected {
             // Mouse movement
@@ -3136,6 +3169,9 @@ impl EvertyDeskApp {
     }
 
     fn handle_remote_keyboard(&mut self, ctx: &egui::Context) {
+        let current_modifiers = ctx.input(|input| input.modifiers);
+        self.sync_remote_modifiers(current_modifiers);
+
         let events = ctx.input(|input| input.events.clone());
         for event in events {
             match event {
@@ -3159,11 +3195,13 @@ impl EvertyDeskApp {
                     // Ctrl+Escape releases keyboard capture
                     if key == egui::Key::Escape && modifiers.ctrl {
                         self.remote_input_focused = false;
+                        self.release_remote_modifiers();
                         continue;
                     }
                     // Escape alone also releases (press Ctrl to send real Escape to remote)
                     if key == egui::Key::Escape && !has_command_modifier(modifiers) {
                         self.remote_input_focused = false;
+                        self.release_remote_modifiers();
                         continue;
                     }
                     // Allow key-repeat only for navigation/edit keys (arrows, backspace, delete,
@@ -3171,25 +3209,53 @@ impl EvertyDeskApp {
                     if repeat && !key_allows_repeat(key) {
                         continue;
                     }
-                    let remote_modifiers = egui_modifiers_to_control_keys(modifiers);
                     if has_command_modifier(modifiers) && egui_key_to_text(key).is_some() {
                         let text = egui_key_to_text(key).unwrap();
-                        self.send_command(SessionCommand::KeyTextWithModifiers {
-                            text,
-                            modifiers: remote_modifiers,
-                        });
+                        self.send_command(SessionCommand::KeyText(text));
                         self.request_visual_refresh_after_input();
                     } else if let Some(control_key) = egui_key_to_control_key(key) {
-                        self.send_command(SessionCommand::KeyControlWithModifiers {
-                            key: control_key,
-                            modifiers: remote_modifiers,
-                        });
+                        self.send_command(SessionCommand::KeyControl(control_key));
                         self.request_visual_refresh_after_input();
                     }
                 }
                 _ => {}
             }
         }
+    }
+
+    fn sync_remote_modifiers(&mut self, modifiers: egui::Modifiers) {
+        let next = RemoteModifierState::from_egui(modifiers);
+        if next == self.remote_modifiers_down {
+            return;
+        }
+
+        let previous = self.remote_modifiers_down;
+        previous.for_each(|key, was_down| {
+            let now_down = remote_modifier_is_down(next, key);
+            if was_down && !now_down {
+                self.send_command(SessionCommand::KeyControlState { key, down: false });
+            }
+        });
+        next.for_each(|key, now_down| {
+            let was_down = remote_modifier_is_down(previous, key);
+            if now_down && !was_down {
+                self.send_command(SessionCommand::KeyControlState { key, down: true });
+            }
+        });
+        self.remote_modifiers_down = next;
+    }
+
+    fn release_remote_modifiers(&mut self) {
+        let previous = self.remote_modifiers_down;
+        if previous == RemoteModifierState::default() {
+            return;
+        }
+        previous.for_each(|key, was_down| {
+            if was_down {
+                self.send_command(SessionCommand::KeyControlState { key, down: false });
+            }
+        });
+        self.remote_modifiers_down = RemoteModifierState::default();
     }
 
     fn wheel_delta(&mut self, unit: egui::MouseWheelUnit, delta: egui::Vec2) -> Option<(i32, i32)> {
@@ -3389,6 +3455,16 @@ fn has_command_modifier(modifiers: egui::Modifiers) -> bool {
     modifiers.ctrl || modifiers.alt || modifiers.mac_cmd || modifiers.command
 }
 
+fn remote_modifier_is_down(state: RemoteModifierState, key: ControlKey) -> bool {
+    match key {
+        ControlKey::Alt => state.alt,
+        ControlKey::Shift => state.shift,
+        ControlKey::Control => state.ctrl,
+        ControlKey::Meta => state.meta,
+        _ => false,
+    }
+}
+
 fn command_is_input(command: &SessionCommand) -> bool {
     matches!(
         command,
@@ -3402,6 +3478,7 @@ fn command_is_input(command: &SessionCommand) -> bool {
             | SessionCommand::MouseWheel { .. }
             | SessionCommand::KeyText(_)
             | SessionCommand::KeyControl(_)
+            | SessionCommand::KeyControlState { .. }
             | SessionCommand::KeyTextWithModifiers { .. }
             | SessionCommand::KeyControlWithModifiers { .. }
             | SessionCommand::KeyEnter
@@ -3735,23 +3812,6 @@ fn egui_key_to_text(key: egui::Key) -> Option<String> {
         _ => return None,
     };
     Some(ch.to_string())
-}
-
-fn egui_modifiers_to_control_keys(modifiers: egui::Modifiers) -> Vec<ControlKey> {
-    let mut keys = Vec::new();
-    if modifiers.alt {
-        keys.push(ControlKey::Alt);
-    }
-    if modifiers.shift {
-        keys.push(ControlKey::Shift);
-    }
-    if modifiers.ctrl {
-        keys.push(ControlKey::Control);
-    }
-    if modifiers.mac_cmd || modifiers.command {
-        keys.push(ControlKey::Meta);
-    }
-    keys
 }
 
 fn configure_style(ctx: &egui::Context) {
