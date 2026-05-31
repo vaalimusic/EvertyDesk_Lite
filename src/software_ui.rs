@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -63,7 +63,7 @@ pub fn run_software_ui() -> Result<(), String> {
     let mut painter = SoftwarePainter::default();
     let mut pixels = vec![0_u32; WIDTH * HEIGHT];
     let started = Instant::now();
-    let mut pointer_buttons_down = [false; 3];
+    let mut input_state = SoftwareInputState::default();
 
     while window.is_open() && !window.is_key_down(MiniKey::Escape) {
         let (width, height) = window.get_size();
@@ -77,7 +77,7 @@ pub fn run_software_ui() -> Result<(), String> {
             width,
             height,
             started.elapsed(),
-            &mut pointer_buttons_down,
+            &mut input_state,
         );
 
         let output = ctx.run(raw_input, |ctx| {
@@ -126,7 +126,7 @@ fn collect_input(
     width: usize,
     height: usize,
     elapsed: Duration,
-    pointer_buttons_down: &mut [bool; 3],
+    state: &mut SoftwareInputState,
 ) -> RawInput {
     let mut input = RawInput::default();
     input.screen_rect = Some(Rect::from_min_size(
@@ -134,16 +134,29 @@ fn collect_input(
         Vec2::new(width as f32, height as f32),
     ));
     input.time = Some(elapsed.as_secs_f64());
+    input.predicted_dt = 1.0 / 60.0;
+    input.focused = true;
     input.modifiers = current_modifiers(window);
 
-    if let Some((x, y)) = window.get_mouse_pos(MouseMode::Pass) {
-        let pos = Pos2::new(x, y);
-        input.events.push(Event::PointerMoved(pos));
+    let pointer_visible = if let Some((x, y)) = window.get_mouse_pos(MouseMode::Pass) {
+        let pos = Pos2::new(
+            x.clamp(0.0, width.saturating_sub(1) as f32),
+            y.clamp(0.0, height.saturating_sub(1) as f32),
+        );
+        if state.last_pointer_pos != Some(pos) {
+            input.events.push(Event::PointerMoved(pos));
+            state.last_pointer_pos = Some(pos);
+        }
+        true
+    } else {
+        false
+    };
+    if let Some(button_pos) = state.last_pointer_pos {
         collect_pointer_button(
             window,
             &mut input,
-            pos,
-            pointer_buttons_down,
+            button_pos,
+            state,
             0,
             MouseButton::Left,
             egui::PointerButton::Primary,
@@ -151,8 +164,8 @@ fn collect_input(
         collect_pointer_button(
             window,
             &mut input,
-            pos,
-            pointer_buttons_down,
+            button_pos,
+            state,
             1,
             MouseButton::Right,
             egui::PointerButton::Secondary,
@@ -160,24 +173,25 @@ fn collect_input(
         collect_pointer_button(
             window,
             &mut input,
-            pos,
-            pointer_buttons_down,
+            button_pos,
+            state,
             2,
             MouseButton::Middle,
             egui::PointerButton::Middle,
         );
     }
-
-    if let Some((x, y)) = window.get_scroll_wheel() {
-        if x != 0.0 || y != 0.0 {
-            input
-                .events
-                .push(Event::Scroll(Vec2::new(x * 32.0, y * 32.0)));
-        }
+    if !pointer_visible
+        && state.last_pointer_pos.is_some()
+        && !state.pointer_buttons_down.iter().any(|down| *down)
+    {
+        input.events.push(Event::PointerGone);
+        state.last_pointer_pos = None;
     }
 
-    for key in window.get_keys_pressed(KeyRepeat::Yes) {
-        if let Some(key) = map_key(key) {
+    let pressed_no_repeat = window.get_keys_pressed(KeyRepeat::No);
+    let pressed_no_repeat_set = pressed_no_repeat.iter().copied().collect::<HashSet<_>>();
+    for mini_key in pressed_no_repeat {
+        if let Some(key) = map_key(mini_key) {
             input.events.push(Event::Key {
                 key,
                 physical_key: None,
@@ -185,10 +199,27 @@ fn collect_input(
                 repeat: false,
                 modifiers: input.modifiers,
             });
+            state.keys_down.insert(mini_key);
         }
     }
-    for key in window.get_keys_released() {
-        if let Some(key) = map_key(key) {
+
+    for mini_key in window.get_keys_pressed(KeyRepeat::Yes) {
+        if pressed_no_repeat_set.contains(&mini_key) {
+            continue;
+        }
+        if let Some(key) = map_key(mini_key) {
+            input.events.push(Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: true,
+                modifiers: input.modifiers,
+            });
+        }
+    }
+
+    for mini_key in window.get_keys_released() {
+        if let Some(key) = map_key(mini_key) {
             input.events.push(Event::Key {
                 key,
                 physical_key: None,
@@ -196,6 +227,15 @@ fn collect_input(
                 repeat: false,
                 modifiers: input.modifiers,
             });
+            state.keys_down.remove(&mini_key);
+        }
+    }
+
+    if let Some((x, y)) = window.get_scroll_wheel() {
+        if x != 0.0 || y != 0.0 {
+            input
+                .events
+                .push(Event::Scroll(Vec2::new(x * 32.0, y * 32.0)));
         }
     }
 
@@ -211,24 +251,33 @@ fn collect_input(
     input
 }
 
+#[derive(Default)]
+struct SoftwareInputState {
+    pointer_buttons_down: [bool; 3],
+    last_pointer_pos: Option<Pos2>,
+    keys_down: HashSet<MiniKey>,
+}
+
 fn collect_pointer_button(
     window: &Window,
     input: &mut RawInput,
     pos: Pos2,
-    pointer_buttons_down: &mut [bool; 3],
+    state: &mut SoftwareInputState,
     index: usize,
     mini_button: MouseButton,
     egui_button: egui::PointerButton,
 ) {
     let down = window.get_mouse_down(mini_button);
-    if down != pointer_buttons_down[index] {
+    if down != state.pointer_buttons_down[index] {
+        input.events.push(Event::PointerMoved(pos));
         input.events.push(Event::PointerButton {
             pos,
             button: egui_button,
             pressed: down,
             modifiers: input.modifiers,
         });
-        pointer_buttons_down[index] = down;
+        state.pointer_buttons_down[index] = down;
+        state.last_pointer_pos = Some(pos);
     }
 }
 
@@ -378,6 +427,15 @@ impl SoftwarePainter {
                 let mut index = 0;
                 while index < mesh.indices.len() {
                     if index + 6 <= mesh.indices.len()
+                        && draw_colored_quad_fast(
+                            buffer, width, height, texture, clip_min_x, clip_min_y, clip_max_x,
+                            clip_max_y, mesh, index,
+                        )
+                    {
+                        index += 6;
+                        continue;
+                    }
+                    if index + 6 <= mesh.indices.len()
                         && draw_textured_quad_fast(
                             buffer, width, height, texture, clip_min_x, clip_min_y, clip_max_x,
                             clip_max_y, mesh, index,
@@ -401,6 +459,107 @@ impl SoftwarePainter {
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_colored_quad_fast(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    texture: Option<&Texture>,
+    clip_min_x: i32,
+    clip_min_y: i32,
+    clip_max_x: i32,
+    clip_max_y: i32,
+    mesh: &egui::epaint::Mesh,
+    index: usize,
+) -> bool {
+    let idx = &mesh.indices[index..index + 6];
+    let verts = [
+        mesh.vertices[idx[0] as usize],
+        mesh.vertices[idx[1] as usize],
+        mesh.vertices[idx[2] as usize],
+        mesh.vertices[idx[3] as usize],
+        mesh.vertices[idx[4] as usize],
+        mesh.vertices[idx[5] as usize],
+    ];
+    let color = verts[0].color;
+    if !verts.iter().all(|v| v.color == color) {
+        return false;
+    }
+    if color.a() == 0 {
+        return true;
+    }
+    if texture.is_some() {
+        let uv = verts[0].uv;
+        if !verts
+            .iter()
+            .all(|v| nearly_equal(v.uv.x, uv.x) && nearly_equal(v.uv.y, uv.y))
+        {
+            return false;
+        }
+    }
+
+    let min_x = verts.iter().map(|v| v.pos.x).fold(f32::INFINITY, f32::min);
+    let max_x = verts
+        .iter()
+        .map(|v| v.pos.x)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let min_y = verts.iter().map(|v| v.pos.y).fold(f32::INFINITY, f32::min);
+    let max_y = verts
+        .iter()
+        .map(|v| v.pos.y)
+        .fold(f32::NEG_INFINITY, f32::max);
+    if max_x - min_x < 1.0 || max_y - min_y < 1.0 {
+        return false;
+    }
+    let mut has_tl = false;
+    let mut has_tr = false;
+    let mut has_bl = false;
+    let mut has_br = false;
+    for vertex in &verts {
+        let on_x_edge = nearly_equal(vertex.pos.x, min_x) || nearly_equal(vertex.pos.x, max_x);
+        let on_y_edge = nearly_equal(vertex.pos.y, min_y) || nearly_equal(vertex.pos.y, max_y);
+        if !on_x_edge || !on_y_edge {
+            return false;
+        }
+        let x_min = nearly_equal(vertex.pos.x, min_x);
+        let x_max = nearly_equal(vertex.pos.x, max_x);
+        let y_min = nearly_equal(vertex.pos.y, min_y);
+        let y_max = nearly_equal(vertex.pos.y, max_y);
+        match (x_min, x_max, y_min, y_max) {
+            (true, false, true, false) => has_tl = true,
+            (false, true, true, false) => has_tr = true,
+            (true, false, false, true) => has_bl = true,
+            (false, true, false, true) => has_br = true,
+            _ => return false,
+        }
+    }
+    if !(has_tl && has_tr && has_bl && has_br) {
+        return false;
+    }
+
+    let dst_min_x = (min_x.floor() as i32).max(clip_min_x).max(0);
+    let dst_max_x = (max_x.ceil() as i32).min(clip_max_x).min(width as i32);
+    let dst_min_y = (min_y.floor() as i32).max(clip_min_y).max(0);
+    let dst_max_y = (max_y.ceil() as i32).min(clip_max_y).min(height as i32);
+    if dst_min_x >= dst_max_x || dst_min_y >= dst_max_y {
+        return true;
+    }
+
+    let rgb = color_to_rgb(color);
+    for y in dst_min_y..dst_max_y {
+        let row = y as usize * width;
+        let range = row + dst_min_x as usize..row + dst_max_x as usize;
+        if color.a() == 255 {
+            buffer[range].fill(rgb);
+        } else {
+            for pixel in &mut buffer[range] {
+                *pixel = blend_over(*pixel, color);
+            }
+        }
+    }
+    true
 }
 
 fn patch_texture(texture: &mut Texture, pos: [usize; 2], size: [usize; 2], pixels: &[Color32]) {
