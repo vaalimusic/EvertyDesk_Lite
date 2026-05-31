@@ -6,11 +6,12 @@ use std::{
 };
 
 use eframe::egui::{
-    self, Color32, Event, ImageData, Key, Modifiers, Pos2, RawInput, Rect, TextureId,
-    TexturesDelta, Vec2,
+    self, Color32, Event, FontData, FontDefinitions, FontFamily, ImageData, Key, Modifiers, Pos2,
+    RawInput, Rect, TextureId, TexturesDelta, Vec2,
 };
 use minifb::{
-    InputCallback, Key as MiniKey, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions,
+    InputCallback, Key as MiniKey, KeyRepeat, MouseButton, MouseMode, ScaleMode, Window,
+    WindowOptions,
 };
 
 use crate::{configure_style, video, EvertyDeskApp, APP_NAME};
@@ -32,6 +33,7 @@ impl InputCallback for CharInput {
 
 pub fn run_software_ui() -> Result<(), String> {
     std::env::set_var("EVERTYDESK_EGUI_SOFTWARE", "1");
+    configure_locale_for_text_input();
 
     let mut window = Window::new(
         APP_NAME,
@@ -39,6 +41,7 @@ pub fn run_software_ui() -> Result<(), String> {
         HEIGHT,
         WindowOptions {
             resize: true,
+            scale_mode: ScaleMode::UpperLeft,
             ..WindowOptions::default()
         },
     )
@@ -57,6 +60,7 @@ pub fn run_software_ui() -> Result<(), String> {
 
     let ctx = egui::Context::default();
     ctx.set_pixels_per_point(1.0);
+    configure_software_fonts(&ctx);
     configure_style(&ctx);
 
     let mut app = EvertyDeskApp::new();
@@ -105,6 +109,95 @@ pub fn run_software_ui() -> Result<(), String> {
     app.shutdown();
     eprintln!("[EvertyDesk] egui CPU software backend closed.");
     Ok(())
+}
+
+fn configure_locale_for_text_input() {
+    #[cfg(unix)]
+    unsafe {
+        for locale in [
+            b"\0".as_slice(),
+            b"C.UTF-8\0",
+            b"ru_RU.UTF-8\0",
+            b"en_US.UTF-8\0",
+        ] {
+            let active = libc::setlocale(libc::LC_CTYPE, locale.as_ptr().cast());
+            if is_utf8_locale(active) {
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+unsafe fn is_utf8_locale(locale: *mut libc::c_char) -> bool {
+    if locale.is_null() {
+        return false;
+    }
+    let locale = std::ffi::CStr::from_ptr(locale).to_string_lossy();
+    locale.to_ascii_uppercase().contains("UTF-8") || locale.to_ascii_uppercase().contains("UTF8")
+}
+
+fn configure_software_fonts(ctx: &egui::Context) {
+    let mut fonts = FontDefinitions::default();
+    if let Some((name, data)) = load_cyrillic_font() {
+        fonts
+            .font_data
+            .insert(name.clone(), FontData::from_owned(data));
+        for family in [FontFamily::Proportional, FontFamily::Monospace] {
+            fonts
+                .families
+                .entry(family)
+                .or_default()
+                .insert(0, name.clone());
+        }
+    }
+    ctx.set_fonts(fonts);
+}
+
+fn load_cyrillic_font() -> Option<(String, Vec<u8>)> {
+    const FONT_PATHS: &[(&str, &str)] = &[
+        (
+            "Noto Sans",
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        ),
+        (
+            "Noto Sans",
+            "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
+        ),
+        (
+            "DejaVu Sans",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ),
+        (
+            "DejaVu Sans",
+            "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+        ),
+        (
+            "Liberation Sans",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        ),
+        (
+            "Liberation Sans",
+            "/usr/share/fonts/liberation-fonts/LiberationSans-Regular.ttf",
+        ),
+        ("Segoe UI", "C:\\Windows\\Fonts\\segoeui.ttf"),
+        ("Arial", "C:\\Windows\\Fonts\\arial.ttf"),
+        ("Tahoma", "C:\\Windows\\Fonts\\tahoma.ttf"),
+        (
+            "Arial Unicode",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        ),
+        ("Arial", "/System/Library/Fonts/Supplemental/Arial.ttf"),
+    ];
+
+    for (name, path) in FONT_PATHS {
+        if let Ok(data) = std::fs::read(path) {
+            if !data.is_empty() {
+                return Some((format!("system-{name}"), data));
+            }
+        }
+    }
+    None
 }
 
 fn tune_frame_pacing(window: &mut Window, repaint_after: Duration) {
@@ -494,7 +587,7 @@ fn draw_colored_quad_fast(
         let uv = verts[0].uv;
         if !verts
             .iter()
-            .all(|v| nearly_equal(v.uv.x, uv.x) && nearly_equal(v.uv.y, uv.y))
+            .all(|v| nearly_equal_uv(v.uv.x, uv.x) && nearly_equal_uv(v.uv.y, uv.y))
         {
             return false;
         }
@@ -518,15 +611,17 @@ fn draw_colored_quad_fast(
     let mut has_bl = false;
     let mut has_br = false;
     for vertex in &verts {
-        let on_x_edge = nearly_equal(vertex.pos.x, min_x) || nearly_equal(vertex.pos.x, max_x);
-        let on_y_edge = nearly_equal(vertex.pos.y, min_y) || nearly_equal(vertex.pos.y, max_y);
+        let on_x_edge =
+            nearly_equal_pos(vertex.pos.x, min_x) || nearly_equal_pos(vertex.pos.x, max_x);
+        let on_y_edge =
+            nearly_equal_pos(vertex.pos.y, min_y) || nearly_equal_pos(vertex.pos.y, max_y);
         if !on_x_edge || !on_y_edge {
             return false;
         }
-        let x_min = nearly_equal(vertex.pos.x, min_x);
-        let x_max = nearly_equal(vertex.pos.x, max_x);
-        let y_min = nearly_equal(vertex.pos.y, min_y);
-        let y_max = nearly_equal(vertex.pos.y, max_y);
+        let x_min = nearly_equal_pos(vertex.pos.x, min_x);
+        let x_max = nearly_equal_pos(vertex.pos.x, max_x);
+        let y_min = nearly_equal_pos(vertex.pos.y, min_y);
+        let y_max = nearly_equal_pos(vertex.pos.y, max_y);
         match (x_min, x_max, y_min, y_max) {
             (true, false, true, false) => has_tl = true,
             (false, true, true, false) => has_tr = true,
@@ -623,7 +718,8 @@ fn draw_textured_quad_fast(
         mesh.vertices[idx[4] as usize],
         mesh.vertices[idx[5] as usize],
     ];
-    if !verts.iter().all(|v| v.color == Color32::WHITE) {
+    let vertex_color = verts[0].color;
+    if !verts.iter().all(|v| v.color == vertex_color) {
         return false;
     }
 
@@ -646,10 +742,10 @@ fn draw_textured_quad_fast(
     let mut bl = None;
     let mut br = None;
     for vertex in &verts {
-        let x_min = nearly_equal(vertex.pos.x, min_x);
-        let x_max = nearly_equal(vertex.pos.x, max_x);
-        let y_min = nearly_equal(vertex.pos.y, min_y);
-        let y_max = nearly_equal(vertex.pos.y, max_y);
+        let x_min = nearly_equal_pos(vertex.pos.x, min_x);
+        let x_max = nearly_equal_pos(vertex.pos.x, max_x);
+        let y_min = nearly_equal_pos(vertex.pos.y, min_y);
+        let y_max = nearly_equal_pos(vertex.pos.y, max_y);
         match (x_min, x_max, y_min, y_max) {
             (true, false, true, false) => tl = Some(vertex.uv),
             (false, true, true, false) => tr = Some(vertex.uv),
@@ -662,10 +758,10 @@ fn draw_textured_quad_fast(
     let (Some(tl), Some(tr), Some(bl), Some(br)) = (tl, tr, bl, br) else {
         return false;
     };
-    if !nearly_equal(tl.y, tr.y)
-        || !nearly_equal(bl.y, br.y)
-        || !nearly_equal(tl.x, bl.x)
-        || !nearly_equal(tr.x, br.x)
+    if !nearly_equal_uv(tl.y, tr.y)
+        || !nearly_equal_uv(bl.y, br.y)
+        || !nearly_equal_uv(tl.x, bl.x)
+        || !nearly_equal_uv(tr.x, br.x)
     {
         return false;
     }
@@ -699,18 +795,28 @@ fn draw_textured_quad_fast(
                 .clamp(0.0, (texture.width - 1) as f32) as usize;
             let idx = dst_row + x as usize;
             let tex_idx = tex_row + tex_x;
-            if texture.opaque {
+            if texture.opaque && vertex_color == Color32::WHITE {
                 buffer[idx] = texture.rgb[tex_idx];
             } else {
-                buffer[idx] = blend_over(buffer[idx], texture.pixels[tex_idx]);
+                let tex_color = texture.pixels[tex_idx];
+                let color = if vertex_color == Color32::WHITE {
+                    tex_color
+                } else {
+                    multiply_color(vertex_color, tex_color)
+                };
+                buffer[idx] = blend_over(buffer[idx], color);
             }
         }
     }
     true
 }
 
-fn nearly_equal(a: f32, b: f32) -> bool {
+fn nearly_equal_pos(a: f32, b: f32) -> bool {
     (a - b).abs() <= 0.5
+}
+
+fn nearly_equal_uv(a: f32, b: f32) -> bool {
+    (a - b).abs() <= 0.0005
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -802,7 +908,7 @@ fn mix_color(c0: Color32, c1: Color32, c2: Color32, w0: f32, w1: f32, w2: f32) -
     let g = c0.g() as f32 * w0 + c1.g() as f32 * w1 + c2.g() as f32 * w2;
     let b = c0.b() as f32 * w0 + c1.b() as f32 * w1 + c2.b() as f32 * w2;
     let a = c0.a() as f32 * w0 + c1.a() as f32 * w1 + c2.a() as f32 * w2;
-    Color32::from_rgba_unmultiplied(r as u8, g as u8, b as u8, a as u8)
+    Color32::from_rgba_premultiplied(r as u8, g as u8, b as u8, a as u8)
 }
 
 fn sample_texture(texture: &Texture, u: f32, v: f32) -> Color32 {
@@ -819,7 +925,7 @@ fn sample_texture(texture: &Texture, u: f32, v: f32) -> Color32 {
 }
 
 fn multiply_color(a: Color32, b: Color32) -> Color32 {
-    Color32::from_rgba_unmultiplied(
+    Color32::from_rgba_premultiplied(
         ((a.r() as u16 * b.r() as u16) / 255) as u8,
         ((a.g() as u16 * b.g() as u16) / 255) as u8,
         ((a.b() as u16 * b.b() as u16) / 255) as u8,
@@ -843,8 +949,8 @@ fn blend_over(dst: u32, src: Color32) -> u32 {
     let dg = (dst >> 8) & 0xff;
     let db = dst & 0xff;
     let inv = 255 - sa;
-    let r = (src.r() as u32 * sa + dr * inv) / 255;
-    let g = (src.g() as u32 * sa + dg * inv) / 255;
-    let b = (src.b() as u32 * sa + db * inv) / 255;
+    let r = (src.r() as u32 + (dr * inv) / 255).min(255);
+    let g = (src.g() as u32 + (dg * inv) / 255).min(255);
+    let b = (src.b() as u32 + (db * inv) / 255).min(255);
     (r << 16) | (g << 8) | b
 }

@@ -28,6 +28,7 @@ eframe = { version = "0.27", default-features = false, features = [
     "accesskit",     # accessibility
 ] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+libc = "0.2"
 openh264 = { version = "0.9", optional = true }
 prost = "0.13"
 serde = { version = "1", features = ["derive"] }
