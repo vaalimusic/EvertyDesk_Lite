@@ -470,6 +470,7 @@ fn run_cli_connect() -> Option<i32> {
         remote_id,
         password,
         server: config.server,
+        display: config.display,
     };
 
     match TransportClient::connect_with_progress(request, |pct, message| {
@@ -649,6 +650,7 @@ impl EvertyDeskApp {
         let refresh_millis = config.ui.refresh_millis.clamp(50, 2000).min(80);
         let fit_to_window = config.ui.fit_to_window;
         let coordinate_mode = config.ui.coordinate_mode;
+        let video_fps = config.display.target_fps.clamp(5, 60) as i32;
         Self {
             config,
             remote_id,
@@ -686,7 +688,7 @@ impl EvertyDeskApp {
             selected_display: 0,
             auto_refresh,
             refresh_millis,
-            video_fps: 30,
+            video_fps,
             fit_to_window,
             coordinate_mode,
             screenshot_count: 0,
@@ -734,6 +736,7 @@ impl EvertyDeskApp {
             remote_id: normalized_remote_id.clone(),
             password: self.password.clone(),
             server: self.config.server.clone(),
+            display: self.config.display.clone(),
         };
 
         if request.remote_id.is_empty() {
@@ -769,6 +772,7 @@ impl EvertyDeskApp {
         self.last_screenshot_at = None;
         self.last_screenshot_sid.clear();
         self.last_frame_codec = "none".to_owned();
+        self.video_fps = self.config.display.target_fps.clamp(5, 60) as i32;
         self.frame_bytes = 0;
         self.frame_queue_ms = 0;
         self.frame_decode_ms = 0;
@@ -2118,7 +2122,7 @@ impl EvertyDeskApp {
                                     ui.end_row();
                                     ui.label("Целевой FPS");
                                     ui.horizontal(|ui| {
-                                        for fps in [15u32, 20, 30] {
+                                        for fps in [15u32, 20, 30, 60] {
                                             ui.selectable_value(
                                                 &mut draft.display.target_fps,
                                                 fps,
@@ -2149,17 +2153,27 @@ impl EvertyDeskApp {
                         .clicked()
                     {
                         let new_cfg = self.settings_draft.take().unwrap();
-                        // If server changed, reconfigure the host service.
-                        if new_cfg.server.id_server != self.config.server.id_server
+                        let host_reconfigure_needed = new_cfg.server.id_server
+                            != self.config.server.id_server
                             || new_cfg.server.relay_server != self.config.server.relay_server
                             || new_cfg.server.public_key != self.config.server.public_key
-                        {
+                            || new_cfg.display.target_fps != self.config.display.target_fps
+                            || new_cfg.display.codec != self.config.display.codec;
+                        let next_video_fps = new_cfg.display.target_fps.clamp(5, 60) as i32;
+                        if host_reconfigure_needed {
                             if let Some(svc) = &self.host_service {
                                 svc.reconfigure(new_cfg.clone());
                             }
                         }
                         self.config = new_cfg;
+                        self.video_fps = next_video_fps;
                         self.config.save();
+                        if self.connected {
+                            self.send_command(SessionCommand::SetVideoProfile {
+                                fps: self.video_fps,
+                                codec: self.config.display.codec,
+                            });
+                        }
                         self.show_settings = false;
                     }
                     if ui.button("Закрыть").clicked() {
@@ -2349,7 +2363,7 @@ impl EvertyDeskApp {
                     ui.separator();
                     ui.horizontal(|ui| {
                         ui.label("Video fps");
-                        for fps in [15, 20, 30] {
+                        for fps in [15, 20, 30, 60] {
                             if ui
                                 .selectable_label(self.video_fps == fps, fps.to_string())
                                 .clicked()
@@ -2659,7 +2673,7 @@ impl EvertyDeskApp {
                         ui.separator();
                         ui.horizontal(|ui| {
                             ui.label("Video fps");
-                            for fps in [15, 20, 30] {
+                            for fps in [15, 20, 30, 60] {
                                 if ui
                                     .selectable_label(self.video_fps == fps, fps.to_string())
                                     .clicked()
@@ -3202,6 +3216,9 @@ impl EvertyDeskApp {
     }
 
     fn should_refresh_after_move(&mut self) -> bool {
+        if self.live_video_active() {
+            return false;
+        }
         // Throttle move-triggered refreshes to once per 60 ms regardless of auto_refresh.
         // auto_refresh already fires every ~80 ms, so this adds at most one extra request
         // between auto-refresh ticks, keeping the view fresh while dragging.
@@ -3223,9 +3240,17 @@ impl EvertyDeskApp {
         // Always request a fresh screenshot after user input so the screen reflects
         // the action immediately — don't wait for the periodic auto-refresh timer.
         // Skip only if a request is already in flight to avoid flooding the server.
-        if !self.screenshot_pending {
+        if !self.screenshot_pending && !self.live_video_active() {
             self.send_command(SessionCommand::Screenshot);
         }
+    }
+
+    fn live_video_active(&self) -> bool {
+        self.last_frame_codec != "PNG"
+            && self
+                .last_live_frame_at
+                .map(|instant| instant.elapsed() < Duration::from_secs(2))
+                .unwrap_or(false)
     }
 
     fn paste_local_clipboard_to_remote(&mut self) {

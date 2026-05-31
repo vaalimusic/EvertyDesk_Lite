@@ -1,8 +1,9 @@
 # EvertyDesk Lite — сборка на Linux / Astra
 
-Лёгкий RustDesk-совместимый клиент. На Linux работает **подключение** (исходящие
-сессии) к любым RustDesk/EvertyDesk-хостам. Хостинг (приём входящих) с экрана
-Linux пока только на Windows — захват X11 в планах.
+Лёгкий RustDesk-совместимый клиент. На Linux работает **подключение** и
+экспериментальный хостинг через универсальный backend:
+X11/XTest для Astra/RED OS/Ubuntu на Xorg, fallback через `grim`/`ydotool`
+для Wayland-сессий, где это разрешено окружением.
 
 ## 1. Зависимости
 
@@ -16,7 +17,10 @@ sudo apt update
 sudo apt install -y build-essential pkg-config cmake nasm \
     libx11-dev libxcb1-dev libxkbcommon-dev \
     libgl1-mesa-dev libegl1-mesa-dev \
-    libasound2-dev
+    libasound2-dev libxtst-dev xdotool
+
+# Опционально для Wayland-хоста:
+sudo apt install -y ydotool grim wtype || true
 ```
 
 ## 2. Сборка

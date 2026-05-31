@@ -84,7 +84,7 @@ impl Default for DisplayConfig {
     fn default() -> Self {
         Self {
             codec: CodecPreference::Auto,
-            target_fps: 30,
+            target_fps: default_target_fps(),
         }
     }
 }
@@ -223,7 +223,7 @@ fn default_fit_to_window() -> bool {
     true
 }
 fn default_target_fps() -> u32 {
-    30
+    60
 }
 fn default_true() -> bool {
     true

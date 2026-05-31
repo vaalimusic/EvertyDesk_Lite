@@ -42,8 +42,7 @@ const RELAY_PORT: u16 = 21117;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(28);
 const READ_TIMEOUT_SHORT: Duration = Duration::from_millis(300);
 const READ_TIMEOUT_AUTH: Duration = Duration::from_secs(10);
-const TARGET_FPS: u64 = 20; // start conservative; 50 ms / frame
-const FRAME_BUDGET: Duration = Duration::from_millis(1000 / TARGET_FPS);
+const MAX_TARGET_FPS: u32 = 60;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -942,7 +941,7 @@ fn relay_session_inner(
     // here is what made the phone show "wrong password" with no input box.
     let mut others = 0u32;
     let mut pw_attempts = 0u32;
-    let _login = loop {
+    let login = loop {
         let msg = match recv_peer_enc(&mut relay, &mut cipher) {
             Ok(Some(m)) => m,
             Ok(None) => continue, // keepalive
@@ -1021,7 +1020,11 @@ fn relay_session_inner(
     };
     send_peer_enc(&mut relay, &mut cipher, &login_ok)?;
 
-    host_log(events, format!("Auth OK for {peer_id}. Starting capture…"));
+    let target_fps = negotiated_target_fps(&login, config.display.target_fps);
+    host_log(
+        events,
+        format!("Auth OK for {peer_id}. Starting capture at {target_fps} fps…"),
+    );
     let _ = events.send(HostEvent::SessionStarted {
         peer_id: peer_id.to_owned(),
     });
@@ -1045,7 +1048,7 @@ fn relay_session_inner(
     // ── Video thread ──────────────────────────────────────────────────────────
     let stop_v = stop.clone();
     let video_handle = thread::spawn(move || {
-        video_loop(write_stream, send_cipher, stop_v);
+        video_loop(write_stream, send_cipher, stop_v, target_fps);
     });
 
     // ── Input loop (this thread) ──────────────────────────────────────────────
@@ -1075,6 +1078,7 @@ fn video_loop(
     mut stream: TcpStream,
     mut send_cipher: Option<crate::crypto::SendCipher>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    target_fps: u32,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -1093,12 +1097,16 @@ fn video_loop(
     };
     #[cfg(not(feature = "live-h264"))]
     let mut encoder: Option<()> = None;
+    #[cfg(feature = "live-h264")]
+    let mut yuv_frame = YuvFrame::default();
 
+    let frame_budget = frame_budget(target_fps);
+    let key_interval = u64::from(target_fps.max(1) * 2);
     let mut frame_idx: u64 = 0;
     let mut last_frame = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
-        if last_frame.elapsed() < FRAME_BUDGET {
+        if last_frame.elapsed() < frame_budget {
             thread::sleep(Duration::from_millis(2));
             continue;
         }
@@ -1106,18 +1114,20 @@ fn video_loop(
         frame_idx += 1;
 
         let Some((cap_w, cap_h, bgra)) = crate::capture::capture_screen() else {
-            thread::sleep(FRAME_BUDGET);
+            thread::sleep(frame_budget);
             continue;
         };
 
         // Encode at native resolution (downscaling broke decoding on the phone
         // when the stream size differed from the announced DisplayInfo).
-        let is_key = frame_idx % 60 == 1;
+        let is_key = frame_idx % key_interval == 1;
         let h264_bytes = encode_h264_frame(
             #[cfg(feature = "live-h264")]
             encoder.as_mut(),
             #[cfg(not(feature = "live-h264"))]
             &mut encoder,
+            #[cfg(feature = "live-h264")]
+            &mut yuv_frame,
             cap_w,
             cap_h,
             &bgra,
@@ -1149,6 +1159,23 @@ fn video_loop(
     stop.store(true, Ordering::Relaxed);
 }
 
+fn negotiated_target_fps(login: &crate::rustdesk_proto::LoginRequest, configured_fps: u32) -> u32 {
+    let host_limit = configured_fps.clamp(5, MAX_TARGET_FPS);
+    let requested = login
+        .option
+        .as_ref()
+        .map(|option| option.custom_fps)
+        .filter(|fps| *fps > 0)
+        .unwrap_or(host_limit as i32)
+        .clamp(5, MAX_TARGET_FPS as i32) as u32;
+    requested.min(host_limit)
+}
+
+fn frame_budget(target_fps: u32) -> Duration {
+    let fps = target_fps.clamp(5, MAX_TARGET_FPS) as u64;
+    Duration::from_micros(1_000_000 / fps)
+}
+
 /// Read a PeerMessage using the receive-only cipher half.
 fn recv_peer_rc(
     stream: &mut TcpStream,
@@ -1172,14 +1199,15 @@ fn recv_peer_rc(
 #[cfg(feature = "live-h264")]
 fn encode_h264_frame(
     encoder: Option<&mut openh264::encoder::Encoder>,
+    yuv: &mut YuvFrame,
     w: u32,
     h: u32,
     bgra: &[u8],
     _key: bool,
 ) -> Option<Vec<u8>> {
     let enc = encoder?;
-    let yuv = bgra_to_yuv420(w as usize, h as usize, bgra);
-    let bitstream = enc.encode(&yuv).ok()?;
+    bgra_to_yuv420_into(yuv, w as usize, h as usize, bgra);
+    let bitstream = enc.encode(yuv).ok()?;
     let mut out = Vec::new();
     for i in 0..bitstream.num_layers() {
         if let Some(layer) = bitstream.layer(i) {
@@ -1211,12 +1239,24 @@ fn encode_h264_frame(
 // ── YUV conversion ────────────────────────────────────────────────────────────
 
 #[cfg(feature = "live-h264")]
+#[derive(Default)]
 struct YuvFrame {
     width: usize,
     height: usize,
     y: Vec<u8>,
     u: Vec<u8>,
     v: Vec<u8>,
+}
+
+#[cfg(feature = "live-h264")]
+impl YuvFrame {
+    fn resize(&mut self, width: usize, height: usize) {
+        self.width = width;
+        self.height = height;
+        self.y.resize(width * height, 0);
+        self.u.resize((width / 2) * (height / 2), 0);
+        self.v.resize((width / 2) * (height / 2), 0);
+    }
 }
 
 #[cfg(feature = "live-h264")]
@@ -1240,11 +1280,8 @@ impl openh264::formats::YUVSource for YuvFrame {
 
 /// BGRA (GDI output) → planar YUV420 (BT.601 limited range).
 #[cfg(feature = "live-h264")]
-fn bgra_to_yuv420(w: usize, h: usize, bgra: &[u8]) -> YuvFrame {
-    let mut y_plane = vec![0u8; w * h];
-    let mut u_plane = vec![0u8; (w / 2) * (h / 2)];
-    let mut v_plane = vec![0u8; (w / 2) * (h / 2)];
-
+fn bgra_to_yuv420_into(out: &mut YuvFrame, w: usize, h: usize, bgra: &[u8]) {
+    out.resize(w, h);
     for row in 0..h {
         for col in 0..w {
             let base = (row * w + col) * 4;
@@ -1254,24 +1291,16 @@ fn bgra_to_yuv420(w: usize, h: usize, bgra: &[u8]) -> YuvFrame {
 
             // BT.601 limited range
             let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-            y_plane[row * w + col] = y.clamp(16, 235) as u8;
+            out.y[row * w + col] = y.clamp(16, 235) as u8;
 
             if row % 2 == 0 && col % 2 == 0 {
                 let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
                 let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
                 let idx = (row / 2) * (w / 2) + (col / 2);
-                u_plane[idx] = u.clamp(16, 240) as u8;
-                v_plane[idx] = v.clamp(16, 240) as u8;
+                out.u[idx] = u.clamp(16, 240) as u8;
+                out.v[idx] = v.clamp(16, 240) as u8;
             }
         }
-    }
-
-    YuvFrame {
-        width: w,
-        height: h,
-        y: y_plane,
-        u: u_plane,
-        v: v_plane,
     }
 }
 
@@ -1602,10 +1631,37 @@ fn inject_key(_ev: crate::rustdesk_proto::KeyEvent) {}
 
 #[cfg(target_os = "linux")]
 mod linux_xtest {
+    use std::{
+        cell::RefCell,
+        process::{Command, Stdio},
+        sync::OnceLock,
+    };
+
     use x11rb::{
         connection::Connection,
-        protocol::{xproto, xtest::ConnectionExt as XtestConnectionExt},
+        protocol::{
+            xproto::{self, ConnectionExt as XprotoConnectionExt},
+            xtest::ConnectionExt as XtestConnectionExt,
+        },
+        rust_connection::RustConnection,
     };
+
+    thread_local! {
+        static X11_INPUT: RefCell<Option<X11Input>> = const { RefCell::new(None) };
+    }
+
+    struct X11Input {
+        conn: RustConnection,
+        root: u32,
+    }
+
+    impl X11Input {
+        fn connect() -> Option<Self> {
+            let (conn, screen_num) = x11rb::connect(None).ok()?;
+            let root = conn.setup().roots[screen_num].root;
+            Some(Self { conn, root })
+        }
+    }
 
     const EVT_MOVE: i32 = 0;
     const EVT_DOWN: i32 = 1;
@@ -1614,113 +1670,142 @@ mod linux_xtest {
     const BTN_LEFT: i32 = 1;
     const BTN_RIGHT: i32 = 2;
     const BTN_MIDDLE: i32 = 4;
+    const BTN_BACK: i32 = 8;
+    const BTN_FORWARD: i32 = 16;
 
     pub fn inject_mouse(ev: crate::rustdesk_proto::MouseEvent) {
-        let Ok((conn, screen_num)) = x11rb::connect(None) else {
-            return;
-        };
-        let screen = &conn.setup().roots[screen_num];
-        let root = screen.root;
-        let evt_type = ev.mask & 0x7;
-        let button = ev.mask >> 3;
+        if !with_x11(|conn, root| {
+            let evt_type = ev.mask & 0x7;
+            let button = ev.mask >> 3;
 
-        match evt_type {
-            EVT_MOVE => {
-                let _ = conn.xtest_fake_input(
-                    xproto::MOTION_NOTIFY_EVENT,
-                    0,
-                    0,
-                    root,
-                    clamp_i16(ev.x),
-                    clamp_i16(ev.y),
-                    0,
-                );
-            }
-            EVT_DOWN | EVT_UP => {
-                if ev.x != 0 || ev.y != 0 {
-                    let _ = conn.xtest_fake_input(
-                        xproto::MOTION_NOTIFY_EVENT,
-                        0,
-                        0,
-                        root,
-                        clamp_i16(ev.x),
-                        clamp_i16(ev.y),
-                        0,
-                    );
+            match evt_type {
+                EVT_MOVE => {
+                    send_motion(&conn, root, ev.x, ev.y);
                 }
-                if let Some(detail) = mouse_button_detail(button) {
-                    if evt_type == EVT_DOWN {
-                        // For remote-control UX a press must immediately focus/click
-                        // the target window. The matching release may arrive later;
-                        // sending it twice is harmless on X11 and fixes "hover works,
-                        // click does not" on conservative desktops.
-                        click_button(&conn, root, detail);
-                    } else {
-                        let _ = conn.xtest_fake_input(
-                            xproto::BUTTON_RELEASE_EVENT,
-                            detail,
-                            0,
-                            root,
-                            clamp_i16(ev.x),
-                            clamp_i16(ev.y),
-                            0,
-                        );
+                EVT_DOWN | EVT_UP => {
+                    if ev.x != 0 || ev.y != 0 {
+                        send_motion(&conn, root, ev.x, ev.y);
+                    }
+                    if let Some(detail) = mouse_button_detail(button) {
+                        send_button(&conn, root, detail, evt_type == EVT_DOWN, ev.x, ev.y);
                     }
                 }
-            }
-            EVT_WHEEL => {
-                if ev.y != 0 {
-                    click_button(&conn, root, if ev.y > 0 { 4 } else { 5 });
+                EVT_WHEEL => {
+                    if ev.y != 0 {
+                        click_button(&conn, root, if ev.y > 0 { 4 } else { 5 }, 0, 0);
+                    }
+                    if ev.x != 0 {
+                        click_button(&conn, root, if ev.x > 0 { 7 } else { 6 }, 0, 0);
+                    }
                 }
-                if ev.x != 0 {
-                    click_button(&conn, root, if ev.x > 0 { 7 } else { 6 });
-                }
-            }
-            _ => {}
+                _ => {}
+            };
+            conn.flush().is_ok()
+        }) {
+            inject_mouse_fallback(ev);
         }
-        let _ = conn.flush();
     }
 
     pub fn inject_key(ev: crate::rustdesk_proto::KeyEvent) {
-        match ev.union {
-            Some(crate::rustdesk_proto::key_event::Union::ControlKey(ck)) => {
-                if let Some(keycode) = control_key_to_x11_keycode(ck) {
-                    if ev.press {
-                        send_keycode(keycode, true);
-                        send_keycode(keycode, false);
-                    } else {
-                        send_keycode(keycode, ev.down);
+        let ev_for_fallback = ev.clone();
+        if !with_x11(|conn, root| {
+            let modifiers = modifier_keycodes(&ev.modifiers);
+            let apply_modifiers = ev.press;
+            if apply_modifiers {
+                press_modifiers(&conn, root, &modifiers, true);
+            }
+            match ev.union {
+                Some(crate::rustdesk_proto::key_event::Union::ControlKey(ck)) => {
+                    if let Some(keycode) = control_key_to_x11_keycode(ck) {
+                        if ev.press {
+                            send_keycode(&conn, root, keycode, true);
+                            send_keycode(&conn, root, keycode, false);
+                        } else {
+                            send_keycode(&conn, root, keycode, ev.down);
+                        }
                     }
                 }
-            }
-            Some(crate::rustdesk_proto::key_event::Union::Unicode(ch)) => {
-                if let Some(c) = char::from_u32(ch) {
-                    if c.is_ascii() {
-                        send_ascii(c);
+                Some(crate::rustdesk_proto::key_event::Union::Unicode(ch)) => {
+                    if let Some(c) = char::from_u32(ch) {
+                        if c.is_ascii() {
+                            send_ascii(&conn, root, c);
+                        } else {
+                            let _ = type_text_with_tool(&c.to_string());
+                        }
                     }
                 }
+                None => {}
             }
-            None => {}
+            if apply_modifiers {
+                press_modifiers(&conn, root, &modifiers, false);
+            }
+            conn.flush().is_ok()
+        }) {
+            inject_key_fallback(ev_for_fallback);
         }
     }
 
     pub fn release_stuck_input() {
-        for button in [1, 2, 3] {
-            if let Ok((conn, screen_num)) = x11rb::connect(None) {
-                let root = conn.setup().roots[screen_num].root;
-                let _ =
-                    conn.xtest_fake_input(xproto::BUTTON_RELEASE_EVENT, button, 0, root, 0, 0, 0);
-                let _ = conn.flush();
+        if with_x11(|conn, root| {
+            for button in [1, 2, 3, 8, 9] {
+                send_button(&conn, root, button, false, 0, 0);
             }
+            for keycode in [37, 50, 62, 64, 108, 133, 134] {
+                send_keycode(&conn, root, keycode, false);
+            }
+            conn.flush().is_ok()
+        }) {
+            return;
         }
-        for keycode in [37, 50, 62, 64, 108, 133, 134] {
-            send_keycode(keycode, false);
+        for button in [0x80, 0x81, 0x82, 0x85, 0x86] {
+            let _ = run_ydotool(["click", &format!("0x{button:02x}")]);
         }
+        let _ = run_ydotool(["key", "29:0", "42:0", "54:0", "56:0", "125:0", "126:0"]);
     }
 
-    fn click_button<C: Connection>(conn: &C, root: u32, detail: u8) {
-        let _ = conn.xtest_fake_input(xproto::BUTTON_PRESS_EVENT, detail, 0, root, 0, 0, 0);
-        let _ = conn.xtest_fake_input(xproto::BUTTON_RELEASE_EVENT, detail, 0, root, 0, 0, 0);
+    fn with_x11(mut f: impl FnMut(&RustConnection, u32) -> bool) -> bool {
+        X11_INPUT.with(|cell| {
+            if cell.borrow().is_none() {
+                *cell.borrow_mut() = X11Input::connect();
+            }
+            let ok = {
+                let guard = cell.borrow();
+                let Some(input) = guard.as_ref() else {
+                    return false;
+                };
+                f(&input.conn, input.root)
+            };
+            if !ok {
+                *cell.borrow_mut() = None;
+            }
+            ok
+        })
+    }
+
+    fn send_motion<C: Connection>(conn: &C, root: u32, x: i32, y: i32) {
+        let _ = conn.xtest_fake_input(
+            xproto::MOTION_NOTIFY_EVENT,
+            0,
+            0,
+            root,
+            clamp_i16(x),
+            clamp_i16(y),
+            0,
+        );
+    }
+
+    fn send_button<C: Connection>(conn: &C, root: u32, detail: u8, down: bool, x: i32, y: i32) {
+        let event = if down {
+            xproto::BUTTON_PRESS_EVENT
+        } else {
+            xproto::BUTTON_RELEASE_EVENT
+        };
+        let _ = conn.xtest_fake_input(event, detail, 0, root, clamp_i16(x), clamp_i16(y), 0);
+    }
+
+    fn click_button<C: Connection>(conn: &C, root: u32, detail: u8, x: i32, y: i32) {
+        send_button(conn, root, detail, true, x, y);
+        send_button(conn, root, detail, false, x, y);
     }
 
     fn mouse_button_detail(button: i32) -> Option<u8> {
@@ -1728,36 +1813,354 @@ mod linux_xtest {
             BTN_LEFT => Some(1),
             BTN_MIDDLE => Some(2),
             BTN_RIGHT => Some(3),
+            BTN_BACK => Some(8),
+            BTN_FORWARD => Some(9),
             _ => None,
         }
     }
 
-    fn send_keycode(keycode: u8, down: bool) {
-        let Ok((conn, screen_num)) = x11rb::connect(None) else {
-            return;
-        };
-        let root = conn.setup().roots[screen_num].root;
+    fn send_keycode<C: Connection>(conn: &C, root: u32, keycode: u8, down: bool) {
         let event = if down {
             xproto::KEY_PRESS_EVENT
         } else {
             xproto::KEY_RELEASE_EVENT
         };
         let _ = conn.xtest_fake_input(event, keycode, 0, root, 0, 0, 0);
-        let _ = conn.flush();
     }
 
-    fn send_ascii(c: char) {
-        let Some((keycode, shift)) = ascii_to_x11_keycode(c) else {
+    fn send_ascii<C>(conn: &C, root: u32, c: char)
+    where
+        C: Connection + XprotoConnectionExt,
+    {
+        let Some((keycode, shift)) = keycode_for_ascii(conn, c).or_else(|| ascii_to_x11_keycode(c))
+        else {
             return;
         };
         if shift {
-            send_keycode(50, true);
+            send_keycode(conn, root, 50, true);
         }
-        send_keycode(keycode, true);
-        send_keycode(keycode, false);
+        send_keycode(conn, root, keycode, true);
+        send_keycode(conn, root, keycode, false);
         if shift {
-            send_keycode(50, false);
+            send_keycode(conn, root, 50, false);
         }
+    }
+
+    fn press_modifiers<C: Connection>(conn: &C, root: u32, keycodes: &[u8], down: bool) {
+        let iter: Box<dyn Iterator<Item = &u8> + '_> = if down {
+            Box::new(keycodes.iter())
+        } else {
+            Box::new(keycodes.iter().rev())
+        };
+        for keycode in iter {
+            send_keycode(conn, root, *keycode, down);
+        }
+    }
+
+    fn modifier_keycodes(modifiers: &[i32]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for modifier in modifiers {
+            if let Some(keycode) = control_key_to_x11_keycode(*modifier) {
+                if !out.contains(&keycode) {
+                    out.push(keycode);
+                }
+            }
+        }
+        out
+    }
+
+    fn keycode_for_ascii<C>(conn: &C, c: char) -> Option<(u8, bool)>
+    where
+        C: Connection + XprotoConnectionExt,
+    {
+        let setup = conn.setup();
+        let min = setup.min_keycode;
+        let count = setup.max_keycode.saturating_sub(min).saturating_add(1);
+        let reply = conn.get_keyboard_mapping(min, count).ok()?.reply().ok()?;
+        let per_key = reply.keysyms_per_keycode as usize;
+        if per_key == 0 {
+            return None;
+        }
+        let target = c as u32;
+        for (index, keysyms) in reply.keysyms.chunks(per_key).enumerate() {
+            if keysyms.first().copied() == Some(target) {
+                return Some((min.saturating_add(index as u8), false));
+            }
+            if keysyms.get(1).copied() == Some(target) {
+                return Some((min.saturating_add(index as u8), true));
+            }
+        }
+        None
+    }
+
+    fn type_text_with_xdotool(text: &str) -> bool {
+        run_tool("xdotool", ["type", "--clearmodifiers", "--", text])
+    }
+
+    fn type_text_with_tool(text: &str) -> bool {
+        type_text_with_xdotool(text) || run_ydotool(["type", text]) || run_tool("wtype", [text])
+    }
+
+    fn inject_mouse_fallback(ev: crate::rustdesk_proto::MouseEvent) {
+        let evt_type = ev.mask & 0x7;
+        let button = ev.mask >> 3;
+        match evt_type {
+            EVT_MOVE => {
+                let _ = run_ydotool([
+                    "mousemove",
+                    "--absolute",
+                    &ev.x.to_string(),
+                    &ev.y.to_string(),
+                ]);
+            }
+            EVT_DOWN | EVT_UP => {
+                if ev.x != 0 || ev.y != 0 {
+                    let _ = run_ydotool([
+                        "mousemove",
+                        "--absolute",
+                        &ev.x.to_string(),
+                        &ev.y.to_string(),
+                    ]);
+                }
+                if let Some(button) = ydotool_button(button) {
+                    let state = if evt_type == EVT_DOWN { 0x40 } else { 0x80 };
+                    let _ = run_ydotool(["click", &format!("0x{:02x}", state | button)]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn inject_key_fallback(ev: crate::rustdesk_proto::KeyEvent) {
+        match ev.union {
+            Some(crate::rustdesk_proto::key_event::Union::ControlKey(ck)) => {
+                if let Some(code) = control_key_to_evdev(ck) {
+                    if ev.press {
+                        send_evdev_key_press(code, &ev.modifiers);
+                    } else {
+                        let _ = run_ydotool(["key", &format!("{code}:{}", i32::from(ev.down))]);
+                    }
+                }
+            }
+            Some(crate::rustdesk_proto::key_event::Union::Unicode(ch)) => {
+                let Some(c) = char::from_u32(ch) else {
+                    return;
+                };
+                if ev.press && !ev.modifiers.is_empty() {
+                    if let Some((code, needs_shift)) = ascii_to_evdev(c) {
+                        let mut modifiers = ev.modifiers.clone();
+                        if needs_shift {
+                            modifiers.push(crate::rustdesk_proto::ControlKey::Shift as i32);
+                        }
+                        send_evdev_key_press(code, &modifiers);
+                        return;
+                    }
+                }
+                let _ = type_text_with_tool(&c.to_string());
+            }
+            None => {}
+        }
+    }
+
+    fn send_evdev_key_press(code: u16, modifiers: &[i32]) {
+        let mut args = vec!["key".to_owned()];
+        let mut modifier_codes = modifiers
+            .iter()
+            .filter_map(|modifier| control_key_to_evdev(*modifier))
+            .collect::<Vec<_>>();
+        modifier_codes.sort_unstable();
+        modifier_codes.dedup();
+        for modifier in &modifier_codes {
+            args.push(format!("{modifier}:1"));
+        }
+        args.push(format!("{code}:1"));
+        args.push(format!("{code}:0"));
+        for modifier in modifier_codes.iter().rev() {
+            args.push(format!("{modifier}:0"));
+        }
+        let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let _ = run_ydotool(refs);
+    }
+
+    fn ydotool_button(button: i32) -> Option<u8> {
+        match button {
+            BTN_LEFT => Some(0x00),
+            BTN_RIGHT => Some(0x01),
+            BTN_MIDDLE => Some(0x02),
+            BTN_FORWARD => Some(0x05),
+            BTN_BACK => Some(0x06),
+            _ => None,
+        }
+    }
+
+    fn control_key_to_evdev(ck: i32) -> Option<u16> {
+        use crate::rustdesk_proto::ControlKey;
+        Some(match ck {
+            x if x == ControlKey::Alt as i32 => 56,
+            x if x == ControlKey::Backspace as i32 => 14,
+            x if x == ControlKey::CapsLock as i32 => 58,
+            x if x == ControlKey::Control as i32 => 29,
+            x if x == ControlKey::Delete as i32 => 111,
+            x if x == ControlKey::DownArrow as i32 => 108,
+            x if x == ControlKey::End as i32 => 107,
+            x if x == ControlKey::Escape as i32 => 1,
+            x if x == ControlKey::F1 as i32 => 59,
+            x if x == ControlKey::F2 as i32 => 60,
+            x if x == ControlKey::F3 as i32 => 61,
+            x if x == ControlKey::F4 as i32 => 62,
+            x if x == ControlKey::F5 as i32 => 63,
+            x if x == ControlKey::F6 as i32 => 64,
+            x if x == ControlKey::F7 as i32 => 65,
+            x if x == ControlKey::F8 as i32 => 66,
+            x if x == ControlKey::F9 as i32 => 67,
+            x if x == ControlKey::F10 as i32 => 68,
+            x if x == ControlKey::F11 as i32 => 87,
+            x if x == ControlKey::F12 as i32 => 88,
+            x if x == ControlKey::Home as i32 => 102,
+            x if x == ControlKey::Insert as i32 => 110,
+            x if x == ControlKey::LeftArrow as i32 => 105,
+            x if x == ControlKey::Meta as i32 => 125,
+            x if x == ControlKey::PageDown as i32 => 109,
+            x if x == ControlKey::PageUp as i32 => 104,
+            x if x == ControlKey::Return as i32 => 28,
+            x if x == ControlKey::NumpadEnter as i32 => 96,
+            x if x == ControlKey::RightArrow as i32 => 106,
+            x if x == ControlKey::Shift as i32 => 42,
+            x if x == ControlKey::Space as i32 => 57,
+            x if x == ControlKey::Tab as i32 => 15,
+            x if x == ControlKey::UpArrow as i32 => 103,
+            _ => return None,
+        })
+    }
+
+    fn ascii_to_evdev(c: char) -> Option<(u16, bool)> {
+        Some(match c {
+            'a'..='z' => (letter_evdev(c), false),
+            'A'..='Z' => (letter_evdev(c.to_ascii_lowercase()), true),
+            '1' => (2, false),
+            '2' => (3, false),
+            '3' => (4, false),
+            '4' => (5, false),
+            '5' => (6, false),
+            '6' => (7, false),
+            '7' => (8, false),
+            '8' => (9, false),
+            '9' => (10, false),
+            '0' => (11, false),
+            '!' => (2, true),
+            '@' => (3, true),
+            '#' => (4, true),
+            '$' => (5, true),
+            '%' => (6, true),
+            '^' => (7, true),
+            '&' => (8, true),
+            '*' => (9, true),
+            '(' => (10, true),
+            ')' => (11, true),
+            '-' => (12, false),
+            '_' => (12, true),
+            '=' => (13, false),
+            '+' => (13, true),
+            '[' => (26, false),
+            '{' => (26, true),
+            ']' => (27, false),
+            '}' => (27, true),
+            ';' => (39, false),
+            ':' => (39, true),
+            '\'' => (40, false),
+            '"' => (40, true),
+            '`' => (41, false),
+            '~' => (41, true),
+            '\\' => (43, false),
+            '|' => (43, true),
+            ',' => (51, false),
+            '<' => (51, true),
+            '.' => (52, false),
+            '>' => (52, true),
+            '/' => (53, false),
+            '?' => (53, true),
+            ' ' => (57, false),
+            _ => return None,
+        })
+    }
+
+    fn letter_evdev(c: char) -> u16 {
+        match c {
+            'q' => 16,
+            'w' => 17,
+            'e' => 18,
+            'r' => 19,
+            't' => 20,
+            'y' => 21,
+            'u' => 22,
+            'i' => 23,
+            'o' => 24,
+            'p' => 25,
+            'a' => 30,
+            's' => 31,
+            'd' => 32,
+            'f' => 33,
+            'g' => 34,
+            'h' => 35,
+            'j' => 36,
+            'k' => 37,
+            'l' => 38,
+            'z' => 44,
+            'x' => 45,
+            'c' => 46,
+            'v' => 47,
+            'b' => 48,
+            'n' => 49,
+            'm' => 50,
+            _ => 0,
+        }
+    }
+
+    fn run_ydotool<I, S>(args: I) -> bool
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        run_tool("ydotool", args)
+    }
+
+    fn run_tool<I, S>(name: &str, args: I) -> bool
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        if !command_exists(name) {
+            return false;
+        }
+        let mut command = Command::new(name);
+        for arg in args {
+            command.arg(arg.as_ref());
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    fn command_exists(name: &str) -> bool {
+        static CACHE: OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
+            OnceLock::new();
+        let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        if let Ok(cache) = cache.lock() {
+            if let Some(value) = cache.get(name).copied() {
+                return value;
+            }
+        }
+        let exists = std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
+            .unwrap_or(false);
+        if let Ok(mut cache) = cache.lock() {
+            cache.insert(name.to_owned(), exists);
+        }
+        exists
     }
 
     fn control_key_to_x11_keycode(ck: i32) -> Option<u8> {

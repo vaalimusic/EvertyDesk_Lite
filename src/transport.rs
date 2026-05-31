@@ -23,7 +23,7 @@ use crate::{
         PunchHoleFailure, PunchHoleRequest, RendezvousMessage, RequestRelay, ScreenshotRequest,
         SupportedDecoding, SwitchDisplay,
     },
-    settings::ServerConfig,
+    settings::{CodecPreference, DisplayConfig, ServerConfig},
 };
 
 const RENDEZVOUS_PORT: u16 = 21116;
@@ -36,6 +36,7 @@ pub struct ConnectionRequest {
     pub remote_id: String,
     pub password: String,
     pub server: ServerConfig,
+    pub display: DisplayConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -159,6 +160,10 @@ pub enum SessionCommand {
     SetVideoFps {
         fps: i32,
     },
+    SetVideoProfile {
+        fps: i32,
+        codec: CodecPreference,
+    },
     Close,
 }
 
@@ -269,6 +274,9 @@ impl TransportClient {
         commands: Receiver<SessionCommand>,
         events: Sender<SessionEvent>,
     ) {
+        let display_config = request.display.clone();
+        let mut codec_preference = display_config.codec;
+        let initial_video_fps = display_config.target_fps.clamp(5, 60) as i32;
         let mut emit_progress = |pct, message: String| {
             let _ = events.send(SessionEvent::Progress(pct, message));
         };
@@ -305,7 +313,7 @@ impl TransportClient {
         let mut peer_messages_seen = 0_u32;
         let mut live_video_seen = false;
         let mut last_frame_received = Instant::now();
-        let mut target_video_fps = 30_i32;
+        let mut target_video_fps = initial_video_fps;
         let mut last_decoder_recovery: Option<Instant> = None;
         let mut last_live_bootstrap = Instant::now();
         // Codec telemetry — reported to UI once on first encounter.
@@ -317,7 +325,13 @@ impl TransportClient {
         // Subscribe to display 0 (SwitchDisplay) then trigger video start.
         // SwitchDisplay must come first — it's the one-time subscription trigger.
         let _ = send_switch_display_subscribe(&mut relay, current_display);
-        let _ = send_video_start_messages(&mut relay, current_display, true, target_video_fps);
+        let _ = send_video_start_messages(
+            &mut relay,
+            current_display,
+            true,
+            target_video_fps,
+            codec_preference,
+        );
         let _ = send_video_received(&mut relay);
         let _ = events.send(SessionEvent::Info(
             "Display subscribed; waiting for first frame".to_owned(),
@@ -348,6 +362,7 @@ impl TransportClient {
                         current_display,
                         false,
                         target_video_fps,
+                        codec_preference,
                     );
                     last_live_bootstrap = Instant::now();
                 }
@@ -438,6 +453,7 @@ impl TransportClient {
                             current_display,
                             false,
                             target_video_fps,
+                            codec_preference,
                         );
                         last_live_bootstrap = Instant::now();
                         request_screenshot_once(
@@ -462,6 +478,7 @@ impl TransportClient {
                             current_display,
                             false,
                             target_video_fps,
+                            codec_preference,
                         );
                         last_live_bootstrap = Instant::now();
                     }
@@ -477,6 +494,7 @@ impl TransportClient {
                             current_display,
                             false,
                             target_video_fps,
+                            codec_preference,
                         );
                         last_live_bootstrap = Instant::now();
                     }
@@ -492,6 +510,26 @@ impl TransportClient {
                             current_display,
                             false,
                             target_video_fps,
+                            codec_preference,
+                        );
+                        last_live_bootstrap = Instant::now();
+                    }
+                    SessionCommand::SetVideoProfile { fps, codec } => {
+                        flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
+                        target_video_fps = fps.clamp(5, 60);
+                        codec_preference = codec;
+                        live_video_seen = false;
+                        last_decoder_recovery = Some(Instant::now());
+                        let _ = events.send(SessionEvent::Info(format!(
+                            "Video profile set to {} at {target_video_fps} fps",
+                            codec_preference.label()
+                        )));
+                        let _ = send_video_start_messages(
+                            &mut relay,
+                            current_display,
+                            true,
+                            target_video_fps,
+                            codec_preference,
                         );
                         last_live_bootstrap = Instant::now();
                     }
@@ -522,6 +560,8 @@ impl TransportClient {
                             &events,
                             &frame_tx,
                             current_display,
+                            target_video_fps,
+                            codec_preference,
                         )
                     }
                     Err(err) => {
@@ -554,7 +594,11 @@ impl TransportClient {
                     // Some servers ignore the LoginRequest codec preference and need
                     // an explicit OptionMessage nudge after they've already started streaming.
                     if vp9_ignored_count == 1 {
-                        let _ = send_codec_sync_options(&mut relay, target_video_fps);
+                        let _ = send_codec_sync_options(
+                            &mut relay,
+                            target_video_fps,
+                            CodecPreference::H264,
+                        );
                         eprintln!(
                             "[session] Server chose VP9 despite H264 preference — \
                              re-sending H264 request (server may lack hardware encoder)"
@@ -609,6 +653,7 @@ impl TransportClient {
                         current_display,
                         true,
                         target_video_fps,
+                        codec_preference,
                     );
                     let _ = send_video_received(&mut relay);
                     last_live_bootstrap = Instant::now();
@@ -709,6 +754,8 @@ fn establish_session(
         .relay_server
         .unwrap_or_else(|| request.server.relay_server.clone());
     let secure_relay = rendezvous.has_signed_pk;
+    let initial_video_fps = request.display.target_fps.clamp(5, 60) as i32;
+    let codec_preference = request.display.codec;
 
     // Relay connection: retry up to 3 times because the peer may not have arrived yet
     // when we open the stream, causing an immediate EOF from the relay server.
@@ -741,7 +788,13 @@ fn establish_session(
         )?;
 
         progress(96, "Waiting for peer secure/login response".to_owned());
-        match read_initial_peer_stage(&mut relay_stream, &request.password, &request.remote_id) {
+        match read_initial_peer_stage(
+            &mut relay_stream,
+            &request.password,
+            &request.remote_id,
+            initial_video_fps,
+            codec_preference,
+        ) {
             Ok((peer_stage, displays)) => return Ok((relay_stream, peer_stage, displays)),
             Err(err) => last_err = err,
         }
@@ -771,7 +824,10 @@ pub fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, String> {
 
     for addr in addrs {
         match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => {
+                configure_tcp_stream(&stream);
+                return Ok(stream);
+            }
             Err(err) => last_error = Some(err),
         }
     }
@@ -782,6 +838,13 @@ pub fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, String> {
             .map(|err| err.to_string())
             .unwrap_or_else(|| "no resolved addresses".to_owned())
     ))
+}
+
+fn configure_tcp_stream(stream: &TcpStream) {
+    // Remote-control traffic is dominated by small control packets and framed
+    // video chunks. Disabling Nagle keeps cursor/key events from waiting behind
+    // the TCP coalescing timer on relay connections.
+    let _ = stream.set_nodelay(true);
 }
 
 fn split_host_port(host: &str, default_port: u16) -> (String, u16) {
@@ -936,6 +999,8 @@ fn read_initial_peer_stage(
     relay: &mut TcpStream,
     password: &str,
     remote_id: &str,
+    fps: i32,
+    codec_preference: CodecPreference,
 ) -> Result<(String, Vec<RemoteDisplay>), String> {
     relay
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -966,7 +1031,14 @@ fn read_initial_peer_stage(
                 send_framed(relay, &encode_peer_message(&fallback))?;
             }
             Some(peer_message::Union::Hash(hash)) => {
-                let login = build_login_request(password, &hash.salt, &hash.challenge, remote_id);
+                let login = build_login_request(
+                    password,
+                    &hash.salt,
+                    &hash.challenge,
+                    remote_id,
+                    fps,
+                    codec_preference,
+                );
                 send_framed(relay, &encode_peer_message(&login))?;
                 sent_login = true;
             }
@@ -978,7 +1050,7 @@ fn read_initial_peer_stage(
                 let displays = displays_from_login_response(&response);
                 let login = describe_login_response(response, sent_login)?;
                 send_switch_display_subscribe(relay, 0)?;
-                send_video_start_messages(relay, 0, true, 30)?;
+                send_video_start_messages(relay, 0, true, fps, codec_preference)?;
                 return Ok((
                     format!("{login}; screenshot/control channel ready"),
                     displays,
@@ -992,7 +1064,7 @@ fn read_initial_peer_stage(
                 );
                 let displays = displays_from_peer_info(&info);
                 send_switch_display_subscribe(relay, 0)?;
-                send_video_start_messages(relay, 0, true, 30)?;
+                send_video_start_messages(relay, 0, true, fps, codec_preference)?;
                 return Ok((
                     format!("{login}; screenshot/control channel ready"),
                     displays,
@@ -1044,8 +1116,9 @@ fn send_video_start_messages(
     display: i32,
     refresh_all: bool,
     fps: i32,
+    codec_preference: CodecPreference,
 ) -> Result<(), String> {
-    send_codec_sync_options(relay, fps)?;
+    send_codec_sync_options(relay, fps, codec_preference)?;
 
     if refresh_all {
         let refresh_all_msg = PeerMessage {
@@ -1080,11 +1153,15 @@ fn send_switch_display_subscribe(relay: &mut TcpStream, display: i32) -> Result<
     send_framed(relay, &encode_peer_message(&switch_msg))
 }
 
-fn send_codec_sync_options(relay: &mut TcpStream, fps: i32) -> Result<(), String> {
+fn send_codec_sync_options(
+    relay: &mut TcpStream,
+    fps: i32,
+    codec_preference: CodecPreference,
+) -> Result<(), String> {
     let message = PeerMessage {
         union: Some(peer_message::Union::Misc(Misc {
             union: Some(misc::Union::Option(OptionMessage {
-                supported_decoding: Some(supported_decoding()),
+                supported_decoding: Some(supported_decoding(codec_preference)),
                 custom_fps: fps.clamp(5, 60),
             })),
         })),
@@ -1092,36 +1169,45 @@ fn send_codec_sync_options(relay: &mut TcpStream, fps: i32) -> Result<(), String
     send_framed(relay, &encode_peer_message(&message))
 }
 
-fn supported_decoding() -> SupportedDecoding {
-    // VP9 can be decoded via libvpx (live-vpx) or Windows Media Foundation (live-vp9-mf on Windows).
-    let vp9_capable =
-        cfg!(feature = "live-vpx") || cfg!(all(feature = "live-vp9-mf", target_os = "windows"));
+fn supported_decoding(codec_preference: CodecPreference) -> SupportedDecoding {
+    // VP9 can be decoded via libvpx, system libvpx, or Windows Media Foundation.
+    let vp9_capable = cfg!(any(
+        feature = "live-vpx",
+        feature = "live-vpx-system",
+        all(feature = "live-vp9-mf", target_os = "windows")
+    ));
+    let h264_capable = cfg!(feature = "live-h264");
+    let prefer = preferred_codec(codec_preference, h264_capable, vp9_capable);
     SupportedDecoding {
         ability_vp9: i32::from(vp9_capable),
-        ability_h264: i32::from(cfg!(feature = "live-h264")),
+        ability_h264: i32::from(h264_capable),
         ability_h265: 0,
-        // In the full build, advertise all live decoders and let the peer pick
-        // the best encoder it actually has. This avoids forcing H264 on peers
-        // that only stream VP9, which would otherwise degrade to PNG fallback.
-        prefer: if vp9_capable && cfg!(feature = "live-h264") {
-            PreferCodec::Auto as i32
-        } else if cfg!(feature = "live-h264") {
-            PreferCodec::H264 as i32
-        } else if vp9_capable {
-            PreferCodec::Vp9 as i32
-        } else {
-            PreferCodec::Auto as i32
-        },
+        prefer: prefer as i32,
         ability_vp8: i32::from(cfg!(feature = "live-vpx")),
         ability_av1: 0,
         i444: Some(CodecAbility {
             vp8: false,
-            vp9: cfg!(feature = "live-vpx"),
+            vp9: cfg!(any(feature = "live-vpx", feature = "live-vpx-system")),
             av1: false,
             h264: false,
             h265: false,
         }),
         prefer_chroma: Chroma::I420 as i32,
+    }
+}
+
+fn preferred_codec(
+    codec_preference: CodecPreference,
+    h264_capable: bool,
+    vp9_capable: bool,
+) -> PreferCodec {
+    match codec_preference {
+        CodecPreference::H264 if h264_capable => PreferCodec::H264,
+        CodecPreference::Vp9 if vp9_capable => PreferCodec::Vp9,
+        CodecPreference::Auto if h264_capable && vp9_capable => PreferCodec::Auto,
+        _ if h264_capable => PreferCodec::H264,
+        _ if vp9_capable => PreferCodec::Vp9,
+        _ => PreferCodec::Auto,
     }
 }
 
@@ -1163,7 +1249,7 @@ fn wait_for_video_probe(relay: &mut TcpStream) -> Result<String, String> {
         let payload = match read_framed(relay) {
             Ok(payload) => payload,
             Err(_) if attempt < 23 => {
-                send_video_start_messages(relay, 0, true, 30)?;
+                send_video_start_messages(relay, 0, true, 30, CodecPreference::Auto)?;
                 continue;
             }
             Err(err) => {
@@ -1248,6 +1334,8 @@ fn handle_session_message(
     events: &Sender<SessionEvent>,
     frame_tx: &Sender<DecoderInput>,
     current_display: i32,
+    target_video_fps: i32,
+    codec_preference: CodecPreference,
 ) -> Option<FrameSource> {
     match message.union {
         Some(peer_message::Union::ScreenshotResponse(response)) => {
@@ -1370,7 +1458,13 @@ fn handle_session_message(
         Some(peer_message::Union::LoginResponse(response)) => {
             emit_displays_from_login_response(&response, events);
             let _ = send_selected_windows_session(relay, &response);
-            let _ = send_video_start_messages(relay, current_display, false, 30);
+            let _ = send_video_start_messages(
+                relay,
+                current_display,
+                false,
+                target_video_fps,
+                codec_preference,
+            );
             if login_response_is_remote_accept_wait(&response) {
                 let _ = events.send(SessionEvent::Info("Waiting for remote accept".to_owned()));
             }
@@ -1379,7 +1473,13 @@ fn handle_session_message(
         Some(peer_message::Union::PeerInfo(info)) => {
             emit_displays_from_peer_info(&info, events);
             let _ = send_selected_windows_session_from_peer_info(relay, &info);
-            let _ = send_video_start_messages(relay, current_display, false, 30);
+            let _ = send_video_start_messages(
+                relay,
+                current_display,
+                false,
+                target_video_fps,
+                codec_preference,
+            );
             None
         }
         Some(peer_message::Union::CursorData(cd)) => {
@@ -2300,6 +2400,8 @@ fn build_login_request(
     salt: &str,
     challenge: &str,
     remote_id: &str,
+    fps: i32,
+    codec_preference: CodecPreference,
 ) -> PeerMessage {
     let password_hash = if password.is_empty() {
         Vec::new()
@@ -2322,8 +2424,8 @@ fn build_login_request(
             my_id: "evertydesk-lite".to_owned(),
             my_name: "EvertyDesk Lite".to_owned(),
             option: Some(OptionMessage {
-                supported_decoding: Some(supported_decoding()),
-                custom_fps: 30,
+                supported_decoding: Some(supported_decoding(codec_preference)),
+                custom_fps: fps.clamp(5, 60),
             }),
             video_ack_required: false,
             version: "1.4.6".to_owned(),
@@ -2454,17 +2556,26 @@ mod tests {
 
     #[test]
     fn login_request_uses_32_byte_password_hash() {
-        let message = build_login_request("secret", "salt", "challenge", "123");
+        let message = build_login_request(
+            "secret",
+            "salt",
+            "challenge",
+            "123",
+            60,
+            CodecPreference::Auto,
+        );
         let Some(peer_message::Union::LoginRequest(login)) = message.union else {
             panic!("expected login request");
         };
         assert_eq!(login.password.len(), 32);
         assert_eq!(login.username, "123");
+        assert_eq!(login.option.unwrap().custom_fps, 60);
     }
 
     #[test]
     fn login_request_uses_empty_password_for_remote_approval() {
-        let message = build_login_request("", "salt", "challenge", "123");
+        let message =
+            build_login_request("", "salt", "challenge", "123", 30, CodecPreference::Auto);
         let Some(peer_message::Union::LoginRequest(login)) = message.union else {
             panic!("expected login request");
         };

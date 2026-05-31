@@ -117,9 +117,14 @@ sudo apt install -y \
   build-essential pkg-config curl ca-certificates git cmake clang nasm \
   libx11-dev libxi-dev libxcursor-dev libxrandr-dev libxinerama-dev \
   libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev \
-  libwayland-dev libasound2-dev libudev-dev \
-  libgl1-mesa-dev libegl1-mesa-dev libvulkan1 mesa-vulkan-drivers
+  libwayland-dev libasound2-dev libudev-dev libxtst-dev \
+  libgl1-mesa-dev libegl1-mesa-dev libvulkan1 mesa-vulkan-drivers \
+  xdotool
 ```
+
+For Wayland host sessions, install the optional helpers available in your
+distribution: `ydotool` + running `ydotoold` for input and `grim` for capture.
+X11/Xorg remains the fastest and most complete Linux host backend.
 
 Install Rust if it is not installed:
 

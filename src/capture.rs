@@ -130,52 +130,195 @@ pub fn screen_size() -> Option<(u32, u32)> {
 
 #[cfg(target_os = "linux")]
 mod linux_x11 {
-    use x11rb::{connection::Connection, protocol::xproto::ConnectionExt};
+    use std::{
+        cell::RefCell,
+        process::{Command, Stdio},
+        sync::OnceLock,
+    };
+
+    use x11rb::{
+        connection::Connection,
+        protocol::xproto::{ConnectionExt, ImageFormat},
+        rust_connection::RustConnection,
+    };
+
+    thread_local! {
+        static X11_CAPTURE: RefCell<Option<X11Capture>> = const { RefCell::new(None) };
+    }
+
+    struct X11Capture {
+        conn: RustConnection,
+        root: u32,
+        width: u16,
+        height: u16,
+    }
+
+    impl X11Capture {
+        fn connect() -> Option<Self> {
+            let (conn, screen_num) = x11rb::connect(None).ok()?;
+            let screen = &conn.setup().roots[screen_num];
+            if screen.width_in_pixels == 0 || screen.height_in_pixels == 0 {
+                return None;
+            }
+            Some(Self {
+                root: screen.root,
+                width: screen.width_in_pixels,
+                height: screen.height_in_pixels,
+                conn,
+            })
+        }
+
+        fn capture(&self) -> Option<(u32, u32, Vec<u8>)> {
+            let reply = self
+                .conn
+                .get_image(
+                    ImageFormat::Z_PIXMAP,
+                    self.root,
+                    0,
+                    0,
+                    self.width,
+                    self.height,
+                    u32::MAX,
+                )
+                .ok()?
+                .reply()
+                .ok()?;
+
+            bgra_from_ximage(self.width as u32, self.height as u32, reply.data)
+        }
+    }
 
     pub fn capture() -> Option<(u32, u32, Vec<u8>)> {
-        let (conn, screen_num) = x11rb::connect(None).ok()?;
-        let screen = &conn.setup().roots[screen_num];
-        let width = screen.width_in_pixels;
-        let height = screen.height_in_pixels;
-        if width == 0 || height == 0 {
-            return None;
+        if let Some(frame) = capture_x11_cached() {
+            return Some(frame);
         }
-
-        let reply = conn
-            .get_image(
-                x11rb::protocol::xproto::ImageFormat::Z_PIXMAP,
-                screen.root,
-                0,
-                0,
-                width,
-                height,
-                u32::MAX,
-            )
-            .ok()?
-            .reply()
-            .ok()?;
-
-        let pixels = width as usize * height as usize;
-        if reply.data.len() < pixels * 4 {
-            return None;
-        }
-
-        let mut bgra = Vec::with_capacity(pixels * 4);
-        for px in reply.data.chunks_exact(4).take(pixels) {
-            bgra.extend_from_slice(&[px[0], px[1], px[2], 255]);
-        }
-        Some((width as u32, height as u32, bgra))
+        capture_grim_ppm()
     }
 
     pub fn screen_size() -> Option<(u32, u32)> {
-        let (conn, screen_num) = x11rb::connect(None).ok()?;
-        let screen = &conn.setup().roots[screen_num];
-        let width = screen.width_in_pixels;
-        let height = screen.height_in_pixels;
-        if width == 0 || height == 0 {
-            None
-        } else {
-            Some((width as u32, height as u32))
+        if let Some(size) = X11_CAPTURE.with(|cell| {
+            if cell.borrow().is_none() {
+                *cell.borrow_mut() = X11Capture::connect();
+            }
+            cell.borrow()
+                .as_ref()
+                .map(|x11| (x11.width as u32, x11.height as u32))
+        }) {
+            return Some(size);
         }
+        capture_grim_ppm().map(|(w, h, _)| (w, h))
+    }
+
+    fn capture_x11_cached() -> Option<(u32, u32, Vec<u8>)> {
+        X11_CAPTURE.with(|cell| {
+            if cell.borrow().is_none() {
+                *cell.borrow_mut() = X11Capture::connect();
+            }
+            let frame = cell.borrow().as_ref().and_then(X11Capture::capture);
+            if frame.is_none() {
+                *cell.borrow_mut() = None;
+            }
+            frame
+        })
+    }
+
+    fn bgra_from_ximage(width: u32, height: u32, mut data: Vec<u8>) -> Option<(u32, u32, Vec<u8>)> {
+        let pixels = width as usize * height as usize;
+        if data.len() >= pixels * 4 {
+            data.truncate(pixels * 4);
+            for alpha in data[3..].iter_mut().step_by(4) {
+                *alpha = 255;
+            }
+            return Some((width, height, data));
+        }
+        if data.len() >= pixels * 3 {
+            let mut bgra = Vec::with_capacity(pixels * 4);
+            for px in data.chunks_exact(3).take(pixels) {
+                bgra.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+            return Some((width, height, bgra));
+        }
+        None
+    }
+
+    fn capture_grim_ppm() -> Option<(u32, u32, Vec<u8>)> {
+        static GRIM_AVAILABLE: OnceLock<bool> = OnceLock::new();
+        if !*GRIM_AVAILABLE.get_or_init(|| command_exists("grim")) {
+            return None;
+        }
+        let output = Command::new("grim")
+            .args(["-t", "ppm", "-"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        parse_ppm_rgb(&output.stdout)
+    }
+
+    fn parse_ppm_rgb(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+        let mut index = 0;
+        let magic = next_ppm_token(bytes, &mut index)?;
+        if magic != b"P6" {
+            return None;
+        }
+        let width = parse_ascii_u32(next_ppm_token(bytes, &mut index)?)?;
+        let height = parse_ascii_u32(next_ppm_token(bytes, &mut index)?)?;
+        let max = parse_ascii_u32(next_ppm_token(bytes, &mut index)?)?;
+        if width == 0 || height == 0 || max != 255 {
+            return None;
+        }
+        if bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+        let pixels = width as usize * height as usize;
+        let rgb_len = pixels.checked_mul(3)?;
+        let rgb = bytes.get(index..index + rgb_len)?;
+        let mut bgra = Vec::with_capacity(pixels * 4);
+        for px in rgb.chunks_exact(3) {
+            bgra.extend_from_slice(&[px[2], px[1], px[0], 255]);
+        }
+        Some((width, height, bgra))
+    }
+
+    fn next_ppm_token<'a>(bytes: &'a [u8], index: &mut usize) -> Option<&'a [u8]> {
+        loop {
+            while bytes.get(*index).is_some_and(u8::is_ascii_whitespace) {
+                *index += 1;
+            }
+            if bytes.get(*index) != Some(&b'#') {
+                break;
+            }
+            while bytes.get(*index).is_some_and(|byte| *byte != b'\n') {
+                *index += 1;
+            }
+        }
+        let start = *index;
+        while bytes
+            .get(*index)
+            .is_some_and(|byte| !byte.is_ascii_whitespace())
+        {
+            *index += 1;
+        }
+        (start < *index).then_some(&bytes[start..*index])
+    }
+
+    fn parse_ascii_u32(bytes: &[u8]) -> Option<u32> {
+        std::str::from_utf8(bytes).ok()?.parse().ok()
+    }
+
+    fn command_exists(name: &str) -> bool {
+        let path = match std::env::var_os("PATH") {
+            Some(path) => path,
+            None => return false,
+        };
+        for dir in std::env::split_paths(&path) {
+            if dir.join(name).is_file() {
+                return true;
+            }
+        }
+        false
     }
 }
