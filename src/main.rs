@@ -28,8 +28,12 @@ use std::{
 use eframe::egui::{self, ColorImage, TextureHandle};
 use host::{HostEvent, HostService, HostState};
 use rustdesk_proto::ControlKey;
+use serde_json::Value;
 use settings as settings_mod;
-use settings_mod::{generate_numeric_token, AppConfig, CodecPreference, CoordinateMode};
+use settings_mod::{
+    generate_agent_machine_id, generate_numeric_token, AppConfig, CodecPreference,
+    ConnectionHistoryEntry, ContactEntry, CoordinateMode,
+};
 use transport::{
     ConnectionRequest, ConnectionState, RemoteDisplay, SessionCommand, SessionEvent,
     TransportClient,
@@ -42,6 +46,28 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 enum AppMode {
     Connect,
     Host,
+    History,
+    Contacts,
+    Settings,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiLang {
+    Ru,
+    En,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectKind {
+    Screen,
+    Shell,
+}
+
+fn tr(lang: UiLang, ru: &'static str, en: &'static str) -> &'static str {
+    match lang {
+        UiLang::Ru => ru,
+        UiLang::En => en,
+    }
 }
 
 fn main() -> eframe::Result<()> {
@@ -275,7 +301,7 @@ struct LinuxGuiAttempt {
 /// Decode the embedded EvertyDesk logo (`edesk_lite_logo.png`) into a window
 /// icon. Returns `None` if the image can't be decoded.
 fn load_app_icon() -> Option<egui::IconData> {
-    let bytes = include_bytes!("../edesk_lite_logo.png");
+    let bytes = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/edesk_lite_logo.png"));
     let img = image::load_from_memory(bytes).ok()?.to_rgba8();
     let (width, height) = img.dimensions();
     Some(egui::IconData {
@@ -296,8 +322,8 @@ fn run_gui(renderer: eframe::Renderer) -> eframe::Result<()> {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(APP_NAME)
-        .with_inner_size([1280.0, 800.0])
-        .with_min_inner_size([1040.0, 680.0]);
+        .with_inner_size([1180.0, 740.0])
+        .with_min_inner_size([920.0, 600.0]);
     if let Some(icon) = load_app_icon() {
         viewport = viewport.with_icon(std::sync::Arc::new(icon));
     }
@@ -349,6 +375,11 @@ fn run_headless_host() {
                 }
                 host::HostEvent::IncomingRequest { peer_id, .. } => {
                     eprintln!("[host] Incoming from {peer_id}")
+                }
+                host::HostEvent::ApprovalRequested { peer_id } => {
+                    eprintln!(
+                        "[host] Approval requested from {peer_id}; GUI confirmation is required"
+                    )
                 }
                 host::HostEvent::SessionStarted { peer_id } => {
                     eprintln!("[host] Session started: {peer_id}")
@@ -457,6 +488,9 @@ fn run_cli_connect() -> Option<i32> {
                     host::HostEvent::IncomingRequest { peer_id, .. } => {
                         eprintln!("[host] Incoming from {peer_id}")
                     }
+                    host::HostEvent::ApprovalRequested { peer_id } => {
+                        eprintln!("[host] Approval requested from {peer_id}; GUI confirmation is required")
+                    }
                     host::HostEvent::SessionStarted { peer_id } => {
                         eprintln!("[host] Session started: {peer_id}")
                     }
@@ -511,7 +545,18 @@ struct EvertyDeskApp {
     password: String,
     show_password: bool,
     show_host_password: bool,
+    connect_kind: ConnectKind,
+    shell_window_open: bool,
+    shell_output: String,
+    shell_input: String,
     mode: AppMode,
+    ui_lang: UiLang,
+    new_contact_name: String,
+    new_contact_id: String,
+    new_contact_note: String,
+    contact_search: String,
+    address_book_status: Option<String>,
+    service_status: Option<String>,
     status: String,
     host_status: String,
     last_error: Option<String>,
@@ -528,6 +573,7 @@ struct EvertyDeskApp {
     events: Vec<String>,
     session_log: Vec<String>,
     remote_texture: Option<TextureHandle>,
+    app_logo_texture: Option<TextureHandle>,
     pending_image: Option<ColorImage>,
     last_frame_rgba: Vec<u8>,
     remote_size: [usize; 2],
@@ -696,14 +742,26 @@ impl EvertyDeskApp {
         let fit_to_window = config.ui.fit_to_window;
         let coordinate_mode = config.ui.coordinate_mode;
         let video_fps = config.display.target_fps.clamp(5, 60) as i32;
+        let host_service = Some(HostService::start(config.clone()));
         Self {
             config,
             remote_id,
             password: String::new(),
             show_password: false,
             show_host_password: false,
+            connect_kind: ConnectKind::Screen,
+            shell_window_open: false,
+            shell_output: String::new(),
+            shell_input: String::new(),
             mode: AppMode::Connect,
-            host_status: "Хост-режим: входящие подключения пока в разработке.".to_owned(),
+            ui_lang: UiLang::Ru,
+            new_contact_name: String::new(),
+            new_contact_id: String::new(),
+            new_contact_note: String::new(),
+            contact_search: String::new(),
+            address_book_status: None,
+            service_status: None,
+            host_status: "Доступ запускается автоматически.".to_owned(),
             status: "Готово".to_owned(),
             last_error: None,
             connection_state: ConnectionState::Idle,
@@ -719,6 +777,7 @@ impl EvertyDeskApp {
             events: vec!["App started".to_owned()],
             session_log: vec!["App started".to_owned()],
             remote_texture: None,
+            app_logo_texture: None,
             pending_image: None,
             last_frame_rgba: Vec::new(),
             remote_size: [0, 0],
@@ -763,9 +822,9 @@ impl EvertyDeskApp {
             cursor_texture: None,
             cursor_pos: None,
             latency_ms: None,
-            host_service: None,
-            host_state: HostState::Idle,
-            host_log: Vec::new(),
+            host_service,
+            host_state: HostState::Connecting,
+            host_log: vec![format!("[{}] Автозапуск доступа...", timestamp_hms())],
             host_pending_peer: None,
             show_settings: false,
             settings_draft: None,
@@ -798,6 +857,7 @@ impl EvertyDeskApp {
         self.busy = true;
         self.connected = false;
         self.remote_viewer_open = false;
+        self.shell_window_open = false;
         self.remote_fullscreen = false;
         self.remote_id = normalized_remote_id;
         self.save_ui_config();
@@ -944,17 +1004,23 @@ impl EvertyDeskApp {
             SessionEvent::Connected(info) => {
                 self.busy = false;
                 self.connected = true;
-                self.remote_viewer_open = true;
+                self.remote_viewer_open = self.connect_kind == ConnectKind::Screen;
+                self.shell_window_open = self.connect_kind == ConnectKind::Shell;
                 self.progress = 100;
                 self.connection_state = ConnectionState::RelayReady {
                     remote_id: self.remote_id.clone(),
                 };
                 self.status = "Подключено".to_owned();
                 self.log(format!("Connected: {info}"));
-                self.send_command(SessionCommand::SetAutoRefresh {
-                    enabled: self.auto_refresh,
-                    millis: self.refresh_millis,
-                });
+                if self.connect_kind == ConnectKind::Shell {
+                    self.shell_output.clear();
+                    self.send_command(SessionCommand::ShellStart);
+                } else {
+                    self.send_command(SessionCommand::SetAutoRefresh {
+                        enabled: self.auto_refresh,
+                        millis: self.refresh_millis,
+                    });
+                }
             }
             SessionEvent::Frame {
                 sid,
@@ -1065,6 +1131,20 @@ impl EvertyDeskApp {
             }
             SessionEvent::Latency(ms) => {
                 self.latency_ms = Some(ms);
+            }
+            SessionEvent::ShellOutput(text) => {
+                self.shell_output.push_str(&text);
+                if self.shell_output.len() > 80_000 {
+                    let drain = self.shell_output.len() - 80_000;
+                    self.shell_output.drain(..drain);
+                }
+            }
+            SessionEvent::ShellClosed => {
+                self.shell_output.push_str("\r\n[console closed]\r\n");
+            }
+            SessionEvent::ShellError(err) => {
+                self.shell_output
+                    .push_str(&format!("\r\n[console error] {err}\r\n"));
             }
             SessionEvent::Info(message) => self.log(message),
             SessionEvent::Failed(err) => {
@@ -1233,6 +1313,7 @@ impl EvertyDeskApp {
     fn save_ui_config(&mut self) {
         self.config.ui.last_remote_id = self.remote_id.clone();
         remember_remote_id(&mut self.config.ui.recent_remote_ids, &self.remote_id);
+        remember_history(&mut self.config.ui.history, &self.remote_id);
         self.config.ui.auto_refresh = self.auto_refresh;
         self.config.ui.refresh_millis = self.refresh_millis;
         self.config.ui.fit_to_window = self.fit_to_window;
@@ -1305,36 +1386,54 @@ impl EvertyDeskApp {
         if self.connected && self.remote_viewer_open {
             self.remote_viewer_window(ctx);
         }
-        if self.show_settings {
-            self.settings_window(ctx);
+        if self.connected && self.shell_window_open {
+            self.shell_window(ctx);
         }
+        if self.host_pending_peer.is_some() {
+            self.incoming_approval_window(ctx);
+        }
+
+        let screen_rect = ctx.screen_rect();
+        ctx.layer_painter(egui::LayerId::background()).rect_filled(
+            screen_rect,
+            egui::Rounding::ZERO,
+            egui::Color32::from_rgb(0xFB, 0xFC, 0xFE),
+        );
 
         // ── Left sidebar: logo · navigation · settings ───────────────────────
         egui::SidePanel::left("everty_sidebar")
             .resizable(false)
-            .exact_width(240.0)
+            .exact_width(220.0)
             .frame(
                 egui::Frame::none()
-                    .fill(egui::Color32::from_rgb(0x0C, 0x0C, 0x0C)) // #0C0C0C
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(20)))
-
-                    
-                    .rounding(egui::Rounding::same(20.0))
-                    .inner_margin(egui::Margin::symmetric(16.0, 20.0))
-                    .outer_margin(egui::Margin::same(12.0)),
+                    .fill(egui::Color32::from_rgb(0xF7, 0xF8, 0xFA))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgb(0xEA, 0xEC, 0xF0),
+                    ))
+                    .rounding(egui::Rounding::ZERO)
+                    .inner_margin(egui::Margin::symmetric(18.0, 20.0))
+                    .outer_margin(egui::Margin::ZERO),
             )
             .show(ctx, |ui| self.sidebar(ui));
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().inner_margin(egui::Margin {
-                left: 8.0,
-                right: 24.0,
-                top: 18.0,
-                bottom: 18.0,
-            }))
+            .frame(
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(0xFB, 0xFC, 0xFE))
+                    .inner_margin(egui::Margin {
+                        left: 26.0,
+                        right: 24.0,
+                        top: 28.0,
+                        bottom: 24.0,
+                    }),
+            )
             .show(ctx, |ui| match self.mode {
                 AppMode::Connect => self.connect_ui(ui),
                 AppMode::Host => self.host_ui(ui),
+                AppMode::History => self.history_ui(ui),
+                AppMode::Contacts => self.contacts_ui(ui),
+                AppMode::Settings => self.settings_ui(ui),
             });
         if self.mode == AppMode::Connect
             && !self.busy
@@ -1352,6 +1451,39 @@ impl EvertyDeskApp {
         if self.connected || self.busy {
             self.disconnect_session("Application closed");
         }
+    }
+
+    fn text(&self, ru: &'static str, en: &'static str) -> &'static str {
+        tr(self.ui_lang, ru, en)
+    }
+
+    fn host_state_text(&self) -> &'static str {
+        match (&self.host_state, self.ui_lang) {
+            (HostState::Idle, UiLang::Ru) => "Остановлен",
+            (HostState::Idle, UiLang::En) => "Stopped",
+            (HostState::Connecting, UiLang::Ru) => "Подключение...",
+            (HostState::Connecting, UiLang::En) => "Connecting...",
+            (HostState::Ready, UiLang::Ru) => "Готов к подключению",
+            (HostState::Ready, UiLang::En) => "Ready to connect",
+            (HostState::Accepting(_), UiLang::Ru) => "Сессия активна",
+            (HostState::Accepting(_), UiLang::En) => "Session active",
+            (HostState::Error(_), UiLang::Ru) => "Ошибка",
+            (HostState::Error(_), UiLang::En) => "Error",
+        }
+    }
+
+    fn ensure_app_logo_texture(&mut self, ctx: &egui::Context) -> Option<&TextureHandle> {
+        if self.app_logo_texture.is_none() {
+            let bytes = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/edesk_lite_logo.png"));
+            if let Ok(img) = image::load_from_memory(bytes) {
+                let rgba = img.to_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                let image = ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                self.app_logo_texture =
+                    Some(ctx.load_texture("evertydesk-logo", image, egui::TextureOptions::LINEAR));
+            }
+        }
+        self.app_logo_texture.as_ref()
     }
 
     fn connect_ui(&mut self, ui: &mut egui::Ui) {
@@ -1496,63 +1628,105 @@ impl EvertyDeskApp {
     /// Left sidebar: logo, app name, version, navigation, and Settings pinned
     /// to the bottom (per UI spec v1 — Arc/Linear-style rail).
     fn sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(6.0);
+        ui.add_space(2.0);
         ui.horizontal(|ui| {
-            // Drawn [É] logo tile.
             let (rect, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
             let p = ui.painter();
             p.rect_filled(
                 rect,
                 egui::Rounding::same(12.0),
-                egui::Color32::from_rgb(0x10, 0x10, 0x10),
+                egui::Color32::from_rgb(0xFC, 0xFD, 0xFF),
             );
             p.rect_stroke(
                 rect,
                 egui::Rounding::same(12.0),
-                egui::Stroke::new(1.0, egui::Color32::from_white_alpha(30)),
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(0xE5, 0xE8, 0xEF)),
             );
-            p.text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "É",
-                egui::FontId::proportional(24.0),
-                egui::Color32::WHITE,
-            );
+            if let Some(texture) = self.ensure_app_logo_texture(ui.ctx()) {
+                let image_rect = rect.shrink(6.0);
+                p.image(
+                    texture.id(),
+                    image_rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            } else {
+                p.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "E",
+                    egui::FontId::proportional(26.0),
+                    egui::Color32::from_rgb(0x16, 0x18, 0x20),
+                );
+            }
             ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                ui.set_visible(false);
+                ui.add_sized(
+                    egui::vec2(180.0, 34.0),
+                    egui::TextEdit::singleline(&mut self.config.ui.address_book_account)
+                        .hint_text(tr(self.ui_lang, "Логин", "Login")),
+                );
+                ui.add_sized(
+                    egui::vec2(180.0, 34.0),
+                    egui::TextEdit::singleline(&mut self.config.ui.address_book_token)
+                        .password(true)
+                        .hint_text(tr(self.ui_lang, "Пароль", "Password")),
+                );
+            });
+            ui.set_visible(true);
             ui.vertical(|ui| {
-                ui.add_space(4.0);
+                ui.add_space(3.0);
                 ui.label(
                     egui::RichText::new(APP_NAME)
-                        .size(16.0)
+                        .size(14.0)
                         .strong()
-                        .color(egui::Color32::WHITE),
+                        .color(egui::Color32::from_rgb(0x17, 0x1A, 0x22)),
                 );
                 ui.label(
                     egui::RichText::new(format!("v{APP_VERSION}"))
                         .size(12.0)
-                        .color(egui::Color32::from_rgb(0x80, 0x80, 0x80)),
+                        .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
                 );
             });
         });
 
-        ui.add_space(28.0);
-        self.nav_item(ui, AppMode::Connect, "Подключиться");
-        ui.add_space(10.0);
-        self.nav_item(ui, AppMode::Host, "Этот компьютер");
+        ui.add_space(18.0);
+        let connect_label = self.text("Подключиться", "Connect");
+        let host_label = self.text("Этот компьютер", "This computer");
+        let history_label = self.text("История", "History");
+        let contacts_label = self.text("Контакты", "Contacts");
+        self.nav_item(ui, AppMode::Connect, connect_label, "connect");
+        ui.add_space(8.0);
+        self.nav_item(ui, AppMode::Host, host_label, "monitor");
+        ui.add_space(8.0);
+        self.nav_item(ui, AppMode::History, history_label, "history");
+        ui.add_space(8.0);
+        self.nav_item(ui, AppMode::Contacts, contacts_label, "contacts");
 
-        // Settings pinned to the bottom.
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            ui.add_space(2.0);
-            if nav_button(ui, "⚙   Настройки", false).clicked() {
-                self.settings_draft = Some(self.config.clone());
-                self.show_settings = true;
+            ui.add_space(4.0);
+            let settings_label = self.text("Настройки", "Settings");
+            if nav_icon_button(
+                ui,
+                settings_label,
+                "settings",
+                self.mode == AppMode::Settings,
+                true,
+            )
+            .clicked()
+            {
+                if self.settings_draft.is_none() {
+                    self.settings_draft = Some(self.config.clone());
+                }
+                self.mode = AppMode::Settings;
             }
         });
     }
 
-    fn nav_item(&mut self, ui: &mut egui::Ui, mode: AppMode, label: &str) {
+    fn nav_item(&mut self, ui: &mut egui::Ui, mode: AppMode, label: &str, icon: &str) {
         let active = self.mode == mode;
-        if nav_button(ui, label, active).clicked() {
+        if nav_icon_button(ui, label, icon, active, false).clicked() {
             self.mode = mode;
         }
     }
@@ -1566,19 +1740,35 @@ impl EvertyDeskApp {
     fn status_capsule(&self, ui: &mut egui::Ui) {
         use egui::Color32;
         let (label, base, pulse) = if self.last_error.is_some() {
-            ("Error", Color32::from_rgb(0xFF, 0x55, 0x55), false)
+            (
+                self.text("Ошибка", "Error"),
+                Color32::from_rgb(0xFF, 0x55, 0x55),
+                false,
+            )
         } else if self.connected {
-            ("Connected", Color32::WHITE, false)
+            (
+                self.text("Подключено", "Connected"),
+                Color32::from_rgb(0x12, 0xC9, 0x72),
+                false,
+            )
         } else if self.busy {
-            ("Connecting", Color32::WHITE, true)
+            (
+                self.text("Подключение", "Connecting"),
+                Color32::from_rgb(0xE5, 0xA1, 0x00),
+                true,
+            )
         } else {
-            ("Ready", Color32::WHITE, false)
+            (
+                self.text("Готово", "Ready"),
+                Color32::from_rgb(0x12, 0xC9, 0x72),
+                false,
+            )
         };
         // Left-align the (content-sized) pill.
         ui.horizontal(|ui| {
             egui::Frame::none()
-                .fill(Color32::from_rgb(0x14, 0x14, 0x14))
-                .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(22)))
+                .fill(Color32::from_rgb(0xFF, 0xFF, 0xFF))
+                .stroke(egui::Stroke::new(1.0, Color32::from_rgb(0xE3, 0xE6, 0xEC)))
                 .rounding(egui::Rounding::same(20.0))
                 .inner_margin(egui::Margin::symmetric(12.0, 6.0))
                 .show(ui, |ui| {
@@ -1588,17 +1778,21 @@ impl EvertyDeskApp {
                         let t = ui.input(|i| i.time);
                         let a = 0.55 + 0.45 * (t * std::f64::consts::TAU / 0.9).sin();
                         ui.ctx().request_repaint();
-                        Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), (a * 255.0) as u8)
+                        Color32::from_rgba_unmultiplied(
+                            base.r(),
+                            base.g(),
+                            base.b(),
+                            (a * 255.0) as u8,
+                        )
                     } else {
                         base
                     };
-                    ui.painter()
-                        .circle_stroke(rect.center(), 4.0, egui::Stroke::new(1.5, col));
+                    ui.painter().circle_filled(rect.center(), 5.0, col);
                     ui.add_space(7.0);
                     ui.label(
                         egui::RichText::new(label)
                             .size(13.0)
-                            .color(Color32::from_rgb(0xD8, 0xD8, 0xD8)),
+                            .color(Color32::from_rgb(0x20, 0x24, 0x2D)),
                     );
                 });
         });
@@ -1637,266 +1831,342 @@ impl EvertyDeskApp {
 
     /// Right-hand "This computer" card: your ID, password, and host status.
     fn this_computer_card(&mut self, ui: &mut egui::Ui, _min_h: f32) {
-        let gray = egui::Color32::from_rgb(0xA0, 0xA0, 0xA0);
+        let gray = egui::Color32::from_rgb(0x50, 0x58, 0x68);
         card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.label(
-                egui::RichText::new("This computer")
-                    .size(16.0)
-                    .strong()
-                    .color(egui::Color32::WHITE),
+                egui::RichText::new(self.text("Этот компьютер", "This computer"))
+                    .size(18.0)
+                    .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
             );
-            ui.add_space(18.0);
+            ui.add_space(16.0);
 
-            ui.label(egui::RichText::new("Your ID").size(13.0).color(gray));
+            ui.label(
+                egui::RichText::new(self.text("Ваш ID", "Your ID"))
+                    .size(12.0)
+                    .color(gray),
+            );
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(format_peer_id(&self.config.local_id))
-                        .size(24.0)
-                        .strong()
-                        .color(egui::Color32::WHITE),
+                        .size(26.0)
+                        .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⎘").on_hover_text("Копировать ID").clicked() {
+                    if icon_button(ui, "copy")
+                        .on_hover_text(self.text("Скопировать ID", "Copy ID"))
+                        .clicked()
+                    {
                         ui.output_mut(|o| o.copied_text = self.config.local_id.clone());
                     }
                 });
             });
 
-            ui.add_space(16.0);
-            ui.label(egui::RichText::new("Password").size(13.0).color(gray));
+            ui.add_space(12.0);
+            let show_host_label = self.text("показать", "show");
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("••••••••")
-                        .size(20.0)
-                        .color(egui::Color32::WHITE),
+                    egui::RichText::new(self.text("Пароль", "Password"))
+                        .size(12.0)
+                        .color(gray),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⎘").on_hover_text("Копировать пароль").clicked() {
+                    ui.checkbox(&mut self.show_host_password, show_host_label);
+                });
+            });
+            ui.horizontal(|ui| {
+                let pw_text = if self.show_host_password {
+                    self.config.local_password.clone()
+                } else {
+                    "•".repeat(self.config.local_password.len().max(8))
+                };
+                ui.label(
+                    egui::RichText::new(pw_text)
+                        .size(22.0)
+                        .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(ui, "copy")
+                        .on_hover_text(self.text("Скопировать пароль", "Copy password"))
+                        .clicked()
+                    {
                         ui.output_mut(|o| o.copied_text = self.config.local_password.clone());
+                    }
+                    if icon_button(ui, "refresh")
+                        .on_hover_text(self.text("Новый пароль", "New password"))
+                        .clicked()
+                    {
+                        self.config.local_password = generate_numeric_token(6);
+                        self.config.save();
                     }
                 });
             });
 
-            ui.add_space(18.0);
+            ui.add_space(12.0);
             ui.separator();
-            ui.add_space(14.0);
+            ui.add_space(12.0);
 
-            ui.label(egui::RichText::new("Status").size(13.0).color(gray));
-            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(self.text("Статус", "Status"))
+                    .size(12.0)
+                    .color(gray),
+            );
+            ui.add_space(6.0);
             let online = self.host_state.is_online();
             ui.horizontal(|ui| {
-                // Pulsing ring (hollow) — soft, premium.
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                let t = ui.input(|i| i.time);
-                let a = 0.55 + 0.45 * (t * std::f64::consts::TAU / 0.9).sin();
-                ui.ctx().request_repaint();
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                 let base = if online {
-                    egui::Color32::WHITE
+                    egui::Color32::from_rgb(0x12, 0xC9, 0x72)
                 } else {
-                    gray
+                    egui::Color32::from_rgb(0x12, 0xC9, 0x72)
                 };
-                let ring = egui::Color32::from_rgba_unmultiplied(
-                    base.r(),
-                    base.g(),
-                    base.b(),
-                    (a * 255.0) as u8,
-                );
-                ui.painter()
-                    .circle_stroke(rect.center(), 5.0, egui::Stroke::new(1.5, ring));
-                ui.add_space(8.0);
+                ui.painter().circle_filled(rect.center(), 5.0, base);
+                ui.add_space(12.0);
                 ui.label(
-                    egui::RichText::new(if online { "Online" } else { "Ready to connect" })
-                        .size(14.0)
-                        .color(egui::Color32::from_rgb(0xE0, 0xE0, 0xE0)),
+                    egui::RichText::new(if online {
+                        self.text("В сети", "Online")
+                    } else {
+                        self.text("Готов к подключению", "Ready to connect")
+                    })
+                    .size(16.0)
+                    .color(egui::Color32::from_rgb(0x20, 0x24, 0x2D)),
                 );
             });
-
         });
     }
 
     fn connect_ui_commercial(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
+        ui.add_space(0.0);
         workspace_frame().show(ui, |ui| {
-        ui.set_min_width(ui.available_width());
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new("Remote control")
-                        .size(28.0)
-                        .color(egui::Color32::WHITE),
-                );
-                ui.add_space(2.0);
-                ui.label(
-                    egui::RichText::new("Fast RustDesk-compatible access through desk.everty.ru")
-                        .size(15.0)
-                        .color(egui::Color32::from_rgb(0xA0, 0xA0, 0xA0)),
-                );
-                ui.add_space(12.0);
-                self.status_capsule(ui);
-            });
-        });
-
-        ui.add_space(18.0);
-        let two_gap = 20.0;
-        let two_left = 520.0_f32.min(ui.available_width() - 360.0);
-        // ui.vertical columns auto-size to their content height, so the
-        // workspace wraps tightly instead of stretching down the window.
-        ui.horizontal_top(|ui| {
-            ui.vertical(|ui| {
-                ui.set_min_width(two_left);
-                ui.set_max_width(two_left);
-                    card_frame().show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                ui.label(
-                    egui::RichText::new("Partner ID")
-                        .size(13.0)
-                        .color(egui::Color32::from_rgb(0xA0, 0xA0, 0xA0)),
-                );
-                let remote_id_response = ui.add_enabled(
-                    !self.connected && !self.busy,
-                    egui::TextEdit::singleline(&mut self.remote_id)
-                        .hint_text("123 456 789")
-                        .desired_width(f32::INFINITY)
-                        .font(egui::TextStyle::Heading),
-                );
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
+            ui.set_min_width(ui.available_width());
+            let title = self.text("Удаленное управление", "Remote control");
+            let subtitle = self.text(
+                "Быстрый RustDesk-совместимый доступ через desk.everty.ru",
+                "Fast RustDesk-compatible access through desk.everty.ru",
+            );
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
                     ui.label(
-                        egui::RichText::new("Password")
-                            .size(12.0)
-                            .color(egui::Color32::from_rgb(155, 164, 176)),
+                        egui::RichText::new(title)
+                            .size(28.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
                     );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.checkbox(&mut self.show_password, "show");
-                    });
+                    ui.add_space(3.0);
+                    ui.label(
+                        egui::RichText::new(subtitle)
+                            .size(13.0)
+                            .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                    );
                 });
-                let password_response = ui.add_enabled(
-                    !self.connected && !self.busy,
-                    egui::TextEdit::singleline(&mut self.password)
-                        .password(!self.show_password)
-                        .hint_text("Optional for remote approval")
-                        .desired_width(f32::INFINITY),
-                );
-                if remote_id_response.changed() || password_response.changed() {
-                    self.last_error = None;
-                    if !self.connected && !self.busy {
-                        self.status = "Ready".to_owned();
-                        self.progress = 0;
-                    }
-                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.status_capsule(ui);
+                });
+            });
 
-                ui.add_space(20.0);
-                // ── Primary: white full-width Connect button with [É] brand ───
-                let connect_label = if self.busy {
-                    "É    Connecting…"
-                } else {
-                    "É    Connect"
-                };
-                let connect_btn = egui::Button::new(
-                    egui::RichText::new(connect_label)
-                        .size(17.0)
-                        .strong()
-                        .color(egui::Color32::BLACK),
-                )
-                .min_size(egui::vec2(ui.available_width(), 52.0))
-                .fill(egui::Color32::WHITE)
-                .rounding(egui::Rounding::same(14.0));
-                if ui
-                    .add_enabled(!self.busy && !self.connected, connect_btn)
-                    .clicked()
-                {
-                    self.connect();
-                }
-
-                ui.add_space(12.0);
-                // ── Secondary row: Check ID · Open screen · Disconnect(danger) ─
-                ui.columns(3, |cols| {
-                    if secondary_button(&mut cols[0], "Check ID")
-                        .on_hover_text("Проверить онлайн ли ID")
-                        .clicked()
-                        && !self.busy
-                        && !self.connected
-                        && !self.remote_check_busy
-                    {
-                        self.check_remote_online();
-                    }
-                    if danger_button(&mut cols[2], "Disconnect").clicked()
-                        && (self.connected || self.busy)
-                    {
-                        self.disconnect_session("Disconnected");
-                    }
-                    if secondary_button(&mut cols[1], "Open screen").clicked()
-                        && self.connected
-                        && !self.remote_viewer_open
-                    {
-                        self.remote_viewer_open = true;
-                        self.status = "Remote screen opened".to_owned();
-                        self.send_command(SessionCommand::SetAutoRefresh {
-                            enabled: self.auto_refresh,
-                            millis: self.refresh_millis,
+            ui.add_space(16.0);
+            let two_gap = 18.0;
+            let right_width = 340.0_f32.min((ui.available_width() - two_gap) * 0.42);
+            let two_left = (ui.available_width() - two_gap - right_width).clamp(320.0, 430.0);
+            // ui.vertical columns auto-size to their content height, so the
+            // workspace wraps tightly instead of stretching down the window.
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_min_width(two_left);
+                    ui.set_max_width(two_left);
+                    card_frame().show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.set_min_height(214.0);
+                        ui.horizontal(|ui| {
+                            let segment_width = (ui.available_width() - 8.0) / 2.0;
+                            if mode_segment_button(
+                                ui,
+                                self.text("Экран", "Screen"),
+                                "monitor",
+                                self.connect_kind == ConnectKind::Screen,
+                                segment_width,
+                            )
+                            .clicked()
+                            {
+                                self.connect_kind = ConnectKind::Screen;
+                            }
+                            ui.add_space(8.0);
+                            if mode_segment_button(
+                                ui,
+                                self.text("Консоль", "Console"),
+                                "console",
+                                self.connect_kind == ConnectKind::Shell,
+                                segment_width,
+                            )
+                            .clicked()
+                            {
+                                self.connect_kind = ConnectKind::Shell;
+                            }
                         });
-                        self.send_command(SessionCommand::Screenshot);
-                    }
-                });
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new(self.text("ID партнера", "Partner ID"))
+                                .size(14.0)
+                                .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+                        );
+                        let remote_id_response = compact_text_input(
+                            ui,
+                            &mut self.remote_id,
+                            "123 456 789",
+                            false,
+                            !self.connected && !self.busy,
+                            Some(22.0),
+                        );
+                        ui.add_space(10.0);
+                        let password_label = self.text("Пароль", "Password");
+                        let show_label = self.text("показать", "show");
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(password_label)
+                                    .size(14.0)
+                                    .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.checkbox(&mut self.show_password, show_label);
+                                },
+                            );
+                        });
+                        let password_hint = self.text(
+                            "Необязательно, если доступ подтверждают вручную",
+                            "Optional for remote approval",
+                        );
+                        let password_response = compact_text_input(
+                            ui,
+                            &mut self.password,
+                            password_hint,
+                            !self.show_password,
+                            !self.connected && !self.busy,
+                            Some(16.0),
+                        );
+                        if remote_id_response.changed() || password_response.changed() {
+                            self.last_error = None;
+                            if !self.connected && !self.busy {
+                                self.status = self.text("Готово", "Ready").to_owned();
+                                self.progress = 0;
+                            }
+                        }
+
+                        ui.add_space(14.0);
+                        let connect_label = if self.busy {
+                            self.text("Подключение...", "Connecting...")
+                        } else {
+                            self.text("Подключиться", "Connect")
+                        };
+                        if ui
+                            .add_enabled_ui(!self.busy && !self.connected, |ui| {
+                                primary_connect_button(
+                                    ui,
+                                    connect_label,
+                                    if self.connect_kind == ConnectKind::Shell {
+                                        "console"
+                                    } else {
+                                        "connect"
+                                    },
+                                )
+                            })
+                            .inner
+                            .clicked()
+                        {
+                            self.connect();
+                        }
+
+                        ui.add_space(10.0);
+                        let check_label = self.text("Проверить ID", "Check ID");
+                        ui.horizontal(|ui| {
+                            if secondary_button(ui, check_label)
+                                .on_hover_text(self.text(
+                                    "Проверить, онлайн ли этот ID",
+                                    "Check whether this ID is online",
+                                ))
+                                .clicked()
+                                && !self.busy
+                                && !self.connected
+                                && !self.remote_check_busy
+                            {
+                                self.check_remote_online();
+                            }
+                        });
                     });
+                });
+                ui.add_space(two_gap);
+                ui.vertical(|ui| {
+                    ui.set_min_width(right_width);
+                    ui.set_max_width(right_width);
+                    self.this_computer_card(ui, 0.0);
+                });
             });
-            ui.add_space(two_gap);
-            ui.vertical(|ui| {
-                self.this_computer_card(ui, 0.0);
-            });
-        });
         }); // ── close workspace container ───────────────────────────────────
 
-        ui.add_space(12.0);
+        ui.add_space(6.0);
         if self.progress > 0 || self.busy || self.connected || self.remote_check_busy {
             ui.add(
                 egui::ProgressBar::new(self.progress as f32 / 100.0)
                     .desired_width(f32::INFINITY)
                     .text(format!("{}%", self.progress)),
             );
-            ui.add_space(6.0);
+            ui.add_space(4.0);
         }
-        let status_color = if self.last_error.is_some() {
-            egui::Color32::from_rgb(238, 95, 95)
-        } else if self.connected {
-            egui::Color32::from_rgb(66, 190, 112)
-        } else {
-            egui::Color32::from_rgb(170, 178, 188)
-        };
-        ui.label(
-            egui::RichText::new(self.visible_status())
-                .size(13.0)
-                .color(status_color),
-        );
+        if self.last_error.is_some() || self.busy || self.connected || self.remote_check_busy {
+            let status_color = if self.last_error.is_some() {
+                egui::Color32::from_rgb(238, 95, 95)
+            } else if self.connected {
+                egui::Color32::from_rgb(66, 190, 112)
+            } else {
+                egui::Color32::from_rgb(100, 112, 128)
+            };
+            ui.label(
+                egui::RichText::new(self.visible_status())
+                    .size(12.0)
+                    .color(status_color),
+            );
+        }
 
-        ui.add_space(12.0);
-        egui::CollapsingHeader::new("Connection details")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("Copy log").clicked() {
-                        ui.output_mut(|o| o.copied_text = self.events.join("\n"));
-                        self.log_status = Some("Log copied".to_owned());
-                    }
-                    if ui.button("Clear").clicked() {
-                        self.events.clear();
-                    }
-                });
-                egui::ScrollArea::vertical()
-                    .max_height(130.0)
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for event in self.events.iter().rev().take(30) {
-                            ui.label(
-                                egui::RichText::new(event)
-                                    .monospace()
-                                    .size(10.5)
-                                    .color(egui::Color32::from_rgb(150, 158, 168)),
-                            );
+        if self.config.ui.show_connection_details {
+            ui.add_space(16.0);
+            card_frame().show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                egui::CollapsingHeader::new(self.text(
+                    "Детали подключения - нажмите, чтобы раскрыть",
+                    "Connection details - click to expand",
+                ))
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(self.text("Скопировать лог", "Copy log"))
+                            .clicked()
+                        {
+                            ui.output_mut(|o| o.copied_text = self.events.join("\n"));
+                            self.log_status = Some("Log copied".to_owned());
+                        }
+                        if ui.button(self.text("Очистить", "Clear")).clicked() {
+                            self.events.clear();
                         }
                     });
+                    egui::ScrollArea::vertical()
+                        .max_height(130.0)
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for event in self.events.iter().rev().take(30) {
+                                ui.label(
+                                    egui::RichText::new(event)
+                                        .monospace()
+                                        .size(10.5)
+                                        .color(egui::Color32::from_rgb(150, 158, 168)),
+                                );
+                            }
+                        });
+                });
             });
+        }
     }
 
     fn host_ui(&mut self, ui: &mut egui::Ui) {
@@ -2067,155 +2337,812 @@ impl EvertyDeskApp {
         }
     }
 
+    fn history_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new(self.text("История подключений", "Connection history"))
+                .size(28.0)
+                .strong()
+                .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(self.text(
+                "Последние ID сохраняются локально. Можно добавить заметку.",
+                "Recent IDs are stored locally. You can add a note.",
+            ))
+            .size(13.0)
+            .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+        );
+        ui.add_space(16.0);
+
+        if self.config.ui.history.is_empty() {
+            card_frame().show(ui, |ui| {
+                ui.label(self.text("История пока пустая.", "History is empty."));
+            });
+            return;
+        }
+
+        ui.add_space(8.0);
+        card_frame().show(ui, |ui| {
+            ui.set_visible(false);
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    egui::vec2(ui.available_width().min(420.0), 34.0),
+                    egui::TextEdit::singleline(&mut self.contact_search).hint_text(tr(
+                        self.ui_lang,
+                        "Поиск по имени, ID или компьютеру",
+                        "Search name, ID, or host",
+                    )),
+                );
+                if !self.contact_search.is_empty()
+                    && ui.button(tr(self.ui_lang, "Очистить", "Clear")).clicked()
+                {
+                    self.contact_search.clear();
+                }
+            });
+        });
+
+        let _query = self.contact_search.trim().to_lowercase();
+        let mut connect_to: Option<String> = None;
+        let mut remove_id: Option<String> = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for entry in &mut self.config.ui.history {
+                card_frame().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new(format_peer_id(&entry.remote_id))
+                                    .size(22.0)
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}: {}",
+                                    tr(self.ui_lang, "Подключений", "Connections"),
+                                    entry.connect_count
+                                ))
+                                .size(12.0)
+                                .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                            );
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(tr(self.ui_lang, "Удалить", "Remove")).clicked() {
+                                remove_id = Some(entry.remote_id.clone());
+                            }
+                            if ui
+                                .button(tr(self.ui_lang, "Подключиться", "Connect"))
+                                .clicked()
+                            {
+                                connect_to = Some(entry.remote_id.clone());
+                            }
+                        });
+                    });
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new(tr(self.ui_lang, "Заметка", "Note"))
+                            .size(12.0)
+                            .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+                    );
+                    ui.add_sized(
+                        egui::vec2(ui.available_width(), 40.0),
+                        egui::TextEdit::singleline(&mut entry.note).hint_text(tr(
+                            self.ui_lang,
+                            "Например: бухгалтерия, ноутбук Ивана...",
+                            "Example: accounting, Ivan's laptop...",
+                        )),
+                    );
+                });
+                ui.add_space(8.0);
+            }
+        });
+
+        if let Some(id) = remove_id {
+            self.config.ui.history.retain(|entry| entry.remote_id != id);
+            self.config.save();
+        } else {
+            self.config.save();
+        }
+        if let Some(id) = connect_to {
+            self.remote_id = id;
+            self.mode = AppMode::Connect;
+        }
+    }
+
+    fn contacts_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new(self.text("Контакты", "Contacts"))
+                .size(28.0)
+                .strong()
+                .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(self.text(
+                "Адресная книга с авторизацией и локальными контактами.",
+                "Address book with sign-in and local contacts.",
+            ))
+            .size(13.0)
+            .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+        );
+        ui.add_space(16.0);
+
+        let lang = self.ui_lang;
+        card_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(tr(
+                            lang,
+                            "Адресная книга RustDesk",
+                            "RustDesk address book",
+                        ))
+                        .size(16.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                    );
+                    ui.label(
+                        egui::RichText::new(if self.config.ui.address_book_signed_in {
+                            tr(
+                                lang,
+                                "Авторизация активна, контакты доступны ниже.",
+                                "Signed in, contacts are available below.",
+                            )
+                        } else {
+                            tr(
+                                lang,
+                                "Войдите, затем добавляйте и используйте контакты.",
+                                "Sign in, then add and use contacts.",
+                            )
+                        })
+                        .size(12.5)
+                        .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let state_text = if self.config.ui.address_book_signed_in {
+                        tr(lang, "В сети", "Online")
+                    } else {
+                        tr(lang, "Не авторизовано", "Signed out")
+                    };
+                    status_pill(
+                        ui,
+                        state_text,
+                        if self.config.ui.address_book_signed_in {
+                            egui::Color32::from_rgb(0x12, 0xC9, 0x72)
+                        } else {
+                            egui::Color32::from_rgb(0xA8, 0xB0, 0xBE)
+                        },
+                    );
+                });
+            });
+            ui.add_space(10.0);
+            settings_text_row(
+                ui,
+                tr(lang, "Логин", "Login"),
+                &mut self.config.ui.address_book_account,
+            );
+            settings_text_row(
+                ui,
+                tr(lang, "Пароль", "Password"),
+                &mut self.config.ui.address_book_token,
+            );
+            ui.horizontal(|ui| {
+                ui.set_visible(false);
+                ui.label(
+                    egui::RichText::new("")
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                );
+                if ui.button(tr(lang, "Сгенерировать", "Regenerate")).clicked() {
+                    self.config.ui.agent_machine_id = generate_agent_machine_id();
+                    self.config.save();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.set_visible(true);
+                let can_sign_in = !self.config.ui.address_book_account.trim().is_empty()
+                    && !self.config.ui.address_book_token.trim().is_empty();
+                if ui
+                    .add_enabled(
+                        can_sign_in,
+                        egui::Button::new(tr(lang, "Войти", "Sign in"))
+                            .min_size(egui::vec2(110.0, 34.0)),
+                    )
+                    .clicked()
+                {
+                    match self.sync_address_book() {
+                        Ok(()) => {
+                            self.address_book_status = Some(
+                                tr(
+                                    lang,
+                                    "РђРґСЂРµСЃРЅР°СЏ РєРЅРёРіР° Р·Р°РіСЂСѓР¶РµРЅР°",
+                                    "Address book loaded",
+                                )
+                                .to_owned(),
+                            );
+                        }
+                        Err(err) => self.address_book_status = Some(err),
+                    }
+                }
+                if ui
+                    .add_enabled(
+                        self.config.ui.address_book_signed_in,
+                        egui::Button::new(tr(lang, "Выйти", "Sign out"))
+                            .min_size(egui::vec2(110.0, 34.0)),
+                    )
+                    .clicked()
+                {
+                    self.config.ui.address_book_signed_in = false;
+                    self.config.ui.address_book_guid.clear();
+                    self.config.ui.address_book_access_token.clear();
+                    self.config.save();
+                }
+                if ui
+                    .add_enabled(
+                        self.config.ui.address_book_signed_in,
+                        egui::Button::new(tr(lang, "Обновить", "Refresh"))
+                            .min_size(egui::vec2(110.0, 34.0)),
+                    )
+                    .clicked()
+                {
+                    match self.sync_address_book() {
+                        Ok(()) => {
+                            self.address_book_status = Some(
+                                tr(lang, "Контакты обновлены", "Contacts refreshed").to_owned(),
+                            );
+                        }
+                        Err(err) => self.address_book_status = Some(err),
+                    }
+                }
+                ui.label(
+                    egui::RichText::new(format!("API: {}", self.config.server.api_url))
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                );
+            });
+            if let Some(status) = &self.address_book_status {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(status)
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(0x57, 0x60, 0x70)),
+                );
+            }
+        });
+
+        ui.add_space(12.0);
+        card_frame().show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(self.text("Новый контакт", "New contact"))
+                    .size(16.0)
+                    .strong(),
+            );
+            ui.add_space(8.0);
+            settings_text_row(ui, self.text("Имя", "Name"), &mut self.new_contact_name);
+            settings_text_row(ui, self.text("ID", "ID"), &mut self.new_contact_id);
+            settings_text_row(ui, self.text("Заметка", "Note"), &mut self.new_contact_note);
+            if ui
+                .add_enabled(
+                    self.config.ui.address_book_signed_in,
+                    egui::Button::new(self.text("Добавить", "Add"))
+                        .min_size(egui::vec2(110.0, 34.0)),
+                )
+                .on_hover_text(self.text(
+                    "Сначала войдите в адресную книгу",
+                    "Sign in to the address book first",
+                ))
+                .clicked()
+            {
+                let id = normalize_remote_id(&self.new_contact_id);
+                if !id.is_empty() {
+                    let contact = ContactEntry {
+                        name: self.new_contact_name.trim().to_owned(),
+                        remote_id: id,
+                        note: self.new_contact_note.trim().to_owned(),
+                        machine_id: String::new(),
+                        os: rustdesk_platform().to_owned(),
+                        last_seen: String::new(),
+                        online: false,
+                    };
+                    match self.add_address_book_contact(&contact) {
+                        Ok(()) => {
+                            self.new_contact_name.clear();
+                            self.new_contact_id.clear();
+                            self.new_contact_note.clear();
+                            let _ = self.sync_address_book();
+                        }
+                        Err(err) => {
+                            self.address_book_status = Some(err);
+                        }
+                    }
+                }
+            }
+        });
+
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{}: {}",
+                    tr(self.ui_lang, "Контактов", "Contacts"),
+                    self.config.ui.contacts.len()
+                ))
+                .size(13.0)
+                .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+            );
+            if false && !self.config.ui.address_book_guid.trim().is_empty() {
+                ui.label(
+                    egui::RichText::new(format!("AB: {}", self.config.ui.address_book_guid))
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(0x8A, 0x94, 0xA6)),
+                );
+            }
+        });
+        if self.config.ui.address_book_signed_in && self.config.ui.contacts.is_empty() {
+            ui.add_space(8.0);
+            card_frame().show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(tr(
+                        self.ui_lang,
+                        "В адресной книге пока нет контактов.",
+                        "Address book has no contacts yet.",
+                    ))
+                    .size(14.0)
+                    .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                );
+            });
+        }
+        ui.add_space(8.0);
+        card_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    egui::vec2(ui.available_width().min(420.0), 34.0),
+                    egui::TextEdit::singleline(&mut self.contact_search).hint_text(tr(
+                        self.ui_lang,
+                        "Поиск по имени, ID или компьютеру",
+                        "Search name, ID, or host",
+                    )),
+                );
+                if !self.contact_search.is_empty()
+                    && ui.button(tr(self.ui_lang, "Очистить", "Clear")).clicked()
+                {
+                    self.contact_search.clear();
+                }
+            });
+        });
+        let query = self.contact_search.trim().to_lowercase();
+        let mut connect_to: Option<String> = None;
+        let mut remove_idx: Option<usize> = None;
+        let mut update_contact: Option<ContactEntry> = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for (idx, contact) in self.config.ui.contacts.iter_mut().enumerate() {
+                let haystack = format!(
+                    "{} {} {} {}",
+                    contact.name, contact.remote_id, contact.note, contact.os
+                )
+                .to_lowercase();
+                if !query.is_empty() && !haystack.contains(&query) {
+                    continue;
+                }
+                card_frame().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new(if contact.name.trim().is_empty() {
+                                    format_peer_id(&contact.remote_id)
+                                } else {
+                                    contact.name.clone()
+                                })
+                                .size(18.0)
+                                .strong(),
+                            );
+                            ui.label(
+                                egui::RichText::new(format_peer_id(&contact.remote_id))
+                                    .size(13.0)
+                                    .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                            );
+                            let host = if contact.note.trim().is_empty() {
+                                "-"
+                            } else {
+                                contact.note.trim()
+                            };
+                            let platform = if contact.os.trim().is_empty() {
+                                "-"
+                            } else {
+                                contact.os.trim()
+                            };
+                            ui.label(
+                                egui::RichText::new(format!("{host} · {platform}"))
+                                    .size(12.0)
+                                    .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                            );
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(tr(self.ui_lang, "Удалить", "Remove")).clicked() {
+                                remove_idx = Some(idx);
+                            }
+                            if ui.button(tr(self.ui_lang, "Сохранить", "Save")).clicked() {
+                                update_contact = Some(contact.clone());
+                            }
+                            if ui
+                                .button(tr(self.ui_lang, "Подключиться", "Connect"))
+                                .clicked()
+                            {
+                                connect_to = Some(contact.remote_id.clone());
+                            }
+                        });
+                    });
+                    ui.add_space(8.0);
+                    ui.add_sized(
+                        egui::vec2(ui.available_width(), 38.0),
+                        egui::TextEdit::singleline(&mut contact.name).hint_text(tr(
+                            self.ui_lang,
+                            "Псевдоним",
+                            "Alias",
+                        )),
+                    );
+                    ui.add_space(6.0);
+                    ui.set_visible(false);
+                    ui.add_sized(
+                        egui::vec2(ui.available_width(), 40.0),
+                        egui::TextEdit::singleline(&mut contact.note).hint_text(tr(
+                            self.ui_lang,
+                            "Заметка",
+                            "Note",
+                        )),
+                    );
+                });
+                ui.add_space(8.0);
+            }
+        });
+        if let Some(contact) = update_contact {
+            match self.update_address_book_contact(&contact) {
+                Ok(()) => {
+                    self.address_book_status =
+                        Some(tr(self.ui_lang, "Контакт сохранен", "Contact saved").to_owned());
+                    self.config.save();
+                }
+                Err(err) => self.address_book_status = Some(err),
+            }
+        }
+        if let Some(idx) = remove_idx {
+            if idx < self.config.ui.contacts.len() {
+                let contact = self.config.ui.contacts[idx].clone();
+                match self.delete_address_book_contact(&contact.remote_id) {
+                    Ok(()) => {
+                        self.config.ui.contacts.remove(idx);
+                    }
+                    Err(err) => self.address_book_status = Some(err),
+                }
+            }
+        }
+        self.config.save();
+        if let Some(id) = connect_to {
+            self.remote_id = id;
+            self.mode = AppMode::Connect;
+        }
+    }
+
+    fn sync_address_book(&mut self) -> Result<(), String> {
+        let mut token = self.ensure_address_book_token()?;
+        let mut guid = match rustdesk_personal_ab_guid(&self.config.server.api_url, &token) {
+            Ok(guid) => guid,
+            Err(err) if err.contains("401") || err.contains("403") => {
+                self.config.ui.address_book_signed_in = false;
+                self.config.ui.address_book_access_token.clear();
+                token = self.ensure_address_book_token()?;
+                rustdesk_personal_ab_guid(&self.config.server.api_url, &token)?
+            }
+            Err(err) => return Err(err),
+        };
+        let contacts = match rustdesk_ab_peers(&self.config.server.api_url, &token, &guid) {
+            Ok(contacts) => contacts,
+            Err(err) if err.contains("401") || err.contains("403") => {
+                self.config.ui.address_book_signed_in = false;
+                self.config.ui.address_book_access_token.clear();
+                token = self.ensure_address_book_token()?;
+                guid = rustdesk_personal_ab_guid(&self.config.server.api_url, &token)?;
+                rustdesk_ab_peers(&self.config.server.api_url, &token, &guid)?
+            }
+            Err(err) => return Err(err),
+        };
+
+        self.config.ui.address_book_guid = guid;
+        self.config.ui.contacts = contacts;
+        self.config.ui.address_book_signed_in = true;
+        self.config.save();
+        Ok(())
+    }
+
+    fn ensure_address_book_token(&mut self) -> Result<String, String> {
+        if self.config.ui.address_book_signed_in
+            && !self.config.ui.address_book_access_token.trim().is_empty()
+        {
+            return Ok(self.config.ui.address_book_access_token.clone());
+        }
+
+        let credential = self.config.ui.address_book_token.trim();
+        if credential.is_empty() {
+            return Err(self
+                .text("Укажите пароль или токен", "Enter password or token")
+                .to_owned());
+        }
+
+        let token = rustdesk_login(
+            &self.config.server.api_url,
+            self.config.ui.address_book_account.trim(),
+            credential,
+            &self.config.local_id,
+            &self.config.ui.agent_machine_id,
+        )?;
+        self.config.ui.address_book_access_token = token.clone();
+        self.config.ui.address_book_signed_in = true;
+        self.config.save();
+        Ok(token)
+    }
+
+    fn add_address_book_contact(&mut self, contact: &ContactEntry) -> Result<(), String> {
+        let guid = self.ensure_address_book_guid()?;
+        let token = self.ensure_address_book_token()?;
+        rustdesk_ab_add_peer(&self.config.server.api_url, &token, &guid, contact)
+    }
+
+    fn update_address_book_contact(&mut self, contact: &ContactEntry) -> Result<(), String> {
+        let guid = self.ensure_address_book_guid()?;
+        let token = self.ensure_address_book_token()?;
+        rustdesk_ab_update_peer(&self.config.server.api_url, &token, &guid, contact)
+    }
+
+    fn delete_address_book_contact(&mut self, remote_id: &str) -> Result<(), String> {
+        let guid = self.ensure_address_book_guid()?;
+        let token = self.ensure_address_book_token()?;
+        rustdesk_ab_delete_peer(&self.config.server.api_url, &token, &guid, remote_id)
+    }
+
+    fn ensure_address_book_guid(&mut self) -> Result<String, String> {
+        if self.config.ui.address_book_guid.trim().is_empty() {
+            self.sync_address_book()?;
+        }
+        Ok(self.config.ui.address_book_guid.clone())
+    }
+
+    fn incoming_approval_window(&mut self, ctx: &egui::Context) {
+        let Some(peer_id) = self.host_pending_peer.clone() else {
+            return;
+        };
+        egui::Window::new(self.text("Входящее подключение", "Incoming connection"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.label(
+                    egui::RichText::new(self.text(
+                        "Удаленный пользователь хочет подключиться без пароля.",
+                        "A remote user wants to connect without a password.",
+                    ))
+                    .size(15.0)
+                    .color(egui::Color32::from_rgb(0x20, 0x24, 0x2D)),
+                );
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new(format!("ID: {}", format_peer_id(&peer_id)))
+                        .size(22.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                );
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(self.text("Разрешить", "Allow"))
+                                .min_size(egui::vec2(132.0, 40.0))
+                                .fill(egui::Color32::from_rgb(0x12, 0xC9, 0x72)),
+                        )
+                        .clicked()
+                    {
+                        if let Some(svc) = &self.host_service {
+                            svc.approve_incoming(&peer_id, true);
+                        }
+                        self.host_pending_peer = None;
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(self.text("Отклонить", "Reject"))
+                                .min_size(egui::vec2(132.0, 40.0)),
+                        )
+                        .clicked()
+                    {
+                        if let Some(svc) = &self.host_service {
+                            svc.approve_incoming(&peer_id, false);
+                        }
+                        self.host_pending_peer = None;
+                    }
+                });
+            });
+    }
+
     fn host_ui_commercial(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(6.0);
+        ui.add_space(0.0);
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(
-                    egui::RichText::new("This device")
-                        .size(22.0)
+                    egui::RichText::new(self.text("Этот компьютер", "This computer"))
+                        .size(34.0)
                         .strong()
-                        .color(egui::Color32::from_rgb(232, 236, 241)),
+                        .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
                 );
+                ui.add_space(6.0);
                 ui.label(
-                    egui::RichText::new("Share this ID and password for direct unattended access")
-                        .size(12.0)
-                        .color(egui::Color32::from_rgb(145, 154, 166)),
+                    egui::RichText::new(self.text(
+                        "Покажите этот ID и пароль для входящего подключения",
+                        "Share this ID and password for direct unattended access",
+                    ))
+                    .size(15.0)
+                    .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (r, g, b) = self.host_state.color();
-                ui.label(
-                    egui::RichText::new(format!("● {}", self.host_state.label()))
-                        .strong()
-                        .color(egui::Color32::from_rgb(r, g, b)),
-                );
+                status_pill(ui, self.host_state_text(), egui::Color32::from_rgb(r, g, b));
             });
         });
 
-        ui.add_space(14.0);
-        egui::Frame::none()
-            .fill(egui::Color32::from_rgb(23, 28, 34))
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 54, 64)))
-            .rounding(egui::Rounding::same(8.0))
-            .inner_margin(egui::Margin::same(16.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new("Your ID")
-                                .size(12.0)
-                                .color(egui::Color32::from_rgb(155, 164, 176)),
-                        );
-                        ui.label(
-                            egui::RichText::new(format_peer_id(&self.config.local_id))
-                                .monospace()
-                                .size(30.0)
-                                .strong()
-                                .color(egui::Color32::from_rgb(245, 247, 250)),
-                        );
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Copy ID").clicked() {
-                            ui.output_mut(|o| o.copied_text = self.config.local_id.clone());
-                        }
-                    });
+        ui.add_space(24.0);
+
+        card_frame().show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                egui::RichText::new(self.text("Данные доступа", "Access credentials"))
+                    .size(18.0)
+                    .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+            );
+            ui.add_space(22.0);
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(self.text("Ваш ID", "Your ID"))
+                            .size(12.0)
+                            .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+                    );
+                    ui.label(
+                        egui::RichText::new(format_peer_id(&self.config.local_id))
+                            .size(28.0)
+                            .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                    );
                 });
-
-                ui.add_space(14.0);
-                ui.separator();
-                ui.add_space(12.0);
-
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new("Access password")
-                                .size(12.0)
-                                .color(egui::Color32::from_rgb(155, 164, 176)),
-                        );
-                        let pw_text = if self.show_host_password {
-                            self.config.local_password.clone()
-                        } else {
-                            "•".repeat(self.config.local_password.len())
-                        };
-                        ui.label(
-                            egui::RichText::new(pw_text)
-                                .monospace()
-                                .size(22.0)
-                                .color(egui::Color32::from_rgb(245, 247, 250)),
-                        );
-                    });
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.checkbox(&mut self.show_host_password, "show");
-                        if ui.button("New").clicked() {
-                            self.config.local_password = generate_numeric_token(6);
-                            self.config.save();
-                        }
-                        if ui.button("Copy").clicked() {
-                            ui.output_mut(|o| o.copied_text = self.config.local_password.clone());
-                        }
-                    });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(ui, "copy")
+                        .on_hover_text(self.text("Скопировать ID", "Copy ID"))
+                        .clicked()
+                    {
+                        ui.output_mut(|o| o.copied_text = self.config.local_id.clone());
+                    }
                 });
             });
 
-        ui.add_space(12.0);
-        ui.horizontal_wrapped(|ui| {
-            let service_running = self.host_service.is_some();
-            if service_running {
-                if ui
-                    .add(
-                        egui::Button::new("Stop sharing")
-                            .min_size(egui::vec2(140.0, 34.0))
-                            .fill(egui::Color32::from_rgb(75, 82, 94)),
-                    )
-                    .clicked()
-                {
-                    self.stop_host_service();
-                }
-            } else if ui
-                .add(
-                    egui::Button::new(egui::RichText::new("Start sharing").strong())
-                        .min_size(egui::vec2(140.0, 34.0))
-                        .fill(egui::Color32::from_rgb(38, 116, 236)),
+            ui.add_space(18.0);
+            ui.separator();
+            ui.add_space(18.0);
+
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(self.text("Пароль доступа", "Access password"))
+                            .size(12.0)
+                            .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+                    );
+                    let pw_text = if self.show_host_password {
+                        self.config.local_password.clone()
+                    } else {
+                        "•".repeat(self.config.local_password.len())
+                    };
+                    ui.label(
+                        egui::RichText::new(pw_text)
+                            .size(24.0)
+                            .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                    );
+                });
+                let show_label = self.text("показать", "show");
+                let copy_pw_tip = self.text("Скопировать пароль", "Copy password");
+                let new_pw_tip = self.text("Новый пароль", "New password");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.checkbox(&mut self.show_host_password, show_label);
+                    if icon_button(ui, "copy").on_hover_text(copy_pw_tip).clicked() {
+                        ui.output_mut(|o| o.copied_text = self.config.local_password.clone());
+                    }
+                    if icon_button(ui, "refresh")
+                        .on_hover_text(new_pw_tip)
+                        .clicked()
+                    {
+                        self.config.local_password = generate_numeric_token(6);
+                        self.config.save();
+                    }
+                });
+            });
+        });
+
+        ui.add_space(24.0);
+        card_frame().show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                egui::RichText::new(self.text("Доступ", "Sharing"))
+                    .size(18.0)
+                    .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+            );
+            ui.add_space(22.0);
+            ui.horizontal(|ui| {
+                let service_running = self.host_service.is_some();
+                let label = if service_running {
+                    self.text("Остановить доступ", "Stop sharing")
+                } else {
+                    self.text("Запустить доступ", "Start sharing")
+                };
+                let button = egui::Button::new(
+                    egui::RichText::new(label)
+                        .size(16.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
                 )
-                .clicked()
-            {
-                self.start_host_service();
-            }
+                .min_size(egui::vec2(180.0, 54.0))
+                .fill(egui::Color32::from_rgb(0xFF, 0xFF, 0xFF))
+                .stroke(egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgb(0xE3, 0xE6, 0xEC),
+                ))
+                .rounding(egui::Rounding::same(10.0));
+                if ui.add(button).clicked() {
+                    if service_running {
+                        self.stop_host_service();
+                    } else {
+                        self.start_host_service();
+                    }
+                }
+            });
+            ui.add_space(18.0);
+            ui.separator();
+            ui.add_space(18.0);
             ui.label(
                 egui::RichText::new(&self.host_status)
-                    .size(12.0)
-                    .color(egui::Color32::from_rgb(160, 170, 182)),
+                    .size(13.0)
+                    .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
             );
         });
 
-        ui.add_space(10.0);
-        egui::CollapsingHeader::new("Host diagnostics")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("Copy log").clicked() {
-                        ui.output_mut(|o| o.copied_text = self.host_log.join("\n"));
-                        self.host_status = "Host log copied".to_owned();
-                    }
-                    if ui.button("Clear").clicked() {
-                        self.host_log.clear();
-                    }
-                });
-                egui::ScrollArea::vertical()
-                    .max_height(140.0)
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for line in self.host_log.iter().rev().take(30) {
-                            ui.label(
-                                egui::RichText::new(line)
-                                    .monospace()
-                                    .size(10.5)
-                                    .color(egui::Color32::from_rgb(150, 158, 168)),
-                            );
+        ui.add_space(24.0);
+        card_frame().show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            egui::CollapsingHeader::new(self.text("Диагностика хоста", "Host diagnostics"))
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(self.text("Скопировать лог", "Copy log"))
+                            .clicked()
+                        {
+                            ui.output_mut(|o| o.copied_text = self.host_log.join("\n"));
+                            self.host_status = "Host log copied".to_owned();
+                        }
+                        if ui.button(self.text("Очистить", "Clear")).clicked() {
+                            self.host_log.clear();
                         }
                     });
-            });
+                    egui::ScrollArea::vertical()
+                        .max_height(140.0)
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for line in self.host_log.iter().rev().take(30) {
+                                ui.label(
+                                    egui::RichText::new(line)
+                                        .monospace()
+                                        .size(10.5)
+                                        .color(egui::Color32::from_rgb(150, 158, 168)),
+                                );
+                            }
+                        });
+                });
+        });
     }
 
     fn start_host_service(&mut self) {
@@ -2268,8 +3195,15 @@ impl EvertyDeskApp {
                     "[{}] Входящий запрос от {peer_id}",
                     timestamp_hms()
                 ));
-                self.host_pending_peer = None;
                 self.host_status = format!("Incoming connection: authenticating {peer_id}");
+            }
+            HostEvent::ApprovalRequested { peer_id } => {
+                self.host_log.push(format!(
+                    "[{}] Запрос подтверждения от {peer_id}",
+                    timestamp_hms()
+                ));
+                self.host_pending_peer = Some(peer_id.clone());
+                self.host_status = format!("Требуется подтверждение: {peer_id}");
             }
             HostEvent::SessionStarted { peer_id } => {
                 self.host_log
@@ -2314,11 +3248,12 @@ impl EvertyDeskApp {
 
     fn settings_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_settings;
-        egui::Window::new("⚙  Настройки")
+        let mut selected_lang = self.ui_lang;
+        egui::Window::new(self.text("Настройки", "Settings"))
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
-            .default_width(420.0)
+            .default_width(560.0)
             .show(ctx, |ui| {
                 let draft = match self.settings_draft.as_mut() {
                     Some(d) => d,
@@ -2326,107 +3261,153 @@ impl EvertyDeskApp {
                 };
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    // ── Сеть ─────────────────────────────────────────────────
-                    egui::CollapsingHeader::new("🌐  Сеть")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            egui::Grid::new("net_grid")
-                                .num_columns(2)
-                                .spacing([8.0, 6.0])
-                                .show(ui, |ui| {
-                                    ui.label("ID сервер");
-                                    ui.text_edit_singleline(&mut draft.server.id_server);
-                                    ui.end_row();
-                                    ui.label("Relay сервер");
-                                    ui.text_edit_singleline(&mut draft.server.relay_server);
-                                    ui.end_row();
-                                    ui.label("Публичный ключ");
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut draft.server.public_key)
-                                            .font(egui::TextStyle::Monospace),
-                                    );
-                                    ui.end_row();
-                                    ui.label("API URL");
-                                    ui.text_edit_singleline(&mut draft.server.api_url);
-                                    ui.end_row();
-                                });
+                    settings_section(ui, tr(selected_lang, "Общие", "General"), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(tr(selected_lang, "Язык интерфейса", "Interface language"));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if language_button(ui, "EN", selected_lang == UiLang::En)
+                                        .clicked()
+                                    {
+                                        selected_lang = UiLang::En;
+                                    }
+                                    if language_button(ui, "RU", selected_lang == UiLang::Ru)
+                                        .clicked()
+                                    {
+                                        selected_lang = UiLang::Ru;
+                                    }
+                                },
+                            );
                         });
+                    });
 
-                    ui.add_space(6.0);
+                    ui.add_space(8.0);
 
-                    // ── Безопасность ──────────────────────────────────────────
-                    egui::CollapsingHeader::new("🔒  Безопасность")
-                        .default_open(true)
-                        .show(ui, |ui| {
+                    settings_section(ui, tr(selected_lang, "Сеть", "Network"), |ui| {
+                        settings_text_row(
+                            ui,
+                            tr(selected_lang, "ID сервер", "ID server"),
+                            &mut draft.server.id_server,
+                        );
+                        settings_text_row(
+                            ui,
+                            tr(selected_lang, "Relay сервер", "Relay server"),
+                            &mut draft.server.relay_server,
+                        );
+                        settings_text_row(
+                            ui,
+                            tr(selected_lang, "API URL", "API URL"),
+                            &mut draft.server.api_url,
+                        );
+                        settings_text_row(
+                            ui,
+                            tr(selected_lang, "Публичный ключ", "Public key"),
+                            &mut draft.server.public_key,
+                        );
+                    });
+
+                    ui.add_space(8.0);
+
+                    settings_section(
+                        ui,
+                        tr(selected_lang, "Безопасность", "Security"),
+                        |ui| {
                             ui.checkbox(
                                 &mut draft.security.require_confirmation,
-                                "Подтверждать каждое входящее подключение",
+                                tr(
+                                    selected_lang,
+                                    "Подтверждать каждое входящее подключение",
+                                    "Confirm every incoming connection",
+                                ),
                             );
                             ui.checkbox(
                                 &mut draft.security.allow_keyboard_mouse,
-                                "Разрешить управление клавиатурой и мышью",
+                                tr(
+                                    selected_lang,
+                                    "Разрешить управление клавиатурой и мышью",
+                                    "Allow keyboard and mouse control",
+                                ),
                             );
                             ui.checkbox(
                                 &mut draft.security.allow_clipboard,
-                                "Разрешить доступ к буферу обмена",
+                                tr(
+                                    selected_lang,
+                                    "Разрешить доступ к буферу обмена",
+                                    "Allow clipboard access",
+                                ),
+                            );
+                        },
+                    );
+
+                    ui.add_space(8.0);
+
+                    settings_section(ui, tr(selected_lang, "Видео", "Video"), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(tr(selected_lang, "Кодек", "Codec"));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    for codec in [
+                                        CodecPreference::Vp9,
+                                        CodecPreference::H264,
+                                        CodecPreference::Auto,
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut draft.display.codec,
+                                            codec,
+                                            codec.label(),
+                                        );
+                                    }
+                                },
                             );
                         });
-
-                    ui.add_space(6.0);
-
-                    // ── Дисплей ───────────────────────────────────────────────
-                    egui::CollapsingHeader::new("🖥  Дисплей")
-                        .default_open(true)
-                        .show(ui, |ui| {
-                            egui::Grid::new("disp_grid")
-                                .num_columns(2)
-                                .spacing([8.0, 6.0])
-                                .show(ui, |ui| {
-                                    ui.label("Кодек");
-                                    ui.horizontal(|ui| {
-                                        for codec in [
-                                            CodecPreference::Auto,
-                                            CodecPreference::H264,
-                                            CodecPreference::Vp9,
-                                        ] {
-                                            ui.selectable_value(
-                                                &mut draft.display.codec,
-                                                codec,
-                                                codec.label(),
-                                            );
-                                        }
-                                    });
-                                    ui.end_row();
-                                    ui.label("Целевой FPS");
-                                    ui.horizontal(|ui| {
-                                        for fps in [15u32, 20, 30, 60] {
-                                            ui.selectable_value(
-                                                &mut draft.display.target_fps,
-                                                fps,
-                                                fps.to_string(),
-                                            );
-                                        }
-                                    });
-                                    ui.end_row();
-                                });
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label(tr(selected_lang, "Целевой FPS", "Target FPS"));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    for fps in [60u32, 30, 20, 15] {
+                                        ui.selectable_value(
+                                            &mut draft.display.target_fps,
+                                            fps,
+                                            fps.to_string(),
+                                        );
+                                    }
+                                },
+                            );
                         });
+                    });
 
-                    ui.add_space(6.0);
+                    ui.add_space(8.0);
 
-                    // ── О программе ───────────────────────────────────────────
-                    egui::CollapsingHeader::new("ℹ  О программе")
-                        .default_open(false)
-                        .show(ui, |ui| {
+                    settings_section(
+                        ui,
+                        tr(selected_lang, "О программе", "About"),
+                        |ui| {
                             ui.label(format!("{APP_NAME} v{APP_VERSION}"));
-                            ui.label("RustDesk-совместимый клиент удалённого доступа.");
-                            ui.label(format!("Конфиг: {}", settings_mod::config_path().display()));
-                        });
+                            ui.label(tr(
+                                selected_lang,
+                                "RustDesk-совместимый клиент удаленного доступа.",
+                                "RustDesk-compatible remote access client.",
+                            ));
+                            ui.label(format!(
+                                "{}: {}",
+                                tr(selected_lang, "Конфиг", "Config"),
+                                settings_mod::config_path().display()
+                            ));
+                        },
+                    );
                 });
 
                 ui.separator();
                 ui.horizontal(|ui| {
                     if ui
-                        .add(egui::Button::new("💾 Сохранить").min_size(egui::vec2(110.0, 28.0)))
+                        .add(
+                            egui::Button::new(tr(selected_lang, "Сохранить", "Save"))
+                                .min_size(egui::vec2(110.0, 32.0)),
+                        )
                         .clicked()
                     {
                         let new_cfg = self.settings_draft.take().unwrap();
@@ -2453,14 +3434,18 @@ impl EvertyDeskApp {
                         }
                         self.show_settings = false;
                     }
-                    if ui.button("Закрыть").clicked() {
+                    if ui.button(tr(selected_lang, "Закрыть", "Close")).clicked() {
                         self.settings_draft = None;
                         self.show_settings = false;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .button("Сбросить")
-                            .on_hover_text("Вернуть настройки по умолчанию")
+                            .button(tr(selected_lang, "Сбросить", "Reset"))
+                            .on_hover_text(tr(
+                                selected_lang,
+                                "Вернуть настройки по умолчанию",
+                                "Restore defaults",
+                            ))
                             .clicked()
                         {
                             *self.settings_draft.as_mut().unwrap() = AppConfig {
@@ -2479,11 +3464,295 @@ impl EvertyDeskApp {
                     });
                 });
             });
+        self.ui_lang = selected_lang;
         // Window was closed via the X button.
         if !open {
             self.settings_draft = None;
             self.show_settings = false;
         }
+    }
+
+    fn settings_ui(&mut self, ui: &mut egui::Ui) {
+        if self.settings_draft.is_none() {
+            self.settings_draft = Some(self.config.clone());
+        }
+
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new(self.text("Настройки", "Settings"))
+                        .size(28.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                );
+                ui.add_space(3.0);
+                ui.label(
+                    egui::RichText::new(self.text(
+                        "Язык, серверы, безопасность и параметры видео",
+                        "Language, servers, security and video options",
+                    ))
+                    .size(13.0)
+                    .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                );
+            });
+        });
+        ui.add_space(16.0);
+
+        let mut selected_lang = self.ui_lang;
+        let draft = match self.settings_draft.as_mut() {
+            Some(d) => d,
+            None => return,
+        };
+        let current_config = self.config.clone();
+        let host_reconfigure_source = (
+            current_config.server.id_server.clone(),
+            current_config.server.relay_server.clone(),
+            current_config.server.public_key.clone(),
+            current_config.display.target_fps,
+            current_config.display.codec,
+        );
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            settings_section(ui, tr(selected_lang, "Общие", "General"), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(tr(selected_lang, "Язык интерфейса", "Interface language"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if language_button(ui, "EN", selected_lang == UiLang::En).clicked() {
+                            selected_lang = UiLang::En;
+                        }
+                        if language_button(ui, "RU", selected_lang == UiLang::Ru).clicked() {
+                            selected_lang = UiLang::Ru;
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+                ui.checkbox(
+                    &mut draft.ui.show_connection_details,
+                    tr(
+                        selected_lang,
+                        "Показывать детали подключения на главной",
+                        "Show connection details on main page",
+                    ),
+                );
+            });
+
+            ui.add_space(8.0);
+            settings_section(ui, tr(selected_lang, "Сеть", "Network"), |ui| {
+                settings_text_row(
+                    ui,
+                    tr(selected_lang, "ID сервер", "ID server"),
+                    &mut draft.server.id_server,
+                );
+                settings_text_row(
+                    ui,
+                    tr(selected_lang, "Relay сервер", "Relay server"),
+                    &mut draft.server.relay_server,
+                );
+                settings_text_row(
+                    ui,
+                    tr(selected_lang, "API URL", "API URL"),
+                    &mut draft.server.api_url,
+                );
+                settings_text_row(
+                    ui,
+                    tr(selected_lang, "Публичный ключ", "Public key"),
+                    &mut draft.server.public_key,
+                );
+            });
+
+            ui.add_space(8.0);
+            settings_section(
+                ui,
+                tr(selected_lang, "Безопасность", "Security"),
+                |ui| {
+                    ui.checkbox(
+                        &mut draft.security.require_confirmation,
+                        tr(
+                            selected_lang,
+                            "Подтверждать каждое входящее подключение",
+                            "Confirm every incoming connection",
+                        ),
+                    );
+                    ui.checkbox(
+                        &mut draft.security.allow_keyboard_mouse,
+                        tr(
+                            selected_lang,
+                            "Разрешить управление клавиатурой и мышью",
+                            "Allow keyboard and mouse control",
+                        ),
+                    );
+                    ui.checkbox(
+                        &mut draft.security.allow_clipboard,
+                        tr(
+                            selected_lang,
+                            "Разрешить доступ к буферу обмена",
+                            "Allow clipboard access",
+                        ),
+                    );
+                },
+            );
+
+            ui.add_space(8.0);
+            settings_section(ui, tr(selected_lang, "Видео", "Video"), |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(tr(selected_lang, "Кодек", "Codec"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        for codec in [
+                            CodecPreference::Vp9,
+                            CodecPreference::H264,
+                            CodecPreference::Auto,
+                        ] {
+                            ui.selectable_value(&mut draft.display.codec, codec, codec.label());
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(tr(selected_lang, "Целевой FPS", "Target FPS"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        for fps in [60u32, 30, 20, 15] {
+                            ui.selectable_value(
+                                &mut draft.display.target_fps,
+                                fps,
+                                fps.to_string(),
+                            );
+                        }
+                    });
+                });
+            });
+
+            ui.add_space(8.0);
+            settings_section(ui, tr(selected_lang, "Служба", "Service"), |ui| {
+                ui.label(tr(
+                    selected_lang,
+                    "Фоновый режим использует этот же исполняемый файл с аргументом --host.",
+                    "Background mode uses this executable with the --host argument.",
+                ));
+                ui.add_space(8.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .button(tr(selected_lang, "Установить службу", "Install service"))
+                        .clicked()
+                    {
+                        self.service_status = Some(match install_host_service() {
+                            Ok(msg) => msg,
+                            Err(err) => err,
+                        });
+                    }
+                    if ui.button(tr(selected_lang, "Запустить", "Start")).clicked() {
+                        self.service_status = Some(match start_installed_service() {
+                            Ok(msg) => msg,
+                            Err(err) => err,
+                        });
+                    }
+                    if ui.button(tr(selected_lang, "Остановить", "Stop")).clicked() {
+                        self.service_status = Some(match stop_installed_service() {
+                            Ok(msg) => msg,
+                            Err(err) => err,
+                        });
+                    }
+                    if ui
+                        .button(tr(selected_lang, "Удалить службу", "Uninstall service"))
+                        .clicked()
+                    {
+                        self.service_status = Some(match uninstall_host_service() {
+                            Ok(msg) => msg,
+                            Err(err) => err,
+                        });
+                    }
+                });
+                if let Some(status) = &self.service_status {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(status)
+                            .size(12.0)
+                            .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                    );
+                }
+            });
+
+            ui.add_space(8.0);
+            settings_section(
+                ui,
+                tr(selected_lang, "О программе", "About"),
+                |ui| {
+                    ui.label(format!("{APP_NAME} v{APP_VERSION}"));
+                    ui.label(tr(
+                        selected_lang,
+                        "RustDesk-совместимый клиент удаленного доступа.",
+                        "RustDesk-compatible remote access client.",
+                    ));
+                    ui.label(format!(
+                        "{}: {}",
+                        tr(selected_lang, "Конфиг", "Config"),
+                        settings_mod::config_path().display()
+                    ));
+                },
+            );
+        });
+
+        self.ui_lang = selected_lang;
+        ui.add_space(12.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(tr(selected_lang, "Сохранить", "Save"))
+                        .min_size(egui::vec2(112.0, 36.0)),
+                )
+                .clicked()
+            {
+                let new_cfg = self.settings_draft.clone().unwrap();
+                let host_reconfigure_needed = new_cfg.server.id_server != host_reconfigure_source.0
+                    || new_cfg.server.relay_server != host_reconfigure_source.1
+                    || new_cfg.server.public_key != host_reconfigure_source.2
+                    || new_cfg.display.target_fps != host_reconfigure_source.3
+                    || new_cfg.display.codec != host_reconfigure_source.4;
+                let next_video_fps = new_cfg.display.target_fps.clamp(5, 60) as i32;
+                if host_reconfigure_needed {
+                    if let Some(svc) = &self.host_service {
+                        svc.reconfigure(new_cfg.clone());
+                    }
+                }
+                self.config = new_cfg.clone();
+                self.video_fps = next_video_fps;
+                self.config.save();
+                if self.connected {
+                    self.send_command(SessionCommand::SetVideoProfile {
+                        fps: self.video_fps,
+                        codec: self.config.display.codec,
+                    });
+                }
+                self.settings_draft = Some(new_cfg);
+            }
+            if ui.button(tr(selected_lang, "Отменить", "Cancel")).clicked() {
+                self.settings_draft = Some(self.config.clone());
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button(tr(selected_lang, "Сбросить", "Reset"))
+                    .on_hover_text(tr(
+                        selected_lang,
+                        "Вернуть настройки по умолчанию",
+                        "Restore defaults",
+                    ))
+                    .clicked()
+                {
+                    self.settings_draft = Some(AppConfig {
+                        server: settings_mod::ServerConfig::default(),
+                        security: settings_mod::SecurityConfig::default(),
+                        display: settings_mod::DisplayConfig::default(),
+                        local_id: self.config.local_id.clone(),
+                        local_password: self.config.local_password.clone(),
+                        ui: self.config.ui.clone(),
+                        udp_bind_port: 0,
+                        host_pk: Vec::new(),
+                        host_sign_pk: self.config.host_sign_pk.clone(),
+                        host_sign_sk: self.config.host_sign_sk.clone(),
+                    });
+                }
+            });
+        });
     }
 
     fn check_remote_online(&mut self) {
@@ -2835,11 +4104,7 @@ impl EvertyDeskApp {
                 self.release_remote_modifiers();
                 self.last_mouse_pos = None;
                 self.wheel_accum = egui::Vec2::ZERO;
-                self.status = "Окно экрана закрыто".to_owned();
-                self.send_command(SessionCommand::SetAutoRefresh {
-                    enabled: false,
-                    millis: self.refresh_millis,
-                });
+                self.disconnect_session("Окно управления закрыто");
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 return;
             }
@@ -3202,6 +4467,64 @@ impl EvertyDeskApp {
             egui::CentralPanel::default().show(ctx, |ui| {
                 self.remote_screen_ui(ui);
             });
+        });
+    }
+
+    fn shell_window(&mut self, ctx: &egui::Context) {
+        let title = format!("EvertyDesk Console - {}", format_peer_id(&self.remote_id));
+        let viewport_id = egui::ViewportId::from_hash_of("evertydesk-lite-shell");
+        let builder = egui::ViewportBuilder::default()
+            .with_title(title)
+            .with_inner_size([820.0, 560.0])
+            .with_min_inner_size([560.0, 360.0]);
+
+        ctx.show_viewport_immediate(viewport_id, builder, |ctx, _class| {
+            if ctx.input(|input| input.viewport().close_requested()) {
+                self.send_command(SessionCommand::ShellStop);
+                self.disconnect_session("Консоль закрыта");
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
+
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(0x0B, 0x10, 0x1A))
+                        .inner_margin(egui::Margin::same(12.0)),
+                )
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.shell_output)
+                                    .font(egui::TextStyle::Monospace)
+                                    .text_color(egui::Color32::from_rgb(0xE8, 0xF1, 0xFF))
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(24)
+                                    .interactive(false),
+                            );
+                        });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut self.shell_input)
+                                .hint_text("command")
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY),
+                        );
+                        let send = response.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                        if ui.button("Send").clicked() || send {
+                            let mut input = std::mem::take(&mut self.shell_input);
+                            if !input.ends_with('\n') {
+                                input.push('\n');
+                            }
+                            self.shell_output.push_str(&format!("> {input}"));
+                            self.send_command(SessionCommand::ShellInput(input));
+                        }
+                    });
+                });
         });
     }
 
@@ -3726,6 +5049,7 @@ fn command_is_input(command: &SessionCommand) -> bool {
             | SessionCommand::KeyTextWithModifiers { .. }
             | SessionCommand::KeyControlWithModifiers { .. }
             | SessionCommand::KeyEnter
+            | SessionCommand::ShellInput(_)
     )
 }
 
@@ -3945,6 +5269,273 @@ fn format_peer_id(id: &str) -> String {
     }
 }
 
+fn rustdesk_login(
+    api_url: &str,
+    username: &str,
+    password: &str,
+    rustdesk_id: &str,
+    uuid: &str,
+) -> Result<String, String> {
+    let json = rustdesk_api_public_send(
+        "POST",
+        api_url,
+        "/api/login",
+        serde_json::json!({
+            "username": username,
+            "password": password,
+            "id": normalize_remote_id(rustdesk_id),
+            "uuid": uuid,
+            "autoLogin": true,
+            "type": "account",
+            "deviceInfo": {
+                "os": rustdesk_platform(),
+                "type": "PC",
+                "name": local_hostname(),
+            }
+        }),
+    )?;
+    check_rustdesk_json_error(&json)?;
+    extract_string_field(&json, "access_token")
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| {
+            extract_string_field(&json, "type")
+                .map(|kind| format!("Login requires extra step: {kind}"))
+                .unwrap_or_else(|| "API did not return access_token".to_owned())
+        })
+}
+
+fn rustdesk_personal_ab_guid(api_url: &str, token: &str) -> Result<String, String> {
+    let json = rustdesk_api_send(
+        "POST",
+        api_url,
+        token,
+        "/api/ab/personal",
+        serde_json::json!({}),
+        &[],
+    )?;
+    extract_string_field(&json, "guid")
+        .or_else(|| extract_string_field(&json, "id"))
+        .or_else(|| json.as_str().map(ToOwned::to_owned))
+        .filter(|guid| !guid.trim().is_empty())
+        .ok_or_else(|| "API did not return address book GUID".to_owned())
+}
+
+fn rustdesk_ab_peers(api_url: &str, token: &str, guid: &str) -> Result<Vec<ContactEntry>, String> {
+    let mut contacts = Vec::new();
+    let mut current = 1usize;
+    loop {
+        let current_s = current.to_string();
+        let json = rustdesk_api_send(
+            "POST",
+            api_url,
+            token,
+            "/api/ab/peers",
+            serde_json::json!({}),
+            &[("ab", guid), ("pageSize", "30"), ("current", &current_s)],
+        )?;
+        check_rustdesk_json_error(&json)?;
+        let data = json
+            .get("data")
+            .and_then(Value::as_array)
+            .or_else(|| json.as_array())
+            .ok_or_else(|| "API did not return peers list".to_owned())?;
+        for peer in data {
+            if let Some(remote_id) = extract_string_field(peer, "id") {
+                contacts.push(ContactEntry {
+                    name: extract_string_field(peer, "alias").unwrap_or_default(),
+                    remote_id: normalize_remote_id(&remote_id),
+                    note: extract_string_field(peer, "hostname").unwrap_or_default(),
+                    machine_id: String::new(),
+                    os: extract_string_field(peer, "platform").unwrap_or_default(),
+                    last_seen: String::new(),
+                    online: false,
+                });
+            }
+        }
+        let total = json
+            .get("total")
+            .and_then(Value::as_u64)
+            .unwrap_or(contacts.len() as u64);
+        if data.len() < 30 || (current as u64) * 30 >= total {
+            break;
+        }
+        current += 1;
+    }
+    Ok(contacts)
+}
+
+fn rustdesk_ab_add_peer(
+    api_url: &str,
+    token: &str,
+    guid: &str,
+    contact: &ContactEntry,
+) -> Result<(), String> {
+    let json = rustdesk_api_send(
+        "POST",
+        api_url,
+        token,
+        &format!("/api/ab/peer/add/{guid}"),
+        serde_json::json!({
+            "id": contact.remote_id,
+            "alias": contact.name,
+            "username": "",
+            "hostname": contact.note,
+            "platform": contact.os,
+            "tags": [],
+            "forceAlwaysRelay": "false",
+            "rdpPort": "",
+            "rdpUsername": "",
+            "loginName": "",
+            "same_server": "",
+        }),
+        &[],
+    )?;
+    check_rustdesk_json_error(&json)
+}
+
+fn rustdesk_ab_update_peer(
+    api_url: &str,
+    token: &str,
+    guid: &str,
+    contact: &ContactEntry,
+) -> Result<(), String> {
+    let json = rustdesk_api_send(
+        "PUT",
+        api_url,
+        token,
+        &format!("/api/ab/peer/update/{guid}"),
+        serde_json::json!({
+            "id": contact.remote_id,
+            "alias": contact.name,
+            "hostname": contact.note,
+            "platform": contact.os,
+            "tags": [],
+        }),
+        &[],
+    )?;
+    check_rustdesk_json_error(&json)
+}
+
+fn rustdesk_ab_delete_peer(
+    api_url: &str,
+    token: &str,
+    guid: &str,
+    remote_id: &str,
+) -> Result<(), String> {
+    let json = rustdesk_api_send(
+        "DELETE",
+        api_url,
+        token,
+        &format!("/api/ab/peer/{guid}"),
+        serde_json::json!([remote_id]),
+        &[],
+    )?;
+    check_rustdesk_json_error(&json)
+}
+
+fn rustdesk_api_send(
+    method: &str,
+    api_url: &str,
+    token: &str,
+    path: &str,
+    body: Value,
+    query: &[(&str, &str)],
+) -> Result<Value, String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(12))
+        .build();
+    let url = rustdesk_api_url(api_url, path);
+    let mut req = agent
+        .request(method, &url)
+        .set("Authorization", &format!("Bearer {token}"));
+    for (key, value) in query {
+        req = req.query(key, value);
+    }
+    rustdesk_response_json(req.send_json(body))
+}
+
+fn rustdesk_api_public_send(
+    method: &str,
+    api_url: &str,
+    path: &str,
+    body: Value,
+) -> Result<Value, String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(12))
+        .build();
+    let url = rustdesk_api_url(api_url, path);
+    rustdesk_response_json(agent.request(method, &url).send_json(body))
+}
+
+fn rustdesk_response_json(result: Result<ureq::Response, ureq::Error>) -> Result<Value, String> {
+    match result {
+        Ok(response) => response
+            .into_string()
+            .map_err(|err| format!("API response error: {err}"))
+            .and_then(|text| {
+                if text.trim().is_empty() {
+                    Ok(serde_json::json!({ "ok": true }))
+                } else {
+                    serde_json::from_str::<Value>(&text)
+                        .map_err(|err| format!("API JSON error: {err}"))
+                }
+            }),
+        Err(ureq::Error::Status(code, response)) => {
+            let text = response.into_string().unwrap_or_default();
+            Err(format!("API HTTP {code}: {text}"))
+        }
+        Err(err) => Err(format!("API request failed: {err}")),
+    }
+}
+
+fn rustdesk_api_url(api_url: &str, path: &str) -> String {
+    format!("{}{}", api_url.trim_end_matches('/'), path)
+}
+
+fn local_hostname() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "EvertyDesk".to_owned())
+}
+
+fn rustdesk_platform() -> &'static str {
+    match std::env::consts::OS {
+        "windows" => "Windows",
+        "linux" => "Linux",
+        "macos" => "Mac",
+        _ => std::env::consts::OS,
+    }
+}
+
+fn check_rustdesk_json_error(json: &Value) -> Result<(), String> {
+    if let Some(error) = extract_string_field(json, "error") {
+        if !error.trim().is_empty() {
+            return Err(error);
+        }
+    }
+    if let Some(message) = extract_string_field(json, "message") {
+        if !message.trim().is_empty() && message != "ok" {
+            return Err(message);
+        }
+    }
+    Ok(())
+}
+
+fn extract_string_field(json: &Value, field: &str) -> Option<String> {
+    json.get(field)
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .or_else(|| value.as_i64().map(|number| number.to_string()))
+                .or_else(|| value.as_u64().map(|number| number.to_string()))
+        })
+        .or_else(|| {
+            json.get("data")
+                .and_then(|data| extract_string_field(data, field))
+        })
+}
+
 fn sanitize_filename(value: &str) -> String {
     let cleaned: String = value
         .chars()
@@ -4061,31 +5652,28 @@ fn egui_key_to_text(key: egui::Key) -> Option<String> {
 fn configure_style(ctx: &egui::Context) {
     use egui::{Color32, Rounding, Stroke};
 
-    // ── Premium Dark, monochrome — no blue (per UI spec v1) ──────────────────
-    let bg = Color32::from_rgb(0x05, 0x05, 0x05); // #050505 window
-    let panel = Color32::from_rgb(0x0A, 0x0A, 0x0A); // #0A0A0A
-    let card = Color32::from_rgb(0x10, 0x10, 0x10); // #101010
-    let input = Color32::from_rgb(0x08, 0x08, 0x08); // #080808
-    let border = Color32::from_white_alpha(20); // ~rgba(255,255,255,0.08)
-    let border_hover = Color32::from_white_alpha(30); // ~0.12
-    let border_focus = Color32::from_white_alpha(46); // ~0.18
-    let text = Color32::from_rgb(0xFF, 0xFF, 0xFF);
-    let text_weak = Color32::from_rgb(0xA0, 0xA0, 0xA0);
-    let text_strong = Color32::from_rgb(0xD0, 0xD0, 0xD0);
+    let bg = Color32::from_rgb(0xFB, 0xFC, 0xFE);
+    let panel = Color32::from_rgb(0xFF, 0xFF, 0xFF);
+    let card = Color32::from_rgb(0xFF, 0xFF, 0xFF);
+    let input = Color32::from_rgb(0xFF, 0xFF, 0xFF);
+    let border = Color32::from_rgb(0xE3, 0xE6, 0xEC);
+    let border_hover = Color32::from_rgb(0xD8, 0xDC, 0xE4);
+    let border_focus = Color32::from_rgb(0xC7, 0xCD, 0xD8);
+    let text = Color32::from_rgb(0x13, 0x17, 0x21);
+    let text_weak = Color32::from_rgb(0x67, 0x70, 0x80);
+    let text_strong = Color32::from_rgb(0x22, 0x27, 0x32);
 
-    let mut visuals = egui::Visuals::dark();
+    let mut visuals = egui::Visuals::light();
     visuals.panel_fill = bg;
     visuals.window_fill = panel;
-    visuals.extreme_bg_color = input; // TextEdit background
+    visuals.extreme_bg_color = input;
     visuals.faint_bg_color = card;
     visuals.window_rounding = Rounding::same(20.0);
-    visuals.window_stroke = Stroke::new(1.0, Color32::from_white_alpha(26));
+    visuals.window_stroke = Stroke::new(1.0, border);
 
-    // Monochrome text selection (no blue).
-    visuals.selection.bg_fill = Color32::from_white_alpha(30);
-    visuals.selection.stroke = Stroke::new(1.0, border_focus);
+    visuals.selection.bg_fill = Color32::from_rgb(0xB9, 0xD7, 0xFF);
+    visuals.selection.stroke = Stroke::new(1.0, Color32::from_rgb(0x3D, 0x73, 0xB8));
 
-    // Widget states — subtle white-on-black glass, no colour.
     let rounding = Rounding::same(12.0);
     visuals.widgets.noninteractive.bg_fill = card;
     visuals.widgets.noninteractive.weak_bg_fill = card;
@@ -4093,20 +5681,20 @@ fn configure_style(ctx: &egui::Context) {
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text_weak);
     visuals.widgets.noninteractive.rounding = rounding;
 
-    visuals.widgets.inactive.bg_fill = Color32::from_white_alpha(8);
-    visuals.widgets.inactive.weak_bg_fill = Color32::from_white_alpha(8);
+    visuals.widgets.inactive.bg_fill = input;
+    visuals.widgets.inactive.weak_bg_fill = input;
     visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, border);
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, text_strong);
     visuals.widgets.inactive.rounding = rounding;
 
-    visuals.widgets.hovered.bg_fill = Color32::from_white_alpha(16);
-    visuals.widgets.hovered.weak_bg_fill = Color32::from_white_alpha(16);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(0xFA, 0xFB, 0xFD);
+    visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(0xFA, 0xFB, 0xFD);
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, border_hover);
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, text);
     visuals.widgets.hovered.rounding = rounding;
 
-    visuals.widgets.active.bg_fill = Color32::from_white_alpha(24);
-    visuals.widgets.active.weak_bg_fill = Color32::from_white_alpha(24);
+    visuals.widgets.active.bg_fill = Color32::from_rgb(0xF3, 0xF5, 0xF8);
+    visuals.widgets.active.weak_bg_fill = Color32::from_rgb(0xF3, 0xF5, 0xF8);
     visuals.widgets.active.bg_stroke = Stroke::new(1.0, border_focus);
     visuals.widgets.active.fg_stroke = Stroke::new(1.0, text);
     visuals.widgets.active.rounding = rounding;
@@ -4118,13 +5706,12 @@ fn configure_style(ctx: &egui::Context) {
 
     ctx.set_visuals(visuals);
 
-    // ── Spacing — generous 24 / 16 / 12 rhythm (no cramped egui defaults) ────
     let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = egui::vec2(16.0, 12.0);
-    style.spacing.button_padding = egui::vec2(16.0, 10.0);
-    style.spacing.menu_margin = egui::Margin::same(12.0);
-    style.spacing.window_margin = egui::Margin::same(24.0);
-    style.spacing.interact_size.y = 28.0;
+    style.spacing.item_spacing = egui::vec2(12.0, 9.0);
+    style.spacing.button_padding = egui::vec2(16.0, 9.0);
+    style.spacing.menu_margin = egui::Margin::same(8.0);
+    style.spacing.window_margin = egui::Margin::same(16.0);
+    style.spacing.interact_size.y = 34.0;
     ctx.set_style(style);
 }
 
@@ -4133,19 +5720,230 @@ fn configure_style(ctx: &egui::Context) {
 /// Card, max two frame levels). Very subtle so it doesn't read as nesting.
 fn workspace_frame() -> egui::Frame {
     egui::Frame::none()
-        .fill(egui::Color32::from_rgb(0x0A, 0x0A, 0x0A))
+        .fill(egui::Color32::TRANSPARENT)
         .stroke(egui::Stroke::NONE)
-        .rounding(egui::Rounding::same(24.0))
-        .inner_margin(egui::Margin::same(22.0))
+        .rounding(egui::Rounding::same(18.0))
+        .inner_margin(egui::Margin::same(0.0))
 }
 
 /// A premium-dark content card — a touch lighter than the workspace behind it.
 fn card_frame() -> egui::Frame {
     egui::Frame::none()
-        .fill(egui::Color32::from_rgb(0x13, 0x13, 0x13)) // #131313, above workspace
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(22)))
-        .rounding(egui::Rounding::same(18.0))
-        .inner_margin(egui::Margin::same(22.0))
+        .fill(egui::Color32::from_rgb(0xFF, 0xFF, 0xFF))
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgb(0xE3, 0xE6, 0xEC),
+        ))
+        .rounding(egui::Rounding::same(14.0))
+        .inner_margin(egui::Margin::same(16.0))
+}
+
+fn settings_section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::none()
+        .fill(egui::Color32::from_rgb(0xFF, 0xFF, 0xFF))
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgb(0xE3, 0xE6, 0xEC),
+        ))
+        .rounding(egui::Rounding::same(12.0))
+        .inner_margin(egui::Margin::same(14.0))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(title)
+                    .size(15.0)
+                    .strong()
+                    .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+            );
+            ui.add_space(10.0);
+            add_contents(ui);
+        });
+}
+
+fn settings_text_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
+    ui.horizontal(|ui| {
+        ui.set_min_height(36.0);
+        ui.label(
+            egui::RichText::new(label)
+                .size(13.0)
+                .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_sized(
+                egui::vec2(330.0, 34.0),
+                egui::TextEdit::singleline(value).font(egui::TextStyle::Button),
+            );
+        });
+    });
+    ui.add_space(6.0);
+}
+
+const SERVICE_NAME: &str = "EvertyDeskLite";
+
+fn install_host_service() -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|err| format!("current_exe: {err}"))?;
+    #[cfg(target_os = "windows")]
+    {
+        let bin = format!("\"{}\" --host", exe.display());
+        let status = std::process::Command::new("sc.exe")
+            .args(["create", SERVICE_NAME, "binPath=", &bin, "start=", "auto"])
+            .status()
+            .map_err(|err| format!("sc create failed: {err}"))?;
+        return if status.success() {
+            Ok("Windows service installed. Admin rights may be required.".to_owned())
+        } else {
+            Err(format!("sc create exited with {status}"))
+        };
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let dir = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "HOME is not set".to_owned())?
+            .join(".config/systemd/user");
+        fs::create_dir_all(&dir).map_err(|err| format!("create systemd dir: {err}"))?;
+        let unit = dir.join("evertydesk-lite.service");
+        let body = format!(
+            "[Unit]\nDescription=EvertyDesk Lite host service\nAfter=network-online.target\n\n\
+             [Service]\nExecStart={} --host\nRestart=always\nRestartSec=5\n\n\
+             [Install]\nWantedBy=default.target\n",
+            exe.display()
+        );
+        fs::write(&unit, body).map_err(|err| format!("write service file: {err}"))?;
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status();
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "enable", "evertydesk-lite.service"])
+            .status();
+        return Ok(format!(
+            "User systemd service installed: {}",
+            unit.display()
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let dir = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "HOME is not set".to_owned())?
+            .join("Library/LaunchAgents");
+        fs::create_dir_all(&dir).map_err(|err| format!("create LaunchAgents dir: {err}"))?;
+        let plist = dir.join("ru.everty.evertydesk-lite.plist");
+        let body = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>ru.everty.evertydesk-lite</string>
+<key>ProgramArguments</key><array><string>{}</string><string>--host</string></array>
+<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+</dict></plist>"#,
+            exe.display()
+        );
+        fs::write(&plist, body).map_err(|err| format!("write plist: {err}"))?;
+        return Ok(format!("LaunchAgent installed: {}", plist.display()));
+    }
+    #[allow(unreachable_code)]
+    Err("Service install is not implemented for this OS".to_owned())
+}
+
+fn start_installed_service() -> Result<String, String> {
+    run_service_command("start")
+}
+
+fn stop_installed_service() -> Result<String, String> {
+    run_service_command("stop")
+}
+
+fn uninstall_host_service() -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("sc.exe")
+            .args(["stop", SERVICE_NAME])
+            .status();
+        let status = std::process::Command::new("sc.exe")
+            .args(["delete", SERVICE_NAME])
+            .status()
+            .map_err(|err| format!("sc delete failed: {err}"))?;
+        return if status.success() {
+            Ok("Windows service removed.".to_owned())
+        } else {
+            Err(format!("sc delete exited with {status}"))
+        };
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "disable", "--now", "evertydesk-lite.service"])
+            .status();
+        let unit = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "HOME is not set".to_owned())?
+            .join(".config/systemd/user/evertydesk-lite.service");
+        let _ = fs::remove_file(&unit);
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status();
+        return Ok("User systemd service removed.".to_owned());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let plist = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "HOME is not set".to_owned())?
+            .join("Library/LaunchAgents/ru.everty.evertydesk-lite.plist");
+        let _ = std::process::Command::new("launchctl")
+            .args(["unload", plist.to_string_lossy().as_ref()])
+            .status();
+        let _ = fs::remove_file(&plist);
+        return Ok("LaunchAgent removed.".to_owned());
+    }
+    #[allow(unreachable_code)]
+    Err("Service uninstall is not implemented for this OS".to_owned())
+}
+
+fn run_service_command(action: &str) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let status = std::process::Command::new("sc.exe")
+            .args([action, SERVICE_NAME])
+            .status()
+            .map_err(|err| format!("sc {action} failed: {err}"))?;
+        return if status.success() {
+            Ok(format!("Windows service {action} requested."))
+        } else {
+            Err(format!("sc {action} exited with {status}"))
+        };
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::process::Command::new("systemctl")
+            .args(["--user", action, "evertydesk-lite.service"])
+            .status()
+            .map_err(|err| format!("systemctl {action} failed: {err}"))?;
+        return if status.success() {
+            Ok(format!("systemd user service {action} requested."))
+        } else {
+            Err(format!("systemctl exited with {status}"))
+        };
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let plist = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "HOME is not set".to_owned())?
+            .join("Library/LaunchAgents/ru.everty.evertydesk-lite.plist");
+        let cmd = if action == "start" { "load" } else { "unload" };
+        let status = std::process::Command::new("launchctl")
+            .args([cmd, plist.to_string_lossy().as_ref()])
+            .status()
+            .map_err(|err| format!("launchctl {cmd} failed: {err}"))?;
+        return if status.success() {
+            Ok(format!("LaunchAgent {cmd} requested."))
+        } else {
+            Err(format!("launchctl exited with {status}"))
+        };
+    }
+    #[allow(unreachable_code)]
+    Err("Service control is not implemented for this OS".to_owned())
 }
 
 /// A `label … value` row for the This Computer info block.
@@ -4170,61 +5968,452 @@ fn info_row(ui: &mut egui::Ui, label: &str, value: &str) {
 
 /// Danger (destructive) outlined button — red hair-line border + faint red
 /// glass, for actions like Disconnect.
+#[allow(dead_code)]
 fn danger_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(
         egui::Button::new(
             egui::RichText::new(text)
-                .size(14.0)
-                .color(egui::Color32::from_rgba_unmultiplied(0xFF, 0x78, 0x78, 220)),
+                .size(13.0)
+                .color(egui::Color32::from_rgb(0xE5, 0x18, 0x2E)),
         )
-        .min_size(egui::vec2(ui.available_width(), 48.0))
-        .fill(egui::Color32::from_rgba_unmultiplied(0xFF, 0x50, 0x50, 12)) // barely there
+        .min_size(egui::vec2(ui.available_width(), 40.0))
+        .fill(egui::Color32::from_rgb(0xFF, 0xFA, 0xFA))
         .stroke(egui::Stroke::new(
             1.0,
-            egui::Color32::from_rgba_unmultiplied(0xFF, 0x50, 0x50, 120),
+            egui::Color32::from_rgb(0xF4, 0xB8, 0xBE),
         ))
-        .rounding(egui::Rounding::same(12.0)),
+        .rounding(egui::Rounding::same(10.0)),
     )
 }
 
-/// Sidebar navigation button — full width, 48 px tall, 14 px corners. Active
-/// item gets a faint glass fill + brighter border (per UI spec v1).
-fn nav_button(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
-    let (fill, stroke, text_col) = if active {
-        (
-            egui::Color32::from_white_alpha(13), // ~0.05
-            egui::Color32::from_white_alpha(51), // ~0.20
-            egui::Color32::WHITE,
-        )
+fn primary_connect_button(ui: &mut egui::Ui, text: &str, icon: &str) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 46.0), egui::Sense::click());
+    let fill = if response.hovered() {
+        egui::Color32::from_rgb(0x0B, 0xB8, 0x68)
     } else {
-        (
-            egui::Color32::TRANSPARENT,
-            egui::Color32::TRANSPARENT,
-            egui::Color32::from_rgb(0xB0, 0xB0, 0xB0),
-        )
+        egui::Color32::from_rgb(0x12, 0xC9, 0x72)
+    };
+    ui.painter()
+        .rect_filled(rect, egui::Rounding::same(11.0), fill);
+    ui.painter().rect_stroke(
+        rect,
+        egui::Rounding::same(11.0),
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(0x0A, 0xA8, 0x5E)),
+    );
+
+    let icon_rect =
+        egui::Rect::from_min_size(rect.min + egui::vec2(18.0, 13.0), egui::vec2(20.0, 20.0));
+    draw_line_icon(ui.painter(), icon_rect, icon, egui::Color32::WHITE);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        egui::FontId::proportional(16.0),
+        egui::Color32::WHITE,
+    );
+
+    let x = rect.max.x - 24.0;
+    let y = rect.center().y;
+    ui.painter().line_segment(
+        [egui::pos2(x - 7.0, y), egui::pos2(x + 4.0, y)],
+        egui::Stroke::new(1.8, egui::Color32::WHITE),
+    );
+    ui.painter().line_segment(
+        [egui::pos2(x, y - 5.0), egui::pos2(x + 5.0, y)],
+        egui::Stroke::new(1.8, egui::Color32::WHITE),
+    );
+    ui.painter().line_segment(
+        [egui::pos2(x + 5.0, y), egui::pos2(x, y + 5.0)],
+        egui::Stroke::new(1.8, egui::Color32::WHITE),
+    );
+    response
+}
+
+fn mode_segment_button(
+    ui: &mut egui::Ui,
+    text: &str,
+    icon: &str,
+    active: bool,
+    width: f32,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 38.0), egui::Sense::click());
+    let fill = if active {
+        egui::Color32::from_rgb(0xEC, 0xF8, 0xF2)
+    } else if response.hovered() {
+        egui::Color32::from_rgb(0xF8, 0xFB, 0xFF)
+    } else {
+        egui::Color32::from_rgb(0xFF, 0xFF, 0xFF)
+    };
+    let stroke = if active {
+        egui::Stroke::new(1.2, egui::Color32::from_rgb(0x12, 0xC9, 0x72))
+    } else {
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(0xDF, 0xE5, 0xEE))
+    };
+    ui.painter()
+        .rect_filled(rect, egui::Rounding::same(10.0), fill);
+    ui.painter()
+        .rect_stroke(rect, egui::Rounding::same(10.0), stroke);
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.min.x + 24.0, rect.center().y),
+        egui::vec2(18.0, 18.0),
+    );
+    let color = if active {
+        egui::Color32::from_rgb(0x0C, 0xA8, 0x60)
+    } else {
+        egui::Color32::from_rgb(0x4E, 0x58, 0x68)
+    };
+    draw_line_icon(ui.painter(), icon_rect, icon, color);
+    ui.painter().text(
+        egui::pos2(rect.min.x + 46.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::FontId::proportional(14.0),
+        if active {
+            egui::Color32::from_rgb(0x12, 0x17, 0x20)
+        } else {
+            egui::Color32::from_rgb(0x4F, 0x58, 0x68)
+        },
+    );
+    response
+}
+
+fn status_pill(ui: &mut egui::Ui, label: &str, dot: egui::Color32) {
+    egui::Frame::none()
+        .fill(egui::Color32::from_rgb(0xFF, 0xFF, 0xFF))
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgb(0xE3, 0xE6, 0xEC),
+        ))
+        .rounding(egui::Rounding::same(20.0))
+        .inner_margin(egui::Margin::symmetric(14.0, 8.0))
+        .show(ui, |ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+            ui.painter().circle_filled(rect.center(), 5.0, dot);
+            ui.add_space(7.0);
+            ui.label(
+                egui::RichText::new(label)
+                    .size(14.0)
+                    .color(egui::Color32::from_rgb(0x20, 0x24, 0x2D)),
+            );
+        });
+}
+
+fn compact_text_input(
+    ui: &mut egui::Ui,
+    value: &mut String,
+    hint: &str,
+    password: bool,
+    enabled: bool,
+    font_size: Option<f32>,
+) -> egui::Response {
+    let desired_size = egui::vec2(ui.available_width(), 44.0);
+    let (rect, mut response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+    let text_rect = rect.shrink2(egui::vec2(12.0, 5.0));
+    let text_id = ui.make_persistent_id(("compact_text_input", hint));
+
+    let is_focused = ui.memory(|memory| memory.has_focus(text_id));
+    let fill = if !enabled {
+        egui::Color32::from_rgb(0xF4, 0xF6, 0xF9)
+    } else if is_focused {
+        egui::Color32::from_rgb(0xFF, 0xFF, 0xFF)
+    } else if response.hovered() {
+        egui::Color32::from_rgb(0xF8, 0xFB, 0xFF)
+    } else {
+        egui::Color32::from_rgb(0xFF, 0xFF, 0xFF)
+    };
+    let stroke = if is_focused {
+        egui::Stroke::new(1.8, egui::Color32::from_rgb(0x5F, 0x86, 0xB8))
+    } else if response.hovered() {
+        egui::Stroke::new(1.6, egui::Color32::from_rgb(0x7F, 0x98, 0xB8))
+    } else {
+        egui::Stroke::new(1.5, egui::Color32::from_rgb(0x9E, 0xAC, 0xBF))
+    };
+    ui.painter()
+        .rect_filled(rect, egui::Rounding::same(10.0), fill);
+    ui.painter()
+        .rect_stroke(rect, egui::Rounding::same(10.0), stroke);
+
+    let inner = ui.allocate_ui_at_rect(text_rect, |ui| {
+        let edit = egui::TextEdit::singleline(value)
+            .id(text_id)
+            .hint_text(hint)
+            .password(password)
+            .desired_width(f32::INFINITY)
+            .text_color(egui::Color32::from_rgb(0x0B, 0x10, 0x1A))
+            .font(
+                font_size
+                    .map(egui::FontId::proportional)
+                    .unwrap_or_else(|| egui::FontId::proportional(16.0)),
+            )
+            .frame(false);
+        ui.add_enabled(enabled, edit)
+    });
+    response |= inner.inner;
+    response.context_menu(|ui| {
+        if ui.button("Копировать").clicked() {
+            ui.output_mut(|o| o.copied_text = value.clone());
+            ui.close_menu();
+        }
+        if ui.button("Вставить").clicked() {
+            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                if let Ok(text) = clipboard.get_text() {
+                    *value = text;
+                }
+            }
+            ui.close_menu();
+        }
+        if ui.button("Очистить").clicked() {
+            value.clear();
+            ui.close_menu();
+        }
+    });
+    response
+}
+
+fn icon_button(ui: &mut egui::Ui, icon: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(36.0, 36.0), egui::Sense::click());
+    let fill = if response.hovered() {
+        egui::Color32::from_rgb(0xF8, 0xFA, 0xFC)
+    } else {
+        egui::Color32::from_rgb(0xFF, 0xFF, 0xFF)
+    };
+    ui.painter()
+        .rect_filled(rect, egui::Rounding::same(10.0), fill);
+    ui.painter().rect_stroke(
+        rect,
+        egui::Rounding::same(10.0),
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(0xE3, 0xE6, 0xEC)),
+    );
+    draw_line_icon(
+        ui.painter(),
+        rect.shrink(10.0),
+        icon,
+        egui::Color32::from_rgb(0x20, 0x24, 0x2D),
+    );
+    response
+}
+
+fn language_button(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
+    let fill = if active {
+        egui::Color32::from_rgb(0xFF, 0xFF, 0xFF)
+    } else {
+        egui::Color32::from_rgb(0xF0, 0xF2, 0xF5)
+    };
+    let stroke = if active {
+        egui::Color32::from_rgb(0xD0, 0xD6, 0xE0)
+    } else {
+        egui::Color32::from_rgb(0xE3, 0xE6, 0xEC)
     };
     ui.add(
-        egui::Button::new(egui::RichText::new(label).size(14.0).color(text_col))
-            .min_size(egui::vec2(ui.available_width(), 48.0))
-            .fill(fill)
-            .stroke(egui::Stroke::new(1.0, stroke))
-            .rounding(egui::Rounding::same(14.0)),
+        egui::Button::new(
+            egui::RichText::new(label)
+                .size(13.0)
+                .strong()
+                .color(egui::Color32::from_rgb(0x20, 0x24, 0x2D)),
+        )
+        .min_size(egui::vec2(56.0, 34.0))
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0, stroke))
+        .rounding(egui::Rounding::same(9.0)),
     )
+}
+
+fn nav_icon_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    icon: &str,
+    active: bool,
+    chevron: bool,
+) -> egui::Response {
+    let desired = egui::vec2(ui.available_width(), 44.0);
+    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
+    let fill = if active || response.hovered() {
+        egui::Color32::from_rgb(0xFF, 0xFF, 0xFF)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    let stroke = if active || response.hovered() {
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(0xD9, 0xDD, 0xE5))
+    } else {
+        egui::Stroke::NONE
+    };
+    ui.painter()
+        .rect_filled(rect, egui::Rounding::same(12.0), fill);
+    ui.painter()
+        .rect_stroke(rect, egui::Rounding::same(12.0), stroke);
+
+    let icon_rect =
+        egui::Rect::from_min_size(rect.min + egui::vec2(13.0, 12.0), egui::vec2(20.0, 20.0));
+    draw_line_icon(
+        ui.painter(),
+        icon_rect,
+        icon,
+        egui::Color32::from_rgb(0x3F, 0x48, 0x58),
+    );
+    ui.painter().text(
+        egui::pos2(rect.min.x + 44.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(14.0),
+        if active {
+            egui::Color32::from_rgb(0x16, 0x18, 0x20)
+        } else {
+            egui::Color32::from_rgb(0x57, 0x60, 0x70)
+        },
+    );
+    if chevron {
+        let x = rect.max.x - 18.0;
+        let y = rect.center().y;
+        let col = egui::Color32::from_rgb(0x57, 0x60, 0x70);
+        ui.painter().line_segment(
+            [egui::pos2(x - 3.0, y - 6.0), egui::pos2(x + 3.0, y)],
+            egui::Stroke::new(1.6, col),
+        );
+        ui.painter().line_segment(
+            [egui::pos2(x + 3.0, y), egui::pos2(x - 3.0, y + 6.0)],
+            egui::Stroke::new(1.6, col),
+        );
+    }
+    response
+}
+
+fn draw_line_icon(p: &egui::Painter, rect: egui::Rect, icon: &str, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.8, color);
+    let c = rect.center();
+    match icon {
+        "monitor" => {
+            let screen =
+                egui::Rect::from_center_size(c + egui::vec2(0.0, -2.0), egui::vec2(18.0, 13.0));
+            p.rect_stroke(screen, egui::Rounding::same(2.0), stroke);
+            p.line_segment(
+                [
+                    egui::pos2(c.x, screen.max.y),
+                    egui::pos2(c.x, screen.max.y + 5.0),
+                ],
+                stroke,
+            );
+            p.line_segment(
+                [
+                    egui::pos2(c.x - 6.0, screen.max.y + 5.0),
+                    egui::pos2(c.x + 6.0, screen.max.y + 5.0),
+                ],
+                stroke,
+            );
+        }
+        "settings" => {
+            p.circle_stroke(c, 7.0, stroke);
+            p.circle_stroke(c, 2.4, stroke);
+            for a in [0.0_f32, 1.57, 3.14, 4.71] {
+                let dir = egui::vec2(a.cos(), a.sin());
+                p.line_segment([c + dir * 9.0, c + dir * 11.0], stroke);
+            }
+        }
+        "copy" => {
+            let back =
+                egui::Rect::from_min_size(rect.min + egui::vec2(3.0, 1.0), egui::vec2(11.0, 13.0));
+            let front =
+                egui::Rect::from_min_size(rect.min + egui::vec2(7.0, 5.0), egui::vec2(11.0, 13.0));
+            p.rect_stroke(back, egui::Rounding::same(1.5), stroke);
+            p.rect_stroke(front, egui::Rounding::same(1.5), stroke);
+        }
+        "refresh" => {
+            p.circle_stroke(c, 7.0, stroke);
+            p.line_segment(
+                [c + egui::vec2(5.0, -7.0), c + egui::vec2(9.0, -7.0)],
+                stroke,
+            );
+            p.line_segment(
+                [c + egui::vec2(9.0, -7.0), c + egui::vec2(9.0, -3.0)],
+                stroke,
+            );
+        }
+        "connect" => {
+            let left = c + egui::vec2(-7.0, 0.0);
+            let right = c + egui::vec2(7.0, 0.0);
+            p.circle_stroke(left, 4.0, stroke);
+            p.circle_stroke(right, 4.0, stroke);
+            p.line_segment(
+                [left + egui::vec2(4.0, 0.0), right + egui::vec2(-4.0, 0.0)],
+                stroke,
+            );
+        }
+        "console" => {
+            let screen = egui::Rect::from_center_size(c, egui::vec2(19.0, 15.0));
+            p.rect_stroke(screen, egui::Rounding::same(2.0), stroke);
+            p.line_segment(
+                [
+                    screen.min + egui::vec2(4.0, 5.0),
+                    screen.min + egui::vec2(7.5, 7.5),
+                ],
+                stroke,
+            );
+            p.line_segment(
+                [
+                    screen.min + egui::vec2(7.5, 7.5),
+                    screen.min + egui::vec2(4.0, 10.0),
+                ],
+                stroke,
+            );
+            p.line_segment(
+                [
+                    screen.min + egui::vec2(10.5, 10.0),
+                    screen.min + egui::vec2(15.0, 10.0),
+                ],
+                stroke,
+            );
+        }
+        "history" => {
+            p.circle_stroke(c, 8.0, stroke);
+            p.line_segment([c, c + egui::vec2(0.0, -5.0)], stroke);
+            p.line_segment([c, c + egui::vec2(5.0, 2.0)], stroke);
+        }
+        "contacts" => {
+            p.circle_stroke(c + egui::vec2(0.0, -5.0), 4.0, stroke);
+            let body = [
+                c + egui::vec2(-8.0, 9.0),
+                c + egui::vec2(-5.0, 3.0),
+                c + egui::vec2(0.0, 1.0),
+                c + egui::vec2(5.0, 3.0),
+                c + egui::vec2(8.0, 9.0),
+            ];
+            for pair in body.windows(2) {
+                p.line_segment([pair[0], pair[1]], stroke);
+            }
+        }
+        _ => {
+            let points = [
+                c + egui::vec2(0.0, -9.0),
+                c + egui::vec2(9.0, 0.0),
+                c + egui::vec2(0.0, 9.0),
+                c + egui::vec2(-9.0, 0.0),
+            ];
+            p.line_segment([points[0], points[1]], stroke);
+            p.line_segment([points[1], points[2]], stroke);
+            p.line_segment([points[2], points[3]], stroke);
+            p.line_segment([points[3], points[0]], stroke);
+            p.circle_stroke(c, 3.0, stroke);
+        }
+    }
 }
 
 /// Outlined, transparent secondary button — full column width, 48 px tall,
 /// 12 px corners, soft border (per UI spec v1).
 fn secondary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let width = ui.available_width().min(156.0);
     ui.add(
         egui::Button::new(
             egui::RichText::new(text)
-                .size(14.0)
-                .color(egui::Color32::from_rgb(0xD0, 0xD0, 0xD0)),
+                .size(13.0)
+                .color(egui::Color32::from_rgb(0x20, 0x24, 0x2D)),
         )
-        .min_size(egui::vec2(ui.available_width(), 48.0))
-        .fill(egui::Color32::TRANSPARENT)
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(20)))
-        .rounding(egui::Rounding::same(12.0)),
+        .min_size(egui::vec2(width, 40.0))
+        .fill(egui::Color32::from_rgb(0xFF, 0xFF, 0xFF))
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgb(0xE3, 0xE6, 0xEC),
+        ))
+        .rounding(egui::Rounding::same(10.0)),
     )
 }
 
@@ -4350,6 +6539,30 @@ fn remember_remote_id(recent: &mut Vec<String>, id: &str) {
     recent.retain(|existing| existing != &id);
     recent.insert(0, id);
     recent.truncate(8);
+}
+
+fn remember_history(history: &mut Vec<ConnectionHistoryEntry>, id: &str) {
+    let id = normalize_remote_id(id);
+    if id.is_empty() {
+        return;
+    }
+    let now = unix_timestamp_secs();
+    if let Some(entry) = history.iter_mut().find(|entry| entry.remote_id == id) {
+        entry.last_connected_unix = now;
+        entry.connect_count = entry.connect_count.saturating_add(1);
+    } else {
+        history.insert(
+            0,
+            ConnectionHistoryEntry {
+                remote_id: id,
+                note: String::new(),
+                last_connected_unix: now,
+                connect_count: 1,
+            },
+        );
+    }
+    history.sort_by(|a, b| b.last_connected_unix.cmp(&a.last_connected_unix));
+    history.truncate(20);
 }
 
 fn friendly_error(error: &str) -> String {

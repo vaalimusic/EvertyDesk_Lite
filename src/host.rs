@@ -11,16 +11,23 @@
 //!    from the remote client.
 
 use std::{
-    io::Write,
+    io::{Read, Write},
     net::{TcpStream, UdpSocket},
+    process::{Child, ChildStdin, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
-        Arc,
+        Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant},
 };
+
+static APPROVALS: OnceLock<Mutex<std::collections::HashMap<String, bool>>> = OnceLock::new();
+
+fn approvals() -> &'static Mutex<std::collections::HashMap<String, bool>> {
+    APPROVALS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
 
 use sha2::{Digest, Sha256};
 
@@ -30,7 +37,8 @@ use crate::{
         decode_message, decode_peer_message, encode_message, encode_peer_message, login_response,
         peer_message, rendezvous_message, video_frame, DisplayInfo, EncodedVideoFrame,
         EncodedVideoFrames, Hash, IdPk, LoginResponse, PeerInfo, PeerMessage, RegisterPeer,
-        RegisterPk, RelayResponse, RendezvousMessage, RequestRelay, SignedId, VideoFrame,
+        RegisterPk, RelayResponse, RendezvousMessage, RequestRelay, ShellMessage, ShellMessageKind,
+        SignedId, VideoFrame,
     },
     settings::AppConfig,
     transport::{connect_tcp, encode_frame_len, read_framed, send_framed},
@@ -102,6 +110,9 @@ pub enum HostEvent {
         #[allow(dead_code)]
         uuid: String,
     },
+    ApprovalRequested {
+        peer_id: String,
+    },
     SessionStarted {
         peer_id: String,
     },
@@ -143,6 +154,12 @@ impl HostService {
 
     pub fn reconfigure(&self, config: AppConfig) {
         let _ = self.command_tx.send(HostCommand::Reconfigure(config));
+    }
+
+    pub fn approve_incoming(&self, peer_id: &str, accept: bool) {
+        if let Ok(mut approvals) = approvals().lock() {
+            approvals.insert(peer_id.to_owned(), accept);
+        }
     }
 
     pub fn try_recv(&self) -> Option<HostEvent> {
@@ -952,15 +969,66 @@ fn relay_session_inner(
         match msg.union {
             Some(peer_message::Union::LoginRequest(lr)) => {
                 if lr.password.is_empty() {
-                    host_log(
-                        events,
-                        "Login probe (empty password) → requesting password".to_owned(),
-                    );
-                    send_login_error(&mut relay, &mut cipher, "Empty Password")?;
-                    pw_attempts += 1;
+                    if config.security.require_confirmation || lr.password.is_empty() {
+                        host_log(
+                            events,
+                            format!("Approval requested for {peer_id} (empty password)"),
+                        );
+                        let _ = events.send(HostEvent::ApprovalRequested {
+                            peer_id: peer_id.to_owned(),
+                        });
+                        match wait_for_approval(peer_id, Duration::from_secs(45)) {
+                            Some(true) => {
+                                host_log(
+                                    events,
+                                    format!("Approved incoming connection from {peer_id}"),
+                                );
+                                break lr;
+                            }
+                            Some(false) => {
+                                send_login_error(&mut relay, &mut cipher, "Rejected")?;
+                                return Err("Incoming connection rejected".to_owned());
+                            }
+                            None => {
+                                send_login_error(&mut relay, &mut cipher, "Timeout")?;
+                                return Err("Incoming approval timed out".to_owned());
+                            }
+                        }
+                    } else {
+                        host_log(
+                            events,
+                            "Login probe (empty password) → requesting password".to_owned(),
+                        );
+                        send_login_error(&mut relay, &mut cipher, "Empty Password")?;
+                        pw_attempts += 1;
+                    }
                 } else if verify_password(&lr.password, &config.local_password, &salt, &challenge) {
                     host_log(events, "Password OK ✓".to_owned());
-                    break lr;
+                    if config.security.require_confirmation {
+                        host_log(events, format!("Approval requested for {peer_id}"));
+                        let _ = events.send(HostEvent::ApprovalRequested {
+                            peer_id: peer_id.to_owned(),
+                        });
+                        match wait_for_approval(peer_id, Duration::from_secs(45)) {
+                            Some(true) => {
+                                host_log(
+                                    events,
+                                    format!("Approved incoming connection from {peer_id}"),
+                                );
+                                break lr;
+                            }
+                            Some(false) => {
+                                send_login_error(&mut relay, &mut cipher, "Rejected")?;
+                                return Err("Incoming connection rejected".to_owned());
+                            }
+                            None => {
+                                send_login_error(&mut relay, &mut cipher, "Timeout")?;
+                                return Err("Incoming approval timed out".to_owned());
+                            }
+                        }
+                    } else {
+                        break lr;
+                    }
                 } else {
                     host_log(events, "Wrong password → asking to retry".to_owned());
                     send_login_error(&mut relay, &mut cipher, "Wrong Password")?;
@@ -1044,26 +1112,31 @@ fn relay_session_inner(
         .try_clone()
         .map_err(|e| format!("try_clone relay stream: {e}"))?;
     let stop = Arc::new(AtomicBool::new(false));
+    let (out_tx, out_rx) = mpsc::channel::<PeerMessage>();
 
     // ── Video thread ──────────────────────────────────────────────────────────
     let stop_v = stop.clone();
     let video_handle = thread::spawn(move || {
-        video_loop(write_stream, send_cipher, stop_v, target_fps);
+        video_loop(write_stream, send_cipher, stop_v, target_fps, out_rx);
     });
 
     // ── Input loop (this thread) ──────────────────────────────────────────────
     // A 1 s read timeout lets us notice the stop flag without busy-waiting.
     let _ = relay.set_read_timeout(Some(Duration::from_secs(1)));
     let mut recv_cipher = recv_cipher;
+    let mut shell: Option<ShellRuntime> = None;
     while !stop.load(Ordering::Relaxed) {
         match recv_peer_rc(&mut relay, &mut recv_cipher) {
-            Ok(Some(msg)) => handle_client_input(msg),
+            Ok(Some(msg)) => handle_client_input(msg, &out_tx, &mut shell),
             Ok(None) => {}
             Err(ref e) if is_timeout(e) => {}
             Err(_) => break, // disconnected
         }
     }
     stop.store(true, Ordering::Relaxed);
+    if let Some(mut shell) = shell.take() {
+        shell.stop();
+    }
     let _ = video_handle.join();
 
     // Release any mouse buttons that may be stuck down (the session could end
@@ -1079,6 +1152,7 @@ fn video_loop(
     mut send_cipher: Option<crate::crypto::SendCipher>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     target_fps: u32,
+    outgoing: Receiver<PeerMessage>,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -1106,6 +1180,17 @@ fn video_loop(
     let mut last_frame = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
+        while let Ok(message) = outgoing.try_recv() {
+            let mut payload = encode_peer_message(&message);
+            if let Some(c) = send_cipher.as_mut() {
+                payload = c.encrypt(&payload);
+            }
+            if send_framed(&mut stream, &payload).is_err() {
+                stop.store(true, Ordering::Relaxed);
+                return;
+            }
+        }
+
         if last_frame.elapsed() < frame_budget {
             thread::sleep(Duration::from_millis(2));
             continue;
@@ -1169,6 +1254,19 @@ fn negotiated_target_fps(login: &crate::rustdesk_proto::LoginRequest, configured
         .unwrap_or(host_limit as i32)
         .clamp(5, MAX_TARGET_FPS as i32) as u32;
     requested.min(host_limit)
+}
+
+fn wait_for_approval(peer_id: &str, timeout: Duration) -> Option<bool> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(mut approvals) = approvals().lock() {
+            if let Some(decision) = approvals.remove(peer_id) {
+                return Some(decision);
+            }
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+    None
 }
 
 fn frame_budget(target_fps: u32) -> Duration {
@@ -1306,12 +1404,126 @@ fn bgra_to_yuv420_into(out: &mut YuvFrame, w: usize, h: usize, bgra: &[u8]) {
 
 // ── Input injection ───────────────────────────────────────────────────────────
 
-fn handle_client_input(msg: PeerMessage) {
+fn handle_client_input(
+    msg: PeerMessage,
+    outgoing: &Sender<PeerMessage>,
+    shell: &mut Option<ShellRuntime>,
+) {
     match msg.union {
         Some(peer_message::Union::MouseEvent(ev)) => inject_mouse(ev),
         Some(peer_message::Union::KeyEvent(ev)) => inject_key(ev),
+        Some(peer_message::Union::Shell(shell_msg)) => {
+            handle_shell_message(shell_msg, outgoing, shell);
+        }
         _ => {}
     }
+}
+
+struct ShellRuntime {
+    child: Child,
+    stdin: Option<ChildStdin>,
+}
+
+impl ShellRuntime {
+    fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn handle_shell_message(
+    msg: ShellMessage,
+    outgoing: &Sender<PeerMessage>,
+    shell: &mut Option<ShellRuntime>,
+) {
+    match ShellMessageKind::try_from(msg.kind).unwrap_or(ShellMessageKind::Input) {
+        ShellMessageKind::Start => {
+            if shell.is_none() {
+                match start_shell_process(outgoing.clone()) {
+                    Ok(runtime) => {
+                        *shell = Some(runtime);
+                        send_shell_out(outgoing, ShellMessageKind::Output, "Shell started\r\n");
+                    }
+                    Err(err) => send_shell_out(outgoing, ShellMessageKind::Error, &err),
+                }
+            }
+        }
+        ShellMessageKind::Input => {
+            if let Some(runtime) = shell.as_mut() {
+                if let Some(stdin) = runtime.stdin.as_mut() {
+                    let _ = stdin.write_all(msg.data.as_bytes());
+                    let _ = stdin.flush();
+                }
+            }
+        }
+        ShellMessageKind::Stop => {
+            if let Some(mut runtime) = shell.take() {
+                runtime.stop();
+            }
+            send_shell_out(outgoing, ShellMessageKind::Closed, "");
+        }
+        _ => {}
+    }
+}
+
+fn start_shell_process(outgoing: Sender<PeerMessage>) -> Result<ShellRuntime, String> {
+    #[cfg(target_os = "windows")]
+    let mut command = { Command::new("cmd.exe") };
+    #[cfg(not(target_os = "windows"))]
+    let mut command = {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
+        Command::new(shell)
+    };
+
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("Start shell failed: {err}"))?;
+
+    if let Some(stdout) = child.stdout.take() {
+        spawn_shell_reader(stdout, outgoing.clone());
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_shell_reader(stderr, outgoing.clone());
+    }
+
+    Ok(ShellRuntime {
+        stdin: child.stdin.take(),
+        child,
+    })
+}
+
+fn spawn_shell_reader(mut reader: impl Read + Send + 'static, outgoing: Sender<PeerMessage>) {
+    thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => {
+                    send_shell_out(&outgoing, ShellMessageKind::Closed, "");
+                    break;
+                }
+                Ok(n) => {
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    send_shell_out(&outgoing, ShellMessageKind::Output, &text);
+                }
+                Err(err) => {
+                    send_shell_out(&outgoing, ShellMessageKind::Error, &format!("{err}"));
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn send_shell_out(outgoing: &Sender<PeerMessage>, kind: ShellMessageKind, data: &str) {
+    let _ = outgoing.send(PeerMessage {
+        union: Some(peer_message::Union::Shell(ShellMessage {
+            kind: kind as i32,
+            data: data.to_owned(),
+        })),
+    });
 }
 
 /// Release mouse buttons (and common modifier keys) that may have been left

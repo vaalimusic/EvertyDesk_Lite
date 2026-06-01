@@ -24,7 +24,8 @@ $paths = @(
     ".gitignore",
     ".cargo",
     "src",
-    "scripts"
+    "scripts",
+    "edesk_lite_logo.png"
 )
 
 $compression = [System.IO.Compression.CompressionLevel]::Optimal

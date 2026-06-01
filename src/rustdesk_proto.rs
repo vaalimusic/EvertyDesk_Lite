@@ -1,4 +1,4 @@
-use prost::Message;
+use prost::{Enumeration, Message};
 
 #[derive(Clone, PartialEq, Message)]
 pub struct PunchHoleRequest {
@@ -481,7 +481,7 @@ pub struct CursorPosition {
 pub struct PeerMessage {
     #[prost(
         oneof = "peer_message::Union",
-        tags = "3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 19, 25, 29, 30"
+        tags = "3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 19, 25, 29, 30, 99"
     )]
     pub union: Option<peer_message::Union>,
 }
@@ -491,8 +491,8 @@ pub mod peer_message {
 
     use super::{
         CursorData, CursorPosition, Hash, KeyEvent, LoginRequest, LoginResponse, Misc, MouseEvent,
-        PeerInfo, PublicKey, ScreenshotRequest, ScreenshotResponse, SignedId, TestDelay,
-        VideoFrame,
+        PeerInfo, PublicKey, ScreenshotRequest, ScreenshotResponse, ShellMessage, SignedId,
+        TestDelay, VideoFrame,
     };
 
     #[derive(Clone, PartialEq, Oneof)]
@@ -532,7 +532,28 @@ pub mod peer_message {
         ScreenshotRequest(ScreenshotRequest),
         #[prost(message, tag = "30")]
         ScreenshotResponse(ScreenshotResponse),
+        #[prost(message, tag = "99")]
+        Shell(ShellMessage),
     }
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ShellMessage {
+    #[prost(enumeration = "ShellMessageKind", tag = "1")]
+    pub kind: i32,
+    #[prost(string, tag = "2")]
+    pub data: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enumeration)]
+#[repr(i32)]
+pub enum ShellMessageKind {
+    Start = 0,
+    Input = 1,
+    Output = 2,
+    Stop = 3,
+    Closed = 4,
+    Error = 5,
 }
 
 #[derive(Clone, PartialEq, Message)]

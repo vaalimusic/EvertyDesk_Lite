@@ -21,7 +21,7 @@ use crate::{
         CursorData, EncodedVideoFrames, KeyEvent, KeyboardMode, LoginRequest, Misc, MouseEvent,
         NatType, OnlineRequest, OptionMessage, PeerMessage, PreferCodec, PublicKey,
         PunchHoleFailure, PunchHoleRequest, RendezvousMessage, RequestRelay, ScreenshotRequest,
-        SupportedDecoding, SwitchDisplay,
+        ShellMessage, ShellMessageKind, SupportedDecoding, SwitchDisplay,
     },
     settings::{CodecPreference, DisplayConfig, ServerConfig},
 };
@@ -91,6 +91,9 @@ pub enum SessionEvent {
     },
     /// Round-trip latency measured by the peer's TestDelay heartbeat (milliseconds).
     Latency(u32),
+    ShellOutput(String),
+    ShellClosed,
+    ShellError(String),
 }
 
 #[derive(Clone, Debug)]
@@ -168,6 +171,9 @@ pub enum SessionCommand {
         fps: i32,
         codec: CodecPreference,
     },
+    ShellStart,
+    ShellInput(String),
+    ShellStop,
     Close,
 }
 
@@ -540,6 +546,18 @@ impl TransportClient {
                             codec_preference,
                         );
                         last_live_bootstrap = Instant::now();
+                    }
+                    SessionCommand::ShellStart => {
+                        flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
+                        let _ = send_shell_message(&mut relay, ShellMessageKind::Start, "");
+                    }
+                    SessionCommand::ShellInput(input) => {
+                        flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
+                        let _ = send_shell_message(&mut relay, ShellMessageKind::Input, &input);
+                    }
+                    SessionCommand::ShellStop => {
+                        flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
+                        let _ = send_shell_message(&mut relay, ShellMessageKind::Stop, "");
                     }
                     SessionCommand::Close => {
                         flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
@@ -1083,6 +1101,7 @@ fn read_initial_peer_stage(
                 echo_test_delay(relay, delay)?;
             }
             Some(peer_message::Union::Misc(_)) => {}
+            Some(peer_message::Union::Shell(_)) => {}
             Some(peer_message::Union::MouseEvent(_))
             | Some(peer_message::Union::KeyEvent(_))
             | Some(peer_message::Union::ScreenshotRequest(_))
@@ -1299,6 +1318,7 @@ fn wait_for_video_probe(relay: &mut TcpStream) -> Result<String, String> {
             | Some(peer_message::Union::SignedId(_))
             | Some(peer_message::Union::PublicKey(_))
             | Some(peer_message::Union::LoginRequest(_))
+            | Some(peer_message::Union::Shell(_))
             | Some(peer_message::Union::MouseEvent(_))
             | Some(peer_message::Union::KeyEvent(_))
             | Some(peer_message::Union::ScreenshotRequest(_))
@@ -1331,6 +1351,20 @@ fn send_video_received(relay: &mut TcpStream) -> Result<(), String> {
     let message = PeerMessage {
         union: Some(peer_message::Union::Misc(Misc {
             union: Some(misc::Union::VideoReceived(true)),
+        })),
+    };
+    send_framed(relay, &encode_peer_message(&message))
+}
+
+fn send_shell_message(
+    relay: &mut TcpStream,
+    kind: ShellMessageKind,
+    data: &str,
+) -> Result<(), String> {
+    let message = PeerMessage {
+        union: Some(peer_message::Union::Shell(ShellMessage {
+            kind: kind as i32,
+            data: data.to_owned(),
         })),
     };
     send_framed(relay, &encode_peer_message(&message))
@@ -1536,6 +1570,21 @@ fn handle_session_message(
                         other.as_ref().map(|_| "variant")
                     );
                 }
+            }
+            None
+        }
+        Some(peer_message::Union::Shell(shell)) => {
+            match ShellMessageKind::try_from(shell.kind).unwrap_or(ShellMessageKind::Output) {
+                ShellMessageKind::Output => {
+                    let _ = events.send(SessionEvent::ShellOutput(shell.data));
+                }
+                ShellMessageKind::Closed => {
+                    let _ = events.send(SessionEvent::ShellClosed);
+                }
+                ShellMessageKind::Error => {
+                    let _ = events.send(SessionEvent::ShellError(shell.data));
+                }
+                _ => {}
             }
             None
         }
@@ -2317,6 +2366,9 @@ fn describe_peer_message(message: &PeerMessage) -> String {
         Some(peer_message::Union::PublicKey(_)) => "PublicKey".to_owned(),
         Some(peer_message::Union::TestDelay(_)) => "TestDelay".to_owned(),
         Some(peer_message::Union::Misc(_)) => "Misc".to_owned(),
+        Some(peer_message::Union::Shell(shell)) => {
+            format!("Shell kind={} bytes={}", shell.kind, shell.data.len())
+        }
         Some(peer_message::Union::MouseEvent(_)) => "MouseEvent".to_owned(),
         Some(peer_message::Union::KeyEvent(_)) => "KeyEvent".to_owned(),
         Some(peer_message::Union::LoginRequest(_)) => "LoginRequest".to_owned(),

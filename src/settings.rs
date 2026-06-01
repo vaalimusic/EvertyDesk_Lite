@@ -105,6 +105,51 @@ pub struct UiConfig {
     pub fit_to_window: bool,
     #[serde(default)]
     pub coordinate_mode: CoordinateMode,
+    #[serde(default = "default_true")]
+    pub show_connection_details: bool,
+    #[serde(default)]
+    pub history: Vec<ConnectionHistoryEntry>,
+    #[serde(default)]
+    pub contacts: Vec<ContactEntry>,
+    #[serde(default)]
+    pub address_book_signed_in: bool,
+    #[serde(default)]
+    pub address_book_account: String,
+    #[serde(default)]
+    pub address_book_token: String,
+    #[serde(default)]
+    pub address_book_access_token: String,
+    #[serde(default)]
+    pub address_book_guid: String,
+    #[serde(default)]
+    pub agent_machine_id: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ConnectionHistoryEntry {
+    pub remote_id: String,
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub last_connected_unix: u64,
+    #[serde(default)]
+    pub connect_count: u32,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ContactEntry {
+    pub name: String,
+    pub remote_id: String,
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub machine_id: String,
+    #[serde(default)]
+    pub os: String,
+    #[serde(default)]
+    pub last_seen: String,
+    #[serde(default)]
+    pub online: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +174,15 @@ impl Default for UiConfig {
             refresh_millis: default_refresh_millis(),
             fit_to_window: default_fit_to_window(),
             coordinate_mode: CoordinateMode::default(),
+            show_connection_details: true,
+            history: Vec::new(),
+            contacts: Vec::new(),
+            address_book_signed_in: false,
+            address_book_account: String::new(),
+            address_book_token: String::new(),
+            address_book_access_token: String::new(),
+            address_book_guid: String::new(),
+            agent_machine_id: String::new(),
         }
     }
 }
@@ -176,6 +230,10 @@ impl AppConfig {
                     let (pk, sk) = crate::crypto::gen_sign_keypair();
                     config.host_sign_pk = pk;
                     config.host_sign_sk = sk;
+                    config.save();
+                }
+                if config.ui.agent_machine_id.trim().is_empty() {
+                    config.ui.agent_machine_id = generate_agent_machine_id();
                     config.save();
                 }
                 return config;
@@ -250,4 +308,8 @@ pub fn generate_numeric_token(len: usize) -> String {
         value = value / 10 + 17;
     }
     out
+}
+
+pub fn generate_agent_machine_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
 }
