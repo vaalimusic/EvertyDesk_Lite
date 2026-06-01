@@ -25,11 +25,17 @@ case "$MODE" in
     echo "codecs: H264 + VP8/VP9 live video + PNG fallback"
     cargo build --release --no-default-features --features live-h264,live-vpx
     ;;
+  system|vpx-system|astra)
+    echo "codecs: H264 + VP9 via SYSTEM libvpx (apt: libvpx-dev)"
+    echo "policy: links -lvpx; for distros where source libvpx build fails (Astra)"
+    cargo build --release --no-default-features --features live-h264,live-vpx-system
+    ;;
   *)
-    echo "Usage: ./scripts/build-linux.sh [auto|h264|vpx]" >&2
-    echo "  auto  default: H264 + VP8/VP9 live video" >&2
-    echo "  h264  H264 live video + PNG fallback" >&2
-    echo "  vpx   H264 + VP8/VP9 live video + PNG fallback" >&2
+    echo "Usage: ./scripts/build-linux.sh [auto|h264|vpx|system]" >&2
+    echo "  auto    H264 + VP8/VP9 (libvpx from source)" >&2
+    echo "  h264    H264 only + PNG fallback" >&2
+    echo "  vpx     H264 + VP8/VP9 (libvpx from source)" >&2
+    echo "  system  H264 + VP9 via system libvpx — Astra (needs libvpx-dev)" >&2
     exit 2
     ;;
 esac

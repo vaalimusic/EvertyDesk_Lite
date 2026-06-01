@@ -272,6 +272,19 @@ struct LinuxGuiAttempt {
     envs: &'static [(&'static str, &'static str)],
 }
 
+/// Decode the embedded EvertyDesk logo (`edesk_lite_logo.png`) into a window
+/// icon. Returns `None` if the image can't be decoded.
+fn load_app_icon() -> Option<egui::IconData> {
+    let bytes = include_bytes!("../edesk_lite_logo.png");
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let (width, height) = img.dimensions();
+    Some(egui::IconData {
+        rgba: img.into_raw(),
+        width,
+        height,
+    })
+}
+
 fn run_gui(renderer: eframe::Renderer) -> eframe::Result<()> {
     // Try all available GPU backends, including software rasterizers
     // (WARP on Windows, lavapipe/llvmpipe on Linux).
@@ -281,11 +294,16 @@ fn run_gui(renderer: eframe::Renderer) -> eframe::Result<()> {
         ..Default::default()
     };
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title(APP_NAME)
+        .with_inner_size([1280.0, 800.0])
+        .with_min_inner_size([1040.0, 680.0]);
+    if let Some(icon) = load_app_icon() {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(APP_NAME)
-            .with_inner_size([500.0, 350.0])
-            .with_min_inner_size([420.0, 300.0]),
+        viewport,
         hardware_acceleration: if std::env::var_os("EVERTYDESK_SOFTWARE").is_some() {
             eframe::HardwareAcceleration::Off
         } else {
@@ -1291,29 +1309,33 @@ impl EvertyDeskApp {
             self.settings_window(ctx);
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.heading(APP_NAME);
-                ui.label(format!("v{APP_VERSION}"));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⚙").on_hover_text("Настройки").clicked() {
-                        self.settings_draft = Some(self.config.clone());
-                        self.show_settings = !self.show_settings;
-                    }
-                });
-            });
-            ui.add_space(14.0);
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.mode, AppMode::Connect, "Подключиться");
-                ui.selectable_value(&mut self.mode, AppMode::Host, "Этот компьютер");
-            });
-            ui.separator();
-            match self.mode {
+        // ── Left sidebar: logo · navigation · settings ───────────────────────
+        egui::SidePanel::left("everty_sidebar")
+            .resizable(false)
+            .exact_width(240.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(0x0C, 0x0C, 0x0C)) // #0C0C0C
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(20)))
+
+                    
+                    .rounding(egui::Rounding::same(20.0))
+                    .inner_margin(egui::Margin::symmetric(16.0, 20.0))
+                    .outer_margin(egui::Margin::same(12.0)),
+            )
+            .show(ctx, |ui| self.sidebar(ui));
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().inner_margin(egui::Margin {
+                left: 8.0,
+                right: 24.0,
+                top: 18.0,
+                bottom: 18.0,
+            }))
+            .show(ctx, |ui| match self.mode {
                 AppMode::Connect => self.connect_ui(ui),
                 AppMode::Host => self.host_ui(ui),
-            }
-        });
+            });
         if self.mode == AppMode::Connect
             && !self.busy
             && !self.connected
@@ -1471,49 +1493,265 @@ impl EvertyDeskApp {
 
     // ── Host UI ───────────────────────────────────────────────────────────────
 
-    fn connect_ui_commercial(&mut self, ui: &mut egui::Ui) {
+    /// Left sidebar: logo, app name, version, navigation, and Settings pinned
+    /// to the bottom (per UI spec v1 — Arc/Linear-style rail).
+    fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
+            // Drawn [É] logo tile.
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
+            let p = ui.painter();
+            p.rect_filled(
+                rect,
+                egui::Rounding::same(12.0),
+                egui::Color32::from_rgb(0x10, 0x10, 0x10),
+            );
+            p.rect_stroke(
+                rect,
+                egui::Rounding::same(12.0),
+                egui::Stroke::new(1.0, egui::Color32::from_white_alpha(30)),
+            );
+            p.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "É",
+                egui::FontId::proportional(24.0),
+                egui::Color32::WHITE,
+            );
+            ui.add_space(10.0);
             ui.vertical(|ui| {
+                ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new("Remote control")
-                        .size(22.0)
+                    egui::RichText::new(APP_NAME)
+                        .size(16.0)
                         .strong()
-                        .color(egui::Color32::from_rgb(232, 236, 241)),
+                        .color(egui::Color32::WHITE),
                 );
                 ui.label(
-                    egui::RichText::new("Fast RustDesk-compatible access through desk.everty.ru")
+                    egui::RichText::new(format!("v{APP_VERSION}"))
                         .size(12.0)
-                        .color(egui::Color32::from_rgb(145, 154, 166)),
-                );
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let (state, color) = if self.connected {
-                    ("Connected", egui::Color32::from_rgb(66, 190, 112))
-                } else if self.busy {
-                    ("Connecting", egui::Color32::from_rgb(235, 180, 75))
-                } else {
-                    ("Ready", egui::Color32::from_rgb(120, 132, 148))
-                };
-                ui.label(
-                    egui::RichText::new(format!("● {state}"))
-                        .strong()
-                        .color(color),
+                        .color(egui::Color32::from_rgb(0x80, 0x80, 0x80)),
                 );
             });
         });
 
-        ui.add_space(14.0);
-        egui::Frame::none()
-            .fill(egui::Color32::from_rgb(23, 28, 34))
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 54, 64)))
-            .rounding(egui::Rounding::same(8.0))
-            .inner_margin(egui::Margin::same(16.0))
-            .show(ui, |ui| {
+        ui.add_space(28.0);
+        self.nav_item(ui, AppMode::Connect, "Подключиться");
+        ui.add_space(10.0);
+        self.nav_item(ui, AppMode::Host, "Этот компьютер");
+
+        // Settings pinned to the bottom.
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            ui.add_space(2.0);
+            if nav_button(ui, "⚙   Настройки", false).clicked() {
+                self.settings_draft = Some(self.config.clone());
+                self.show_settings = true;
+            }
+        });
+    }
+
+    fn nav_item(&mut self, ui: &mut egui::Ui, mode: AppMode, label: &str) {
+        let active = self.mode == mode;
+        if nav_button(ui, label, active).clicked() {
+            self.mode = mode;
+        }
+    }
+
+    /// Monochrome connection-status indicator (`● Ready` / `Connecting` …).
+    /// Drawn inside a right-to-left layout, so the label is added first
+    /// (rightmost) and the 8 px dot to its left. Connecting pulses softly.
+    /// Connection-status pill (`╭ ○ Ready ╮`) — content-sized capsule that sits
+    /// inside the Remote Control header, below the subtitle. The ring pulses
+    /// softly while connecting.
+    fn status_capsule(&self, ui: &mut egui::Ui) {
+        use egui::Color32;
+        let (label, base, pulse) = if self.last_error.is_some() {
+            ("Error", Color32::from_rgb(0xFF, 0x55, 0x55), false)
+        } else if self.connected {
+            ("Connected", Color32::WHITE, false)
+        } else if self.busy {
+            ("Connecting", Color32::WHITE, true)
+        } else {
+            ("Ready", Color32::WHITE, false)
+        };
+        // Left-align the (content-sized) pill.
+        ui.horizontal(|ui| {
+            egui::Frame::none()
+                .fill(Color32::from_rgb(0x14, 0x14, 0x14))
+                .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(22)))
+                .rounding(egui::Rounding::same(20.0))
+                .inner_margin(egui::Margin::symmetric(12.0, 6.0))
+                .show(ui, |ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                    let col = if pulse {
+                        let t = ui.input(|i| i.time);
+                        let a = 0.55 + 0.45 * (t * std::f64::consts::TAU / 0.9).sin();
+                        ui.ctx().request_repaint();
+                        Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), (a * 255.0) as u8)
+                    } else {
+                        base
+                    };
+                    ui.painter()
+                        .circle_stroke(rect.center(), 4.0, egui::Stroke::new(1.5, col));
+                    ui.add_space(7.0);
+                    ui.label(
+                        egui::RichText::new(label)
+                            .size(13.0)
+                            .color(Color32::from_rgb(0xD8, 0xD8, 0xD8)),
+                    );
+                });
+        });
+    }
+
+    #[allow(dead_code)]
+    fn status_indicator(&self, ui: &mut egui::Ui) {
+        use egui::Color32;
+        let (label, base, pulse) = if self.last_error.is_some() {
+            ("Error", Color32::from_rgb(0xFF, 0x55, 0x55), false)
+        } else if self.connected {
+            ("Connected", Color32::WHITE, false)
+        } else if self.busy {
+            ("Connecting", Color32::WHITE, true)
+        } else {
+            ("Ready", Color32::WHITE, false)
+        };
+        ui.label(
+            egui::RichText::new(label)
+                .size(14.0)
+                .color(Color32::from_rgb(0xC8, 0xC8, 0xC8)),
+        );
+        ui.add_space(8.0);
+        let dot = if pulse {
+            let t = ui.input(|i| i.time);
+            let a = 0.5 + 0.5 * (t * std::f64::consts::TAU / 0.8).sin();
+            let alpha = (110.0 + 145.0 * a) as u8;
+            ui.ctx().request_repaint();
+            Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), alpha)
+        } else {
+            base
+        };
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), 4.0, dot);
+    }
+
+    /// Right-hand "This computer" card: your ID, password, and host status.
+    fn this_computer_card(&mut self, ui: &mut egui::Ui, _min_h: f32) {
+        let gray = egui::Color32::from_rgb(0xA0, 0xA0, 0xA0);
+        card_frame().show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                egui::RichText::new("This computer")
+                    .size(16.0)
+                    .strong()
+                    .color(egui::Color32::WHITE),
+            );
+            ui.add_space(18.0);
+
+            ui.label(egui::RichText::new("Your ID").size(13.0).color(gray));
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format_peer_id(&self.config.local_id))
+                        .size(24.0)
+                        .strong()
+                        .color(egui::Color32::WHITE),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("⎘").on_hover_text("Копировать ID").clicked() {
+                        ui.output_mut(|o| o.copied_text = self.config.local_id.clone());
+                    }
+                });
+            });
+
+            ui.add_space(16.0);
+            ui.label(egui::RichText::new("Password").size(13.0).color(gray));
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("••••••••")
+                        .size(20.0)
+                        .color(egui::Color32::WHITE),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("⎘").on_hover_text("Копировать пароль").clicked() {
+                        ui.output_mut(|o| o.copied_text = self.config.local_password.clone());
+                    }
+                });
+            });
+
+            ui.add_space(18.0);
+            ui.separator();
+            ui.add_space(14.0);
+
+            ui.label(egui::RichText::new("Status").size(13.0).color(gray));
+            ui.add_space(8.0);
+            let online = self.host_state.is_online();
+            ui.horizontal(|ui| {
+                // Pulsing ring (hollow) — soft, premium.
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                let t = ui.input(|i| i.time);
+                let a = 0.55 + 0.45 * (t * std::f64::consts::TAU / 0.9).sin();
+                ui.ctx().request_repaint();
+                let base = if online {
+                    egui::Color32::WHITE
+                } else {
+                    gray
+                };
+                let ring = egui::Color32::from_rgba_unmultiplied(
+                    base.r(),
+                    base.g(),
+                    base.b(),
+                    (a * 255.0) as u8,
+                );
+                ui.painter()
+                    .circle_stroke(rect.center(), 5.0, egui::Stroke::new(1.5, ring));
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(if online { "Online" } else { "Ready to connect" })
+                        .size(14.0)
+                        .color(egui::Color32::from_rgb(0xE0, 0xE0, 0xE0)),
+                );
+            });
+
+        });
+    }
+
+    fn connect_ui_commercial(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        workspace_frame().show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new("Remote control")
+                        .size(28.0)
+                        .color(egui::Color32::WHITE),
+                );
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new("Fast RustDesk-compatible access through desk.everty.ru")
+                        .size(15.0)
+                        .color(egui::Color32::from_rgb(0xA0, 0xA0, 0xA0)),
+                );
+                ui.add_space(12.0);
+                self.status_capsule(ui);
+            });
+        });
+
+        ui.add_space(18.0);
+        let two_gap = 20.0;
+        let two_left = 520.0_f32.min(ui.available_width() - 360.0);
+        // ui.vertical columns auto-size to their content height, so the
+        // workspace wraps tightly instead of stretching down the window.
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.set_min_width(two_left);
+                ui.set_max_width(two_left);
+                    card_frame().show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
                 ui.label(
                     egui::RichText::new("Partner ID")
-                        .size(12.0)
-                        .color(egui::Color32::from_rgb(155, 164, 176)),
+                        .size(13.0)
+                        .color(egui::Color32::from_rgb(0xA0, 0xA0, 0xA0)),
                 );
                 let remote_id_response = ui.add_enabled(
                     !self.connected && !self.busy,
@@ -1548,50 +1786,49 @@ impl EvertyDeskApp {
                     }
                 }
 
-                ui.add_space(16.0);
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .add_enabled(
-                            !self.busy && !self.connected,
-                            egui::Button::new(
-                                egui::RichText::new(if self.busy {
-                                    "Connecting..."
-                                } else {
-                                    "Connect"
-                                })
-                                .strong(),
-                            )
-                            .min_size(egui::vec2(150.0, 36.0))
-                            .fill(egui::Color32::from_rgb(38, 116, 236)),
-                        )
+                ui.add_space(20.0);
+                // ── Primary: white full-width Connect button with [É] brand ───
+                let connect_label = if self.busy {
+                    "É    Connecting…"
+                } else {
+                    "É    Connect"
+                };
+                let connect_btn = egui::Button::new(
+                    egui::RichText::new(connect_label)
+                        .size(17.0)
+                        .strong()
+                        .color(egui::Color32::BLACK),
+                )
+                .min_size(egui::vec2(ui.available_width(), 52.0))
+                .fill(egui::Color32::WHITE)
+                .rounding(egui::Rounding::same(14.0));
+                if ui
+                    .add_enabled(!self.busy && !self.connected, connect_btn)
+                    .clicked()
+                {
+                    self.connect();
+                }
+
+                ui.add_space(12.0);
+                // ── Secondary row: Check ID · Open screen · Disconnect(danger) ─
+                ui.columns(3, |cols| {
+                    if secondary_button(&mut cols[0], "Check ID")
+                        .on_hover_text("Проверить онлайн ли ID")
                         .clicked()
-                    {
-                        self.connect();
-                    }
-                    if ui
-                        .add_enabled(
-                            !self.busy && !self.connected && !self.remote_check_busy,
-                            egui::Button::new("Check ID").min_size(egui::vec2(110.0, 36.0)),
-                        )
-                        .clicked()
+                        && !self.busy
+                        && !self.connected
+                        && !self.remote_check_busy
                     {
                         self.check_remote_online();
                     }
-                    if ui
-                        .add_enabled(
-                            self.connected || self.busy,
-                            egui::Button::new("Disconnect").min_size(egui::vec2(120.0, 36.0)),
-                        )
-                        .clicked()
+                    if danger_button(&mut cols[2], "Disconnect").clicked()
+                        && (self.connected || self.busy)
                     {
                         self.disconnect_session("Disconnected");
                     }
-                    if ui
-                        .add_enabled(
-                            self.connected && !self.remote_viewer_open,
-                            egui::Button::new("Open screen").min_size(egui::vec2(120.0, 36.0)),
-                        )
-                        .clicked()
+                    if secondary_button(&mut cols[1], "Open screen").clicked()
+                        && self.connected
+                        && !self.remote_viewer_open
                     {
                         self.remote_viewer_open = true;
                         self.status = "Remote screen opened".to_owned();
@@ -1602,7 +1839,14 @@ impl EvertyDeskApp {
                         self.send_command(SessionCommand::Screenshot);
                     }
                 });
+                    });
             });
+            ui.add_space(two_gap);
+            ui.vertical(|ui| {
+                self.this_computer_card(ui, 0.0);
+            });
+        });
+        }); // ── close workspace container ───────────────────────────────────
 
         ui.add_space(12.0);
         if self.progress > 0 || self.busy || self.connected || self.remote_check_busy {
@@ -3815,24 +4059,173 @@ fn egui_key_to_text(key: egui::Key) -> Option<String> {
 }
 
 fn configure_style(ctx: &egui::Context) {
+    use egui::{Color32, Rounding, Stroke};
+
+    // ── Premium Dark, monochrome — no blue (per UI spec v1) ──────────────────
+    let bg = Color32::from_rgb(0x05, 0x05, 0x05); // #050505 window
+    let panel = Color32::from_rgb(0x0A, 0x0A, 0x0A); // #0A0A0A
+    let card = Color32::from_rgb(0x10, 0x10, 0x10); // #101010
+    let input = Color32::from_rgb(0x08, 0x08, 0x08); // #080808
+    let border = Color32::from_white_alpha(20); // ~rgba(255,255,255,0.08)
+    let border_hover = Color32::from_white_alpha(30); // ~0.12
+    let border_focus = Color32::from_white_alpha(46); // ~0.18
+    let text = Color32::from_rgb(0xFF, 0xFF, 0xFF);
+    let text_weak = Color32::from_rgb(0xA0, 0xA0, 0xA0);
+    let text_strong = Color32::from_rgb(0xD0, 0xD0, 0xD0);
+
     let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = egui::Color32::from_rgb(20, 24, 28);
-    visuals.window_fill = egui::Color32::from_rgb(18, 22, 26);
-    visuals.extreme_bg_color = egui::Color32::from_rgb(12, 14, 16);
-    visuals.selection.bg_fill = egui::Color32::from_rgb(45, 120, 170);
-    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(34, 40, 46);
-    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(46, 55, 62);
-    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(54, 92, 118);
+    visuals.panel_fill = bg;
+    visuals.window_fill = panel;
+    visuals.extreme_bg_color = input; // TextEdit background
+    visuals.faint_bg_color = card;
+    visuals.window_rounding = Rounding::same(20.0);
+    visuals.window_stroke = Stroke::new(1.0, Color32::from_white_alpha(26));
+
+    // Monochrome text selection (no blue).
+    visuals.selection.bg_fill = Color32::from_white_alpha(30);
+    visuals.selection.stroke = Stroke::new(1.0, border_focus);
+
+    // Widget states — subtle white-on-black glass, no colour.
+    let rounding = Rounding::same(12.0);
+    visuals.widgets.noninteractive.bg_fill = card;
+    visuals.widgets.noninteractive.weak_bg_fill = card;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, border);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text_weak);
+    visuals.widgets.noninteractive.rounding = rounding;
+
+    visuals.widgets.inactive.bg_fill = Color32::from_white_alpha(8);
+    visuals.widgets.inactive.weak_bg_fill = Color32::from_white_alpha(8);
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, border);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, text_strong);
+    visuals.widgets.inactive.rounding = rounding;
+
+    visuals.widgets.hovered.bg_fill = Color32::from_white_alpha(16);
+    visuals.widgets.hovered.weak_bg_fill = Color32::from_white_alpha(16);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, border_hover);
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, text);
+    visuals.widgets.hovered.rounding = rounding;
+
+    visuals.widgets.active.bg_fill = Color32::from_white_alpha(24);
+    visuals.widgets.active.weak_bg_fill = Color32::from_white_alpha(24);
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0, border_focus);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0, text);
+    visuals.widgets.active.rounding = rounding;
+
+    visuals.widgets.open.bg_fill = card;
+    visuals.widgets.open.bg_stroke = Stroke::new(1.0, border);
+    visuals.widgets.open.fg_stroke = Stroke::new(1.0, text);
+    visuals.widgets.open.rounding = rounding;
+
     ctx.set_visuals(visuals);
 
+    // ── Spacing — generous 24 / 16 / 12 rhythm (no cramped egui defaults) ────
     let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-    style.spacing.button_padding = egui::vec2(12.0, 7.0);
-    style.visuals.widgets.noninteractive.rounding = egui::Rounding::same(6.0);
-    style.visuals.widgets.inactive.rounding = egui::Rounding::same(6.0);
-    style.visuals.widgets.hovered.rounding = egui::Rounding::same(6.0);
-    style.visuals.widgets.active.rounding = egui::Rounding::same(6.0);
+    style.spacing.item_spacing = egui::vec2(16.0, 12.0);
+    style.spacing.button_padding = egui::vec2(16.0, 10.0);
+    style.spacing.menu_margin = egui::Margin::same(12.0);
+    style.spacing.window_margin = egui::Margin::same(24.0);
+    style.spacing.interact_size.y = 28.0;
     ctx.set_style(style);
+}
+
+/// Outer "workspace" container that groups the title + the two cards into one
+/// glass surface — gives the app a sense of structure (Window › Workspace ›
+/// Card, max two frame levels). Very subtle so it doesn't read as nesting.
+fn workspace_frame() -> egui::Frame {
+    egui::Frame::none()
+        .fill(egui::Color32::from_rgb(0x0A, 0x0A, 0x0A))
+        .stroke(egui::Stroke::NONE)
+        .rounding(egui::Rounding::same(24.0))
+        .inner_margin(egui::Margin::same(22.0))
+}
+
+/// A premium-dark content card — a touch lighter than the workspace behind it.
+fn card_frame() -> egui::Frame {
+    egui::Frame::none()
+        .fill(egui::Color32::from_rgb(0x13, 0x13, 0x13)) // #131313, above workspace
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(22)))
+        .rounding(egui::Rounding::same(18.0))
+        .inner_margin(egui::Margin::same(22.0))
+}
+
+/// A `label … value` row for the This Computer info block.
+#[allow(dead_code)]
+fn info_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(label)
+                .size(13.0)
+                .color(egui::Color32::from_rgb(0x80, 0x80, 0x80)),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                egui::RichText::new(value)
+                    .size(13.0)
+                    .color(egui::Color32::from_rgb(0xCC, 0xCC, 0xCC)),
+            );
+        });
+    });
+    ui.add_space(9.0);
+}
+
+/// Danger (destructive) outlined button — red hair-line border + faint red
+/// glass, for actions like Disconnect.
+fn danger_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(
+            egui::RichText::new(text)
+                .size(14.0)
+                .color(egui::Color32::from_rgba_unmultiplied(0xFF, 0x78, 0x78, 220)),
+        )
+        .min_size(egui::vec2(ui.available_width(), 48.0))
+        .fill(egui::Color32::from_rgba_unmultiplied(0xFF, 0x50, 0x50, 12)) // barely there
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(0xFF, 0x50, 0x50, 120),
+        ))
+        .rounding(egui::Rounding::same(12.0)),
+    )
+}
+
+/// Sidebar navigation button — full width, 48 px tall, 14 px corners. Active
+/// item gets a faint glass fill + brighter border (per UI spec v1).
+fn nav_button(ui: &mut egui::Ui, label: &str, active: bool) -> egui::Response {
+    let (fill, stroke, text_col) = if active {
+        (
+            egui::Color32::from_white_alpha(13), // ~0.05
+            egui::Color32::from_white_alpha(51), // ~0.20
+            egui::Color32::WHITE,
+        )
+    } else {
+        (
+            egui::Color32::TRANSPARENT,
+            egui::Color32::TRANSPARENT,
+            egui::Color32::from_rgb(0xB0, 0xB0, 0xB0),
+        )
+    };
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).size(14.0).color(text_col))
+            .min_size(egui::vec2(ui.available_width(), 48.0))
+            .fill(fill)
+            .stroke(egui::Stroke::new(1.0, stroke))
+            .rounding(egui::Rounding::same(14.0)),
+    )
+}
+
+/// Outlined, transparent secondary button — full column width, 48 px tall,
+/// 12 px corners, soft border (per UI spec v1).
+fn secondary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(
+            egui::RichText::new(text)
+                .size(14.0)
+                .color(egui::Color32::from_rgb(0xD0, 0xD0, 0xD0)),
+        )
+        .min_size(egui::vec2(ui.available_width(), 48.0))
+        .fill(egui::Color32::TRANSPARENT)
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_white_alpha(20)))
+        .rounding(egui::Rounding::same(12.0)),
+    )
 }
 
 /// Try to read the 32-byte Ed25519 public key from the installed EvertyDesk

@@ -27,26 +27,32 @@ sudo apt install -y ydotool grim wtype || true
 
 На Linux НЕ используй дефолтные фичи — `live-vp9-mf` тянет Windows-only код.
 
-### Astra Linux → собирай в режиме `h264`
+### Astra Linux → режим `system` (H264 + VP9 через системный libvpx)
 
 ```bash
+sudo apt install libvpx-dev           # системный libvpx (1.7.x)
 cd EvertyDesk_Lite
 chmod +x scripts/build-linux.sh
+./scripts/build-linux.sh system        # H264 + VP9 через -lvpx
+```
+
+Это линкуется к **готовому системному libvpx** (`libvpx-dev`), а не собирает
+его из исходников. Сборка из исходников на Astra падает: libvpx содержит код
+AVX-512 (`_mm512_reduce_add_epi32`), который понимает только GCC 7+, а на Astra
+GCC старый. Системный libvpx собран мейнтейнерами под тулчейн Astra — работает.
+
+Теперь клиент декодирует **и H264, и VP9** → живое видео с любого хоста.
+
+### Только H264 (без VP9, минимальная сборка)
+
+```bash
 ./scripts/build-linux.sh h264
 ```
 
-**Почему не VP9 на Astra:** libvpx содержит код AVX-512
-(`_mm512_reduce_add_epi32`), который понимает только GCC 7+. На Astra
-GCC старый → сборка libvpx падает на линковке. VP9 на Astra недоступен,
-пока не обновишь GCC (`sudo apt install gcc-8 g++-8` + `update-alternatives`).
-
-H264-only клиент сообщает хосту «шлю/принимаю только H264», и хост шлёт H264
-(у RustDesk-хостов есть программный H264-энкодер). Этого достаточно.
-
-### VP8/VP9 (только на системах с GCC ≥ 7)
+### VP8/VP9 из исходников (системы с GCC ≥ 7, не Astra)
 
 ```bash
-./scripts/build-linux.sh auto          # H264 + VP8/VP9 (libvpx из исходников)
+./scripts/build-linux.sh auto          # libvpx из исходников
 ```
 
 Бинарь: `target/release/evertydesk-lite`
