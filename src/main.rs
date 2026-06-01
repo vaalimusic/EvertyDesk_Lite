@@ -31,8 +31,8 @@ use rustdesk_proto::ControlKey;
 use serde_json::Value;
 use settings as settings_mod;
 use settings_mod::{
-    generate_agent_machine_id, generate_numeric_token, AppConfig, CodecPreference,
-    ConnectionHistoryEntry, ContactEntry, CoordinateMode,
+    generate_numeric_token, AppConfig, CodecPreference, ConnectionHistoryEntry, ContactEntry,
+    CoordinateMode,
 };
 use transport::{
     ConnectionRequest, ConnectionState, RemoteDisplay, SessionCommand, SessionEvent,
@@ -1628,6 +1628,7 @@ impl EvertyDeskApp {
     /// Left sidebar: logo, app name, version, navigation, and Settings pinned
     /// to the bottom (per UI spec v1 — Arc/Linear-style rail).
     fn sidebar(&mut self, ui: &mut egui::Ui) {
+        ui.set_width(ui.available_width());
         ui.add_space(2.0);
         ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
@@ -1660,22 +1661,8 @@ impl EvertyDeskApp {
                 );
             }
             ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.set_visible(false);
-                ui.add_sized(
-                    egui::vec2(180.0, 34.0),
-                    egui::TextEdit::singleline(&mut self.config.ui.address_book_account)
-                        .hint_text(tr(self.ui_lang, "Логин", "Login")),
-                );
-                ui.add_sized(
-                    egui::vec2(180.0, 34.0),
-                    egui::TextEdit::singleline(&mut self.config.ui.address_book_token)
-                        .password(true)
-                        .hint_text(tr(self.ui_lang, "Пароль", "Password")),
-                );
-            });
-            ui.set_visible(true);
             ui.vertical(|ui| {
+                ui.set_max_width(118.0);
                 ui.add_space(3.0);
                 ui.label(
                     egui::RichText::new(APP_NAME)
@@ -1704,24 +1691,23 @@ impl EvertyDeskApp {
         ui.add_space(8.0);
         self.nav_item(ui, AppMode::Contacts, contacts_label, "contacts");
 
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            ui.add_space(4.0);
-            let settings_label = self.text("Настройки", "Settings");
-            if nav_icon_button(
-                ui,
-                settings_label,
-                "settings",
-                self.mode == AppMode::Settings,
-                true,
-            )
-            .clicked()
-            {
-                if self.settings_draft.is_none() {
-                    self.settings_draft = Some(self.config.clone());
-                }
-                self.mode = AppMode::Settings;
+        let spacer = (ui.available_height() - 50.0).max(10.0);
+        ui.add_space(spacer);
+        let settings_label = self.text("Настройки", "Settings");
+        if nav_icon_button(
+            ui,
+            settings_label,
+            "settings",
+            self.mode == AppMode::Settings,
+            true,
+        )
+        .clicked()
+        {
+            if self.settings_draft.is_none() {
+                self.settings_draft = Some(self.config.clone());
             }
-        });
+            self.mode = AppMode::Settings;
+        }
     }
 
     fn nav_item(&mut self, ui: &mut egui::Ui, mode: AppMode, label: &str, icon: &str) {
@@ -2362,27 +2348,6 @@ impl EvertyDeskApp {
             return;
         }
 
-        ui.add_space(8.0);
-        card_frame().show(ui, |ui| {
-            ui.set_visible(false);
-            ui.horizontal(|ui| {
-                ui.add_sized(
-                    egui::vec2(ui.available_width().min(420.0), 34.0),
-                    egui::TextEdit::singleline(&mut self.contact_search).hint_text(tr(
-                        self.ui_lang,
-                        "Поиск по имени, ID или компьютеру",
-                        "Search name, ID, or host",
-                    )),
-                );
-                if !self.contact_search.is_empty()
-                    && ui.button(tr(self.ui_lang, "Очистить", "Clear")).clicked()
-                {
-                    self.contact_search.clear();
-                }
-            });
-        });
-
-        let _query = self.contact_search.trim().to_lowercase();
         let mut connect_to: Option<String> = None;
         let mut remove_id: Option<String> = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -2469,7 +2434,8 @@ impl EvertyDeskApp {
 
         let lang = self.ui_lang;
         card_frame().show(ui, |ui| {
-            ui.horizontal(|ui| {
+            let wide = ui.available_width() >= 620.0;
+            let header = |ui: &mut egui::Ui| {
                 ui.vertical(|ui| {
                     ui.label(
                         egui::RichText::new(tr(
@@ -2499,8 +2465,10 @@ impl EvertyDeskApp {
                         .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
                     );
                 });
+            };
+            let status = |ui: &mut egui::Ui, signed_in: bool| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let state_text = if self.config.ui.address_book_signed_in {
+                    let state_text = if signed_in {
                         tr(lang, "В сети", "Online")
                     } else {
                         tr(lang, "Не авторизовано", "Signed out")
@@ -2508,14 +2476,24 @@ impl EvertyDeskApp {
                     status_pill(
                         ui,
                         state_text,
-                        if self.config.ui.address_book_signed_in {
+                        if signed_in {
                             egui::Color32::from_rgb(0x12, 0xC9, 0x72)
                         } else {
                             egui::Color32::from_rgb(0xA8, 0xB0, 0xBE)
                         },
                     );
                 });
-            });
+            };
+            if wide {
+                ui.horizontal(|ui| {
+                    header(ui);
+                    status(ui, self.config.ui.address_book_signed_in);
+                });
+            } else {
+                header(ui);
+                ui.add_space(8.0);
+                status(ui, self.config.ui.address_book_signed_in);
+            }
             ui.add_space(10.0);
             settings_text_row(
                 ui,
@@ -2527,20 +2505,7 @@ impl EvertyDeskApp {
                 tr(lang, "Пароль", "Password"),
                 &mut self.config.ui.address_book_token,
             );
-            ui.horizontal(|ui| {
-                ui.set_visible(false);
-                ui.label(
-                    egui::RichText::new("")
-                        .size(12.0)
-                        .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
-                );
-                if ui.button(tr(lang, "Сгенерировать", "Regenerate")).clicked() {
-                    self.config.ui.agent_machine_id = generate_agent_machine_id();
-                    self.config.save();
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.set_visible(true);
+            ui.horizontal_wrapped(|ui| {
                 let can_sign_in = !self.config.ui.address_book_account.trim().is_empty()
                     && !self.config.ui.address_book_token.trim().is_empty();
                 if ui
@@ -2554,12 +2519,8 @@ impl EvertyDeskApp {
                     match self.sync_address_book() {
                         Ok(()) => {
                             self.address_book_status = Some(
-                                tr(
-                                    lang,
-                                    "РђРґСЂРµСЃРЅР°СЏ РєРЅРёРіР° Р·Р°РіСЂСѓР¶РµРЅР°",
-                                    "Address book loaded",
-                                )
-                                .to_owned(),
+                                tr(lang, "Адресная книга загружена", "Address book loaded")
+                                    .to_owned(),
                             );
                         }
                         Err(err) => self.address_book_status = Some(err),
@@ -2595,12 +2556,13 @@ impl EvertyDeskApp {
                         Err(err) => self.address_book_status = Some(err),
                     }
                 }
-                ui.label(
-                    egui::RichText::new(format!("API: {}", self.config.server.api_url))
-                        .size(12.0)
-                        .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
-                );
             });
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(format!("API: {}", self.config.server.api_url))
+                    .size(12.0)
+                    .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+            );
             if let Some(status) = &self.address_book_status {
                 ui.add_space(6.0);
                 ui.label(
@@ -2695,9 +2657,17 @@ impl EvertyDeskApp {
         }
         ui.add_space(8.0);
         card_frame().show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                let clear_width = if self.contact_search.is_empty() {
+                    0.0
+                } else {
+                    86.0
+                };
+                let search_width = (ui.available_width() - clear_width - 8.0)
+                    .max(220.0)
+                    .min(520.0);
                 ui.add_sized(
-                    egui::vec2(ui.available_width().min(420.0), 34.0),
+                    egui::vec2(search_width, 34.0),
                     egui::TextEdit::singleline(&mut self.contact_search).hint_text(tr(
                         self.ui_lang,
                         "Поиск по имени, ID или компьютеру",
@@ -2726,7 +2696,8 @@ impl EvertyDeskApp {
                     continue;
                 }
                 card_frame().show(ui, |ui| {
-                    ui.horizontal(|ui| {
+                    let narrow = ui.available_width() < 620.0;
+                    if narrow {
                         ui.vertical(|ui| {
                             ui.label(
                                 egui::RichText::new(if contact.name.trim().is_empty() {
@@ -2758,21 +2729,76 @@ impl EvertyDeskApp {
                                     .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
                             );
                         });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button(tr(self.ui_lang, "Удалить", "Remove")).clicked() {
-                                remove_idx = Some(idx);
-                            }
-                            if ui.button(tr(self.ui_lang, "Сохранить", "Save")).clicked() {
-                                update_contact = Some(contact.clone());
-                            }
+                        ui.add_space(10.0);
+                        ui.horizontal_wrapped(|ui| {
                             if ui
                                 .button(tr(self.ui_lang, "Подключиться", "Connect"))
                                 .clicked()
                             {
                                 connect_to = Some(contact.remote_id.clone());
                             }
+                            if ui.button(tr(self.ui_lang, "Сохранить", "Save")).clicked() {
+                                update_contact = Some(contact.clone());
+                            }
+                            if ui.button(tr(self.ui_lang, "Удалить", "Remove")).clicked() {
+                                remove_idx = Some(idx);
+                            }
                         });
-                    });
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.set_max_width((ui.available_width() - 300.0).max(220.0));
+                                ui.label(
+                                    egui::RichText::new(if contact.name.trim().is_empty() {
+                                        format_peer_id(&contact.remote_id)
+                                    } else {
+                                        contact.name.clone()
+                                    })
+                                    .size(18.0)
+                                    .strong(),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format_peer_id(&contact.remote_id))
+                                        .size(13.0)
+                                        .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                                );
+                                let host = if contact.note.trim().is_empty() {
+                                    "-"
+                                } else {
+                                    contact.note.trim()
+                                };
+                                let platform = if contact.os.trim().is_empty() {
+                                    "-"
+                                } else {
+                                    contact.os.trim()
+                                };
+                                ui.label(
+                                    egui::RichText::new(format!("{host} · {platform}"))
+                                        .size(12.0)
+                                        .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                                );
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button(tr(self.ui_lang, "Удалить", "Remove")).clicked()
+                                    {
+                                        remove_idx = Some(idx);
+                                    }
+                                    if ui.button(tr(self.ui_lang, "Сохранить", "Save")).clicked()
+                                    {
+                                        update_contact = Some(contact.clone());
+                                    }
+                                    if ui
+                                        .button(tr(self.ui_lang, "Подключиться", "Connect"))
+                                        .clicked()
+                                    {
+                                        connect_to = Some(contact.remote_id.clone());
+                                    }
+                                },
+                            );
+                        });
+                    }
                     ui.add_space(8.0);
                     ui.add_sized(
                         egui::vec2(ui.available_width(), 38.0),
@@ -2783,7 +2809,6 @@ impl EvertyDeskApp {
                         )),
                     );
                     ui.add_space(6.0);
-                    ui.set_visible(false);
                     ui.add_sized(
                         egui::vec2(ui.available_width(), 40.0),
                         egui::TextEdit::singleline(&mut contact.note).hint_text(tr(
@@ -5760,23 +5785,43 @@ fn settings_section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&m
 }
 
 fn settings_text_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
-    ui.horizontal(|ui| {
-        ui.set_min_height(36.0);
+    let wide = ui.available_width() >= 520.0;
+    if wide {
+        ui.horizontal(|ui| {
+            ui.set_min_height(36.0);
+            ui.set_width(ui.available_width());
+            ui.add_sized(
+                egui::vec2(150.0, 24.0),
+                egui::Label::new(
+                    egui::RichText::new(label)
+                        .size(13.0)
+                        .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+                )
+                .wrap(false),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let width = ui.available_width().min(360.0);
+                ui.add_sized(
+                    egui::vec2(width, 34.0),
+                    egui::TextEdit::singleline(value).font(egui::TextStyle::Button),
+                );
+            });
+        });
+    } else {
         ui.label(
             egui::RichText::new(label)
                 .size(13.0)
                 .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
         );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.add_sized(
-                egui::vec2(330.0, 34.0),
-                egui::TextEdit::singleline(value).font(egui::TextStyle::Button),
-            );
-        });
-    });
+        ui.add_sized(
+            egui::vec2(ui.available_width(), 34.0),
+            egui::TextEdit::singleline(value).font(egui::TextStyle::Button),
+        );
+    }
     ui.add_space(6.0);
 }
 
+#[allow(dead_code)]
 const SERVICE_NAME: &str = "EvertyDeskLite";
 
 fn install_host_service() -> Result<String, String> {
