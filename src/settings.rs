@@ -89,6 +89,83 @@ impl Default for DisplayConfig {
     }
 }
 
+// ── LLM terminal assistant configuration ──────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LlmProvider {
+    #[default]
+    Ollama,
+    OpenAi,
+    YandexGpt,
+}
+
+impl LlmProvider {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ollama => "Ollama",
+            Self::OpenAi => "OpenAI",
+            Self::YandexGpt => "YandexGPT",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LlmConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub provider: LlmProvider,
+    #[serde(default = "default_llm_openai_base_url")]
+    pub openai_base_url: String,
+    #[serde(default)]
+    pub openai_api_key: String,
+    #[serde(default = "default_llm_openai_model")]
+    pub openai_model: String,
+    #[serde(default = "default_llm_yandex_base_url")]
+    pub yandex_base_url: String,
+    #[serde(default)]
+    pub yandex_api_key: String,
+    #[serde(default)]
+    pub yandex_folder_id: String,
+    #[serde(default = "default_llm_yandex_model_uri")]
+    pub yandex_model_uri: String,
+    #[serde(default = "default_llm_ollama_base_url")]
+    pub ollama_base_url: String,
+    #[serde(default = "default_llm_ollama_model")]
+    pub ollama_model: String,
+    #[serde(default = "default_llm_system_prompt")]
+    pub system_prompt: String,
+    #[serde(default = "default_llm_max_tokens")]
+    pub max_tokens: u32,
+    #[serde(default = "default_llm_temperature")]
+    pub temperature: f32,
+    #[serde(default)]
+    pub auto_suggest: bool,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: LlmProvider::default(),
+            openai_base_url: default_llm_openai_base_url(),
+            openai_api_key: String::new(),
+            openai_model: default_llm_openai_model(),
+            yandex_base_url: default_llm_yandex_base_url(),
+            yandex_api_key: String::new(),
+            yandex_folder_id: String::new(),
+            yandex_model_uri: default_llm_yandex_model_uri(),
+            ollama_base_url: default_llm_ollama_base_url(),
+            ollama_model: default_llm_ollama_model(),
+            system_prompt: default_llm_system_prompt(),
+            max_tokens: default_llm_max_tokens(),
+            temperature: default_llm_temperature(),
+            auto_suggest: false,
+        }
+    }
+}
+
 // ── UI / session configuration ───────────────────────────────────────────────
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -199,6 +276,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub display: DisplayConfig,
     #[serde(default)]
+    pub llm: LlmConfig,
+    #[serde(default)]
     pub ui: UiConfig,
     /// Optional: bind the hbbs UDP socket to this specific local port.
     /// Useful when `--bind-port` is passed on the CLI so we can reuse the
@@ -247,6 +326,7 @@ impl AppConfig {
             local_password: generate_numeric_token(6),
             security: SecurityConfig::default(),
             display: DisplayConfig::default(),
+            llm: LlmConfig::default(),
             ui: UiConfig::default(),
             udp_bind_port: 0,
             host_pk: Vec::new(),
@@ -285,6 +365,33 @@ fn default_target_fps() -> u32 {
 }
 fn default_true() -> bool {
     true
+}
+fn default_llm_openai_base_url() -> String {
+    "https://api.openai.com/v1/chat/completions".to_owned()
+}
+fn default_llm_openai_model() -> String {
+    "gpt-4o-mini".to_owned()
+}
+fn default_llm_yandex_base_url() -> String {
+    "https://llm.api.cloud.yandex.net/foundationModels/v1/completion".to_owned()
+}
+fn default_llm_yandex_model_uri() -> String {
+    "gpt://{folder_id}/yandexgpt/latest".to_owned()
+}
+fn default_llm_ollama_base_url() -> String {
+    "http://localhost:11434".to_owned()
+}
+fn default_llm_ollama_model() -> String {
+    "llama3.1".to_owned()
+}
+fn default_llm_system_prompt() -> String {
+    "Ты встроенный помощник терминала EvertyDesk Lite. Отвечай коротко, по делу, на русском. Если предлагаешь команду, объясни риск и не предлагай разрушительные действия без явного предупреждения.".to_owned()
+}
+fn default_llm_max_tokens() -> u32 {
+    700
+}
+fn default_llm_temperature() -> f32 {
+    0.2
 }
 
 pub fn config_path() -> PathBuf {

@@ -1,6 +1,6 @@
 use eframe::egui;
 
-use crate::settings::{self as settings_mod, AppConfig, CodecPreference};
+use crate::settings::{self as settings_mod, AppConfig, CodecPreference, LlmProvider};
 use crate::ui::widgets::{language_button, settings_section, settings_text_row};
 use crate::{
     install_host_service, start_installed_service, stop_installed_service, tr,
@@ -144,6 +144,10 @@ impl EvertyDeskApp {
 
                     ui.add_space(8.0);
 
+                    llm_settings_section(ui, selected_lang, draft);
+
+                    ui.add_space(8.0);
+
                     settings_section(
                         ui,
                         tr(selected_lang, "О программе", "About"),
@@ -239,8 +243,8 @@ impl EvertyDeskApp {
                 ui.add_space(3.0);
                 ui.label(
                     egui::RichText::new(self.text(
-                        "Язык, серверы, безопасность и параметры видео",
-                        "Language, servers, security and video options",
+                        "Язык, серверы, безопасность, видео и AI терминал",
+                        "Language, servers, security, video and AI terminal",
                     ))
                     .size(13.0)
                     .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
@@ -373,6 +377,10 @@ impl EvertyDeskApp {
             });
 
             ui.add_space(8.0);
+
+            llm_settings_section(ui, selected_lang, draft);
+
+            ui.add_space(8.0);
             settings_section(ui, tr(selected_lang, "Служба", "Service"), |ui| {
                 ui.label(tr(
                     selected_lang,
@@ -496,11 +504,176 @@ impl EvertyDeskApp {
     }
 }
 
+fn llm_settings_section(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut AppConfig) {
+    settings_section(
+        ui,
+        tr(selected_lang, "AI терминал", "AI terminal"),
+        |ui| {
+            ui.checkbox(
+                &mut draft.llm.enabled,
+                tr(
+                    selected_lang,
+                    "Включить LLM-помощник в терминале",
+                    "Enable LLM assistant in terminal",
+                ),
+            );
+            ui.checkbox(
+                &mut draft.llm.auto_suggest,
+                tr(
+                    selected_lang,
+                    "Автоматически анализировать вывод после команды",
+                    "Automatically analyze output after commands",
+                ),
+            );
+
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(tr(selected_lang, "Провайдер", "Provider"));
+                for provider in [
+                    LlmProvider::Ollama,
+                    LlmProvider::OpenAi,
+                    LlmProvider::YandexGpt,
+                ] {
+                    ui.selectable_value(&mut draft.llm.provider, provider, provider.label());
+                }
+            });
+
+            ui.add_space(8.0);
+            match draft.llm.provider {
+                LlmProvider::Ollama => {
+                    settings_text_row(
+                        ui,
+                        tr(selected_lang, "Ollama URL", "Ollama URL"),
+                        &mut draft.llm.ollama_base_url,
+                    );
+                    settings_text_row(
+                        ui,
+                        tr(selected_lang, "Модель", "Model"),
+                        &mut draft.llm.ollama_model,
+                    );
+                }
+                LlmProvider::OpenAi => {
+                    settings_text_row(
+                        ui,
+                        tr(selected_lang, "OpenAI endpoint", "OpenAI endpoint"),
+                        &mut draft.llm.openai_base_url,
+                    );
+                    settings_text_row(
+                        ui,
+                        tr(selected_lang, "Модель", "Model"),
+                        &mut draft.llm.openai_model,
+                    );
+                    settings_secret_row(
+                        ui,
+                        tr(selected_lang, "API key", "API key"),
+                        &mut draft.llm.openai_api_key,
+                    );
+                }
+                LlmProvider::YandexGpt => {
+                    settings_text_row(
+                        ui,
+                        tr(selected_lang, "Yandex endpoint", "Yandex endpoint"),
+                        &mut draft.llm.yandex_base_url,
+                    );
+                    settings_secret_row(
+                        ui,
+                        tr(selected_lang, "API key / IAM", "API key / IAM"),
+                        &mut draft.llm.yandex_api_key,
+                    );
+                    settings_text_row(
+                        ui,
+                        tr(selected_lang, "Folder ID", "Folder ID"),
+                        &mut draft.llm.yandex_folder_id,
+                    );
+                    settings_text_row(
+                        ui,
+                        tr(selected_lang, "Model URI", "Model URI"),
+                        &mut draft.llm.yandex_model_uri,
+                    );
+                    ui.label(
+                        egui::RichText::new(tr(
+                            selected_lang,
+                            "Для IAM token укажите значение с префиксом Bearer, для API key можно без префикса.",
+                            "For IAM token use the Bearer prefix; API key may be entered without a prefix.",
+                        ))
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                    );
+                }
+            }
+
+            ui.add_space(8.0);
+            settings_text_row(
+                ui,
+                tr(selected_lang, "Системный prompt", "System prompt"),
+                &mut draft.llm.system_prompt,
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.label(tr(selected_lang, "Лимит ответа", "Token limit"));
+                ui.add(
+                    egui::DragValue::new(&mut draft.llm.max_tokens)
+                        .clamp_range(128..=4096)
+                        .speed(32),
+                );
+                ui.add_space(16.0);
+                ui.label("Temperature");
+                ui.add(
+                    egui::Slider::new(&mut draft.llm.temperature, 0.0..=2.0)
+                        .show_value(true)
+                        .clamp_to_range(true),
+                );
+            });
+        },
+    );
+}
+
+fn settings_secret_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
+    let wide = ui.available_width() >= 520.0;
+    if wide {
+        ui.horizontal(|ui| {
+            ui.set_min_height(36.0);
+            ui.set_width(ui.available_width());
+            ui.add_sized(
+                egui::vec2(150.0, 24.0),
+                egui::Label::new(
+                    egui::RichText::new(label)
+                        .size(13.0)
+                        .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+                )
+                .wrap(false),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let width = ui.available_width().min(360.0);
+                ui.add_sized(
+                    egui::vec2(width, 34.0),
+                    egui::TextEdit::singleline(value)
+                        .password(true)
+                        .font(egui::TextStyle::Button),
+                );
+            });
+        });
+    } else {
+        ui.label(
+            egui::RichText::new(label)
+                .size(13.0)
+                .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+        );
+        ui.add_sized(
+            egui::vec2(ui.available_width(), 34.0),
+            egui::TextEdit::singleline(value)
+                .password(true)
+                .font(egui::TextStyle::Button),
+        );
+    }
+    ui.add_space(6.0);
+}
+
 fn default_config_from(config: &AppConfig) -> AppConfig {
     AppConfig {
         server: settings_mod::ServerConfig::default(),
         security: settings_mod::SecurityConfig::default(),
         display: settings_mod::DisplayConfig::default(),
+        llm: settings_mod::LlmConfig::default(),
         local_id: config.local_id.clone(),
         local_password: config.local_password.clone(),
         ui: config.ui.clone(),

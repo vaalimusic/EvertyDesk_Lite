@@ -7,6 +7,7 @@ mod address_book;
 mod capture;
 mod crypto;
 mod host;
+mod llm;
 mod rustdesk_proto;
 mod settings;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -550,6 +551,15 @@ struct EvertyDeskApp {
     shell_window_open: bool,
     shell_output: String,
     shell_input: String,
+    shell_history: Vec<String>,
+    shell_history_pos: Option<usize>,
+    shell_last_command: String,
+    terminal_goal: String,
+    terminal_ai_answer: String,
+    terminal_ai_status: Option<String>,
+    terminal_ai_rx: Option<Receiver<Result<String, String>>>,
+    terminal_auto_pending: bool,
+    terminal_auto_request_at: Option<Instant>,
     mode: AppMode,
     ui_lang: UiLang,
     new_contact_name: String,
@@ -758,6 +768,15 @@ impl EvertyDeskApp {
             shell_window_open: false,
             shell_output: String::new(),
             shell_input: String::new(),
+            shell_history: Vec::new(),
+            shell_history_pos: None,
+            shell_last_command: String::new(),
+            terminal_goal: String::new(),
+            terminal_ai_answer: String::new(),
+            terminal_ai_status: None,
+            terminal_ai_rx: None,
+            terminal_auto_pending: false,
+            terminal_auto_request_at: None,
             mode: AppMode::Connect,
             ui_lang: UiLang::Ru,
             new_contact_name: String::new(),
@@ -1143,9 +1162,9 @@ impl EvertyDeskApp {
             }
             SessionEvent::ShellOutput(text) => {
                 self.shell_output.push_str(&text);
-                if self.shell_output.len() > 80_000 {
-                    let drain = self.shell_output.len() - 80_000;
-                    self.shell_output.drain(..drain);
+                self.trim_shell_output();
+                if self.terminal_auto_pending {
+                    self.terminal_auto_request_at = Some(Instant::now());
                 }
             }
             SessionEvent::ShellClosed => {
@@ -1360,6 +1379,8 @@ impl eframe::App for EvertyDeskApp {
 impl EvertyDeskApp {
     fn update_egui(&mut self, ctx: &egui::Context) {
         self.poll_worker();
+        self.poll_terminal_ai();
+        self.maybe_request_terminal_auto_ai();
         self.poll_host_service();
         if let Some(image) = self.pending_image.take() {
             if let Some(texture) = self.remote_texture.as_mut() {
@@ -1378,6 +1399,7 @@ impl EvertyDeskApp {
             || self.connected
             || self.host_check_busy
             || self.remote_check_busy
+            || self.terminal_ai_rx.is_some()
             || self.host_state.is_online()
         {
             ctx.request_repaint_after(Duration::from_millis(33));
@@ -3474,64 +3496,6 @@ impl EvertyDeskApp {
             egui::CentralPanel::default().show(ctx, |ui| {
                 self.remote_screen_ui(ui);
             });
-        });
-    }
-
-    fn shell_window(&mut self, ctx: &egui::Context) {
-        let title = format!("EvertyDesk Console - {}", format_peer_id(&self.remote_id));
-        let viewport_id = egui::ViewportId::from_hash_of("evertydesk-lite-shell");
-        let builder = egui::ViewportBuilder::default()
-            .with_title(title)
-            .with_inner_size([820.0, 560.0])
-            .with_min_inner_size([560.0, 360.0]);
-
-        ctx.show_viewport_immediate(viewport_id, builder, |ctx, _class| {
-            if ctx.input(|input| input.viewport().close_requested()) {
-                self.send_command(SessionCommand::ShellStop);
-                self.disconnect_session("Консоль закрыта");
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                return;
-            }
-
-            egui::CentralPanel::default()
-                .frame(
-                    egui::Frame::none()
-                        .fill(egui::Color32::from_rgb(0x0B, 0x10, 0x1A))
-                        .inner_margin(egui::Margin::same(12.0)),
-                )
-                .show(ctx, |ui| {
-                    egui::ScrollArea::vertical()
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::TextEdit::multiline(&mut self.shell_output)
-                                    .font(egui::TextStyle::Monospace)
-                                    .text_color(egui::Color32::from_rgb(0xE8, 0xF1, 0xFF))
-                                    .desired_width(f32::INFINITY)
-                                    .desired_rows(24)
-                                    .interactive(false),
-                            );
-                        });
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        let response = ui.add(
-                            egui::TextEdit::singleline(&mut self.shell_input)
-                                .hint_text("command")
-                                .font(egui::TextStyle::Monospace)
-                                .desired_width(f32::INFINITY),
-                        );
-                        let send = response.lost_focus()
-                            && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                        if ui.button("Send").clicked() || send {
-                            let mut input = std::mem::take(&mut self.shell_input);
-                            if !input.ends_with('\n') {
-                                input.push('\n');
-                            }
-                            self.shell_output.push_str(&format!("> {input}"));
-                            self.send_command(SessionCommand::ShellInput(input));
-                        }
-                    });
-                });
         });
     }
 

@@ -224,6 +224,10 @@ The long-term target is a simple package flow for:
 - Astra Linux;
 - portable admin builds.
 
+## Documentation
+
+- [AI terminal setup](docs/terminal-llm.md)
+
 ## Roadmap
 
 Next planned direction:
