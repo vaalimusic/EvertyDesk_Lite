@@ -118,7 +118,7 @@ impl EvertyDeskApp {
 
             egui::CentralPanel::default()
                 .frame(
-                    egui::Frame::none()
+                    egui::Frame::NONE
                         .fill(egui::Color32::from_rgb(0x08, 0x0C, 0x12))
                         .inner_margin(egui::Margin::same(14)),
                 )
@@ -172,13 +172,13 @@ impl EvertyDeskApp {
                     ui.add_space(10.0);
 
                     let terminal_height = (ui.available_height() - 252.0).max(190.0);
-                    egui::Frame::none()
+                    egui::Frame::NONE
                         .fill(egui::Color32::from_rgb(0x05, 0x08, 0x0D))
                         .stroke(egui::Stroke::new(
                             1.0,
                             egui::Color32::from_rgb(0x1D, 0x2B, 0x3D),
                         ))
-                        .rounding(egui::Rounding::same(8))
+                        .corner_radius(egui::CornerRadius::same(8))
                         .inner_margin(egui::Margin::same(10))
                         .show(ui, |ui| {
                             egui::ScrollArea::vertical()
@@ -203,13 +203,13 @@ impl EvertyDeskApp {
 
                     ui.add_space(8.0);
 
-                    egui::Frame::none()
+                    egui::Frame::NONE
                         .fill(egui::Color32::from_rgb(0x0D, 0x14, 0x1F))
                         .stroke(egui::Stroke::new(
                             1.0,
                             egui::Color32::from_rgb(0x24, 0x34, 0x49),
                         ))
-                        .rounding(egui::Rounding::same(8))
+                        .corner_radius(egui::CornerRadius::same(8))
                         .inner_margin(egui::Margin::symmetric(10, 8))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
@@ -256,13 +256,13 @@ impl EvertyDeskApp {
                         });
 
                     ui.add_space(8.0);
-                    egui::Frame::none()
+                    egui::Frame::NONE
                         .fill(egui::Color32::from_rgb(0x0D, 0x13, 0x1D))
                         .stroke(egui::Stroke::new(
                             1.0,
                             egui::Color32::from_rgb(0x22, 0x30, 0x44),
                         ))
-                        .rounding(egui::Rounding::same(8))
+                        .corner_radius(egui::CornerRadius::same(8))
                         .inner_margin(egui::Margin::same(10))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
@@ -462,9 +462,9 @@ impl EvertyDeskApp {
 }
 
 fn terminal_badge(ui: &mut egui::Ui, text: &str, fill: egui::Color32) {
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(fill)
-        .rounding(egui::Rounding::same(12))
+        .corner_radius(egui::CornerRadius::same(12))
         .inner_margin(egui::Margin::symmetric(8, 4))
         .show(ui, |ui| {
             ui.label(
@@ -488,7 +488,7 @@ fn terminal_example_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
             1.0,
             egui::Color32::from_rgb(0x2B, 0x3C, 0x52),
         ))
-        .rounding(egui::Rounding::same(6)),
+        .corner_radius(egui::CornerRadius::same(6)),
     )
 }
 

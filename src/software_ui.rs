@@ -84,8 +84,8 @@ pub fn run_software_ui() -> Result<(), String> {
             &mut input_state,
         );
 
-        let output = ctx.run(raw_input, |ctx| {
-            app.update_egui(ctx);
+        let output = ctx.run_ui(raw_input, |ui| {
+            app.update_egui(ui.ctx());
         });
         let repaint_delay = output
             .viewport_output
@@ -142,7 +142,7 @@ fn configure_software_fonts(ctx: &egui::Context) {
     if let Some((name, data)) = load_cyrillic_font() {
         fonts
             .font_data
-            .insert(name.clone(), FontData::from_owned(data));
+            .insert(name.clone(), FontData::from_owned(data).into());
         for family in [FontFamily::Proportional, FontFamily::Monospace] {
             fonts
                 .families
@@ -326,9 +326,12 @@ fn collect_input(
 
     if let Some((x, y)) = window.get_scroll_wheel() {
         if x != 0.0 || y != 0.0 {
-            input
-                .events
-                .push(Event::Scroll(Vec2::new(x * 32.0, y * 32.0)));
+            input.events.push(Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: Vec2::new(x * 32.0, y * 32.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: input.modifiers,
+            });
         }
     }
 
@@ -457,9 +460,11 @@ fn map_key(key: MiniKey) -> Option<Key> {
 }
 
 fn handle_platform_output(output: &egui::PlatformOutput) {
-    if !output.copied_text.is_empty() {
-        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-            let _ = clipboard.set_text(output.copied_text.clone());
+    for command in &output.commands {
+        if let egui::OutputCommand::CopyText(text) = command {
+            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                let _ = clipboard.set_text(text.clone());
+            }
         }
     }
 }
@@ -483,10 +488,6 @@ impl SoftwarePainter {
             let image = image_delta.image;
             let (size, pixels) = match image {
                 ImageData::Color(image) => (image.size, image.pixels.clone()),
-                ImageData::Font(image) => {
-                    let pixels: Vec<Color32> = image.srgba_pixels(None).collect();
-                    (image.size, pixels)
-                }
             };
             if let Some(pos) = image_delta.pos {
                 if let Some(texture) = self.textures.get_mut(&id) {

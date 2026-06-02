@@ -1448,25 +1448,25 @@ impl EvertyDeskApp {
             self.incoming_approval_window(ctx);
         }
 
-        let screen_rect = ctx.screen_rect();
+        let screen_rect = ctx.content_rect();
         ctx.layer_painter(egui::LayerId::background()).rect_filled(
             screen_rect,
-            egui::Rounding::ZERO,
+            egui::CornerRadius::ZERO,
             egui::Color32::from_rgb(0xFB, 0xFC, 0xFE),
         );
 
         // ── Left sidebar: logo · navigation · settings ───────────────────────
-        egui::SidePanel::left("everty_sidebar")
+        egui::Panel::left("everty_sidebar")
             .resizable(false)
-            .exact_width(220.0)
+            .exact_size(220.0)
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(egui::Color32::from_rgb(0xF7, 0xF8, 0xFA))
                     .stroke(egui::Stroke::new(
                         1.0,
                         egui::Color32::from_rgb(0xEA, 0xEC, 0xF0),
                     ))
-                    .rounding(egui::Rounding::ZERO)
+                    .corner_radius(egui::CornerRadius::ZERO)
                     .inner_margin(egui::Margin::symmetric(18, 20))
                     .outer_margin(egui::Margin::ZERO),
             )
@@ -1474,7 +1474,7 @@ impl EvertyDeskApp {
 
         egui::CentralPanel::default()
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(egui::Color32::from_rgb(0xFB, 0xFC, 0xFE))
                     .inner_margin(egui::Margin {
                         left: 26,
@@ -1690,12 +1690,12 @@ impl EvertyDeskApp {
             let p = ui.painter();
             p.rect_filled(
                 rect,
-                egui::Rounding::same(12),
+                egui::CornerRadius::same(12),
                 egui::Color32::from_rgb(0xFC, 0xFD, 0xFF),
             );
             p.rect_stroke(
                 rect,
-                egui::Rounding::same(12),
+                egui::CornerRadius::same(12),
                 egui::Stroke::new(1.0, egui::Color32::from_rgb(0xE5, 0xE8, 0xEF)),
                 egui::StrokeKind::Inside,
             );
@@ -1808,10 +1808,10 @@ impl EvertyDeskApp {
         };
         // Left-align the (content-sized) pill.
         ui.horizontal(|ui| {
-            egui::Frame::none()
+            egui::Frame::NONE
                 .fill(Color32::from_rgb(0xFF, 0xFF, 0xFF))
                 .stroke(egui::Stroke::new(1.0, Color32::from_rgb(0xE3, 0xE6, 0xEC)))
-                .rounding(egui::Rounding::same(20))
+                .corner_radius(egui::CornerRadius::same(20))
                 .inner_margin(egui::Margin::symmetric(12, 6))
                 .show(ui, |ui| {
                     let (rect, _) =
@@ -2654,7 +2654,7 @@ impl EvertyDeskApp {
                     1.0,
                     egui::Color32::from_rgb(0xE3, 0xE6, 0xEC),
                 ))
-                .rounding(egui::Rounding::same(10));
+                .corner_radius(egui::CornerRadius::same(10));
                 if ui.add(button).clicked() {
                     if service_running {
                         self.stop_host_service();
@@ -2846,7 +2846,7 @@ impl EvertyDeskApp {
             self.wheel_accum = egui::Vec2::ZERO;
         }
 
-        egui::TopBottomPanel::top("software-remote-toolbar").show(ctx, |ui| {
+        egui::Panel::top("software-remote-toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui
                     .button("Back")
@@ -2877,7 +2877,7 @@ impl EvertyDeskApp {
                         .find(|d| d.index == self.selected_display)
                         .map(display_label)
                         .unwrap_or_else(|| format!("Display {}", self.selected_display + 1));
-                    egui::ComboBox::from_id_source("software-remote-display")
+                    egui::ComboBox::from_id_salt("software-remote-display")
                         .selected_text(selected_text)
                         .show_ui(ui, |ui| {
                             let displays = self.remote_displays.clone();
@@ -2951,7 +2951,7 @@ impl EvertyDeskApp {
                         .add(
                             egui::Slider::new(&mut refresh_ms, 50.0..=2000.0)
                                 .text("ms/frame")
-                                .clamp_to_range(true),
+                                .clamping(egui::SliderClamping::Always),
                         )
                         .changed()
                     {
@@ -2978,26 +2978,26 @@ impl EvertyDeskApp {
                     if ui.button("Ctrl+Alt+Del").clicked() {
                         self.send_command(SessionCommand::KeyControl(ControlKey::CtrlAltDel));
                         self.request_visual_refresh_after_input();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Lock screen").clicked() {
                         self.send_command(SessionCommand::KeyControl(ControlKey::LockScreen));
                         self.request_visual_refresh_after_input();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Save log").clicked() {
                         self.save_session_log_file();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button("Support report").clicked() {
                         self.save_support_report();
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
             });
         });
 
-        egui::TopBottomPanel::bottom("software-remote-statusbar").show(ctx, |ui| {
+        egui::Panel::bottom("software-remote-statusbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if self.remote_size[0] > 0 {
                     ui.label(
@@ -3168,7 +3168,7 @@ impl EvertyDeskApp {
             }
 
             // ── Toolbar ────────────────────────────────────────────────────────────
-            egui::TopBottomPanel::top("remote-toolbar").show(ctx, |ui| {
+            egui::Panel::top("remote-toolbar").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     // Display selector
                     if !self.remote_displays.is_empty() {
@@ -3178,7 +3178,7 @@ impl EvertyDeskApp {
                             .find(|d| d.index == self.selected_display)
                             .map(display_label)
                             .unwrap_or_else(|| format!("Дисплей {}", self.selected_display + 1));
-                        egui::ComboBox::from_id_source("remote-display")
+                        egui::ComboBox::from_id_salt("remote-display")
                             .selected_text(selected_text)
                             .show_ui(ui, |ui| {
                                 let displays = self.remote_displays.clone();
@@ -3258,7 +3258,7 @@ impl EvertyDeskApp {
                             .add(
                                 egui::Slider::new(&mut refresh_ms, 50.0..=2000.0)
                                     .text("мс / кадр")
-                                    .clamp_to_range(true),
+                                    .clamping(egui::SliderClamping::Always),
                             )
                             .changed()
                         {
@@ -3284,26 +3284,26 @@ impl EvertyDeskApp {
                         });
                         if ui.button("↺ Обновить поток").clicked() {
                             self.send_command(SessionCommand::RefreshVideo);
-                            ui.close_menu();
+                            ui.close();
                         }
                         if ui.button("Вставить буфер").clicked() {
                             self.paste_local_clipboard_to_remote();
-                            ui.close_menu();
+                            ui.close();
                         }
                         if ui.button("Сохранить кадр PNG").clicked() {
                             self.save_current_frame_png();
-                            ui.close_menu();
+                            ui.close();
                         }
                         if ui.button("Сохранить лог").clicked() {
                             self.save_session_log_file();
-                            ui.close_menu();
+                            ui.close();
                         }
                         if ui.button("Собрать отчёт").clicked() {
                             self.save_support_report();
-                            ui.close_menu();
+                            ui.close();
                         }
                         ui.separator();
-                        egui::ComboBox::from_id_source("coordinate-mode")
+                        egui::ComboBox::from_id_salt("coordinate-mode")
                             .selected_text(coordinate_mode_label(self.coordinate_mode))
                             .show_ui(ui, |ui| {
                                 for mode in [
@@ -3328,12 +3328,12 @@ impl EvertyDeskApp {
                         if ui.button("Ctrl+Alt+Del").clicked() {
                             self.send_command(SessionCommand::KeyControl(ControlKey::CtrlAltDel));
                             self.request_visual_refresh_after_input();
-                            ui.close_menu();
+                            ui.close();
                         }
                         if ui.button("🔒 Заблокировать экран").clicked() {
                             self.send_command(SessionCommand::KeyControl(ControlKey::LockScreen));
                             self.request_visual_refresh_after_input();
-                            ui.close_menu();
+                            ui.close();
                         }
                         ui.separator();
                         if let Some((x, y)) = self.last_mouse_pos {
@@ -3348,7 +3348,7 @@ impl EvertyDeskApp {
             });
 
             // ── Status bar (bottom) ─────────────────────────────────────────────────
-            egui::TopBottomPanel::bottom("remote-statusbar").show(ctx, |ui| {
+            egui::Panel::bottom("remote-statusbar").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     // Resolution
                     if self.remote_size[0] > 0 {
@@ -3729,7 +3729,7 @@ impl EvertyDeskApp {
             }
 
             // Keyboard (active when pointer is over screen, no UI widget has focus)
-            if self.remote_input_focused && !ui.ctx().wants_keyboard_input() {
+            if self.remote_input_focused && !ui.ctx().egui_wants_keyboard_input() {
                 self.handle_remote_keyboard(ui.ctx());
             }
         }
@@ -4392,7 +4392,7 @@ fn egui_key_to_text(key: egui::Key) -> Option<String> {
 }
 
 fn configure_style(ctx: &egui::Context) {
-    use egui::{Color32, Rounding, Stroke};
+    use egui::{Color32, CornerRadius, Stroke};
 
     let bg = Color32::from_rgb(0xFB, 0xFC, 0xFE);
     let panel = Color32::from_rgb(0xFF, 0xFF, 0xFF);
@@ -4415,7 +4415,7 @@ fn configure_style(ctx: &egui::Context) {
     visuals.selection.bg_fill = Color32::from_rgb(0xB9, 0xD7, 0xFF);
     visuals.selection.stroke = Stroke::new(1.0, Color32::from_rgb(0x3D, 0x73, 0xB8));
 
-    let rounding = Rounding::same(12);
+    let rounding = CornerRadius::same(12);
     visuals.widgets.noninteractive.bg_fill = card;
     visuals.widgets.noninteractive.weak_bg_fill = card;
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, border);
@@ -4447,13 +4447,13 @@ fn configure_style(ctx: &egui::Context) {
 
     ctx.set_visuals(visuals);
 
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.global_style()).clone();
     style.spacing.item_spacing = egui::vec2(12.0, 9.0);
     style.spacing.button_padding = egui::vec2(16.0, 9.0);
     style.spacing.menu_margin = egui::Margin::same(8);
     style.spacing.window_margin = egui::Margin::same(16);
     style.spacing.interact_size.y = 34.0;
-    ctx.set_style(style);
+    ctx.set_global_style(style);
 }
 
 #[allow(dead_code)]

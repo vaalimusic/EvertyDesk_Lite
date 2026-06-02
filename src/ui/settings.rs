@@ -703,7 +703,7 @@ fn llm_settings_section(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut Ap
                 ui.label(tr(selected_lang, "Лимит ответа", "Token limit"));
                 ui.add(
                     egui::DragValue::new(&mut draft.llm.max_tokens)
-                        .clamp_range(128..=4096)
+                        .range(128..=4096)
                         .speed(32),
                 );
                 ui.add_space(16.0);
@@ -711,7 +711,7 @@ fn llm_settings_section(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut Ap
                 ui.add(
                     egui::Slider::new(&mut draft.llm.temperature, 0.0..=2.0)
                         .show_value(true)
-                        .clamp_to_range(true),
+                        .clamping(egui::SliderClamping::Always),
                 );
             });
         },

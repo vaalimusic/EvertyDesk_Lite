@@ -746,13 +746,13 @@ impl EvertyDeskApp {
 }
 
 fn compact_panel_frame() -> egui::Frame {
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(egui::Color32::from_rgb(0xFF, 0xFF, 0xFF))
         .stroke(egui::Stroke::new(
             1.0,
             egui::Color32::from_rgb(0xE2, 0xE6, 0xEE),
         ))
-        .rounding(egui::Rounding::same(8))
+        .corner_radius(egui::CornerRadius::same(8))
         .inner_margin(egui::Margin::symmetric(12, 10))
 }
 
@@ -822,15 +822,15 @@ fn draw_contact_tile(
                 let menu = ui.menu_button("☰", |ui| {
                     if ui.button(tr(lang, "Информация", "Details")).clicked() {
                         open_details();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button(tr(lang, "Подключиться", "Connect")).clicked() {
                         connect();
-                        ui.close_menu();
+                        ui.close();
                     }
                     if ui.button(tr(lang, "Удалить", "Remove")).clicked() {
                         remove();
-                        ui.close_menu();
+                        ui.close();
                     }
                 });
                 menu.response.on_hover_text(tr(lang, "Действия", "Actions"));
@@ -888,7 +888,7 @@ fn draw_contact_tile(
 }
 
 fn contact_tile_frame(online: bool) -> egui::Frame {
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(if online {
             egui::Color32::from_rgb(0xFA, 0xFF, 0xFC)
         } else {
@@ -902,7 +902,7 @@ fn contact_tile_frame(online: bool) -> egui::Frame {
                 egui::Color32::from_rgb(0xE2, 0xE6, 0xEE)
             },
         ))
-        .rounding(egui::Rounding::same(8))
+        .corner_radius(egui::CornerRadius::same(8))
         .inner_margin(egui::Margin::same(10))
 }
 
