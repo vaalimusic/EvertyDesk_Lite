@@ -116,6 +116,12 @@ $env:EVERTYDESK_ENABLE_AV1_MF="1"
 - Added Media Foundation H.264/H.265 encode selection before software fallback.
 - Added Media Foundation encode status into codec diagnostics.
 - Disabled default AV1 advertisement after a real runtime crash on AV1 decode.
+- Added host-side encode telemetry logs for active backend, codec, bitrate,
+  packet bytes, keyframes, empty outputs, and fallback reason.
+- Surfaced the latest host video telemetry in the Host UI and headless host
+  output.
+- Added codec preference tests for conservative H.264/H.265/AV1/VP9 fallback
+  ordering.
 
 ## Remaining Work
 
@@ -134,8 +140,8 @@ Priority: high.
 - Improve SPS/PPS/VPS handling for H.264/H.265 streams.
 - Add robust recovery when MFT returns stream change, bad output type, or empty
   packets.
-- Add runtime telemetry for selected encoder, packet size, FPS, bitrate, dropped
-  frames, fallback reason.
+- Add richer UI history/graphs for runtime telemetry: selected encoder, packet
+  size, FPS, bitrate, dropped frames, and fallback reason.
 - Keep AV1 disabled by default until the MF AV1 decoder survives long sessions.
 - Build an isolated AV1/H.265 decoder test harness with captured packets.
 
@@ -181,7 +187,8 @@ Priority: high.
   - active decoder;
   - active encoder;
   - fallback reason.
-- Add tests for H.264/H.265/AV1/VP9 preference ordering.
+- Extend tests for H.264/H.265/AV1/VP9 preference ordering across host encoder
+  capability combinations.
 
 ### 5. Performance
 

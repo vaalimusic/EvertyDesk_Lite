@@ -120,6 +120,10 @@ pub enum HostEvent {
         peer_id: String,
         reason: String,
     },
+    VideoTelemetry {
+        summary: String,
+        fallback_reason: Option<String>,
+    },
     Log(String),
 }
 
@@ -1121,6 +1125,7 @@ fn relay_session_inner(
     let stop_v = stop.clone();
     let target_fps_v = shared_target_fps.clone();
     let encoder_preference = config.display.encoder;
+    let video_events = events.clone();
     let video_handle = thread::spawn(move || {
         video_loop(
             write_stream,
@@ -1128,6 +1133,7 @@ fn relay_session_inner(
             stop_v,
             target_fps_v,
             out_rx,
+            video_events,
             encoder_preference,
             codec_preference,
             client_video,
@@ -1167,6 +1173,7 @@ fn video_loop(
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     target_fps: Arc<AtomicU32>,
     outgoing: Receiver<PeerMessage>,
+    events: Sender<HostEvent>,
     encoder_preference: EncoderPreference,
     codec_preference: CodecPreference,
     client_video: ClientVideoSupport,
@@ -1238,15 +1245,42 @@ fn video_loop(
         (None, None, None) if cfg!(feature = "live-h264") => "OpenH264 software".to_owned(),
         (None, None, None) => "PNG fallback (live-h264 disabled)".to_owned(),
     };
-    eprintln!(
-        "[host-video] encoder policy: {}; active backend: {active_encoder_backend}",
-        crate::video::selected_encoder_label(encoder_preference),
+    host_log(
+        &events,
+        format!(
+            "Video encoder policy: {}; active backend: {active_encoder_backend}",
+            crate::video::selected_encoder_label(encoder_preference),
+        ),
     );
+
+    host_log(
+        &events,
+        format!(
+            "Video client decode: h264={} h265={} av1={} prefer={:?}; requested codec={:?}; target_fps={}",
+            client_video.h264,
+            client_video.h265,
+            client_video.av1,
+            client_video.prefer,
+            codec_preference,
+            target_fps.load(Ordering::Relaxed).clamp(5, MAX_TARGET_FPS)
+        ),
+    );
+
+    let _ = events.send(HostEvent::VideoTelemetry {
+        summary: format!(
+            "planned={} codec_pref={} fps={}",
+            active_encoder_backend,
+            codec_preference.label(),
+            target_fps.load(Ordering::Relaxed).clamp(5, MAX_TARGET_FPS)
+        ),
+        fallback_reason: None,
+    });
 
     let mut frame_idx: u64 = 0;
     let mut last_frame = Instant::now();
     let mut change_detector = FrameChangeDetector::default();
     let mut last_video_stats = Instant::now();
+    let mut encode_stats = VideoEncodeTelemetry::new(active_encoder_backend);
 
     while !stop.load(Ordering::Relaxed) {
         while let Ok(message) = outgoing.try_recv() {
@@ -1273,6 +1307,7 @@ fn video_loop(
             thread::sleep(frame_budget);
             continue;
         };
+        let bitrate = h264_target_bitrate_bps(cap_w, cap_h, fps);
 
         // Encode at native resolution (downscaling broke decoding on the phone
         // when the stream size differed from the announced DisplayInfo).
@@ -1280,23 +1315,20 @@ fn video_loop(
         let periodic_key = frame_idx % key_interval == 1;
         let decision = change_detector.decide(cap_w, cap_h, &bgra, periodic_key);
         if !decision.send {
-            if last_video_stats.elapsed() >= Duration::from_secs(10) {
-                let stats = change_detector.take_stats();
-                if stats.skipped_static > 0 {
-                    eprintln!(
-                        "[host-video] fps={} sent={} skipped_static={}",
-                        fps, stats.sent, stats.skipped_static
-                    );
-                }
-                last_video_stats = Instant::now();
-            }
             if let Some(delay) = change_detector.static_backoff_delay(fps) {
                 thread::sleep(delay);
             }
+            maybe_log_video_telemetry(
+                &events,
+                &mut encode_stats,
+                &mut change_detector,
+                &mut last_video_stats,
+                fps,
+                bitrate,
+            );
             continue;
         }
 
-        let bitrate = h264_target_bitrate_bps(cap_w, cap_h, fps);
         let tried_mf = desired_mf_codec.is_some() && !mf_disabled;
         let mut tried_hardware = tried_mf;
         let mut packet = if let Some(codec) = desired_mf_codec.filter(|_| !mf_disabled) {
@@ -1316,19 +1348,32 @@ fn video_loop(
                 }
                 Ok(None) => {
                     mf_empty_packets = mf_empty_packets.saturating_add(1);
+                    encode_stats.mark_empty(VideoEncoderBackend::MediaFoundation, codec);
                     if mf_empty_packets > fps.min(15) {
-                        eprintln!(
-                            "[host-video] Media Foundation {} produced no packets; falling back",
-                            codec.label()
+                        let reason = format!(
+                            "Media Foundation {} produced no packets for {} frames",
+                            codec.label(),
+                            mf_empty_packets
+                        );
+                        report_video_fallback(
+                            &events,
+                            &mut encode_stats,
+                            VideoEncoderBackend::MediaFoundation,
+                            codec,
+                            reason,
                         );
                         mf_disabled = true;
                     }
                     None
                 }
                 Err(err) => {
-                    eprintln!(
-                        "[host-video] Media Foundation {} failed: {err}; falling back",
-                        codec.label()
+                    let reason = format!("Media Foundation {} failed: {err}", codec.label());
+                    report_video_fallback(
+                        &events,
+                        &mut encode_stats,
+                        VideoEncoderBackend::MediaFoundation,
+                        codec,
+                        reason,
                     );
                     mf_disabled = true;
                     None
@@ -1360,19 +1405,32 @@ fn video_loop(
                     }
                     Ok(None) => {
                         videotoolbox_empty_packets = videotoolbox_empty_packets.saturating_add(1);
+                        encode_stats.mark_empty(VideoEncoderBackend::VideoToolbox, codec);
                         if videotoolbox_empty_packets > fps.min(15) {
-                            eprintln!(
-                                "[host-video] VideoToolbox {} produced no packets; falling back",
-                                codec.label()
+                            let reason = format!(
+                                "VideoToolbox {} produced no packets for {} frames",
+                                codec.label(),
+                                videotoolbox_empty_packets
+                            );
+                            report_video_fallback(
+                                &events,
+                                &mut encode_stats,
+                                VideoEncoderBackend::VideoToolbox,
+                                codec,
+                                reason,
                             );
                             videotoolbox_disabled = true;
                         }
                         None
                     }
                     Err(err) => {
-                        eprintln!(
-                            "[host-video] VideoToolbox {} failed: {err}; falling back",
-                            codec.label()
+                        let reason = format!("VideoToolbox {} failed: {err}", codec.label());
+                        report_video_fallback(
+                            &events,
+                            &mut encode_stats,
+                            VideoEncoderBackend::VideoToolbox,
+                            codec,
+                            reason,
                         );
                         videotoolbox_disabled = true;
                         None
@@ -1402,19 +1460,32 @@ fn video_loop(
                     }
                     Ok(None) => {
                         nvenc_empty_packets = nvenc_empty_packets.saturating_add(1);
+                        encode_stats.mark_empty(VideoEncoderBackend::Nvenc, codec);
                         if nvenc_empty_packets > fps.min(15) {
-                            eprintln!(
-                                "[host-video] NVENC {} produced no packets; falling back",
-                                codec.label()
+                            let reason = format!(
+                                "NVENC {} produced no packets for {} frames",
+                                codec.label(),
+                                nvenc_empty_packets
+                            );
+                            report_video_fallback(
+                                &events,
+                                &mut encode_stats,
+                                VideoEncoderBackend::Nvenc,
+                                codec,
+                                reason,
                             );
                             nvenc_disabled = true;
                         }
                         None
                     }
                     Err(err) => {
-                        eprintln!(
-                            "[host-video] NVENC {} failed: {err}; falling back",
-                            codec.label()
+                        let reason = format!("NVENC {} failed: {err}", codec.label());
+                        report_video_fallback(
+                            &events,
+                            &mut encode_stats,
+                            VideoEncoderBackend::Nvenc,
+                            codec,
+                            reason,
                         );
                         nvenc_disabled = true;
                         None
@@ -1445,6 +1516,7 @@ fn video_loop(
         };
 
         if let Some(packet) = packet {
+            encode_stats.mark_sent(&packet, cap_w, cap_h);
             let frame_msg = PeerMessage {
                 union: Some(peer_message::Union::VideoFrame(VideoFrame {
                     union: Some(packet.into_video_union()),
@@ -1460,6 +1532,14 @@ fn video_loop(
             }
             change_detector.mark_sent(cap_w, cap_h, &bgra);
         }
+        maybe_log_video_telemetry(
+            &events,
+            &mut encode_stats,
+            &mut change_detector,
+            &mut last_video_stats,
+            fps,
+            bitrate,
+        );
     }
     stop.store(true, Ordering::Relaxed);
 }
@@ -1494,6 +1574,84 @@ fn frame_budget(target_fps: u32) -> Duration {
     Duration::from_micros(1_000_000 / fps)
 }
 
+fn report_video_fallback(
+    events: &Sender<HostEvent>,
+    encode_stats: &mut VideoEncodeTelemetry,
+    backend: VideoEncoderBackend,
+    codec: crate::nvenc::NvencCodec,
+    reason: String,
+) {
+    encode_stats.mark_fallback(backend, codec, reason.clone());
+    let summary = format!(
+        "fallback backend={} codec={} reason={}",
+        backend.label(),
+        codec.label(),
+        reason
+    );
+    host_log(events, format!("Video {summary}; trying next backend"));
+    let _ = events.send(HostEvent::VideoTelemetry {
+        summary,
+        fallback_reason: Some(reason),
+    });
+}
+
+fn maybe_log_video_telemetry(
+    events: &Sender<HostEvent>,
+    encode_stats: &mut VideoEncodeTelemetry,
+    change_detector: &mut FrameChangeDetector,
+    last_video_stats: &mut Instant,
+    fps: u32,
+    bitrate: u32,
+) {
+    const TELEMETRY_INTERVAL: Duration = Duration::from_secs(10);
+    if last_video_stats.elapsed() < TELEMETRY_INTERVAL {
+        return;
+    }
+
+    let frame_stats = change_detector.take_stats();
+    let encode = encode_stats.reset_interval();
+    let backend = encode
+        .active_backend
+        .map(VideoEncoderBackend::label)
+        .unwrap_or("none");
+    let codec = encode
+        .active_codec
+        .map(crate::nvenc::NvencCodec::label)
+        .unwrap_or("none");
+    let avg_packet = if encode.sent_packets == 0 {
+        0
+    } else {
+        encode.sent_bytes / encode.sent_packets
+    };
+    let fallback = encode.last_fallback_reason.as_deref().unwrap_or("none");
+
+    let summary = format!(
+        "planned=\"{}\" active_backend={} codec={} size={}x{} fps={} bitrate={} sent={} skipped_static={} packets={} keyframes={} bytes={} avg_packet={} empty_outputs={} fallbacks={} last_fallback=\"{}\"",
+        encode_stats.planned_backend,
+        backend,
+        codec,
+        encode.width,
+        encode.height,
+        fps,
+        bitrate,
+        frame_stats.sent,
+        frame_stats.skipped_static,
+        encode.sent_packets,
+        encode.keyframes,
+        encode.sent_bytes,
+        avg_packet,
+        encode.empty_outputs,
+        encode.fallback_count,
+        fallback,
+    );
+    host_log(events, format!("Video telemetry: {summary}"));
+    let _ = events.send(HostEvent::VideoTelemetry {
+        summary,
+        fallback_reason: encode.last_fallback_reason,
+    });
+    *last_video_stats = Instant::now();
+}
+
 #[cfg_attr(not(feature = "live-h264"), allow(dead_code))]
 fn h264_target_bitrate_bps(width: u32, height: u32, fps: u32) -> u32 {
     const MIN_BPS: u64 = 800_000;
@@ -1526,6 +1684,113 @@ struct FrameSkipStats {
     skipped_static: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VideoEncoderBackend {
+    MediaFoundation,
+    VideoToolbox,
+    Nvenc,
+    OpenH264,
+}
+
+impl VideoEncoderBackend {
+    fn label(self) -> &'static str {
+        match self {
+            Self::MediaFoundation => "Media Foundation",
+            Self::VideoToolbox => "VideoToolbox",
+            Self::Nvenc => "NVENC",
+            Self::OpenH264 => "OpenH264",
+        }
+    }
+}
+
+#[derive(Default)]
+struct VideoEncodeTelemetry {
+    planned_backend: String,
+    active_backend: Option<VideoEncoderBackend>,
+    active_codec: Option<crate::nvenc::NvencCodec>,
+    width: u32,
+    height: u32,
+    sent_packets: u64,
+    sent_bytes: u64,
+    keyframes: u64,
+    empty_outputs: u64,
+    fallback_count: u64,
+    last_fallback_reason: Option<String>,
+}
+
+impl VideoEncodeTelemetry {
+    fn new(planned_backend: String) -> Self {
+        Self {
+            planned_backend,
+            ..Default::default()
+        }
+    }
+
+    fn mark_sent(&mut self, packet: &EncodedPacket, width: u32, height: u32) {
+        self.active_backend = Some(packet.backend);
+        self.active_codec = Some(packet.codec);
+        self.width = width;
+        self.height = height;
+        self.sent_packets = self.sent_packets.saturating_add(1);
+        self.sent_bytes = self.sent_bytes.saturating_add(packet.bytes.len() as u64);
+        if packet.key {
+            self.keyframes = self.keyframes.saturating_add(1);
+        }
+    }
+
+    fn mark_empty(&mut self, backend: VideoEncoderBackend, codec: crate::nvenc::NvencCodec) {
+        self.active_backend = Some(backend);
+        self.active_codec = Some(codec);
+        self.empty_outputs = self.empty_outputs.saturating_add(1);
+    }
+
+    fn mark_fallback(
+        &mut self,
+        backend: VideoEncoderBackend,
+        codec: crate::nvenc::NvencCodec,
+        reason: String,
+    ) {
+        self.active_backend = Some(backend);
+        self.active_codec = Some(codec);
+        self.fallback_count = self.fallback_count.saturating_add(1);
+        self.last_fallback_reason = Some(reason);
+    }
+
+    fn reset_interval(&mut self) -> VideoEncodeInterval {
+        let interval = VideoEncodeInterval {
+            active_backend: self.active_backend,
+            active_codec: self.active_codec,
+            width: self.width,
+            height: self.height,
+            sent_packets: self.sent_packets,
+            sent_bytes: self.sent_bytes,
+            keyframes: self.keyframes,
+            empty_outputs: self.empty_outputs,
+            fallback_count: self.fallback_count,
+            last_fallback_reason: self.last_fallback_reason.clone(),
+        };
+        self.sent_packets = 0;
+        self.sent_bytes = 0;
+        self.keyframes = 0;
+        self.empty_outputs = 0;
+        self.fallback_count = 0;
+        interval
+    }
+}
+
+struct VideoEncodeInterval {
+    active_backend: Option<VideoEncoderBackend>,
+    active_codec: Option<crate::nvenc::NvencCodec>,
+    width: u32,
+    height: u32,
+    sent_packets: u64,
+    sent_bytes: u64,
+    keyframes: u64,
+    empty_outputs: u64,
+    fallback_count: u64,
+    last_fallback_reason: Option<String>,
+}
+
 #[derive(Clone, Copy)]
 struct ClientVideoSupport {
     h264: bool,
@@ -1546,6 +1811,7 @@ impl Default for ClientVideoSupport {
 }
 
 struct EncodedPacket {
+    backend: VideoEncoderBackend,
     codec: crate::nvenc::NvencCodec,
     bytes: Vec<u8>,
     key: bool,
@@ -1554,6 +1820,7 @@ struct EncodedPacket {
 impl EncodedPacket {
     fn h264(packet: H264Packet) -> Self {
         Self {
+            backend: VideoEncoderBackend::OpenH264,
             codec: crate::nvenc::NvencCodec::H264,
             bytes: packet.bytes,
             key: packet.key,
@@ -1868,6 +2135,7 @@ fn encode_mf_frame(
     };
     encoder.encode_bgra(bgra, force_key).map(|packet| {
         packet.map(|packet| EncodedPacket {
+            backend: VideoEncoderBackend::MediaFoundation,
             codec: packet.codec,
             bytes: packet.bytes,
             key: packet.key,
@@ -1907,6 +2175,7 @@ fn encode_videotoolbox_frame(
     };
     encoder.encode_bgra(bgra).map(|packet| {
         packet.map(|packet| EncodedPacket {
+            backend: VideoEncoderBackend::VideoToolbox,
             codec: packet.codec,
             bytes: packet.bytes,
             key: packet.key,
@@ -1946,6 +2215,7 @@ fn encode_nvenc_frame(
     };
     encoder.encode_bgra(bgra).map(|packet| {
         packet.map(|packet| EncodedPacket {
+            backend: VideoEncoderBackend::Nvenc,
             codec: packet.codec,
             bytes: packet.bytes,
             key: packet.key,

@@ -387,6 +387,16 @@ fn run_headless_host() {
                 host::HostEvent::SessionEnded { peer_id, reason } => {
                     eprintln!("[host] Session ended: {peer_id} {reason}")
                 }
+                host::HostEvent::VideoTelemetry {
+                    summary,
+                    fallback_reason,
+                } => {
+                    if let Some(reason) = fallback_reason {
+                        eprintln!("[host-video] {summary}; fallback={reason}");
+                    } else {
+                        eprintln!("[host-video] {summary}");
+                    }
+                }
             }
         }
     }
@@ -497,6 +507,16 @@ fn run_cli_connect() -> Option<i32> {
                     host::HostEvent::SessionEnded { peer_id, reason } => {
                         eprintln!("[host] Session ended: {peer_id} {reason}")
                     }
+                    host::HostEvent::VideoTelemetry {
+                        summary,
+                        fallback_reason,
+                    } => {
+                        if let Some(reason) = fallback_reason {
+                            eprintln!("[host-video] {summary}; fallback={reason}");
+                        } else {
+                            eprintln!("[host-video] {summary}");
+                        }
+                    }
                 }
             }
         }
@@ -572,6 +592,7 @@ struct EvertyDeskApp {
     service_status: Option<String>,
     status: String,
     host_status: String,
+    host_video_status: Option<String>,
     last_error: Option<String>,
     connection_state: ConnectionState,
     worker: Option<Receiver<WorkerEvent>>,
@@ -795,6 +816,7 @@ impl EvertyDeskApp {
             contact_details_draft: None,
             service_status: None,
             host_status: "Доступ запускается автоматически.".to_owned(),
+            host_video_status: None,
             status: "Готово".to_owned(),
             last_error: None,
             connection_state: ConnectionState::Idle,
@@ -2308,6 +2330,15 @@ impl EvertyDeskApp {
                 }
             });
         });
+        if let Some(video_status) = &self.host_video_status {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(format!("Видео: {video_status}"))
+                    .monospace()
+                    .size(10.5)
+                    .color(egui::Color32::from_rgb(120, 130, 145)),
+            );
+        }
 
         // Pending incoming connection
         if let Some(peer_id) = self.host_pending_peer.clone() {
@@ -2674,6 +2705,15 @@ impl EvertyDeskApp {
                     .size(13.0)
                     .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
             );
+            if let Some(video_status) = &self.host_video_status {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(format!("Video: {video_status}"))
+                        .monospace()
+                        .size(10.5)
+                        .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                );
+            }
         });
 
         ui.add_space(24.0);
@@ -2718,6 +2758,7 @@ impl EvertyDeskApp {
         self.host_log
             .push(format!("[{}] Запуск хост-сервиса...", timestamp_hms()));
         self.host_state = HostState::Connecting;
+        self.host_video_status = None;
         self.host_service = Some(HostService::start(self.config.clone()));
     }
 
@@ -2729,6 +2770,7 @@ impl EvertyDeskApp {
         }
         self.host_state = HostState::Idle;
         self.host_pending_peer = None;
+        self.host_video_status = None;
     }
 
     fn poll_host_service(&mut self) {
@@ -2776,12 +2818,23 @@ impl EvertyDeskApp {
                     .push(format!("[{}] Сессия с {peer_id} начата", timestamp_hms()));
                 self.host_pending_peer = None;
                 self.host_status = format!("Connected: {peer_id}");
+                self.host_video_status = None;
             }
             HostEvent::SessionEnded { peer_id, reason } => {
                 self.host_log.push(format!(
                     "[{}] Сессия с {peer_id} завершена {reason}",
                     timestamp_hms(),
                 ));
+                self.host_video_status = None;
+            }
+            HostEvent::VideoTelemetry {
+                summary,
+                fallback_reason,
+            } => {
+                self.host_video_status = Some(compact_host_video_status(&summary));
+                if let Some(reason) = fallback_reason {
+                    self.host_status = format!("Video fallback: {reason}");
+                }
             }
             HostEvent::Log(msg) => {
                 self.host_log.push(format!("[{}] {msg}", timestamp_hms()));
@@ -4272,6 +4325,43 @@ fn timestamp_hms() -> String {
         (secs / 60) % 60,
         secs % 60
     )
+}
+
+fn compact_host_video_status(summary: &str) -> String {
+    let mut parts = Vec::new();
+    for key in [
+        "active_backend",
+        "codec",
+        "size",
+        "fps",
+        "bitrate",
+        "packets",
+        "avg_packet",
+        "fallbacks",
+        "reason",
+    ] {
+        if let Some(value) = telemetry_value(summary, key) {
+            parts.push(format!("{key}={value}"));
+        }
+    }
+    if parts.is_empty() {
+        summary.chars().take(160).collect()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn telemetry_value<'a>(summary: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("{key}=");
+    let start = summary.find(&needle)? + needle.len();
+    let rest = &summary[start..];
+    if let Some(stripped) = rest.strip_prefix('"') {
+        let end = stripped.find('"')?;
+        Some(&stripped[..end])
+    } else {
+        let end = rest.find(' ').unwrap_or(rest.len());
+        Some(&rest[..end])
+    }
 }
 
 /// Format 9-digit peer ID as "XXX XXX XXX" (like RustDesk).

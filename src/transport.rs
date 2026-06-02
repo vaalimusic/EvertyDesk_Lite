@@ -3149,6 +3149,22 @@ mod tests {
     }
 
     #[test]
+    fn explicit_codec_preference_falls_back_to_supported_decoder() {
+        assert_eq!(
+            preferred_codec(CodecPreference::H265, true, false, false, true) as i32,
+            PreferCodec::H264 as i32
+        );
+        assert_eq!(
+            preferred_codec(CodecPreference::Av1, true, true, false, true) as i32,
+            PreferCodec::H265 as i32
+        );
+        assert_eq!(
+            preferred_codec(CodecPreference::Vp9, true, false, false, false) as i32,
+            PreferCodec::H264 as i32
+        );
+    }
+
+    #[test]
     fn decoder_dimensions_use_active_display_with_first_display_fallback() {
         let displays = vec![
             RemoteDisplay {

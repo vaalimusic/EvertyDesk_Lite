@@ -47,6 +47,19 @@ The host selection order is:
 H.265 is selected only when both sides support it. H.264 remains the safest
 default path.
 
+Host sessions now emit periodic encode telemetry to logs:
+
+- planned and active encoder backend;
+- active codec;
+- frame size, target FPS, and target bitrate;
+- sent packets, bytes, average packet size, and keyframes;
+- empty encoder outputs;
+- hardware/native fallback reason.
+
+The latest host video telemetry is also surfaced in the Host UI and in
+headless host output. Full per-interval details remain copyable from the host
+diagnostics log.
+
 ## NVENC
 
 The app currently detects NVIDIA support in two layers:
@@ -112,7 +125,7 @@ runtime libraries.
 - Add Media Foundation CodecAPI controls for bitrate, GOP, low latency, and
   force-keyframe.
 - Add better SPS/PPS/VPS handling for H.264/H.265.
-- Add per-session codec telemetry.
+- Add richer per-session codec telemetry history/graphs in the UI.
 - Add D3D11/async MFT support for true hardware Media Foundation paths.
 - Add direct NVENC encoder backend.
 - Add captured-packet tests for H.265 and AV1 decoder stability.
