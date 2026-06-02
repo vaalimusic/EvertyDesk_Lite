@@ -100,6 +100,7 @@ impl EvertyDeskApp {
         self.shell_output.drain(..split);
     }
 
+    #[allow(deprecated)]
     pub(crate) fn shell_window(&mut self, ctx: &egui::Context) {
         let title = format!("EvertyDesk Terminal - {}", format_peer_id(&self.remote_id));
         let viewport_id = egui::ViewportId::from_hash_of("evertydesk-lite-shell");

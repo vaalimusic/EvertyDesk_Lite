@@ -8,6 +8,8 @@ mod capture;
 mod crypto;
 mod host;
 mod llm;
+mod mf_encode;
+mod mf_video;
 mod nvenc;
 mod rustdesk_proto;
 mod settings;
@@ -1393,6 +1395,7 @@ impl eframe::App for EvertyDeskApp {
 }
 
 impl EvertyDeskApp {
+    #[allow(deprecated)]
     fn update_egui(&mut self, ctx: &egui::Context) {
         self.poll_worker();
         self.poll_terminal_ai();
@@ -2838,6 +2841,7 @@ impl EvertyDeskApp {
         self.worker = Some(rx);
     }
 
+    #[allow(deprecated)]
     fn remote_viewer_inline(&mut self, ctx: &egui::Context) {
         if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.remote_input_focused = false;
@@ -3127,6 +3131,7 @@ impl EvertyDeskApp {
         });
     }
 
+    #[allow(deprecated)]
     fn remote_viewer_window(&mut self, ctx: &egui::Context) {
         let title = {
             let id = if self.remote_id.trim().is_empty() {

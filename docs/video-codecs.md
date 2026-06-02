@@ -1,66 +1,118 @@
-# Video codecs and hardware encoders
+# Video codecs and native encoder backends
 
-EvertyDesk Lite negotiates live-video codecs through RustDesk-compatible `SupportedDecoding`.
+EvertyDesk Lite negotiates live-video codecs through RustDesk-compatible
+`SupportedDecoding`. The rule is conservative: advertise a codec only when the
+local build has a decoder path that is expected to survive real sessions.
 
-## Current runtime behavior
+## Current Runtime Behavior
 
-- `Auto` prefers modern codecs only when the local build has a real decoder backend.
-- H264 is available through OpenH264 when the `live-h264` feature is enabled.
-- VP9 is available through libvpx, system libvpx, or Windows Media Foundation depending on build features.
-- H265 and AV1 are present in the protocol and settings, but are not advertised as decodable until a real decoder backend is wired in.
-- If a server still sends unsupported H265/AV1/VP8/VP9, the client requests a supported fallback and keeps screenshot refresh alive.
+- H.264 is available through OpenH264 when `live-h264` is enabled.
+- VP9 is available through libvpx, system libvpx, or Windows Media Foundation,
+  depending on build features.
+- H.265 decode is available through Windows Media Foundation on Windows builds
+  with `live-vp9-mf`.
+- AV1 decode probing exists, but AV1 is not advertised by default because the
+  current Windows Media Foundation AV1 path can crash native MFTs on some
+  streams.
+- If the server sends an unsupported codec anyway, the client treats it as
+  skipped video, keeps screenshot refresh alive, and asks for fallback.
+
+Experimental AV1 decode can be enabled manually:
+
+```powershell
+$env:EVERTYDESK_ENABLE_AV1_MF="1"
+cargo run
+```
+
+## Windows Media Foundation Encode
+
+The first direct native encoder backend is `src/mf_encode.rs`.
+
+It does not start an external encoder process. It:
+
+- receives BGRA frames from screen capture;
+- converts BGRA to NV12;
+- configures a Media Foundation encoder MFT;
+- emits H.264 or H.265 packets;
+- normalizes length-prefixed H.264/H.265 packets to Annex-B when needed;
+- falls back to OpenH264 when startup/output fails.
+
+The host selection order is:
+
+1. Media Foundation H.264/H.265 when available and allowed by client capability.
+2. Platform-specific direct hardware backend placeholders.
+3. OpenH264 software H.264.
+4. Screenshot fallback when live video is unavailable.
+
+H.265 is selected only when both sides support it. H.264 remains the safest
+default path.
 
 ## NVENC
 
-The app detects NVENC on two levels:
+The app currently detects NVIDIA support in two layers:
 
-- `NvEncodeAPI` runtime probe through a Rust FFI wrapper around `NvEncodeAPICreateInstance`.
-- Packet encoder availability through `ffmpeg -encoders` (`h264_nvenc`, `hevc_nvenc`, `av1_nvenc`).
+- `NvEncodeAPI` runtime probe through a Rust FFI wrapper.
+- NVIDIA GPU presence through runtime diagnostics.
 
-The result is shown in the video settings and status label. If the FFI probe works but the ffmpeg adapter is missing, the app reports that explicitly and keeps using software H264.
+The direct NVENC encoder backend is still planned. The intended path is:
 
-On macOS, NVENC is intentionally disabled and the app uses software H264/other compiled software paths. NVIDIA does not provide the NVENC runtime used here for current macOS builds, so Mac launch remains independent of the SDK folder.
+- load `nvEncodeAPI64.dll` dynamically on Windows;
+- avoid hard-linking portable builds to the SDK;
+- start with CPU/NV12 H.264;
+- add H.265;
+- add AV1 only after AV1 decode is stable;
+- later add D3D11 interop for lower-copy capture/encode.
 
-The repository can also discover NVIDIA Video Codec SDK automatically. Put the SDK in the project root as `Video_Codec_SDK_*` or set one of:
+The NVIDIA Video Codec SDK can be discovered by the build script for headers
+and version diagnostics. Put it in the project root as `Video_Codec_SDK_*` or
+set one of:
 
 - `EVERTYDESK_NV_CODEC_SDK`
 - `NV_CODEC_SDK`
 - `NVIDIA_VIDEO_CODEC_SDK`
 
-The build script checks for `Interface/nvEncodeAPI.h` and exposes the detected SDK path/version to the Rust code. Feature `live-nvenc-sdk` enables the `NvEncodeAPI` FFI probe, but does not hard-link the final binary to NVIDIA SDK stubs. The driver library is loaded dynamically at runtime, so portable builds still start on machines without NVIDIA.
-
-## Host encoder selection
-
-Host streaming now has a backend selector:
-
-- `Software` always uses OpenH264 when `live-h264` is enabled.
-- `Auto` / `NVENC` try the ffmpeg-NVENC adapter first when the requested codec is supported by both the host runtime and the connected client.
-- If NVENC startup, packet reading, or frame writing fails, the session falls back to OpenH264 without disconnecting.
-
-The ffmpeg-NVENC adapter accepts BGRA capture frames and emits RustDesk-compatible packet payloads:
-
-- H264 and H265 are emitted as Annex-B access units split by Access Unit Delimiters.
-- AV1 is emitted through IVF output; the adapter strips IVF container headers and sends the raw AV1 frame payload.
-
-Do not advertise H265 or AV1 support until both sides can decode the selected codec reliably.
+The current accelerated Windows path is Media Foundation, not direct NVENC.
 
 ## macOS VideoToolbox
 
-Apple Silicon and modern Intel Macs expose hardware video encode through
-VideoToolbox. EvertyDesk Lite treats it as a separate hardware backend from
-NVENC:
+VideoToolbox is the planned native macOS hardware encoder backend.
 
-- macOS `Auto` encoder selection tries VideoToolbox before software H264.
-- The explicit hardware encoder option is labeled `VideoToolbox` on macOS.
-- Runtime detection uses `ffmpeg -encoders` and looks for
-  `h264_videotoolbox` / `hevc_videotoolbox`.
-- If ffmpeg is not installed, VideoToolbox is reported as unavailable and the
-  session falls back to OpenH264 without disconnecting.
+Target behavior:
 
-The current VideoToolbox adapter accepts BGRA capture frames and emits
-RustDesk-compatible H264/H265 Annex-B access units. H264 is the preferred Mac
-hardware path until a native H265 decoder is wired into the client side.
+- use `VTCompressionSession`;
+- support H.264 first;
+- add H.265 when client decode is stable;
+- keep OpenH264 fallback;
+- keep application startup independent from optional hardware availability.
 
-Long term, a native `VTCompressionSession` backend can remove the ffmpeg
-runtime dependency while still keeping the app launchable as one portable
-binary on machines without optional hardware acceleration.
+## Linux Hardware Encode
+
+Linux hardware encode is planned but not first priority.
+
+Likely paths:
+
+- VA-API for Intel/AMD;
+- direct NVENC for NVIDIA;
+- software H.264 fallback;
+- VP9 through libvpx/system libvpx where available.
+
+Enterprise Linux builds must continue to work without optional hardware
+runtime libraries.
+
+## Compatibility Rules
+
+- Do not advertise AV1 by default until the decoder is stable.
+- Do not select H.265 unless both host and client support it.
+- Do not make hardware acceleration mandatory.
+- Do not remove screenshot fallback.
+- Any backend failure must downgrade without disconnecting the session.
+
+## Next Codec Tasks
+
+- Add Media Foundation CodecAPI controls for bitrate, GOP, low latency, and
+  force-keyframe.
+- Add better SPS/PPS/VPS handling for H.264/H.265.
+- Add per-session codec telemetry.
+- Add D3D11/async MFT support for true hardware Media Foundation paths.
+- Add direct NVENC encoder backend.
+- Add captured-packet tests for H.265 and AV1 decoder stability.

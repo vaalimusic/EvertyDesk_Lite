@@ -203,6 +203,22 @@ enum DecoderInput {
         queued_at: Instant,
         bytes: usize,
     },
+    H265 {
+        sid: String,
+        frames: EncodedVideoFrames,
+        queued_at: Instant,
+        bytes: usize,
+        width: u32,
+        height: u32,
+    },
+    Av1 {
+        sid: String,
+        frames: EncodedVideoFrames,
+        queued_at: Instant,
+        bytes: usize,
+        width: u32,
+        height: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -318,8 +334,9 @@ impl TransportClient {
         eprintln!("[session] Connected: {peer_stage}");
         eprintln!("[session] Displays from login: {}", displays.len());
         let _ = events.send(SessionEvent::Connected(peer_stage));
-        if !displays.is_empty() {
-            let _ = events.send(SessionEvent::Displays(displays.clone()));
+        let mut known_displays = displays;
+        if !known_displays.is_empty() {
+            let _ = events.send(SessionEvent::Displays(known_displays.clone()));
         }
         let (frame_tx, frame_rx) = mpsc::channel::<DecoderInput>();
         let (decoder_feedback_tx, decoder_feedback_rx) = mpsc::channel::<DecoderFeedback>();
@@ -344,6 +361,8 @@ impl TransportClient {
         let mut stable_decoded_frames = 0_u32;
         let mut h264_decode_failures = 0_u32;
         let mut vp9_decode_failures = 0_u32;
+        let mut h265_decode_failures = 0_u32;
+        let mut av1_decode_failures = 0_u32;
         let mut last_live_bootstrap = Instant::now();
         // Codec telemetry — reported to UI once on first encounter.
         let mut first_live_video_seen = false;
@@ -410,6 +429,8 @@ impl TransportClient {
                         match codec {
                             "H264" => h264_decode_failures += 1,
                             "VP9" => vp9_decode_failures += 1,
+                            "H265" => h265_decode_failures += 1,
+                            "AV1" => av1_decode_failures += 1,
                             _ => {}
                         }
                         let codec_switched = if codec == "VP9"
@@ -435,6 +456,28 @@ impl TransportClient {
                                 "H264 decode is unstable; switching stream preference to VP9"
                                     .to_owned(),
                             ));
+                            true
+                        } else if codec == "AV1"
+                            && av1_decode_failures >= 2
+                            && codec_preference != fallback_codec_preference()
+                        {
+                            codec_preference = fallback_codec_preference();
+                            av1_decode_failures = 0;
+                            let _ = events.send(SessionEvent::Info(format!(
+                                "AV1 decode is unstable; switching stream preference to {}",
+                                codec_preference.label()
+                            )));
+                            true
+                        } else if codec == "H265"
+                            && h265_decode_failures >= 2
+                            && codec_preference != fallback_codec_preference()
+                        {
+                            codec_preference = fallback_codec_preference();
+                            h265_decode_failures = 0;
+                            let _ = events.send(SessionEvent::Info(format!(
+                                "H265 decode is unstable; switching stream preference to {}",
+                                codec_preference.label()
+                            )));
                             true
                         } else {
                             false
@@ -485,6 +528,8 @@ impl TransportClient {
                         match codec {
                             "H264" => h264_decode_failures = 0,
                             "VP9" => vp9_decode_failures = 0,
+                            "H265" => h265_decode_failures = 0,
+                            "AV1" => av1_decode_failures = 0,
                             _ => {}
                         }
                         if adaptive_quality
@@ -730,6 +775,7 @@ impl TransportClient {
                             &mut relay,
                             &events,
                             &frame_tx,
+                            &mut known_displays,
                             current_display,
                             target_video_fps,
                             codec_preference,
@@ -1569,6 +1615,7 @@ fn handle_session_message(
     relay: &mut TcpStream,
     events: &Sender<SessionEvent>,
     frame_tx: &Sender<DecoderInput>,
+    known_displays: &mut Vec<RemoteDisplay>,
     current_display: i32,
     target_video_fps: i32,
     codec_preference: CodecPreference,
@@ -1675,20 +1722,74 @@ fn handle_session_message(
                     }
                 }
                 Some(video_frame::Union::H265s(frames)) => {
-                    let _ = (frame_tx, frames);
-                    let _ = events.send(SessionEvent::Info(
-                        "Server sent H265, but this build has no H265 decoder; requesting fallback"
-                            .to_owned(),
-                    ));
-                    Some(FrameSource::SkippedVideo { codec: "H265" })
+                    if crate::video::h265_available() {
+                        if let Some((width, height)) =
+                            decoder_dimensions(known_displays, current_display)
+                        {
+                            queue_encoded_frame(
+                                frame_tx,
+                                DecoderInput::H265 {
+                                    sid: encoded_sid("h265", &frames),
+                                    bytes: encoded_frame_bytes(&frames),
+                                    queued_at: Instant::now(),
+                                    frames,
+                                    width,
+                                    height,
+                                },
+                                events,
+                            );
+                            Some(FrameSource::Video)
+                        } else {
+                            let _ = (frame_tx, frames);
+                            let _ = events.send(SessionEvent::Info(
+                                "Server sent H265 before display size was known; requesting fallback"
+                                    .to_owned(),
+                            ));
+                            Some(FrameSource::SkippedVideo { codec: "H265" })
+                        }
+                    } else {
+                        let _ = (frame_tx, frames);
+                        let _ = events.send(SessionEvent::Info(
+                            "Server sent H265, but hardware H265 decode is unavailable; requesting fallback"
+                                .to_owned(),
+                        ));
+                        Some(FrameSource::SkippedVideo { codec: "H265" })
+                    }
                 }
                 Some(video_frame::Union::Av1s(frames)) => {
-                    let _ = (frame_tx, frames);
-                    let _ = events.send(SessionEvent::Info(
-                        "Server sent AV1, but this build has no AV1 decoder; requesting fallback"
-                            .to_owned(),
-                    ));
-                    Some(FrameSource::SkippedVideo { codec: "AV1" })
+                    if crate::video::av1_available() {
+                        if let Some((width, height)) =
+                            decoder_dimensions(known_displays, current_display)
+                        {
+                            queue_encoded_frame(
+                                frame_tx,
+                                DecoderInput::Av1 {
+                                    sid: encoded_sid("av1", &frames),
+                                    bytes: encoded_frame_bytes(&frames),
+                                    queued_at: Instant::now(),
+                                    frames,
+                                    width,
+                                    height,
+                                },
+                                events,
+                            );
+                            Some(FrameSource::Video)
+                        } else {
+                            let _ = (frame_tx, frames);
+                            let _ = events.send(SessionEvent::Info(
+                                "Server sent AV1 before display size was known; requesting fallback"
+                                    .to_owned(),
+                            ));
+                            Some(FrameSource::SkippedVideo { codec: "AV1" })
+                        }
+                    } else {
+                        let _ = (frame_tx, frames);
+                        let _ = events.send(SessionEvent::Info(
+                            "Server sent AV1, but hardware AV1 decode is unavailable; requesting fallback"
+                                .to_owned(),
+                        ));
+                        Some(FrameSource::SkippedVideo { codec: "AV1" })
+                    }
                 }
                 _ => {
                     let _ = events.send(SessionEvent::Info(format!(
@@ -1708,7 +1809,7 @@ fn handle_session_message(
             None
         }
         Some(peer_message::Union::LoginResponse(response)) => {
-            emit_displays_from_login_response(&response, events);
+            update_displays_from_login_response(&response, known_displays, events);
             let _ = send_selected_windows_session(relay, &response);
             let _ = send_video_start_messages(
                 relay,
@@ -1723,7 +1824,7 @@ fn handle_session_message(
             None
         }
         Some(peer_message::Union::PeerInfo(info)) => {
-            emit_displays_from_peer_info(&info, events);
+            update_displays_from_peer_info(&info, known_displays, events);
             let _ = send_selected_windows_session_from_peer_info(relay, &info);
             let _ = send_video_start_messages(
                 relay,
@@ -1887,21 +1988,26 @@ fn request_screenshot_once(
     }
 }
 
-fn emit_displays_from_login_response(
+fn update_displays_from_login_response(
     response: &crate::rustdesk_proto::LoginResponse,
+    known_displays: &mut Vec<RemoteDisplay>,
     events: &Sender<SessionEvent>,
 ) {
-    if let Some(crate::rustdesk_proto::login_response::Union::PeerInfo(info)) = &response.union {
-        emit_displays_from_peer_info(info, events);
+    let displays = displays_from_login_response(response);
+    if !displays.is_empty() {
+        *known_displays = displays.clone();
+        let _ = events.send(SessionEvent::Displays(displays));
     }
 }
 
-fn emit_displays_from_peer_info(
+fn update_displays_from_peer_info(
     info: &crate::rustdesk_proto::PeerInfo,
+    known_displays: &mut Vec<RemoteDisplay>,
     events: &Sender<SessionEvent>,
 ) {
     let displays = displays_from_peer_info(info);
     if !displays.is_empty() {
+        *known_displays = displays.clone();
         let _ = events.send(SessionEvent::Displays(displays));
     }
 }
@@ -1935,6 +2041,22 @@ fn displays_from_peer_info(info: &crate::rustdesk_proto::PeerInfo) -> Vec<Remote
         })
         .collect::<Vec<_>>();
     displays
+}
+
+fn decoder_dimensions(displays: &[RemoteDisplay], current_display: i32) -> Option<(u32, u32)> {
+    displays
+        .iter()
+        .find(|display| display.index == current_display)
+        .or_else(|| displays.first())
+        .and_then(|display| {
+            let width = u32::try_from(display.width).ok()?;
+            let height = u32::try_from(display.height).ok()?;
+            if width == 0 || height == 0 {
+                None
+            } else {
+                Some((width, height))
+            }
+        })
 }
 
 fn request_screenshot(
@@ -2014,6 +2136,13 @@ fn decode_frame_loop(
         eprintln!("[decoder] Windows MF VP9 decoder ready");
     }
 
+    let mut h265_mf: Option<crate::mf_video::MfVideoDecoder> = None;
+    let mut av1_mf: Option<crate::mf_video::MfVideoDecoder> = None;
+    let mf_status = crate::mf_video::mf_video_decode_status();
+    if mf_status.h265 || mf_status.av1 {
+        eprintln!("[decoder] {}", mf_status.label());
+    }
+
     while let Ok(first) = frame_rx.recv() {
         let mut batch = vec![first];
         while let Ok(next) = frame_rx.try_recv() {
@@ -2052,6 +2181,8 @@ fn decode_frame_loop(
                 &mut vp9,
                 &mut vp9_sys,
                 &mut vp9_mf,
+                &mut h265_mf,
+                &mut av1_mf,
             ) {
                 Ok(Some(event)) => {
                     let decode_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
@@ -2086,15 +2217,21 @@ impl DecoderInput {
     fn is_video(&self) -> bool {
         matches!(
             self,
-            Self::H264 { .. } | Self::Vp8 { .. } | Self::Vp9 { .. }
+            Self::H264 { .. }
+                | Self::Vp8 { .. }
+                | Self::Vp9 { .. }
+                | Self::H265 { .. }
+                | Self::Av1 { .. }
         )
     }
 
     fn has_keyframe(&self) -> bool {
         match self {
-            Self::H264 { frames, .. } | Self::Vp8 { frames, .. } | Self::Vp9 { frames, .. } => {
-                frames.frames.iter().any(|frame| frame.key)
-            }
+            Self::H264 { frames, .. }
+            | Self::Vp8 { frames, .. }
+            | Self::Vp9 { frames, .. }
+            | Self::H265 { frames, .. }
+            | Self::Av1 { frames, .. } => frames.frames.iter().any(|frame| frame.key),
             Self::Png { .. } => false,
         }
     }
@@ -2104,7 +2241,9 @@ impl DecoderInput {
             Self::Png { queued_at, .. }
             | Self::H264 { queued_at, .. }
             | Self::Vp8 { queued_at, .. }
-            | Self::Vp9 { queued_at, .. } => *queued_at,
+            | Self::Vp9 { queued_at, .. }
+            | Self::H265 { queued_at, .. }
+            | Self::Av1 { queued_at, .. } => *queued_at,
         }
     }
 
@@ -2113,7 +2252,9 @@ impl DecoderInput {
             Self::Png { bytes, .. }
             | Self::H264 { bytes, .. }
             | Self::Vp8 { bytes, .. }
-            | Self::Vp9 { bytes, .. } => *bytes,
+            | Self::Vp9 { bytes, .. }
+            | Self::H265 { bytes, .. }
+            | Self::Av1 { bytes, .. } => *bytes,
         }
     }
 
@@ -2123,6 +2264,8 @@ impl DecoderInput {
             Self::H264 { .. } => "H264",
             Self::Vp8 { .. } => "VP8",
             Self::Vp9 { .. } => "VP9",
+            Self::H265 { .. } => "H265",
+            Self::Av1 { .. } => "AV1",
         }
     }
 }
@@ -2157,6 +2300,8 @@ fn decode_one_frame(
     #[cfg(feature = "live-vpx-system")] vp9_sys: &mut Option<crate::vpx_system::Vp9Decoder>,
     #[cfg(not(feature = "live-vpx-system"))] _vp9_sys: &mut (),
     vp9_mf: &mut Option<crate::vp9_mf::Vp9MfDecoder>,
+    h265_mf: &mut Option<crate::mf_video::MfVideoDecoder>,
+    av1_mf: &mut Option<crate::mf_video::MfVideoDecoder>,
 ) -> Result<Option<SessionEvent>, String> {
     // Suppress unused-variable warning when live-vpx handles VP9 instead of MF.
     #[cfg(feature = "live-vpx")]
@@ -2277,7 +2422,78 @@ fn decode_one_frame(
                 }))
             }
         }
+        DecoderInput::H265 {
+            sid,
+            frames,
+            width,
+            height,
+            ..
+        } => decode_mf_video_rgba(
+            h265_mf,
+            crate::mf_video::MfVideoCodec::H265,
+            width,
+            height,
+            frames,
+        )
+        .map(|decoded| {
+            decoded.map(|(width, height, rgba)| SessionEvent::Frame {
+                sid,
+                codec: "H265".to_owned(),
+                width,
+                height,
+                rgba,
+            })
+        }),
+        DecoderInput::Av1 {
+            sid,
+            frames,
+            width,
+            height,
+            ..
+        } => decode_mf_video_rgba(
+            av1_mf,
+            crate::mf_video::MfVideoCodec::Av1,
+            width,
+            height,
+            frames,
+        )
+        .map(|decoded| {
+            decoded.map(|(width, height, rgba)| SessionEvent::Frame {
+                sid,
+                codec: "AV1".to_owned(),
+                width,
+                height,
+                rgba,
+            })
+        }),
     }
+}
+
+fn decode_mf_video_rgba(
+    decoder: &mut Option<crate::mf_video::MfVideoDecoder>,
+    codec: crate::mf_video::MfVideoCodec,
+    width: u32,
+    height: u32,
+    frames: EncodedVideoFrames,
+) -> Result<Option<(usize, usize, Vec<u8>)>, String> {
+    let recreate = decoder
+        .as_ref()
+        .map(|decoder| !decoder.matches(codec, width, height))
+        .unwrap_or(true);
+    if recreate {
+        *decoder = Some(crate::mf_video::MfVideoDecoder::new(codec, width, height)?);
+        eprintln!(
+            "[decoder] Media Foundation {} decoder started at {}x{}",
+            codec.label(),
+            width,
+            height
+        );
+    }
+
+    let decoder = decoder
+        .as_mut()
+        .ok_or_else(|| format!("{} decoder unavailable", codec.label()))?;
+    decoder.decode_packets(frames.frames.into_iter().map(|frame| frame.data))
 }
 
 #[cfg(feature = "live-h264")]
@@ -2930,6 +3146,34 @@ mod tests {
             preferred_codec(CodecPreference::Auto, true, true, true, true) as i32,
             PreferCodec::Av1 as i32
         );
+    }
+
+    #[test]
+    fn decoder_dimensions_use_active_display_with_first_display_fallback() {
+        let displays = vec![
+            RemoteDisplay {
+                index: 0,
+                name: "Built-in".to_owned(),
+                width: 1366,
+                height: 768,
+                x: 0,
+                y: 0,
+                cursor_embedded: false,
+            },
+            RemoteDisplay {
+                index: 2,
+                name: "External".to_owned(),
+                width: 1920,
+                height: 1080,
+                x: 1366,
+                y: 0,
+                cursor_embedded: false,
+            },
+        ];
+
+        assert_eq!(decoder_dimensions(&displays, 2), Some((1920, 1080)));
+        assert_eq!(decoder_dimensions(&displays, 9), Some((1366, 768)));
+        assert_eq!(decoder_dimensions(&[], 0), None);
     }
 
     #[test]

@@ -1203,27 +1203,40 @@ fn video_loop(
     let mut encoder: Option<()> = None;
     #[cfg(feature = "live-h264")]
     let mut yuv_frame = YuvFrame::default();
+    let desired_mf_codec =
+        choose_mf_encoder_codec(encoder_preference, codec_preference, client_video);
+    let mut mf_encoder: Option<crate::mf_encode::MfVideoEncoder> = None;
+    let mut mf_disabled = false;
+    let mut mf_empty_packets = 0_u32;
     let desired_videotoolbox_codec =
         choose_videotoolbox_codec(encoder_preference, codec_preference, client_video);
-    let mut videotoolbox_encoder: Option<crate::videotoolbox::FfmpegVideoToolboxEncoder> = None;
+    let mut videotoolbox_encoder: Option<crate::videotoolbox::VideoToolboxEncoder> = None;
     let mut videotoolbox_disabled = false;
     let mut videotoolbox_empty_packets = 0_u32;
     let desired_nvenc_codec =
         choose_nvenc_codec(encoder_preference, codec_preference, client_video);
-    let mut nvenc_encoder: Option<crate::nvenc::FfmpegNvencEncoder> = None;
+    let mut nvenc_encoder: Option<crate::nvenc::NvencEncoder> = None;
     let mut nvenc_disabled = false;
     let mut nvenc_empty_packets = 0_u32;
-    let active_encoder_backend = match (desired_videotoolbox_codec, desired_nvenc_codec) {
-        (Some(codec), _) => format!(
-            "VideoToolbox {} requested, ffmpeg adapter lazy-start",
+    let active_encoder_backend = match (
+        desired_mf_codec,
+        desired_videotoolbox_codec,
+        desired_nvenc_codec,
+    ) {
+        (Some(codec), _, _) => format!(
+            "Media Foundation {} requested, direct backend lazy-start",
             codec.label()
         ),
-        (None, Some(codec)) => format!(
-            "NVENC {} requested, ffmpeg adapter lazy-start",
+        (None, Some(codec), _) => format!(
+            "VideoToolbox {} requested, direct backend lazy-start",
             codec.label()
         ),
-        (None, None) if cfg!(feature = "live-h264") => "OpenH264 software".to_owned(),
-        (None, None) => "PNG fallback (live-h264 disabled)".to_owned(),
+        (None, None, Some(codec)) => format!(
+            "NVENC {} requested, direct backend lazy-start",
+            codec.label()
+        ),
+        (None, None, None) if cfg!(feature = "live-h264") => "OpenH264 software".to_owned(),
+        (None, None, None) => "PNG fallback (live-h264 disabled)".to_owned(),
     };
     eprintln!(
         "[host-video] encoder policy: {}; active backend: {active_encoder_backend}",
@@ -1284,10 +1297,54 @@ fn video_loop(
         }
 
         let bitrate = h264_target_bitrate_bps(cap_w, cap_h, fps);
-        let tried_videotoolbox = desired_videotoolbox_codec.is_some() && !videotoolbox_disabled;
-        let mut tried_hardware = tried_videotoolbox;
-        let mut packet =
-            if let Some(codec) = desired_videotoolbox_codec.filter(|_| !videotoolbox_disabled) {
+        let tried_mf = desired_mf_codec.is_some() && !mf_disabled;
+        let mut tried_hardware = tried_mf;
+        let mut packet = if let Some(codec) = desired_mf_codec.filter(|_| !mf_disabled) {
+            match encode_mf_frame(
+                &mut mf_encoder,
+                codec,
+                cap_w,
+                cap_h,
+                fps,
+                bitrate,
+                &bgra,
+                decision.force_key,
+            ) {
+                Ok(Some(packet)) => {
+                    mf_empty_packets = 0;
+                    Some(packet)
+                }
+                Ok(None) => {
+                    mf_empty_packets = mf_empty_packets.saturating_add(1);
+                    if mf_empty_packets > fps.min(15) {
+                        eprintln!(
+                            "[host-video] Media Foundation {} produced no packets; falling back",
+                            codec.label()
+                        );
+                        mf_disabled = true;
+                    }
+                    None
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[host-video] Media Foundation {} failed: {err}; falling back",
+                        codec.label()
+                    );
+                    mf_disabled = true;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let tried_videotoolbox =
+            packet.is_none() && desired_videotoolbox_codec.is_some() && !videotoolbox_disabled;
+        tried_hardware |= tried_videotoolbox;
+        if packet.is_none() {
+            packet = if let Some(codec) =
+                desired_videotoolbox_codec.filter(|_| !videotoolbox_disabled)
+            {
                 match encode_videotoolbox_frame(
                     &mut videotoolbox_encoder,
                     codec,
@@ -1324,6 +1381,7 @@ fn video_loop(
             } else {
                 None
             };
+        }
 
         let tried_nvenc = packet.is_none() && desired_nvenc_codec.is_some() && !nvenc_disabled;
         tried_hardware |= tried_nvenc;
@@ -1367,7 +1425,7 @@ fn video_loop(
             };
         }
 
-        let hardware_disabled = videotoolbox_disabled || nvenc_disabled;
+        let hardware_disabled = mf_disabled || videotoolbox_disabled || nvenc_disabled;
         let packet = if packet.is_none() && (!tried_hardware || hardware_disabled) {
             encode_h264_frame(
                 #[cfg(feature = "live-h264")]
@@ -1652,6 +1710,40 @@ fn client_video_support(login: &crate::rustdesk_proto::LoginRequest) -> ClientVi
     }
 }
 
+fn choose_mf_encoder_codec(
+    encoder_preference: EncoderPreference,
+    codec_preference: CodecPreference,
+    client: ClientVideoSupport,
+) -> Option<crate::nvenc::NvencCodec> {
+    if encoder_preference == EncoderPreference::Software {
+        return None;
+    }
+    let available = crate::mf_encode::mf_encoder_codecs();
+    if available.is_empty() {
+        return None;
+    }
+
+    let mut candidates = Vec::new();
+    match codec_preference {
+        CodecPreference::H265 => candidates.push(crate::nvenc::NvencCodec::H265),
+        CodecPreference::H264 => candidates.push(crate::nvenc::NvencCodec::H264),
+        CodecPreference::Auto => {
+            push_client_preferred_codec(&mut candidates, client.prefer);
+            candidates.extend([
+                crate::nvenc::NvencCodec::H265,
+                crate::nvenc::NvencCodec::H264,
+            ]);
+        }
+        CodecPreference::Av1 | CodecPreference::Vp9 => {
+            candidates.push(crate::nvenc::NvencCodec::H264);
+        }
+    }
+
+    candidates
+        .into_iter()
+        .find(|codec| available.contains(codec) && client_can_decode_hardware(client, *codec))
+}
+
 fn choose_videotoolbox_codec(
     encoder_preference: EncoderPreference,
     codec_preference: CodecPreference,
@@ -1660,7 +1752,7 @@ fn choose_videotoolbox_codec(
     if encoder_preference == EncoderPreference::Software {
         return None;
     }
-    let available = crate::videotoolbox::ffmpeg_videotoolbox_codecs();
+    let available = crate::videotoolbox::videotoolbox_codecs();
     if available.is_empty() {
         return None;
     }
@@ -1694,7 +1786,7 @@ fn choose_nvenc_codec(
     if encoder_preference == EncoderPreference::Software {
         return None;
     }
-    let available = crate::nvenc::ffmpeg_nvenc_codecs();
+    let available = crate::nvenc::nvenc_encoder_codecs();
     if available.is_empty() {
         return None;
     }
@@ -1743,8 +1835,48 @@ fn client_can_decode_hardware(client: ClientVideoSupport, codec: crate::nvenc::N
     }
 }
 
+fn encode_mf_frame(
+    encoder: &mut Option<crate::mf_encode::MfVideoEncoder>,
+    codec: crate::nvenc::NvencCodec,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate: u32,
+    bgra: &[u8],
+    force_key: bool,
+) -> Result<Option<EncodedPacket>, String> {
+    let fps = fps.clamp(5, MAX_TARGET_FPS);
+    let recreate = encoder
+        .as_ref()
+        .map(|encoder| !encoder.matches(codec, width, height, fps))
+        .unwrap_or(true);
+    if recreate {
+        *encoder = Some(crate::mf_encode::MfVideoEncoder::new(
+            codec, width, height, fps, bitrate,
+        )?);
+        eprintln!(
+            "[host-video] Media Foundation {} backend started at {}x{}@{}",
+            codec.label(),
+            width,
+            height,
+            fps
+        );
+    }
+
+    let Some(encoder) = encoder.as_mut() else {
+        return Ok(None);
+    };
+    encoder.encode_bgra(bgra, force_key).map(|packet| {
+        packet.map(|packet| EncodedPacket {
+            codec: packet.codec,
+            bytes: packet.bytes,
+            key: packet.key,
+        })
+    })
+}
+
 fn encode_videotoolbox_frame(
-    encoder: &mut Option<crate::videotoolbox::FfmpegVideoToolboxEncoder>,
+    encoder: &mut Option<crate::videotoolbox::VideoToolboxEncoder>,
     codec: crate::nvenc::NvencCodec,
     width: u32,
     height: u32,
@@ -1758,7 +1890,7 @@ fn encode_videotoolbox_frame(
         .map(|encoder| !encoder.matches(codec, width, height, fps))
         .unwrap_or(true);
     if recreate {
-        *encoder = Some(crate::videotoolbox::FfmpegVideoToolboxEncoder::new(
+        *encoder = Some(crate::videotoolbox::VideoToolboxEncoder::new(
             codec, width, height, fps, bitrate,
         )?);
         eprintln!(
@@ -1783,7 +1915,7 @@ fn encode_videotoolbox_frame(
 }
 
 fn encode_nvenc_frame(
-    encoder: &mut Option<crate::nvenc::FfmpegNvencEncoder>,
+    encoder: &mut Option<crate::nvenc::NvencEncoder>,
     codec: crate::nvenc::NvencCodec,
     width: u32,
     height: u32,
@@ -1797,7 +1929,7 @@ fn encode_nvenc_frame(
         .map(|encoder| !encoder.matches(codec, width, height, fps))
         .unwrap_or(true);
     if recreate {
-        *encoder = Some(crate::nvenc::FfmpegNvencEncoder::new(
+        *encoder = Some(crate::nvenc::NvencEncoder::new(
             codec, width, height, fps, bitrate,
         )?);
         eprintln!(

@@ -66,13 +66,11 @@ pub fn h264_available() -> bool {
 }
 
 pub fn h265_available() -> bool {
-    // Do not advertise H265 until a real decoder backend is wired in.
-    false
+    crate::mf_video::h265_decode_available()
 }
 
 pub fn av1_available() -> bool {
-    // Do not advertise AV1 until a real decoder backend is wired in.
-    false
+    crate::mf_video::av1_decode_available()
 }
 
 pub fn vp8_available() -> bool {
@@ -100,11 +98,14 @@ pub fn vp9_backend_label() -> &'static str {
 }
 
 pub fn build_codec_label() -> String {
+    let mf_encoder = crate::mf_encode::mf_encoder_status().label();
     let nvenc = nvenc_status().label();
     let videotoolbox = videotoolbox_status().label();
     format!(
-        "{}; {}; {}; {}",
+        "{}; {}; {}; {}; {}; {}",
         LiveVideoMode::current().label(),
+        crate::mf_video::mf_video_decode_status().label(),
+        mf_encoder,
         videotoolbox,
         nv_codec_sdk_label(),
         nvenc
@@ -117,8 +118,8 @@ pub enum NvencStatus {
         encoders: Vec<String>,
         api_ready: bool,
     },
-    ApiReadyNoFfmpeg,
-    NvidiaGpuButNoFfmpeg,
+    ApiReadyNoDirectEncoder,
+    NvidiaGpuNoDirectEncoder,
     UnsupportedPlatform,
     NotAvailable,
 }
@@ -145,8 +146,12 @@ impl NvencStatus {
                     format!("NVENC: {}; {api}", encoders.join(", "))
                 }
             }
-            Self::ApiReadyNoFfmpeg => "NVENC API ready, ffmpeg adapter missing".to_owned(),
-            Self::NvidiaGpuButNoFfmpeg => "NVENC: NVIDIA detected, ffmpeg missing".to_owned(),
+            Self::ApiReadyNoDirectEncoder => {
+                "NVENC API ready, direct encoder backend in progress".to_owned()
+            }
+            Self::NvidiaGpuNoDirectEncoder => {
+                "NVENC: NVIDIA detected, direct encoder backend in progress".to_owned()
+            }
             Self::UnsupportedPlatform => "NVENC: not supported on macOS".to_owned(),
             Self::NotAvailable => "NVENC: not available".to_owned(),
         }
@@ -161,9 +166,8 @@ pub fn nvenc_status() -> &'static NvencStatus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VideoToolboxStatus {
     Available { encoders: Vec<String> },
-    FfmpegMissing,
+    DirectEncoderUnavailable,
     UnsupportedPlatform,
-    NotAvailable,
 }
 
 impl VideoToolboxStatus {
@@ -179,9 +183,10 @@ impl VideoToolboxStatus {
             Self::Available { encoders } => {
                 format!("VideoToolbox: {}", encoders.join(", "))
             }
-            Self::FfmpegMissing => "VideoToolbox: ffmpeg missing".to_owned(),
+            Self::DirectEncoderUnavailable => {
+                "VideoToolbox: direct encoder backend in progress".to_owned()
+            }
             Self::UnsupportedPlatform => "VideoToolbox: macOS only".to_owned(),
-            Self::NotAvailable => "VideoToolbox: not available".to_owned(),
         }
     }
 }
@@ -193,6 +198,9 @@ pub fn videotoolbox_status() -> &'static VideoToolboxStatus {
 
 pub fn selected_encoder_label(preference: EncoderPreference) -> String {
     match preference {
+        EncoderPreference::Auto if !crate::mf_encode::mf_encoder_codecs().is_empty() => {
+            format!("Auto -> {}", crate::mf_encode::mf_encoder_status().label())
+        }
         EncoderPreference::Auto if videotoolbox_status().available() => {
             format!("Auto -> {}", videotoolbox_status().label())
         }
@@ -214,6 +222,12 @@ pub fn selected_encoder_label(preference: EncoderPreference) -> String {
         }
         EncoderPreference::Nvenc if nvenc_status().available() => {
             format!("{}; {}", nvenc_status().label(), nv_codec_sdk_label())
+        }
+        EncoderPreference::Nvenc if !crate::mf_encode::mf_encoder_codecs().is_empty() => {
+            format!(
+                "Native hardware requested -> {}",
+                crate::mf_encode::mf_encoder_status().label()
+            )
         }
         EncoderPreference::Nvenc if cfg!(target_os = "macos") => {
             format!(
@@ -254,17 +268,18 @@ fn detect_nvenc_status() -> NvencStatus {
         return NvencStatus::UnsupportedPlatform;
     }
     let api_ready = crate::nvenc::nvencode_api_available();
-    if let Some(encoders) = crate::nvenc::ffmpeg_nvenc_encoders() {
-        if !encoders.is_empty() {
-            return NvencStatus::Available {
-                encoders,
-                api_ready,
-            };
-        }
-    } else if api_ready {
-        return NvencStatus::ApiReadyNoFfmpeg;
-    } else if command_exists("nvidia-smi") {
-        return NvencStatus::NvidiaGpuButNoFfmpeg;
+    let encoders = crate::nvenc::nvenc_encoder_names().unwrap_or_default();
+    if !encoders.is_empty() {
+        return NvencStatus::Available {
+            encoders,
+            api_ready,
+        };
+    }
+    if api_ready {
+        return NvencStatus::ApiReadyNoDirectEncoder;
+    }
+    if command_exists("nvidia-smi") {
+        return NvencStatus::NvidiaGpuNoDirectEncoder;
     }
 
     NvencStatus::NotAvailable
@@ -274,11 +289,11 @@ fn detect_videotoolbox_status() -> VideoToolboxStatus {
     if !crate::videotoolbox::videotoolbox_supported_platform() {
         return VideoToolboxStatus::UnsupportedPlatform;
     }
-    let Some(encoders) = crate::videotoolbox::ffmpeg_videotoolbox_encoders() else {
-        return VideoToolboxStatus::FfmpegMissing;
+    let Some(encoders) = crate::videotoolbox::videotoolbox_encoder_names() else {
+        return VideoToolboxStatus::DirectEncoderUnavailable;
     };
     if encoders.is_empty() {
-        VideoToolboxStatus::NotAvailable
+        VideoToolboxStatus::DirectEncoderUnavailable
     } else {
         VideoToolboxStatus::Available { encoders }
     }
