@@ -4337,6 +4337,12 @@ fn compact_host_video_status(summary: &str) -> String {
         "bitrate",
         "packets",
         "avg_packet",
+        "capture_avg",
+        "capture_max",
+        "change_avg",
+        "encode_avg",
+        "encode_max",
+        "send_avg",
         "fallbacks",
         "reason",
     ] {

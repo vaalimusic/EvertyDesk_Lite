@@ -22,6 +22,9 @@ The product direction is:
 - Safe fallback to screenshots when live video is not available.
 - Terminal and operator automation as first-class support tools.
 - Direct native codec backends instead of external encoder processes.
+- A separate "interactive/game-grade" path for high-motion sessions: 60 FPS
+  target, low input latency, hardware capture/encode/decode where possible,
+  and graceful fallback when a machine cannot sustain it.
 
 ## Implemented
 
@@ -120,6 +123,10 @@ $env:EVERTYDESK_ENABLE_AV1_MF="1"
   packet bytes, keyframes, empty outputs, and fallback reason.
 - Surfaced the latest host video telemetry in the Host UI and headless host
   output.
+- Added host video stage timing telemetry for capture, change detection,
+  encode, and send phases.
+- Reduced frame-change detector memory copying by storing a sampled frame
+  signature instead of cloning the whole previous BGRA frame.
 - Added codec preference tests for conservative H.264/H.265/AV1/VP9 fallback
   ordering.
 
@@ -194,7 +201,12 @@ Priority: high.
 
 Priority: high.
 
+- Treat 2-3 FPS during window dragging as a pipeline bug, not an acceptable
+  fallback. Use telemetry first to identify whether the current bottleneck is
+  capture, BGRA/NV12 conversion, encode, relay send, client decode, or render.
 - Make BGRA -> NV12 conversion faster with row batching and optional SIMD.
+- Reuse capture buffers and platform capture objects; avoid per-frame
+  allocation of device contexts, bitmaps, and full-frame scratch buffers.
 - Add dirty-rectangle capture/encode where the host backend supports it.
 - Add adaptive bitrate from frame change density and measured relay throughput.
 - Add adaptive FPS floor/ceiling for static vs active screens.
@@ -202,7 +214,42 @@ Priority: high.
 - Measure CPU cost separately for capture, conversion, encode, network, decode,
   and render.
 
-### 6. Host/Service Mode
+### 6. Interactive/Game-Grade Streaming
+
+Priority: high.
+
+Target profile:
+
+- 1080p60 for ordinary desktop motion on modern machines.
+- 1080p60 game/video motion when hardware capture and hardware encode are
+  available.
+- End-to-end input-to-photon latency target below 80 ms on a local network.
+- No UI stutter when moving windows, scrolling, or playing video.
+
+Required architecture:
+
+- Windows: Desktop Duplication API or Windows Graphics Capture for low-copy
+  capture; D3D11 texture path into async Media Foundation/NVENC.
+- macOS: ScreenCaptureKit capture and `VTCompressionSession` encode.
+- Linux X11: XDamage/region tracking instead of full-screen polling.
+- Linux Wayland: PipeWire portal capture with damage/region metadata where
+  available.
+- Encode only changed regions when the codec/backend can accept it; otherwise
+  use dirty-region-driven bitrate/FPS decisions.
+- Move toward GPU texture upload/decode paths on the client, not repeated
+  full RGBA copies.
+- Add transport mode for high-motion sessions: lower buffering, explicit frame
+  dropping, frame pacing, and latency telemetry. Relay TCP remains the safe
+  compatibility path; low-latency UDP/QUIC/WebRTC-like transport is a separate
+  optional path.
+- Separate control/input priority from video traffic so mouse/keyboard remain
+  responsive during large frames.
+- Add a "Performance mode" profile in settings:
+  - Support mode: conservative, stable, lower CPU.
+  - Interactive mode: higher FPS, lower buffering.
+  - Game mode: lowest latency, hardware-only preference, aggressive frame drop.
+
+### 7. Host/Service Mode
 
 Priority: medium.
 
@@ -213,7 +260,7 @@ Priority: medium.
 - Linux X11/Wayland capture/input permissions.
 - Host logs with session IDs and approval decisions.
 
-### 7. Terminal and Automation
+### 8. Terminal and Automation
 
 Priority: medium.
 
@@ -226,7 +273,7 @@ Priority: medium.
 - Add automation run history.
 - Keep AI suggestions human-approved.
 
-### 8. API and Address Book
+### 9. API and Address Book
 
 Priority: medium.
 
@@ -236,7 +283,7 @@ Priority: medium.
 - Online status where the server exposes it.
 - Import/export contacts.
 
-### 9. Packaging and Diagnostics
+### 10. Packaging and Diagnostics
 
 Priority: medium.
 

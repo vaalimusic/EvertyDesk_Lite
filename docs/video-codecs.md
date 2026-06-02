@@ -53,6 +53,7 @@ Host sessions now emit periodic encode telemetry to logs:
 - active codec;
 - frame size, target FPS, and target bitrate;
 - sent packets, bytes, average packet size, and keyframes;
+- capture/change-detection/encode/send timings;
 - empty encoder outputs;
 - hardware/native fallback reason.
 
@@ -129,3 +130,6 @@ runtime libraries.
 - Add D3D11/async MFT support for true hardware Media Foundation paths.
 - Add direct NVENC encoder backend.
 - Add captured-packet tests for H.265 and AV1 decoder stability.
+- Add platform capture paths required for interactive/game-grade streaming:
+  Desktop Duplication/Windows Graphics Capture, macOS ScreenCaptureKit, Linux
+  XDamage/PipeWire.

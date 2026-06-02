@@ -1303,17 +1303,21 @@ fn video_loop(
         last_frame = Instant::now();
         frame_idx += 1;
 
+        let capture_started = Instant::now();
         let Some((cap_w, cap_h, bgra)) = crate::capture::capture_screen() else {
             thread::sleep(frame_budget);
             continue;
         };
+        encode_stats.mark_capture_ms(elapsed_ms(capture_started));
         let bitrate = h264_target_bitrate_bps(cap_w, cap_h, fps);
 
         // Encode at native resolution (downscaling broke decoding on the phone
         // when the stream size differed from the announced DisplayInfo).
         let key_interval = u64::from(fps.max(1) * 2);
         let periodic_key = frame_idx % key_interval == 1;
+        let change_started = Instant::now();
         let decision = change_detector.decide(cap_w, cap_h, &bgra, periodic_key);
+        encode_stats.mark_change_ms(elapsed_ms(change_started));
         if !decision.send {
             if let Some(delay) = change_detector.static_backoff_delay(fps) {
                 thread::sleep(delay);
@@ -1329,6 +1333,7 @@ fn video_loop(
             continue;
         }
 
+        let encode_started = Instant::now();
         let tried_mf = desired_mf_codec.is_some() && !mf_disabled;
         let mut tried_hardware = tried_mf;
         let mut packet = if let Some(codec) = desired_mf_codec.filter(|_| !mf_disabled) {
@@ -1514,9 +1519,11 @@ fn video_loop(
         } else {
             packet
         };
+        encode_stats.mark_encode_ms(elapsed_ms(encode_started));
 
         if let Some(packet) = packet {
             encode_stats.mark_sent(&packet, cap_w, cap_h);
+            let send_started = Instant::now();
             let frame_msg = PeerMessage {
                 union: Some(peer_message::Union::VideoFrame(VideoFrame {
                     union: Some(packet.into_video_union()),
@@ -1530,6 +1537,7 @@ fn video_loop(
             if send_framed(&mut stream, &payload).is_err() {
                 break;
             }
+            encode_stats.mark_send_ms(elapsed_ms(send_started));
             change_detector.mark_sent(cap_w, cap_h, &bgra);
         }
         maybe_log_video_telemetry(
@@ -1623,10 +1631,14 @@ fn maybe_log_video_telemetry(
     } else {
         encode.sent_bytes / encode.sent_packets
     };
+    let capture_avg = avg_ms(encode.capture_ms_total, encode.timing_samples);
+    let change_avg = avg_ms(encode.change_ms_total, encode.timing_samples);
+    let encode_avg = avg_ms(encode.encode_ms_total, encode.timing_samples);
+    let send_avg = avg_ms(encode.send_ms_total, encode.sent_packets);
     let fallback = encode.last_fallback_reason.as_deref().unwrap_or("none");
 
     let summary = format!(
-        "planned=\"{}\" active_backend={} codec={} size={}x{} fps={} bitrate={} sent={} skipped_static={} packets={} keyframes={} bytes={} avg_packet={} empty_outputs={} fallbacks={} last_fallback=\"{}\"",
+        "planned=\"{}\" active_backend={} codec={} size={}x{} fps={} bitrate={} sent={} skipped_static={} packets={} keyframes={} bytes={} avg_packet={} capture_avg={} capture_max={} change_avg={} change_max={} encode_avg={} encode_max={} send_avg={} send_max={} empty_outputs={} fallbacks={} last_fallback=\"{}\"",
         encode_stats.planned_backend,
         backend,
         codec,
@@ -1640,6 +1652,14 @@ fn maybe_log_video_telemetry(
         encode.keyframes,
         encode.sent_bytes,
         avg_packet,
+        capture_avg,
+        encode.capture_ms_max,
+        change_avg,
+        encode.change_ms_max,
+        encode_avg,
+        encode.encode_ms_max,
+        send_avg,
+        encode.send_ms_max,
         encode.empty_outputs,
         encode.fallback_count,
         fallback,
@@ -1650,6 +1670,18 @@ fn maybe_log_video_telemetry(
         fallback_reason: encode.last_fallback_reason,
     });
     *last_video_stats = Instant::now();
+}
+
+fn avg_ms(total: u64, count: u64) -> u64 {
+    if count == 0 {
+        0
+    } else {
+        total / count
+    }
+}
+
+fn elapsed_ms(start: Instant) -> u64 {
+    start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg_attr(not(feature = "live-h264"), allow(dead_code))]
@@ -1667,7 +1699,7 @@ fn h264_target_bitrate_bps(width: u32, height: u32, fps: u32) -> u32 {
 struct FrameChangeDetector {
     width: u32,
     height: u32,
-    last_sent_bgra: Vec<u8>,
+    last_sample_bgr: Vec<u8>,
     last_sent_at: Option<Instant>,
     consecutive_static_skips: u32,
     sent_since_log: u64,
@@ -1716,6 +1748,15 @@ struct VideoEncodeTelemetry {
     empty_outputs: u64,
     fallback_count: u64,
     last_fallback_reason: Option<String>,
+    timing_samples: u64,
+    capture_ms_total: u64,
+    capture_ms_max: u64,
+    change_ms_total: u64,
+    change_ms_max: u64,
+    encode_ms_total: u64,
+    encode_ms_max: u64,
+    send_ms_total: u64,
+    send_ms_max: u64,
 }
 
 impl VideoEncodeTelemetry {
@@ -1736,6 +1777,27 @@ impl VideoEncodeTelemetry {
         if packet.key {
             self.keyframes = self.keyframes.saturating_add(1);
         }
+    }
+
+    fn mark_capture_ms(&mut self, ms: u64) {
+        self.timing_samples = self.timing_samples.saturating_add(1);
+        self.capture_ms_total = self.capture_ms_total.saturating_add(ms);
+        self.capture_ms_max = self.capture_ms_max.max(ms);
+    }
+
+    fn mark_change_ms(&mut self, ms: u64) {
+        self.change_ms_total = self.change_ms_total.saturating_add(ms);
+        self.change_ms_max = self.change_ms_max.max(ms);
+    }
+
+    fn mark_encode_ms(&mut self, ms: u64) {
+        self.encode_ms_total = self.encode_ms_total.saturating_add(ms);
+        self.encode_ms_max = self.encode_ms_max.max(ms);
+    }
+
+    fn mark_send_ms(&mut self, ms: u64) {
+        self.send_ms_total = self.send_ms_total.saturating_add(ms);
+        self.send_ms_max = self.send_ms_max.max(ms);
     }
 
     fn mark_empty(&mut self, backend: VideoEncoderBackend, codec: crate::nvenc::NvencCodec) {
@@ -1768,12 +1830,30 @@ impl VideoEncodeTelemetry {
             empty_outputs: self.empty_outputs,
             fallback_count: self.fallback_count,
             last_fallback_reason: self.last_fallback_reason.clone(),
+            timing_samples: self.timing_samples,
+            capture_ms_total: self.capture_ms_total,
+            capture_ms_max: self.capture_ms_max,
+            change_ms_total: self.change_ms_total,
+            change_ms_max: self.change_ms_max,
+            encode_ms_total: self.encode_ms_total,
+            encode_ms_max: self.encode_ms_max,
+            send_ms_total: self.send_ms_total,
+            send_ms_max: self.send_ms_max,
         };
         self.sent_packets = 0;
         self.sent_bytes = 0;
         self.keyframes = 0;
         self.empty_outputs = 0;
         self.fallback_count = 0;
+        self.timing_samples = 0;
+        self.capture_ms_total = 0;
+        self.capture_ms_max = 0;
+        self.change_ms_total = 0;
+        self.change_ms_max = 0;
+        self.encode_ms_total = 0;
+        self.encode_ms_max = 0;
+        self.send_ms_total = 0;
+        self.send_ms_max = 0;
         interval
     }
 }
@@ -1789,6 +1869,15 @@ struct VideoEncodeInterval {
     empty_outputs: u64,
     fallback_count: u64,
     last_fallback_reason: Option<String>,
+    timing_samples: u64,
+    capture_ms_total: u64,
+    capture_ms_max: u64,
+    change_ms_total: u64,
+    change_ms_max: u64,
+    encode_ms_total: u64,
+    encode_ms_max: u64,
+    send_ms_total: u64,
+    send_ms_max: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -1853,8 +1942,7 @@ impl FrameChangeDetector {
     ) -> FrameDecision {
         const STATIC_REFRESH: Duration = Duration::from_secs(2);
 
-        let size_changed =
-            self.width != width || self.height != height || self.last_sent_bgra.len() != bgra.len();
+        let size_changed = self.width != width || self.height != height;
         let idle_refresh = self
             .last_sent_at
             .map(|instant| instant.elapsed() >= STATIC_REFRESH)
@@ -1879,8 +1967,7 @@ impl FrameChangeDetector {
     fn mark_sent(&mut self, width: u32, height: u32, bgra: &[u8]) {
         self.width = width;
         self.height = height;
-        self.last_sent_bgra.clear();
-        self.last_sent_bgra.extend_from_slice(bgra);
+        self.update_sample(width, height, bgra);
         self.last_sent_at = Some(Instant::now());
         self.consecutive_static_skips = 0;
         self.sent_since_log = self.sent_since_log.saturating_add(1);
@@ -1901,7 +1988,7 @@ impl FrameChangeDetector {
         const MIN_SMALL_CHANGE_SAMPLES: usize = 8;
         const MIN_LARGE_CHANGE_SAMPLES: usize = 24;
 
-        if self.last_sent_bgra.is_empty() || self.last_sent_bgra.len() != bgra.len() {
+        if self.last_sample_bgr.is_empty() {
             return true;
         }
 
@@ -1912,29 +1999,34 @@ impl FrameChangeDetector {
         }
 
         let pixels = width.saturating_mul(height);
-        let step = if pixels >= 3_000_000 { 6 } else { 4 };
+        let step = frame_sample_step(pixels);
         let mut total = 0usize;
         let mut changed = 0usize;
+        let mut sample = 0usize;
 
         for y in (0..height).step_by(step) {
             let row = y * width * 4;
             for x in (0..width).step_by(step) {
                 let offset = row + x * 4;
-                if offset + 2 >= bgra.len() || offset + 2 >= self.last_sent_bgra.len() {
-                    continue;
+                if offset + 2 >= bgra.len() || sample + 2 >= self.last_sample_bgr.len() {
+                    return true;
                 }
                 total += 1;
-                let db = bgra[offset].abs_diff(self.last_sent_bgra[offset]) as u32;
-                let dg = bgra[offset + 1].abs_diff(self.last_sent_bgra[offset + 1]) as u32;
-                let dr = bgra[offset + 2].abs_diff(self.last_sent_bgra[offset + 2]) as u32;
+                let db = bgra[offset].abs_diff(self.last_sample_bgr[sample]) as u32;
+                let dg = bgra[offset + 1].abs_diff(self.last_sample_bgr[sample + 1]) as u32;
+                let dr = bgra[offset + 2].abs_diff(self.last_sample_bgr[sample + 2]) as u32;
                 if db + dg + dr >= PIXEL_DIFF_THRESHOLD {
                     changed += 1;
                 }
+                sample += 3;
             }
         }
 
         if total == 0 {
             return false;
+        }
+        if sample != self.last_sample_bgr.len() {
+            return true;
         }
 
         let ratio_per_10k = changed.saturating_mul(10_000) / total;
@@ -1951,6 +2043,46 @@ impl FrameChangeDetector {
         } else {
             Some(Duration::from_millis(50))
         }
+    }
+
+    fn update_sample(&mut self, width: u32, height: u32, bgra: &[u8]) {
+        self.last_sample_bgr.clear();
+        let width = width as usize;
+        let height = height as usize;
+        if width == 0 || height == 0 {
+            return;
+        }
+        let step = frame_sample_step(width.saturating_mul(height));
+        let sample_w = width.div_ceil(step);
+        let sample_h = height.div_ceil(step);
+        self.last_sample_bgr
+            .reserve(sample_w.saturating_mul(sample_h).saturating_mul(3));
+        for y in (0..height).step_by(step) {
+            let row = y * width * 4;
+            for x in (0..width).step_by(step) {
+                let offset = row + x * 4;
+                if offset + 2 >= bgra.len() {
+                    return;
+                }
+                self.last_sample_bgr.extend_from_slice(&[
+                    bgra[offset],
+                    bgra[offset + 1],
+                    bgra[offset + 2],
+                ]);
+            }
+        }
+    }
+}
+
+fn frame_sample_step(pixels: usize) -> usize {
+    if pixels >= 8_000_000 {
+        12
+    } else if pixels >= 3_000_000 {
+        8
+    } else if pixels >= 1_000_000 {
+        6
+    } else {
+        4
     }
 }
 
