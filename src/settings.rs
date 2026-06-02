@@ -59,6 +59,8 @@ pub enum CodecPreference {
     #[default]
     Auto,
     H264,
+    H265,
+    Av1,
     Vp9,
 }
 
@@ -67,7 +69,28 @@ impl CodecPreference {
         match self {
             Self::Auto => "Авто",
             Self::H264 => "H264",
+            Self::H265 => "H265",
+            Self::Av1 => "AV1",
             Self::Vp9 => "VP9",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EncoderPreference {
+    #[default]
+    Auto,
+    Nvenc,
+    Software,
+}
+
+impl EncoderPreference {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Авто",
+            Self::Nvenc => "NVENC",
+            Self::Software => "Software",
         }
     }
 }
@@ -76,6 +99,8 @@ impl CodecPreference {
 pub struct DisplayConfig {
     #[serde(default)]
     pub codec: CodecPreference,
+    #[serde(default)]
+    pub encoder: EncoderPreference,
     #[serde(default = "default_target_fps")]
     pub target_fps: u32,
     #[serde(default = "default_adaptive_quality")]
@@ -88,6 +113,7 @@ impl Default for DisplayConfig {
     fn default() -> Self {
         Self {
             codec: CodecPreference::Auto,
+            encoder: EncoderPreference::Auto,
             target_fps: default_target_fps(),
             adaptive_quality: default_adaptive_quality(),
             min_fps: default_min_fps(),

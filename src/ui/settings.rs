@@ -1,6 +1,8 @@
 use eframe::egui;
 
-use crate::settings::{self as settings_mod, AppConfig, CodecPreference, LlmProvider};
+use crate::settings::{
+    self as settings_mod, AppConfig, CodecPreference, EncoderPreference, LlmProvider,
+};
 use crate::ui::widgets::{language_button, settings_section, settings_text_row};
 use crate::{
     install_host_service, start_installed_service, stop_installed_service, tr,
@@ -110,11 +112,7 @@ impl EvertyDeskApp {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    for codec in [
-                                        CodecPreference::Vp9,
-                                        CodecPreference::H264,
-                                        CodecPreference::Auto,
-                                    ] {
+                                    for codec in codec_preference_order() {
                                         ui.selectable_value(
                                             &mut draft.display.codec,
                                             codec,
@@ -124,6 +122,34 @@ impl EvertyDeskApp {
                                 },
                             );
                         });
+                        ui.label(
+                            egui::RichText::new(codec_status_text(draft.display.codec))
+                                .size(12.0)
+                                .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                        );
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label(tr(selected_lang, "Энкодер", "Encoder"));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    for encoder in encoder_preference_order() {
+                                        ui.selectable_value(
+                                            &mut draft.display.encoder,
+                                            encoder,
+                                            encoder.label(),
+                                        );
+                                    }
+                                },
+                            );
+                        });
+                        ui.label(
+                            egui::RichText::new(crate::video::selected_encoder_label(
+                                draft.display.encoder,
+                            ))
+                            .size(12.0)
+                            .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                        );
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             ui.label(tr(selected_lang, "Целевой FPS", "Target FPS"));
@@ -206,7 +232,8 @@ impl EvertyDeskApp {
                             || new_cfg.server.relay_server != self.config.server.relay_server
                             || new_cfg.server.public_key != self.config.server.public_key
                             || new_cfg.display.target_fps != self.config.display.target_fps
-                            || new_cfg.display.codec != self.config.display.codec;
+                            || new_cfg.display.codec != self.config.display.codec
+                            || new_cfg.display.encoder != self.config.display.encoder;
                         let next_video_fps = new_cfg.display.target_fps.clamp(5, 60) as i32;
                         if host_reconfigure_needed {
                             if let Some(svc) = &self.host_service {
@@ -289,6 +316,7 @@ impl EvertyDeskApp {
             current_config.server.public_key.clone(),
             current_config.display.target_fps,
             current_config.display.codec,
+            current_config.display.encoder,
         );
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -376,15 +404,36 @@ impl EvertyDeskApp {
                 ui.horizontal(|ui| {
                     ui.label(tr(selected_lang, "Кодек", "Codec"));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        for codec in [
-                            CodecPreference::Vp9,
-                            CodecPreference::H264,
-                            CodecPreference::Auto,
-                        ] {
+                        for codec in codec_preference_order() {
                             ui.selectable_value(&mut draft.display.codec, codec, codec.label());
                         }
                     });
                 });
+                ui.label(
+                    egui::RichText::new(codec_status_text(draft.display.codec))
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(tr(selected_lang, "Энкодер", "Encoder"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        for encoder in encoder_preference_order() {
+                            ui.selectable_value(
+                                &mut draft.display.encoder,
+                                encoder,
+                                encoder.label(),
+                            );
+                        }
+                    });
+                });
+                ui.label(
+                    egui::RichText::new(crate::video::selected_encoder_label(
+                        draft.display.encoder,
+                    ))
+                    .size(12.0)
+                    .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                );
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.label(tr(selected_lang, "Целевой FPS", "Target FPS"));
@@ -507,7 +556,8 @@ impl EvertyDeskApp {
                     || new_cfg.server.relay_server != host_reconfigure_source.1
                     || new_cfg.server.public_key != host_reconfigure_source.2
                     || new_cfg.display.target_fps != host_reconfigure_source.3
-                    || new_cfg.display.codec != host_reconfigure_source.4;
+                    || new_cfg.display.codec != host_reconfigure_source.4
+                    || new_cfg.display.encoder != host_reconfigure_source.5;
                 let next_video_fps = new_cfg.display.target_fps.clamp(5, 60) as i32;
                 if host_reconfigure_needed {
                     if let Some(svc) = &self.host_service {
@@ -707,6 +757,39 @@ fn settings_secret_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
         );
     }
     ui.add_space(6.0);
+}
+
+fn codec_preference_order() -> [CodecPreference; 5] {
+    [
+        CodecPreference::Av1,
+        CodecPreference::H265,
+        CodecPreference::Vp9,
+        CodecPreference::H264,
+        CodecPreference::Auto,
+    ]
+}
+
+fn codec_status_text(codec: CodecPreference) -> String {
+    match codec {
+        CodecPreference::Auto => {
+            "Auto: AV1/H265 используются только когда в сборке есть decoder backend".to_owned()
+        }
+        CodecPreference::Av1 if !crate::video::av1_available() => {
+            "AV1 decoder пока не подключен: будет fallback на H264/VP9".to_owned()
+        }
+        CodecPreference::H265 if !crate::video::h265_available() => {
+            "H265 decoder пока не подключен: будет fallback на H264/VP9".to_owned()
+        }
+        _ => "Кодек будет запрошен, если локальная сборка умеет его декодировать".to_owned(),
+    }
+}
+
+fn encoder_preference_order() -> [EncoderPreference; 3] {
+    [
+        EncoderPreference::Software,
+        EncoderPreference::Nvenc,
+        EncoderPreference::Auto,
+    ]
 }
 
 fn default_config_from(config: &AppConfig) -> AppConfig {

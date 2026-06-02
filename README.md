@@ -227,6 +227,7 @@ The long-term target is a simple package flow for:
 ## Documentation
 
 - [AI terminal setup](docs/terminal-llm.md)
+- [Video codecs and NVENC](docs/video-codecs.md)
 
 ## Roadmap
 

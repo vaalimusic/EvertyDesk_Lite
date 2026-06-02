@@ -212,7 +212,9 @@ enum FrameSource {
     Video,
     /// Video frame arrived but we cannot decode it (e.g. VP9/VP8 without live-vpx).
     /// Counted separately so the session loop can warn the user.
-    SkippedVideo,
+    SkippedVideo {
+        codec: &'static str,
+    },
 }
 
 enum DecoderFeedback {
@@ -345,9 +347,9 @@ impl TransportClient {
         let mut last_live_bootstrap = Instant::now();
         // Codec telemetry — reported to UI once on first encounter.
         let mut first_live_video_seen = false;
-        let mut vp9_ignored_count = 0_u64;
-        let mut vp9_last_log = 0_u64; // vp9_ignored_count at last log
-                                      // Tracks when we last sent a screenshot request — drives time-based refresh.
+        let mut skipped_video_count = 0_u64;
+        let mut skipped_video_last_log = 0_u64; // skipped_video_count at last log
+                                                // Tracks when we last sent a screenshot request — drives time-based refresh.
         let mut last_screenshot_sent: Option<Instant> = None;
         // Subscribe to display 0 (SwitchDisplay) then trigger video start.
         // SwitchDisplay must come first — it's the one-time subscription trigger.
@@ -755,32 +757,29 @@ impl TransportClient {
             };
 
             match frame_source {
-                Some(FrameSource::SkippedVideo) => {
-                    // Server is still sending VP9/VP8 we cannot decode.
+                Some(FrameSource::SkippedVideo { codec }) => {
+                    // Server is still sending a codec we cannot decode.
                     // Do NOT set live_video_seen — screenshots must keep firing.
-                    vp9_ignored_count += 1;
-                    // On first VP9 frame: aggressively re-negotiate codec.
+                    skipped_video_count += 1;
+                    // On first unsupported frame: aggressively re-negotiate codec.
                     // Some servers ignore the LoginRequest codec preference and need
                     // an explicit OptionMessage nudge after they've already started streaming.
-                    if vp9_ignored_count == 1 {
-                        let _ = send_codec_sync_options(
-                            &mut relay,
-                            target_video_fps,
-                            CodecPreference::H264,
-                        );
+                    if skipped_video_count == 1 {
+                        let fallback = fallback_codec_preference();
+                        let _ = send_codec_sync_options(&mut relay, target_video_fps, fallback);
                         eprintln!(
-                            "[session] Server chose VP9 despite H264 preference — \
-                             re-sending H264 request (server may lack hardware encoder)"
+                            "[session] Server chose unsupported {codec}; re-sending {} request",
+                            fallback.label()
                         );
                     }
                     // Log first occurrence and every 300 after that.
-                    if vp9_ignored_count - vp9_last_log >= 300
-                        || (vp9_ignored_count == 1 && vp9_last_log == 0)
+                    if skipped_video_count - skipped_video_last_log >= 300
+                        || (skipped_video_count == 1 && skipped_video_last_log == 0)
                     {
-                        vp9_last_log = vp9_ignored_count;
+                        skipped_video_last_log = skipped_video_count;
                         let _ = events.send(SessionEvent::Info(format!(
-                            "Сервер шлёт VP9 (ignored: {vp9_ignored_count}). \
-                             Нет H264-энкодера на сервере — работаем в режиме скриншотов."
+                            "Сервер шлёт {codec} (ignored: {skipped_video_count}). \
+                             Запрошен поддерживаемый fallback, пока работаем в режиме скриншотов."
                         )));
                     }
                 }
@@ -1368,20 +1367,28 @@ fn send_codec_sync_options(
 fn supported_decoding(codec_preference: CodecPreference) -> SupportedDecoding {
     let vp9_capable = crate::video::vp9_available();
     let h264_capable = crate::video::h264_available();
-    let prefer = preferred_codec(codec_preference, h264_capable, vp9_capable);
+    let h265_capable = crate::video::h265_available();
+    let av1_capable = crate::video::av1_available();
+    let prefer = preferred_codec(
+        codec_preference,
+        h264_capable,
+        h265_capable,
+        av1_capable,
+        vp9_capable,
+    );
     SupportedDecoding {
         ability_vp9: i32::from(vp9_capable),
         ability_h264: i32::from(h264_capable),
-        ability_h265: 0,
+        ability_h265: i32::from(h265_capable),
         prefer: prefer as i32,
         ability_vp8: i32::from(crate::video::vp8_available()),
-        ability_av1: 0,
+        ability_av1: i32::from(av1_capable),
         i444: Some(CodecAbility {
             vp8: false,
             vp9: cfg!(any(feature = "live-vpx", feature = "live-vpx-system")),
-            av1: false,
+            av1: av1_capable,
             h264: false,
-            h265: false,
+            h265: h265_capable,
         }),
         prefer_chroma: Chroma::I420 as i32,
     }
@@ -1390,16 +1397,38 @@ fn supported_decoding(codec_preference: CodecPreference) -> SupportedDecoding {
 fn preferred_codec(
     codec_preference: CodecPreference,
     h264_capable: bool,
+    h265_capable: bool,
+    av1_capable: bool,
     vp9_capable: bool,
 ) -> PreferCodec {
     match codec_preference {
+        CodecPreference::Av1 if av1_capable => PreferCodec::Av1,
+        CodecPreference::H265 if h265_capable => PreferCodec::H265,
         CodecPreference::H264 if h264_capable => PreferCodec::H264,
         CodecPreference::Vp9 if vp9_capable => PreferCodec::Vp9,
+        CodecPreference::Auto if av1_capable => PreferCodec::Av1,
+        CodecPreference::Auto if h265_capable => PreferCodec::H265,
         CodecPreference::Auto if h264_capable => PreferCodec::H264,
         CodecPreference::Auto if vp9_capable => PreferCodec::Vp9,
+        _ if av1_capable => PreferCodec::Av1,
+        _ if h265_capable => PreferCodec::H265,
         _ if h264_capable => PreferCodec::H264,
         _ if vp9_capable => PreferCodec::Vp9,
         _ => PreferCodec::Auto,
+    }
+}
+
+fn fallback_codec_preference() -> CodecPreference {
+    if crate::video::h264_available() {
+        CodecPreference::H264
+    } else if crate::video::vp9_available() {
+        CodecPreference::Vp9
+    } else if crate::video::h265_available() {
+        CodecPreference::H265
+    } else if crate::video::av1_available() {
+        CodecPreference::Av1
+    } else {
+        CodecPreference::Auto
     }
 }
 
@@ -1609,7 +1638,7 @@ fn handle_session_message(
                     #[cfg(not(feature = "live-vpx"))]
                     {
                         let _ = (frame_tx, frames, events);
-                        Some(FrameSource::SkippedVideo) // VP8 arrived but undecoded
+                        Some(FrameSource::SkippedVideo { codec: "VP8" }) // VP8 arrived but undecoded
                     }
                 }
                 Some(video_frame::Union::Vp9s(frames)) => {
@@ -1642,8 +1671,24 @@ fn handle_session_message(
                     )))]
                     {
                         let _ = (frame_tx, frames, events);
-                        Some(FrameSource::SkippedVideo) // VP9 arrived but no decoder available
+                        Some(FrameSource::SkippedVideo { codec: "VP9" }) // VP9 arrived but no decoder available
                     }
+                }
+                Some(video_frame::Union::H265s(frames)) => {
+                    let _ = (frame_tx, frames);
+                    let _ = events.send(SessionEvent::Info(
+                        "Server sent H265, but this build has no H265 decoder; requesting fallback"
+                            .to_owned(),
+                    ));
+                    Some(FrameSource::SkippedVideo { codec: "H265" })
+                }
+                Some(video_frame::Union::Av1s(frames)) => {
+                    let _ = (frame_tx, frames);
+                    let _ = events.send(SessionEvent::Info(
+                        "Server sent AV1, but this build has no AV1 decoder; requesting fallback"
+                            .to_owned(),
+                    ));
+                    Some(FrameSource::SkippedVideo { codec: "AV1" })
                 }
                 _ => {
                     let _ = events.send(SessionEvent::Info(format!(
@@ -1707,9 +1752,11 @@ fn handle_session_message(
                 Some(misc::Union::Option(opt)) => {
                     if let Some(dec) = &opt.supported_decoding {
                         eprintln!(
-                            "[session] Server codec reply: prefer={} h264={} vp9={} vp8={} fps={}",
+                            "[session] Server codec reply: prefer={} h264={} h265={} av1={} vp9={} vp8={} fps={}",
                             dec.prefer,
                             dec.ability_h264,
+                            dec.ability_h265,
+                            dec.ability_av1,
                             dec.ability_vp9,
                             dec.ability_vp8,
                             opt.custom_fps
@@ -2864,12 +2911,24 @@ mod tests {
     #[test]
     fn auto_codec_prefers_low_latency_h264_when_available() {
         assert_eq!(
-            preferred_codec(CodecPreference::Auto, true, true) as i32,
+            preferred_codec(CodecPreference::Auto, true, false, false, true) as i32,
             PreferCodec::H264 as i32
         );
         assert_eq!(
-            preferred_codec(CodecPreference::Auto, false, true) as i32,
+            preferred_codec(CodecPreference::Auto, false, false, false, true) as i32,
             PreferCodec::Vp9 as i32
+        );
+    }
+
+    #[test]
+    fn auto_codec_prefers_modern_codecs_when_available() {
+        assert_eq!(
+            preferred_codec(CodecPreference::Auto, true, true, false, true) as i32,
+            PreferCodec::H265 as i32
+        );
+        assert_eq!(
+            preferred_codec(CodecPreference::Auto, true, true, true, true) as i32,
+            PreferCodec::Av1 as i32
         );
     }
 

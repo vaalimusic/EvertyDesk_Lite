@@ -3030,7 +3030,7 @@ impl EvertyDeskApp {
                 ui.separator();
 
                 let (codec_label, codec_color) = match self.last_frame_codec.as_str() {
-                    "H264" | "VP9" => (
+                    "H264" | "H265" | "AV1" | "VP9" => (
                         self.last_frame_codec.as_str(),
                         egui::Color32::from_rgb(80, 220, 110),
                     ),
@@ -3391,10 +3391,10 @@ impl EvertyDeskApp {
                             egui::Color32::from_rgb(80, 220, 110),
                             "Live H264 video, lowest latency",
                         ),
-                        "VP9" => (
-                            "VP9",
+                        "H265" | "AV1" | "VP9" => (
+                            self.last_frame_codec.as_str(),
                             egui::Color32::from_rgb(80, 220, 110),
-                            "Live VP9 video",
+                            "Live video",
                         ),
                         "PNG" => (
                             "PNG",

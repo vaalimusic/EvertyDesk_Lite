@@ -40,7 +40,7 @@ use crate::{
         RegisterPk, RelayResponse, RendezvousMessage, RequestRelay, ShellMessage, ShellMessageKind,
         SignedId, VideoFrame,
     },
-    settings::AppConfig,
+    settings::{AppConfig, EncoderPreference},
     transport::{connect_tcp, encode_frame_len, read_framed, send_framed},
 };
 use prost::Message as _;
@@ -1118,8 +1118,16 @@ fn relay_session_inner(
     // ── Video thread ──────────────────────────────────────────────────────────
     let stop_v = stop.clone();
     let target_fps_v = shared_target_fps.clone();
+    let encoder_preference = config.display.encoder;
     let video_handle = thread::spawn(move || {
-        video_loop(write_stream, send_cipher, stop_v, target_fps_v, out_rx);
+        video_loop(
+            write_stream,
+            send_cipher,
+            stop_v,
+            target_fps_v,
+            out_rx,
+            encoder_preference,
+        );
     });
 
     // ── Input loop (this thread) ──────────────────────────────────────────────
@@ -1155,6 +1163,7 @@ fn video_loop(
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     target_fps: Arc<AtomicU32>,
     outgoing: Receiver<PeerMessage>,
+    encoder_preference: EncoderPreference,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -1188,6 +1197,15 @@ fn video_loop(
     let mut encoder: Option<()> = None;
     #[cfg(feature = "live-h264")]
     let mut yuv_frame = YuvFrame::default();
+    let active_encoder_backend = if cfg!(feature = "live-h264") {
+        "OpenH264 software"
+    } else {
+        "PNG fallback (live-h264 disabled)"
+    };
+    eprintln!(
+        "[host-video] encoder policy: {}; active backend: {active_encoder_backend}",
+        crate::video::selected_encoder_label(encoder_preference),
+    );
 
     let mut frame_idx: u64 = 0;
     let mut last_frame = Instant::now();
@@ -1311,6 +1329,7 @@ fn frame_budget(target_fps: u32) -> Duration {
     Duration::from_micros(1_000_000 / fps)
 }
 
+#[cfg_attr(not(feature = "live-h264"), allow(dead_code))]
 fn h264_target_bitrate_bps(width: u32, height: u32, fps: u32) -> u32 {
     const MIN_BPS: u64 = 800_000;
     const MAX_BPS: u64 = 14_000_000;
