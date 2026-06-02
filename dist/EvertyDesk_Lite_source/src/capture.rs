@@ -13,7 +13,7 @@ mod win {
         Foundation::HWND,
         Graphics::Gdi::{
             BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
-            GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT,
+            GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
             DIB_RGB_COLORS, RGBQUAD, SRCCOPY,
         },
         UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN},
@@ -43,17 +43,7 @@ mod win {
         let hbmp_old = SelectObject(hdc_mem, hbmp);
 
         // Copy screen → memory DC.
-        let _ = BitBlt(
-            hdc_mem,
-            0,
-            0,
-            width,
-            height,
-            hdc_screen,
-            0,
-            0,
-            SRCCOPY | CAPTUREBLT,
-        );
+        let _ = BitBlt(hdc_mem, 0, 0, width, height, hdc_screen, 0, 0, SRCCOPY);
 
         // Extract pixels as 32-bit BGRA (no palette).
         let mut bi = BITMAPINFO {

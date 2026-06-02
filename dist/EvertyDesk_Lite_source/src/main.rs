@@ -631,9 +631,9 @@ struct EvertyDeskApp {
     stream_health: String,
     wheel_accum: egui::Vec2,
     /// Cache of remote cursor images by cursor ID (RGBA + hotspot).
-    cursor_cache: HashMap<u64, CursorCacheEntry>,
+    cursor_cache: HashMap<u64, (egui::ColorImage, i32, i32)>,
     /// Pending cursor image to be loaded into a texture in the next frame.
-    pending_cursor: Option<(u64, egui::ColorImage, i32, i32)>,
+    pending_cursor: Option<(egui::ColorImage, i32, i32)>,
     /// Currently active cursor texture + hotspot offset.
     cursor_texture: Option<(egui::TextureHandle, i32, i32)>,
     /// Last known cursor position in remote-screen coordinates.
@@ -656,13 +656,6 @@ struct EvertyDeskApp {
     show_settings: bool,
     /// Editable copy of config while the settings window is open.
     settings_draft: Option<AppConfig>,
-}
-
-struct CursorCacheEntry {
-    image: Option<egui::ColorImage>,
-    texture: Option<egui::TextureHandle>,
-    hotx: i32,
-    hoty: i32,
 }
 
 enum WorkerEvent {
@@ -1085,9 +1078,8 @@ impl EvertyDeskApp {
                     self.last_live_frame_at = Some(Instant::now());
                     self.png_fallback_started_at = None;
                 }
-                self.last_frame_rgba = rgba;
-                let image =
-                    ColorImage::from_rgba_unmultiplied([width, height], &self.last_frame_rgba);
+                self.last_frame_rgba = rgba.clone();
+                let image = ColorImage::from_rgba_unmultiplied([width, height], &rgba);
                 self.remote_size = image.size;
                 self.pending_image = Some(image);
                 self.last_screenshot_sid = sid;
@@ -1154,24 +1146,12 @@ impl EvertyDeskApp {
                     [width as usize, height as usize],
                     &rgba,
                 );
-                self.cursor_cache.insert(
-                    id,
-                    CursorCacheEntry {
-                        image: Some(image.clone()),
-                        texture: None,
-                        hotx,
-                        hoty,
-                    },
-                );
-                self.pending_cursor = Some((id, image, hotx, hoty));
+                self.cursor_cache.insert(id, (image.clone(), hotx, hoty));
+                self.pending_cursor = Some((image, hotx, hoty));
             }
             SessionEvent::CursorId { id } => {
-                if let Some(entry) = self.cursor_cache.get(&id) {
-                    if let Some(texture) = entry.texture.clone() {
-                        self.cursor_texture = Some((texture, entry.hotx, entry.hoty));
-                    } else if let Some(image) = entry.image.clone() {
-                        self.pending_cursor = Some((id, image, entry.hotx, entry.hoty));
-                    }
+                if let Some((image, hotx, hoty)) = self.cursor_cache.get(&id).cloned() {
+                    self.pending_cursor = Some((image, hotx, hoty));
                 }
             }
             SessionEvent::CursorPosition { x, y } => {
@@ -1404,24 +1384,16 @@ impl EvertyDeskApp {
         self.poll_host_service();
         if let Some(image) = self.pending_image.take() {
             if let Some(texture) = self.remote_texture.as_mut() {
-                texture.set(image, remote_texture_options());
+                texture.set(image, egui::TextureOptions::LINEAR);
             } else {
                 self.remote_texture =
-                    Some(ctx.load_texture("remote-screen", image, remote_texture_options()));
+                    Some(ctx.load_texture("remote-screen", image, egui::TextureOptions::LINEAR));
             }
             ctx.request_repaint();
         }
-        if let Some((id, image, hotx, hoty)) = self.pending_cursor.take() {
-            let texture = ctx.load_texture(
-                format!("remote-cursor-{id}"),
-                image,
-                egui::TextureOptions::NEAREST,
-            );
-            self.cursor_texture = Some((texture.clone(), hotx, hoty));
-            if let Some(entry) = self.cursor_cache.get_mut(&id) {
-                entry.texture = Some(texture);
-                entry.image = None;
-            }
+        if let Some((image, hotx, hoty)) = self.pending_cursor.take() {
+            let texture = ctx.load_texture("remote-cursor", image, egui::TextureOptions::LINEAR);
+            self.cursor_texture = Some((texture, hotx, hoty));
         }
         if self.busy
             || self.connected
@@ -3394,7 +3366,7 @@ impl EvertyDeskApp {
                         "VP9" => (
                             "VP9",
                             egui::Color32::from_rgb(80, 220, 110),
-                            "Live VP9 video",
+                            "Live VP9 video in the live-vpx build",
                         ),
                         "PNG" => (
                             "PNG",
@@ -4078,14 +4050,6 @@ fn stream_health_color(text: &str) -> egui::Color32 {
         egui::Color32::from_rgb(220, 180, 60)
     } else {
         egui::Color32::from_rgb(220, 110, 80)
-    }
-}
-
-fn remote_texture_options() -> egui::TextureOptions {
-    egui::TextureOptions {
-        magnification: egui::TextureFilter::Nearest,
-        minification: egui::TextureFilter::Linear,
-        wrap_mode: egui::TextureWrapMode::ClampToEdge,
     }
 }
 

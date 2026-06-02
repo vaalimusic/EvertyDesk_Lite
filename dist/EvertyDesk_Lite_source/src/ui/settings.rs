@@ -140,30 +140,6 @@ impl EvertyDeskApp {
                                 },
                             );
                         });
-                        ui.add_space(6.0);
-                        ui.checkbox(
-                            &mut draft.display.adaptive_quality,
-                            tr(
-                                selected_lang,
-                                "Автоматически снижать FPS при перегрузке декодера",
-                                "Automatically lower FPS when the decoder is overloaded",
-                            ),
-                        );
-                        ui.horizontal(|ui| {
-                            ui.label(tr(selected_lang, "Минимальный FPS", "Minimum FPS"));
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    for fps in [30u32, 20, 15, 10, 5] {
-                                        ui.selectable_value(
-                                            &mut draft.display.min_fps,
-                                            fps,
-                                            fps.to_string(),
-                                        );
-                                    }
-                                },
-                            );
-                        });
                     });
 
                     ui.add_space(8.0);
@@ -395,23 +371,6 @@ impl EvertyDeskApp {
                                 fps,
                                 fps.to_string(),
                             );
-                        }
-                    });
-                });
-                ui.add_space(6.0);
-                ui.checkbox(
-                    &mut draft.display.adaptive_quality,
-                    tr(
-                        selected_lang,
-                        "Автоматически снижать FPS при перегрузке декодера",
-                        "Automatically lower FPS when the decoder is overloaded",
-                    ),
-                );
-                ui.horizontal(|ui| {
-                    ui.label(tr(selected_lang, "Минимальный FPS", "Minimum FPS"));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        for fps in [30u32, 20, 15, 10, 5] {
-                            ui.selectable_value(&mut draft.display.min_fps, fps, fps.to_string());
                         }
                     });
                 });

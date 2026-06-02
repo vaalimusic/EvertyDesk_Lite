@@ -78,10 +78,6 @@ pub struct DisplayConfig {
     pub codec: CodecPreference,
     #[serde(default = "default_target_fps")]
     pub target_fps: u32,
-    #[serde(default = "default_adaptive_quality")]
-    pub adaptive_quality: bool,
-    #[serde(default = "default_min_fps")]
-    pub min_fps: u32,
 }
 
 impl Default for DisplayConfig {
@@ -89,8 +85,6 @@ impl Default for DisplayConfig {
         Self {
             codec: CodecPreference::Auto,
             target_fps: default_target_fps(),
-            adaptive_quality: default_adaptive_quality(),
-            min_fps: default_min_fps(),
         }
     }
 }
@@ -368,12 +362,6 @@ fn default_fit_to_window() -> bool {
 }
 fn default_target_fps() -> u32 {
     60
-}
-fn default_adaptive_quality() -> bool {
-    true
-}
-fn default_min_fps() -> u32 {
-    15
 }
 fn default_true() -> bool {
     true

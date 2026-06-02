@@ -216,17 +216,8 @@ enum FrameSource {
 }
 
 enum DecoderFeedback {
-    BacklogTrimmed {
-        dropped: usize,
-    },
-    DecodeFailed {
-        codec: &'static str,
-    },
-    FrameDecoded {
-        codec: &'static str,
-        queue_ms: u64,
-        decode_ms: u64,
-    },
+    BacklogTrimmed { dropped: usize },
+    DecodeFailed,
 }
 
 impl ConnectionState {
@@ -296,10 +287,6 @@ impl TransportClient {
         let display_config = request.display.clone();
         let mut codec_preference = display_config.codec;
         let initial_video_fps = display_config.target_fps.clamp(5, 60) as i32;
-        let adaptive_quality = display_config.adaptive_quality;
-        let min_video_fps = display_config
-            .min_fps
-            .clamp(5, display_config.target_fps.clamp(5, 60)) as i32;
         let mut emit_progress = |pct, message: String| {
             let _ = events.send(SessionEvent::Progress(pct, message));
         };
@@ -338,13 +325,9 @@ impl TransportClient {
         let mut last_frame_received = Instant::now();
         let mut target_video_fps = initial_video_fps;
         let mut last_decoder_recovery: Option<Instant> = None;
-        let mut last_adaptive_raise = Instant::now();
-        let mut stable_decoded_frames = 0_u32;
-        let mut h264_decode_failures = 0_u32;
-        let mut vp9_decode_failures = 0_u32;
         let mut last_live_bootstrap = Instant::now();
         // Codec telemetry — reported to UI once on first encounter.
-        let mut first_live_video_seen = false;
+        let mut first_h264_seen = false;
         let mut vp9_ignored_count = 0_u64;
         let mut vp9_last_log = 0_u64; // vp9_ignored_count at last log
                                       // Tracks when we last sent a screenshot request — drives time-based refresh.
@@ -371,153 +354,27 @@ impl TransportClient {
 
         loop {
             while let Ok(feedback) = decoder_feedback_rx.try_recv() {
-                match feedback {
-                    DecoderFeedback::BacklogTrimmed { dropped } => {
-                        stable_decoded_frames = 0;
-                        if adaptive_quality {
-                            let cooldown_ready = last_decoder_recovery
-                                .map(|instant| instant.elapsed() >= Duration::from_secs(4))
-                                .unwrap_or(true);
-                            if cooldown_ready {
-                                let next_fps = lower_adaptive_fps(
-                                    target_video_fps,
-                                    min_video_fps,
-                                    dropped >= 16,
-                                );
-                                if next_fps < target_video_fps {
-                                    target_video_fps = next_fps;
-                                    last_decoder_recovery = Some(Instant::now());
-                                    last_adaptive_raise = Instant::now();
-                                    let _ = events.send(SessionEvent::Info(format!(
-                                        "Decoder backlog trimmed ({dropped}); lowering stream to {target_video_fps} fps"
-                                    )));
-                                    let _ = send_video_start_messages(
-                                        &mut relay,
-                                        current_display,
-                                        false,
-                                        target_video_fps,
-                                        codec_preference,
-                                    );
-                                    last_live_bootstrap = Instant::now();
-                                }
-                            }
-                        }
-                    }
-                    DecoderFeedback::DecodeFailed { codec } => {
-                        stable_decoded_frames = 0;
-                        match codec {
-                            "H264" => h264_decode_failures += 1,
-                            "VP9" => vp9_decode_failures += 1,
-                            _ => {}
-                        }
-                        let codec_switched = if codec == "VP9"
-                            && vp9_decode_failures >= 3
-                            && crate::video::h264_available()
-                            && codec_preference != CodecPreference::H264
-                        {
-                            codec_preference = CodecPreference::H264;
-                            vp9_decode_failures = 0;
-                            let _ = events.send(SessionEvent::Info(
-                                "VP9 decode is unstable; switching stream preference to H264"
-                                    .to_owned(),
-                            ));
-                            true
-                        } else if codec == "H264"
-                            && h264_decode_failures >= 3
-                            && crate::video::vp9_available()
-                            && codec_preference != CodecPreference::Vp9
-                        {
-                            codec_preference = CodecPreference::Vp9;
-                            h264_decode_failures = 0;
-                            let _ = events.send(SessionEvent::Info(
-                                "H264 decode is unstable; switching stream preference to VP9"
-                                    .to_owned(),
-                            ));
-                            true
-                        } else {
-                            false
-                        };
-
-                        if codec_switched {
-                            target_video_fps = target_video_fps.min(30).max(min_video_fps);
-                            last_decoder_recovery = Some(Instant::now());
-                            let _ = send_video_start_messages(
-                                &mut relay,
-                                current_display,
-                                true,
-                                target_video_fps,
-                                codec_preference,
-                            );
-                            last_live_bootstrap = Instant::now();
-                        } else if adaptive_quality {
-                            let cooldown_ready = last_decoder_recovery
-                                .map(|instant| instant.elapsed() >= Duration::from_secs(4))
-                                .unwrap_or(true);
-                            if cooldown_ready {
-                                let next_fps =
-                                    lower_adaptive_fps(target_video_fps, min_video_fps, false);
-                                if next_fps < target_video_fps {
-                                    target_video_fps = next_fps;
-                                    last_decoder_recovery = Some(Instant::now());
-                                    last_adaptive_raise = Instant::now();
-                                    let _ = events.send(SessionEvent::Info(format!(
-                                        "{codec} decode failed; lowering stream to {target_video_fps} fps"
-                                    )));
-                                    let _ = send_video_start_messages(
-                                        &mut relay,
-                                        current_display,
-                                        false,
-                                        target_video_fps,
-                                        codec_preference,
-                                    );
-                                    last_live_bootstrap = Instant::now();
-                                }
-                            }
-                        }
-                    }
-                    DecoderFeedback::FrameDecoded {
-                        codec,
-                        queue_ms,
-                        decode_ms,
-                    } => {
-                        match codec {
-                            "H264" => h264_decode_failures = 0,
-                            "VP9" => vp9_decode_failures = 0,
-                            _ => {}
-                        }
-                        if adaptive_quality
-                            && target_video_fps < initial_video_fps
-                            && queue_ms <= 120
-                            && decode_ms <= 45
-                        {
-                            stable_decoded_frames = stable_decoded_frames.saturating_add(1);
-                            let needed = (target_video_fps.max(5) as u32).saturating_mul(8);
-                            if stable_decoded_frames >= needed
-                                && last_adaptive_raise.elapsed() >= Duration::from_secs(8)
-                            {
-                                let next_fps =
-                                    raise_adaptive_fps(target_video_fps, initial_video_fps);
-                                if next_fps > target_video_fps {
-                                    target_video_fps = next_fps;
-                                    stable_decoded_frames = 0;
-                                    last_adaptive_raise = Instant::now();
-                                    let _ = events.send(SessionEvent::Info(format!(
-                                        "Video decode is stable; raising stream to {target_video_fps} fps"
-                                    )));
-                                    let _ = send_video_start_messages(
-                                        &mut relay,
-                                        current_display,
-                                        false,
-                                        target_video_fps,
-                                        codec_preference,
-                                    );
-                                    last_live_bootstrap = Instant::now();
-                                }
-                            }
-                        } else {
-                            stable_decoded_frames = 0;
-                        }
-                    }
+                let dropped = match feedback {
+                    DecoderFeedback::BacklogTrimmed { dropped } => dropped,
+                    DecoderFeedback::DecodeFailed => 1,
+                };
+                let cooldown_ready = last_decoder_recovery
+                    .map(|instant| instant.elapsed() >= Duration::from_secs(4))
+                    .unwrap_or(true);
+                if cooldown_ready {
+                    target_video_fps = if dropped >= 16 { 15 } else { 20 };
+                    last_decoder_recovery = Some(Instant::now());
+                    let _ = events.send(SessionEvent::Info(format!(
+                        "Video decoder lag detected; requesting fresh stream at {target_video_fps} fps"
+                    )));
+                    let _ = send_video_start_messages(
+                        &mut relay,
+                        current_display,
+                        false,
+                        target_video_fps,
+                        codec_preference,
+                    );
+                    last_live_bootstrap = Instant::now();
                 }
             }
 
@@ -789,10 +646,10 @@ impl TransportClient {
                     screenshot_pending = false;
                     last_frame_received = Instant::now();
                     if source == FrameSource::Video {
-                        if !first_live_video_seen {
-                            first_live_video_seen = true;
+                        if !first_h264_seen {
+                            first_h264_seen = true;
                             let _ = events.send(SessionEvent::Info(
-                                "Live video stream active; using low-latency frame path".to_owned(),
+                                "H264 live-видео активно — минимальная задержка".to_owned(),
                             ));
                         }
                         live_video_seen = true;
@@ -868,32 +725,6 @@ fn flush_pending_mouse_move(relay: &mut TcpStream, pending: &mut Option<(i32, i3
     if let Some((x, y)) = pending.take() {
         let _ = send_mouse(relay, MOUSE_TYPE_MOVE, x, y);
     }
-}
-
-fn lower_adaptive_fps(current: i32, min_fps: i32, severe: bool) -> i32 {
-    let ladder = [60, 30, 20, 15, 10, 5];
-    let mut next = current.clamp(5, 60);
-    let steps = if severe { 2 } else { 1 };
-    for _ in 0..steps {
-        if let Some(candidate) = ladder
-            .iter()
-            .copied()
-            .filter(|fps| *fps < next)
-            .find(|fps| *fps >= min_fps)
-        {
-            next = candidate;
-        }
-    }
-    next.max(min_fps.clamp(5, 60))
-}
-
-fn raise_adaptive_fps(current: i32, max_fps: i32) -> i32 {
-    let ladder = [5, 10, 15, 20, 30, 60];
-    ladder
-        .iter()
-        .copied()
-        .find(|fps| *fps > current && *fps <= max_fps)
-        .unwrap_or(current)
 }
 
 fn establish_session(
@@ -1055,10 +886,10 @@ fn split_host_port(host: &str, default_port: u16) -> (String, u16) {
 }
 
 pub fn send_framed(stream: &mut TcpStream, payload: &[u8]) -> Result<(), String> {
-    let header = encode_frame_len(payload.len())?;
+    let mut out = encode_frame_len(payload.len())?;
+    out.extend_from_slice(payload);
     stream
-        .write_all(&header)
-        .and_then(|_| stream.write_all(payload))
+        .write_all(&out)
         .map_err(|err| format!("TCP write failed: {err}"))
 }
 
@@ -1366,15 +1197,20 @@ fn send_codec_sync_options(
 }
 
 fn supported_decoding(codec_preference: CodecPreference) -> SupportedDecoding {
-    let vp9_capable = crate::video::vp9_available();
-    let h264_capable = crate::video::h264_available();
+    // VP9 can be decoded via libvpx, system libvpx, or Windows Media Foundation.
+    let vp9_capable = cfg!(any(
+        feature = "live-vpx",
+        feature = "live-vpx-system",
+        all(feature = "live-vp9-mf", target_os = "windows")
+    ));
+    let h264_capable = cfg!(feature = "live-h264");
     let prefer = preferred_codec(codec_preference, h264_capable, vp9_capable);
     SupportedDecoding {
         ability_vp9: i32::from(vp9_capable),
         ability_h264: i32::from(h264_capable),
         ability_h265: 0,
         prefer: prefer as i32,
-        ability_vp8: i32::from(crate::video::vp8_available()),
+        ability_vp8: i32::from(cfg!(feature = "live-vpx")),
         ability_av1: 0,
         i444: Some(CodecAbility {
             vp8: false,
@@ -1395,8 +1231,7 @@ fn preferred_codec(
     match codec_preference {
         CodecPreference::H264 if h264_capable => PreferCodec::H264,
         CodecPreference::Vp9 if vp9_capable => PreferCodec::Vp9,
-        CodecPreference::Auto if h264_capable => PreferCodec::H264,
-        CodecPreference::Auto if vp9_capable => PreferCodec::Vp9,
+        CodecPreference::Auto if h264_capable && vp9_capable => PreferCodec::Auto,
         _ if h264_capable => PreferCodec::H264,
         _ if vp9_capable => PreferCodec::Vp9,
         _ => PreferCodec::Auto,
@@ -1990,7 +1825,6 @@ fn decode_frame_loop(
 
         let mut latest_event = None;
         for frame in batch {
-            let codec = frame.codec_name();
             let bytes = frame.byte_len();
             let queue_ms = frame
                 .queued_at()
@@ -2014,17 +1848,12 @@ fn decode_frame_loop(
                         decode_ms,
                         dropped: dropped_frames,
                     });
-                    let _ = feedback.send(DecoderFeedback::FrameDecoded {
-                        codec,
-                        queue_ms,
-                        decode_ms,
-                    });
                     dropped_frames = 0;
                     latest_event = Some(event);
                 }
                 Ok(None) => {}
                 Err(err) => {
-                    let _ = feedback.send(DecoderFeedback::DecodeFailed { codec });
+                    let _ = feedback.send(DecoderFeedback::DecodeFailed);
                     let _ = events.send(SessionEvent::Info(format!("Frame decode failed: {err}")));
                 }
             }
@@ -2067,15 +1896,6 @@ impl DecoderInput {
             | Self::H264 { bytes, .. }
             | Self::Vp8 { bytes, .. }
             | Self::Vp9 { bytes, .. } => *bytes,
-        }
-    }
-
-    fn codec_name(&self) -> &'static str {
-        match self {
-            Self::Png { .. } => "PNG",
-            Self::H264 { .. } => "H264",
-            Self::Vp8 { .. } => "VP8",
-            Self::Vp9 { .. } => "VP9",
         }
     }
 }
@@ -2287,35 +2107,6 @@ fn decode_vpx_rgba(
 }
 
 #[cfg(feature = "live-vpx")]
-struct YuvRgbTables {
-    u_b: [i32; 256],
-    u_g: [i32; 256],
-    v_g: [i32; 256],
-    v_r: [i32; 256],
-}
-
-#[cfg(feature = "live-vpx")]
-fn yuv_rgb_tables() -> &'static YuvRgbTables {
-    static TABLES: std::sync::OnceLock<YuvRgbTables> = std::sync::OnceLock::new();
-    TABLES.get_or_init(|| {
-        let mut tables = YuvRgbTables {
-            u_b: [0; 256],
-            u_g: [0; 256],
-            v_g: [0; 256],
-            v_r: [0; 256],
-        };
-        for i in 0..256 {
-            let c = i as i32 - 128;
-            tables.u_b[i] = (1815 * c) >> 10;
-            tables.u_g[i] = (352 * c) >> 10;
-            tables.v_g[i] = (731 * c) >> 10;
-            tables.v_r[i] = (1436 * c) >> 10;
-        }
-        tables
-    })
-}
-
-#[cfg(feature = "live-vpx")]
 fn i420_to_rgba(
     width: usize,
     height: usize,
@@ -2326,7 +2117,17 @@ fn i420_to_rgba(
     u_stride: usize,
     v_stride: usize,
 ) -> (usize, usize, Vec<u8>) {
-    let tables = yuv_rgb_tables();
+    let mut u_b = [0_i32; 256];
+    let mut u_g = [0_i32; 256];
+    let mut v_g = [0_i32; 256];
+    let mut v_r = [0_i32; 256];
+    for i in 0..256 {
+        let c = i as i32 - 128;
+        u_b[i] = (1815 * c) >> 10;
+        u_g[i] = (352 * c) >> 10;
+        v_g[i] = (731 * c) >> 10;
+        v_r[i] = (1436 * c) >> 10;
+    }
 
     let mut rgba = vec![0_u8; width * height * 4];
     let even_width = width & !1;
@@ -2341,9 +2142,9 @@ fn i420_to_rgba(
         for x in (0..even_width).step_by(2) {
             let ui = u_plane[chroma_y + x / 2] as usize;
             let vi = v_plane[chroma_v_y + x / 2] as usize;
-            let add_b = tables.u_b[ui];
-            let sub_g = tables.u_g[ui] + tables.v_g[vi];
-            let add_r = tables.v_r[vi];
+            let add_b = u_b[ui];
+            let sub_g = u_g[ui] + v_g[vi];
+            let add_r = v_r[vi];
 
             write_yuv_pixel(
                 &mut rgba,
@@ -2393,9 +2194,9 @@ fn i420_to_rgba(
                     &mut rgba,
                     offset,
                     y_plane[y * y_stride + x],
-                    tables.v_r[vi],
-                    tables.u_g[ui] + tables.v_g[vi],
-                    tables.u_b[ui],
+                    v_r[vi],
+                    u_g[ui] + v_g[vi],
+                    u_b[ui],
                 );
             }
         }
@@ -2859,18 +2660,6 @@ mod tests {
         };
         assert!(login.password.is_empty());
         assert_eq!(login.username, "123");
-    }
-
-    #[test]
-    fn auto_codec_prefers_low_latency_h264_when_available() {
-        assert_eq!(
-            preferred_codec(CodecPreference::Auto, true, true) as i32,
-            PreferCodec::H264 as i32
-        );
-        assert_eq!(
-            preferred_codec(CodecPreference::Auto, false, true) as i32,
-            PreferCodec::Vp9 as i32
-        );
     }
 
     #[test]

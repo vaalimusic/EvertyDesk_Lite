@@ -15,7 +15,7 @@ use std::{
     net::{TcpStream, UdpSocket},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
         Arc, Mutex, OnceLock,
     },
@@ -35,8 +35,8 @@ use crate::{
     crypto::{self, StreamCipher},
     rustdesk_proto::{
         decode_message, decode_peer_message, encode_message, encode_peer_message, login_response,
-        misc, peer_message, rendezvous_message, video_frame, DisplayInfo, EncodedVideoFrame,
-        EncodedVideoFrames, Hash, IdPk, LoginResponse, Misc, PeerInfo, PeerMessage, RegisterPeer,
+        peer_message, rendezvous_message, video_frame, DisplayInfo, EncodedVideoFrame,
+        EncodedVideoFrames, Hash, IdPk, LoginResponse, PeerInfo, PeerMessage, RegisterPeer,
         RegisterPk, RelayResponse, RendezvousMessage, RequestRelay, ShellMessage, ShellMessageKind,
         SignedId, VideoFrame,
     },
@@ -1112,14 +1112,12 @@ fn relay_session_inner(
         .try_clone()
         .map_err(|e| format!("try_clone relay stream: {e}"))?;
     let stop = Arc::new(AtomicBool::new(false));
-    let shared_target_fps = Arc::new(AtomicU32::new(target_fps));
     let (out_tx, out_rx) = mpsc::channel::<PeerMessage>();
 
     // ── Video thread ──────────────────────────────────────────────────────────
     let stop_v = stop.clone();
-    let target_fps_v = shared_target_fps.clone();
     let video_handle = thread::spawn(move || {
-        video_loop(write_stream, send_cipher, stop_v, target_fps_v, out_rx);
+        video_loop(write_stream, send_cipher, stop_v, target_fps, out_rx);
     });
 
     // ── Input loop (this thread) ──────────────────────────────────────────────
@@ -1129,7 +1127,7 @@ fn relay_session_inner(
     let mut shell: Option<ShellRuntime> = None;
     while !stop.load(Ordering::Relaxed) {
         match recv_peer_rc(&mut relay, &mut recv_cipher) {
-            Ok(Some(msg)) => handle_client_input(msg, &out_tx, &mut shell, &shared_target_fps),
+            Ok(Some(msg)) => handle_client_input(msg, &out_tx, &mut shell),
             Ok(None) => {}
             Err(ref e) if is_timeout(e) => {}
             Err(_) => break, // disconnected
@@ -1153,28 +1151,15 @@ fn video_loop(
     mut stream: TcpStream,
     mut send_cipher: Option<crate::crypto::SendCipher>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    target_fps: Arc<AtomicU32>,
+    target_fps: u32,
     outgoing: Receiver<PeerMessage>,
 ) {
     use std::sync::atomic::Ordering;
 
     #[cfg(feature = "live-h264")]
     let mut encoder = {
-        use openh264::encoder::{
-            BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode,
-            SpsPpsStrategy, UsageType,
-        };
-        let initial_fps = target_fps.load(Ordering::Relaxed).clamp(5, MAX_TARGET_FPS);
-        let (screen_w, screen_h) = crate::capture::screen_size().unwrap_or((1920, 1080));
-        let bitrate = h264_target_bitrate_bps(screen_w, screen_h, initial_fps);
-        let cfg = EncoderConfig::new()
-            .usage_type(UsageType::ScreenContentRealTime)
-            .rate_control_mode(RateControlMode::Bitrate)
-            .bitrate(BitRate::from_bps(bitrate))
-            .max_frame_rate(FrameRate::from_hz(MAX_TARGET_FPS as f32))
-            .sps_pps_strategy(SpsPpsStrategy::IncreasingId)
-            .intra_frame_period(IntraFramePeriod::from_num_frames(MAX_TARGET_FPS * 2))
-            .num_threads(0);
+        use openh264::encoder::{Encoder, EncoderConfig, UsageType};
+        let cfg = EncoderConfig::new().usage_type(UsageType::ScreenContentRealTime);
         let api = openh264::OpenH264API::from_source();
         match Encoder::with_api_config(api, cfg) {
             Ok(e) => Some(e),
@@ -1189,10 +1174,10 @@ fn video_loop(
     #[cfg(feature = "live-h264")]
     let mut yuv_frame = YuvFrame::default();
 
+    let frame_budget = frame_budget(target_fps);
+    let key_interval = u64::from(target_fps.max(1) * 2);
     let mut frame_idx: u64 = 0;
     let mut last_frame = Instant::now();
-    let mut change_detector = FrameChangeDetector::default();
-    let mut last_video_stats = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
         while let Ok(message) = outgoing.try_recv() {
@@ -1206,8 +1191,6 @@ fn video_loop(
             }
         }
 
-        let fps = target_fps.load(Ordering::Relaxed).clamp(5, MAX_TARGET_FPS);
-        let frame_budget = frame_budget(fps);
         if last_frame.elapsed() < frame_budget {
             thread::sleep(Duration::from_millis(2));
             continue;
@@ -1222,26 +1205,7 @@ fn video_loop(
 
         // Encode at native resolution (downscaling broke decoding on the phone
         // when the stream size differed from the announced DisplayInfo).
-        let key_interval = u64::from(fps.max(1) * 2);
-        let periodic_key = frame_idx % key_interval == 1;
-        let decision = change_detector.decide(cap_w, cap_h, &bgra, periodic_key);
-        if !decision.send {
-            if last_video_stats.elapsed() >= Duration::from_secs(10) {
-                let stats = change_detector.take_stats();
-                if stats.skipped_static > 0 {
-                    eprintln!(
-                        "[host-video] fps={} sent={} skipped_static={}",
-                        fps, stats.sent, stats.skipped_static
-                    );
-                }
-                last_video_stats = Instant::now();
-            }
-            if let Some(delay) = change_detector.static_backoff_delay(fps) {
-                thread::sleep(delay);
-            }
-            continue;
-        }
-
+        let is_key = frame_idx % key_interval == 1;
         let h264_bytes = encode_h264_frame(
             #[cfg(feature = "live-h264")]
             encoder.as_mut(),
@@ -1252,16 +1216,16 @@ fn video_loop(
             cap_w,
             cap_h,
             &bgra,
-            decision.force_key,
+            is_key,
         );
 
-        if let Some(packet) = h264_bytes {
+        if let Some(bytes) = h264_bytes {
             let frame_msg = PeerMessage {
                 union: Some(peer_message::Union::VideoFrame(VideoFrame {
                     union: Some(video_frame::Union::H264s(EncodedVideoFrames {
                         frames: vec![EncodedVideoFrame {
-                            data: packet.bytes,
-                            key: packet.key,
+                            data: bytes,
+                            key: is_key,
                             ..Default::default()
                         }],
                     })),
@@ -1275,7 +1239,6 @@ fn video_loop(
             if send_framed(&mut stream, &payload).is_err() {
                 break;
             }
-            change_detector.mark_sent(cap_w, cap_h, &bgra);
         }
     }
     stop.store(true, Ordering::Relaxed);
@@ -1311,148 +1274,6 @@ fn frame_budget(target_fps: u32) -> Duration {
     Duration::from_micros(1_000_000 / fps)
 }
 
-fn h264_target_bitrate_bps(width: u32, height: u32, fps: u32) -> u32 {
-    const MIN_BPS: u64 = 800_000;
-    const MAX_BPS: u64 = 14_000_000;
-    const SCREEN_CONTENT_MILLI_BPP: u64 = 55;
-
-    let pixels = u64::from(width.max(1)) * u64::from(height.max(1));
-    let fps = u64::from(fps.clamp(5, MAX_TARGET_FPS));
-    ((pixels * fps * SCREEN_CONTENT_MILLI_BPP) / 1000).clamp(MIN_BPS, MAX_BPS) as u32
-}
-
-#[derive(Default)]
-struct FrameChangeDetector {
-    width: u32,
-    height: u32,
-    last_sent_bgra: Vec<u8>,
-    last_sent_at: Option<Instant>,
-    consecutive_static_skips: u32,
-    sent_since_log: u64,
-    skipped_static_since_log: u64,
-}
-
-struct FrameDecision {
-    send: bool,
-    force_key: bool,
-}
-
-struct FrameSkipStats {
-    sent: u64,
-    skipped_static: u64,
-}
-
-impl FrameChangeDetector {
-    fn decide(
-        &mut self,
-        width: u32,
-        height: u32,
-        bgra: &[u8],
-        periodic_key: bool,
-    ) -> FrameDecision {
-        const STATIC_REFRESH: Duration = Duration::from_secs(2);
-
-        let size_changed =
-            self.width != width || self.height != height || self.last_sent_bgra.len() != bgra.len();
-        let idle_refresh = self
-            .last_sent_at
-            .map(|instant| instant.elapsed() >= STATIC_REFRESH)
-            .unwrap_or(true);
-        let changed = size_changed || self.frame_changed(width, height, bgra);
-        let send = changed || periodic_key || idle_refresh;
-        if send {
-            FrameDecision {
-                send: true,
-                force_key: size_changed || periodic_key || idle_refresh,
-            }
-        } else {
-            self.consecutive_static_skips = self.consecutive_static_skips.saturating_add(1);
-            self.skipped_static_since_log = self.skipped_static_since_log.saturating_add(1);
-            FrameDecision {
-                send: false,
-                force_key: false,
-            }
-        }
-    }
-
-    fn mark_sent(&mut self, width: u32, height: u32, bgra: &[u8]) {
-        self.width = width;
-        self.height = height;
-        self.last_sent_bgra.clear();
-        self.last_sent_bgra.extend_from_slice(bgra);
-        self.last_sent_at = Some(Instant::now());
-        self.consecutive_static_skips = 0;
-        self.sent_since_log = self.sent_since_log.saturating_add(1);
-    }
-
-    fn take_stats(&mut self) -> FrameSkipStats {
-        let stats = FrameSkipStats {
-            sent: self.sent_since_log,
-            skipped_static: self.skipped_static_since_log,
-        };
-        self.sent_since_log = 0;
-        self.skipped_static_since_log = 0;
-        stats
-    }
-
-    fn frame_changed(&self, width: u32, height: u32, bgra: &[u8]) -> bool {
-        const PIXEL_DIFF_THRESHOLD: u32 = 24;
-        const MIN_SMALL_CHANGE_SAMPLES: usize = 8;
-        const MIN_LARGE_CHANGE_SAMPLES: usize = 24;
-
-        if self.last_sent_bgra.is_empty() || self.last_sent_bgra.len() != bgra.len() {
-            return true;
-        }
-
-        let width = width as usize;
-        let height = height as usize;
-        if width == 0 || height == 0 {
-            return false;
-        }
-
-        let pixels = width.saturating_mul(height);
-        let step = if pixels >= 3_000_000 { 6 } else { 4 };
-        let mut total = 0usize;
-        let mut changed = 0usize;
-
-        for y in (0..height).step_by(step) {
-            let row = y * width * 4;
-            for x in (0..width).step_by(step) {
-                let offset = row + x * 4;
-                if offset + 2 >= bgra.len() || offset + 2 >= self.last_sent_bgra.len() {
-                    continue;
-                }
-                total += 1;
-                let db = bgra[offset].abs_diff(self.last_sent_bgra[offset]) as u32;
-                let dg = bgra[offset + 1].abs_diff(self.last_sent_bgra[offset + 1]) as u32;
-                let dr = bgra[offset + 2].abs_diff(self.last_sent_bgra[offset + 2]) as u32;
-                if db + dg + dr >= PIXEL_DIFF_THRESHOLD {
-                    changed += 1;
-                }
-            }
-        }
-
-        if total == 0 {
-            return false;
-        }
-
-        let ratio_per_10k = changed.saturating_mul(10_000) / total;
-        changed >= MIN_LARGE_CHANGE_SAMPLES
-            || (changed >= MIN_SMALL_CHANGE_SAMPLES && ratio_per_10k >= 1)
-    }
-
-    fn static_backoff_delay(&self, fps: u32) -> Option<Duration> {
-        let fps = fps.clamp(5, MAX_TARGET_FPS);
-        if self.consecutive_static_skips < fps {
-            None
-        } else if self.consecutive_static_skips < fps.saturating_mul(4) {
-            Some(Duration::from_millis(25))
-        } else {
-            Some(Duration::from_millis(50))
-        }
-    }
-}
-
 /// Read a PeerMessage using the receive-only cipher half.
 fn recv_peer_rc(
     stream: &mut TcpStream,
@@ -1473,11 +1294,6 @@ fn recv_peer_rc(
 
 // ── H264 encoding ─────────────────────────────────────────────────────────────
 
-struct H264Packet {
-    bytes: Vec<u8>,
-    key: bool,
-}
-
 #[cfg(feature = "live-h264")]
 fn encode_h264_frame(
     encoder: Option<&mut openh264::encoder::Encoder>,
@@ -1485,18 +1301,11 @@ fn encode_h264_frame(
     w: u32,
     h: u32,
     bgra: &[u8],
-    key: bool,
-) -> Option<H264Packet> {
+    _key: bool,
+) -> Option<Vec<u8>> {
     let enc = encoder?;
-    if key {
-        enc.force_intra_frame();
-    }
     bgra_to_yuv420_into(yuv, w as usize, h as usize, bgra);
     let bitstream = enc.encode(yuv).ok()?;
-    let encoded_key = matches!(
-        bitstream.frame_type(),
-        openh264::encoder::FrameType::IDR | openh264::encoder::FrameType::I
-    );
     let mut out = Vec::new();
     for i in 0..bitstream.num_layers() {
         if let Some(layer) = bitstream.layer(i) {
@@ -1510,10 +1319,7 @@ fn encode_h264_frame(
     if out.is_empty() {
         None
     } else {
-        Some(H264Packet {
-            bytes: out,
-            key: encoded_key,
-        })
+        Some(out)
     }
 }
 
@@ -1524,7 +1330,7 @@ fn encode_h264_frame(
     _h: u32,
     _bgra: &[u8],
     _key: bool,
-) -> Option<H264Packet> {
+) -> Option<Vec<u8>> {
     None
 }
 
@@ -1543,11 +1349,11 @@ struct YuvFrame {
 #[cfg(feature = "live-h264")]
 impl YuvFrame {
     fn resize(&mut self, width: usize, height: usize) {
-        self.width = width.next_multiple_of(2);
-        self.height = height.next_multiple_of(2);
-        self.y.resize(self.width * self.height, 0);
-        self.u.resize((self.width / 2) * (self.height / 2), 0);
-        self.v.resize((self.width / 2) * (self.height / 2), 0);
+        self.width = width;
+        self.height = height;
+        self.y.resize(width * height, 0);
+        self.u.resize((width / 2) * (height / 2), 0);
+        self.v.resize((width / 2) * (height / 2), 0);
     }
 }
 
@@ -1573,206 +1379,26 @@ impl openh264::formats::YUVSource for YuvFrame {
 /// BGRA (GDI output) → planar YUV420 (BT.601 limited range).
 #[cfg(feature = "live-h264")]
 fn bgra_to_yuv420_into(out: &mut YuvFrame, w: usize, h: usize, bgra: &[u8]) {
-    if w == 0 || h == 0 || bgra.len() < w.saturating_mul(h).saturating_mul(4) {
-        return;
-    }
     out.resize(w, h);
+    for row in 0..h {
+        for col in 0..w {
+            let base = (row * w + col) * 4;
+            let b = bgra[base] as i32;
+            let g = bgra[base + 1] as i32;
+            let r = bgra[base + 2] as i32;
 
-    let dst_w = out.width;
-    let dst_h = out.height;
-    if dst_w == w && dst_h == h {
-        bgra_to_yuv420_even_into(out, w, h, bgra);
-        return;
-    }
+            // BT.601 limited range
+            let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+            out.y[row * w + col] = y.clamp(16, 235) as u8;
 
-    bgra_to_yuv420_padded_into(out, w, h, bgra);
-}
-
-#[cfg(feature = "live-h264")]
-fn bgra_to_yuv420_even_into(out: &mut YuvFrame, w: usize, h: usize, bgra: &[u8]) {
-    for by in (0..h).step_by(2) {
-        let bgra_row0 = by * w * 4;
-        let bgra_row1 = (by + 1) * w * 4;
-        let y_row0 = by * w;
-        let y_row1 = (by + 1) * w;
-        let chroma_row = (by / 2) * (w / 2);
-
-        for bx in (0..w).step_by(2) {
-            let p00 = bgra_row0 + bx * 4;
-            let p01 = p00 + 4;
-            let p10 = bgra_row1 + bx * 4;
-            let p11 = p10 + 4;
-
-            let (r00, g00, b00) = bgra_pixel_rgb_at(bgra, p00);
-            let (r01, g01, b01) = bgra_pixel_rgb_at(bgra, p01);
-            let (r10, g10, b10) = bgra_pixel_rgb_at(bgra, p10);
-            let (r11, g11, b11) = bgra_pixel_rgb_at(bgra, p11);
-
-            out.y[y_row0 + bx] = y_from_rgb(r00, g00, b00);
-            out.y[y_row0 + bx + 1] = y_from_rgb(r01, g01, b01);
-            out.y[y_row1 + bx] = y_from_rgb(r10, g10, b10);
-            out.y[y_row1 + bx + 1] = y_from_rgb(r11, g11, b11);
-
-            let r = (r00 + r01 + r10 + r11 + 2) / 4;
-            let g = (g00 + g01 + g10 + g11 + 2) / 4;
-            let b = (b00 + b01 + b10 + b11 + 2) / 4;
-            let chroma = chroma_row + bx / 2;
-            out.u[chroma] = u_from_rgb(r, g, b);
-            out.v[chroma] = v_from_rgb(r, g, b);
-        }
-    }
-}
-
-#[cfg(feature = "live-h264")]
-fn bgra_to_yuv420_padded_into(out: &mut YuvFrame, w: usize, h: usize, bgra: &[u8]) {
-    let dst_w = out.width;
-    let dst_h = out.height;
-    for by in (0..dst_h).step_by(2) {
-        for bx in (0..dst_w).step_by(2) {
-            let mut r_sum = 0_i32;
-            let mut g_sum = 0_i32;
-            let mut b_sum = 0_i32;
-
-            for dy in 0..2 {
-                let y = by + dy;
-                for dx in 0..2 {
-                    let x = bx + dx;
-                    let (r, g, b) = bgra_pixel_rgb_clamped(bgra, w, h, x, y);
-                    out.y[y * dst_w + x] = y_from_rgb(r, g, b);
-                    r_sum += r;
-                    g_sum += g;
-                    b_sum += b;
-                }
+            if row % 2 == 0 && col % 2 == 0 {
+                let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+                let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+                let idx = (row / 2) * (w / 2) + (col / 2);
+                out.u[idx] = u.clamp(16, 240) as u8;
+                out.v[idx] = v.clamp(16, 240) as u8;
             }
-
-            let r = (r_sum + 2) / 4;
-            let g = (g_sum + 2) / 4;
-            let b = (b_sum + 2) / 4;
-            let chroma = (by / 2) * (dst_w / 2) + (bx / 2);
-            out.u[chroma] = u_from_rgb(r, g, b);
-            out.v[chroma] = v_from_rgb(r, g, b);
         }
-    }
-}
-
-#[cfg(feature = "live-h264")]
-#[inline(always)]
-fn bgra_pixel_rgb_clamped(
-    bgra: &[u8],
-    width: usize,
-    height: usize,
-    x: usize,
-    y: usize,
-) -> (i32, i32, i32) {
-    let sx = x.min(width - 1);
-    let sy = y.min(height - 1);
-    let base = (sy * width + sx) * 4;
-    (
-        bgra[base + 2] as i32,
-        bgra[base + 1] as i32,
-        bgra[base] as i32,
-    )
-}
-
-#[cfg(feature = "live-h264")]
-#[inline(always)]
-fn bgra_pixel_rgb_at(bgra: &[u8], base: usize) -> (i32, i32, i32) {
-    (
-        bgra[base + 2] as i32,
-        bgra[base + 1] as i32,
-        bgra[base] as i32,
-    )
-}
-
-#[cfg(feature = "live-h264")]
-#[inline(always)]
-fn y_from_rgb(r: i32, g: i32, b: i32) -> u8 {
-    (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(16, 235) as u8
-}
-
-#[cfg(feature = "live-h264")]
-#[inline(always)]
-fn u_from_rgb(r: i32, g: i32, b: i32) -> u8 {
-    (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(16, 240) as u8
-}
-
-#[cfg(feature = "live-h264")]
-#[inline(always)]
-fn v_from_rgb(r: i32, g: i32, b: i32) -> u8 {
-    (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(16, 240) as u8
-}
-
-#[cfg(test)]
-mod video_quality_tests {
-    use super::*;
-
-    #[test]
-    fn frame_change_detector_sends_first_frame_then_skips_static() {
-        let mut detector = FrameChangeDetector::default();
-        let frame = vec![0_u8; 64 * 64 * 4];
-
-        let first = detector.decide(64, 64, &frame, false);
-        assert!(first.send);
-        detector.mark_sent(64, 64, &frame);
-
-        let second = detector.decide(64, 64, &frame, false);
-        assert!(!second.send);
-    }
-
-    #[test]
-    fn frame_change_detector_detects_large_change() {
-        let mut detector = FrameChangeDetector::default();
-        let frame = vec![0_u8; 64 * 64 * 4];
-        detector.mark_sent(64, 64, &frame);
-
-        let changed = vec![255_u8; 64 * 64 * 4];
-        assert!(detector.decide(64, 64, &changed, false).send);
-    }
-
-    #[test]
-    fn frame_change_detector_backs_off_after_static_frames() {
-        let mut detector = FrameChangeDetector::default();
-        let frame = vec![0_u8; 64 * 64 * 4];
-        detector.mark_sent(64, 64, &frame);
-
-        for _ in 0..59 {
-            let decision = detector.decide(64, 64, &frame, false);
-            assert!(!decision.send);
-            assert!(detector.static_backoff_delay(60).is_none());
-        }
-
-        let decision = detector.decide(64, 64, &frame, false);
-        assert!(!decision.send);
-        assert_eq!(
-            detector.static_backoff_delay(60),
-            Some(Duration::from_millis(25))
-        );
-    }
-
-    #[test]
-    fn h264_bitrate_scales_with_resolution() {
-        let small = h264_target_bitrate_bps(1280, 720, 30);
-        let full_hd = h264_target_bitrate_bps(1920, 1080, 30);
-        let ultra_hd = h264_target_bitrate_bps(3840, 2160, 60);
-
-        assert!(small >= 800_000);
-        assert!(full_hd > small);
-        assert!(ultra_hd > full_hd);
-        assert!(ultra_hd <= 14_000_000);
-    }
-
-    #[cfg(feature = "live-h264")]
-    #[test]
-    fn yuv_conversion_pads_odd_dimensions_for_i420() {
-        let mut yuv = YuvFrame::default();
-        let bgra = vec![128_u8; 3 * 3 * 4];
-
-        bgra_to_yuv420_into(&mut yuv, 3, 3, &bgra);
-
-        assert_eq!((yuv.width, yuv.height), (4, 4));
-        assert_eq!(yuv.y.len(), 16);
-        assert_eq!(yuv.u.len(), 4);
-        assert_eq!(yuv.v.len(), 4);
     }
 }
 
@@ -1782,19 +1408,10 @@ fn handle_client_input(
     msg: PeerMessage,
     outgoing: &Sender<PeerMessage>,
     shell: &mut Option<ShellRuntime>,
-    target_fps: &AtomicU32,
 ) {
     match msg.union {
         Some(peer_message::Union::MouseEvent(ev)) => inject_mouse(ev),
         Some(peer_message::Union::KeyEvent(ev)) => inject_key(ev),
-        Some(peer_message::Union::Misc(Misc {
-            union: Some(misc::Union::Option(option)),
-        })) => {
-            if option.custom_fps > 0 {
-                let fps = (option.custom_fps as u32).clamp(5, MAX_TARGET_FPS);
-                target_fps.store(fps, Ordering::Relaxed);
-            }
-        }
         Some(peer_message::Union::Shell(shell_msg)) => {
             handle_shell_message(shell_msg, outgoing, shell);
         }
