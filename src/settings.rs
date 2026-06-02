@@ -89,6 +89,7 @@ impl EncoderPreference {
     pub fn label(self) -> &'static str {
         match self {
             Self::Auto => "Авто",
+            Self::Nvenc if cfg!(target_os = "macos") => "VideoToolbox",
             Self::Nvenc => "NVENC",
             Self::Software => "Software",
         }

@@ -120,7 +120,7 @@ impl EvertyDeskApp {
                 .frame(
                     egui::Frame::none()
                         .fill(egui::Color32::from_rgb(0x08, 0x0C, 0x12))
-                        .inner_margin(egui::Margin::same(14.0)),
+                        .inner_margin(egui::Margin::same(14)),
                 )
                 .show(ctx, |ui| {
                     let provider = self.config.llm.provider.label();
@@ -178,8 +178,8 @@ impl EvertyDeskApp {
                             1.0,
                             egui::Color32::from_rgb(0x1D, 0x2B, 0x3D),
                         ))
-                        .rounding(egui::Rounding::same(8.0))
-                        .inner_margin(egui::Margin::same(10.0))
+                        .rounding(egui::Rounding::same(8))
+                        .inner_margin(egui::Margin::same(10))
                         .show(ui, |ui| {
                             egui::ScrollArea::vertical()
                                 .stick_to_bottom(true)
@@ -194,7 +194,7 @@ impl EvertyDeskApp {
                                                     0xDF, 0xEA, 0xF7,
                                                 ))
                                                 .desired_width(f32::INFINITY)
-                                                .frame(false)
+                                                .frame(egui::Frame::NONE)
                                                 .interactive(false),
                                         );
                                     });
@@ -209,8 +209,8 @@ impl EvertyDeskApp {
                             1.0,
                             egui::Color32::from_rgb(0x24, 0x34, 0x49),
                         ))
-                        .rounding(egui::Rounding::same(8.0))
-                        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                        .rounding(egui::Rounding::same(8))
+                        .inner_margin(egui::Margin::symmetric(10, 8))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label(
@@ -226,7 +226,7 @@ impl EvertyDeskApp {
                                             .hint_text("command")
                                             .font(egui::TextStyle::Monospace)
                                             .text_color(egui::Color32::from_rgb(0xF5, 0xF8, 0xFC))
-                                            .frame(false),
+                                            .frame(egui::Frame::NONE),
                                     )
                                 });
                                 if response.has_focus()
@@ -262,8 +262,8 @@ impl EvertyDeskApp {
                             1.0,
                             egui::Color32::from_rgb(0x22, 0x30, 0x44),
                         ))
-                        .rounding(egui::Rounding::same(8.0))
-                        .inner_margin(egui::Margin::same(10.0))
+                        .rounding(egui::Rounding::same(8))
+                        .inner_margin(egui::Margin::same(10))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 let task_hint = self
@@ -282,7 +282,7 @@ impl EvertyDeskApp {
                                             .hint_text(task_hint)
                                             .font(egui::TextStyle::Button)
                                             .text_color(egui::Color32::from_rgb(0xF5, 0xF8, 0xFC))
-                                            .frame(false),
+                                            .frame(egui::Frame::NONE),
                                     );
                                 });
                                 let ask_clicked = ui
@@ -346,9 +346,7 @@ impl EvertyDeskApp {
                                     }
                                     if ui.button(self.text("Копировать", "Copy")).clicked()
                                     {
-                                        ui.output_mut(|o| {
-                                            o.copied_text = self.terminal_ai_answer.clone()
-                                        });
+                                        ui.ctx().copy_text(self.terminal_ai_answer.clone());
                                     }
                                     if ui.button(self.text("Скрыть", "Hide")).clicked() {
                                         self.terminal_ai_answer.clear();
@@ -466,8 +464,8 @@ impl EvertyDeskApp {
 fn terminal_badge(ui: &mut egui::Ui, text: &str, fill: egui::Color32) {
     egui::Frame::none()
         .fill(fill)
-        .rounding(egui::Rounding::same(12.0))
-        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+        .rounding(egui::Rounding::same(12))
+        .inner_margin(egui::Margin::symmetric(8, 4))
         .show(ui, |ui| {
             ui.label(
                 egui::RichText::new(text)
@@ -490,7 +488,7 @@ fn terminal_example_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
             1.0,
             egui::Color32::from_rgb(0x2B, 0x3C, 0x52),
         ))
-        .rounding(egui::Rounding::same(6.0)),
+        .rounding(egui::Rounding::same(6)),
     )
 }
 

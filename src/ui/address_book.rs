@@ -752,8 +752,8 @@ fn compact_panel_frame() -> egui::Frame {
             1.0,
             egui::Color32::from_rgb(0xE2, 0xE6, 0xEE),
         ))
-        .rounding(egui::Rounding::same(8.0))
-        .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+        .rounding(egui::Rounding::same(8))
+        .inner_margin(egui::Margin::symmetric(12, 10))
 }
 
 fn contact_grid_columns(available: f32) -> usize {
@@ -805,7 +805,7 @@ fn draw_contact_tile(
                         .strong()
                         .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
                     )
-                    .wrap(false),
+                    .truncate(),
                 );
                 ui.add_sized(
                     egui::vec2(ui.available_width(), 18.0),
@@ -815,7 +815,7 @@ fn draw_contact_tile(
                             .monospace()
                             .color(egui::Color32::from_rgb(0x57, 0x60, 0x70)),
                     )
-                    .wrap(false),
+                    .truncate(),
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -854,7 +854,7 @@ fn draw_contact_tile(
                     .size(12.0)
                     .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
             )
-            .wrap(false),
+            .truncate(),
         );
 
         ui.add_space((inner_height - 98.0).max(0.0));
@@ -902,8 +902,8 @@ fn contact_tile_frame(online: bool) -> egui::Frame {
                 egui::Color32::from_rgb(0xE2, 0xE6, 0xEE)
             },
         ))
-        .rounding(egui::Rounding::same(8.0))
-        .inner_margin(egui::Margin::same(10.0))
+        .rounding(egui::Rounding::same(8))
+        .inner_margin(egui::Margin::same(10))
 }
 
 fn status_dot(ui: &mut egui::Ui, label: &str, dot: egui::Color32) {
@@ -949,7 +949,7 @@ fn compact_info_row(ui: &mut egui::Ui, label: &str, value: &str) {
                     .size(12.0)
                     .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
             )
-            .wrap(false),
+            .truncate(),
         );
         ui.add_sized(
             egui::vec2((ui.available_width()).max(80.0), 20.0),
@@ -958,7 +958,7 @@ fn compact_info_row(ui: &mut egui::Ui, label: &str, value: &str) {
                     .size(12.5)
                     .color(egui::Color32::from_rgb(0x20, 0x24, 0x2D)),
             )
-            .wrap(false),
+            .truncate(),
         );
     });
     ui.add_space(4.0);

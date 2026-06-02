@@ -8,6 +8,7 @@ mod capture;
 mod crypto;
 mod host;
 mod llm;
+mod nvenc;
 mod rustdesk_proto;
 mod settings;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -15,6 +16,7 @@ mod software_ui;
 mod transport;
 mod ui;
 mod video;
+mod videotoolbox;
 mod vp9_mf;
 #[cfg(feature = "live-vpx-system")]
 mod vpx_system;
@@ -314,13 +316,7 @@ fn load_app_icon() -> Option<egui::IconData> {
 }
 
 fn run_gui(renderer: eframe::Renderer) -> eframe::Result<()> {
-    // Try all available GPU backends, including software rasterizers
-    // (WARP on Windows, lavapipe/llvmpipe on Linux).
-    let wgpu_opts = eframe::egui_wgpu::WgpuConfiguration {
-        // Enables DX12/DX11/Vulkan/GL/Metal — WARP on Windows falls under DX11
-        supported_backends: eframe::egui_wgpu::wgpu::Backends::all(),
-        ..Default::default()
-    };
+    let wgpu_opts = eframe::egui_wgpu::WgpuConfiguration::default();
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(APP_NAME)
@@ -352,7 +348,7 @@ fn run_gui(renderer: eframe::Renderer) -> eframe::Result<()> {
                 "[EvertyDesk] Build codecs: {}",
                 crate::video::build_codec_label()
             );
-            Box::new(EvertyDeskApp::new())
+            Ok(Box::new(EvertyDeskApp::new()))
         }),
     )
 }
@@ -1387,8 +1383,8 @@ impl EvertyDeskApp {
 }
 
 impl eframe::App for EvertyDeskApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.update_egui(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.update_egui(ui.ctx());
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -1471,7 +1467,7 @@ impl EvertyDeskApp {
                         egui::Color32::from_rgb(0xEA, 0xEC, 0xF0),
                     ))
                     .rounding(egui::Rounding::ZERO)
-                    .inner_margin(egui::Margin::symmetric(18.0, 20.0))
+                    .inner_margin(egui::Margin::symmetric(18, 20))
                     .outer_margin(egui::Margin::ZERO),
             )
             .show(ctx, |ui| self.sidebar(ui));
@@ -1481,10 +1477,10 @@ impl EvertyDeskApp {
                 egui::Frame::none()
                     .fill(egui::Color32::from_rgb(0xFB, 0xFC, 0xFE))
                     .inner_margin(egui::Margin {
-                        left: 26.0,
-                        right: 24.0,
-                        top: 28.0,
-                        bottom: 24.0,
+                        left: 26,
+                        right: 24,
+                        top: 28,
+                        bottom: 24,
                     }),
             )
             .show(ctx, |ui| match self.mode {
@@ -1651,7 +1647,7 @@ impl EvertyDeskApp {
                         .clicked()
                     {
                         let all = self.events.join("\n");
-                        ui.output_mut(|o| o.copied_text = all);
+                        ui.ctx().copy_text(all);
                         self.log_status = Some("Лог скопирован в буфер обмена".to_owned());
                     }
                     if ui
@@ -1694,13 +1690,14 @@ impl EvertyDeskApp {
             let p = ui.painter();
             p.rect_filled(
                 rect,
-                egui::Rounding::same(12.0),
+                egui::Rounding::same(12),
                 egui::Color32::from_rgb(0xFC, 0xFD, 0xFF),
             );
             p.rect_stroke(
                 rect,
-                egui::Rounding::same(12.0),
+                egui::Rounding::same(12),
                 egui::Stroke::new(1.0, egui::Color32::from_rgb(0xE5, 0xE8, 0xEF)),
+                egui::StrokeKind::Inside,
             );
             if let Some(texture) = self.ensure_app_logo_texture(ui.ctx()) {
                 let image_rect = rect.shrink(6.0);
@@ -1814,8 +1811,8 @@ impl EvertyDeskApp {
             egui::Frame::none()
                 .fill(Color32::from_rgb(0xFF, 0xFF, 0xFF))
                 .stroke(egui::Stroke::new(1.0, Color32::from_rgb(0xE3, 0xE6, 0xEC)))
-                .rounding(egui::Rounding::same(20.0))
-                .inner_margin(egui::Margin::symmetric(12.0, 6.0))
+                .rounding(egui::Rounding::same(20))
+                .inner_margin(egui::Margin::symmetric(12, 6))
                 .show(ui, |ui| {
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
@@ -1902,7 +1899,7 @@ impl EvertyDeskApp {
                         .on_hover_text(self.text("Скопировать ID", "Copy ID"))
                         .clicked()
                     {
-                        ui.output_mut(|o| o.copied_text = self.config.local_id.clone());
+                        ui.ctx().copy_text(self.config.local_id.clone());
                     }
                 });
             });
@@ -1935,7 +1932,7 @@ impl EvertyDeskApp {
                         .on_hover_text(self.text("Скопировать пароль", "Copy password"))
                         .clicked()
                     {
-                        ui.output_mut(|o| o.copied_text = self.config.local_password.clone());
+                        ui.ctx().copy_text(self.config.local_password.clone());
                     }
                     if icon_button(ui, "refresh")
                         .on_hover_text(self.text("Новый пароль", "New password"))
@@ -2189,7 +2186,7 @@ impl EvertyDeskApp {
                             .button(self.text("Скопировать лог", "Copy log"))
                             .clicked()
                         {
-                            ui.output_mut(|o| o.copied_text = self.events.join("\n"));
+                            ui.ctx().copy_text(self.events.join("\n"));
                             self.log_status = Some("Log copied".to_owned());
                         }
                         if ui.button(self.text("Очистить", "Clear")).clicked() {
@@ -2223,7 +2220,7 @@ impl EvertyDeskApp {
 
         // ── ID + Password block ───────────────────────────────────────────────
         egui::Frame::group(ui.style())
-            .inner_margin(egui::Margin::same(12.0))
+            .inner_margin(egui::Margin::same(12))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
 
@@ -2242,10 +2239,10 @@ impl EvertyDeskApp {
                                 .size(26.0)
                                 .strong(),
                         )
-                        .wrap(false),
+                        .truncate(),
                     );
                     if ui.button("⎘").on_hover_text("Копировать ID").clicked() {
-                        ui.output_mut(|o| o.copied_text = self.config.local_id.clone());
+                        ui.ctx().copy_text(self.config.local_id.clone());
                     }
                 });
 
@@ -2265,11 +2262,11 @@ impl EvertyDeskApp {
                     };
                     ui.add(
                         egui::Label::new(egui::RichText::new(pw_text).monospace().size(20.0))
-                            .wrap(false),
+                            .truncate(),
                     );
                     if ui.button("⎘").on_hover_text("Копировать пароль").clicked()
                     {
-                        ui.output_mut(|o| o.copied_text = self.config.local_password.clone());
+                        ui.ctx().copy_text(self.config.local_password.clone());
                     }
                     if ui.button("↺").on_hover_text("Новый пароль").clicked() {
                         self.config.local_password = generate_numeric_token(6);
@@ -2314,7 +2311,7 @@ impl EvertyDeskApp {
             ui.add_space(8.0);
             egui::Frame::group(ui.style())
                 .fill(egui::Color32::from_rgba_premultiplied(60, 110, 180, 40))
-                .inner_margin(egui::Margin::same(10.0))
+                .inner_margin(egui::Margin::same(10))
                 .show(ui, |ui| {
                     ui.label(
                         egui::RichText::new(format!("📡 Входящий запрос от: {peer_id}")).strong(),
@@ -2358,7 +2355,7 @@ impl EvertyDeskApp {
                         .clicked()
                     {
                         let all = self.host_log.join("\n");
-                        ui.output_mut(|o| o.copied_text = all);
+                        ui.ctx().copy_text(all);
                         self.host_status = "Лог хоста скопирован в буфер обмена".to_owned();
                     }
                     if ui
@@ -2583,7 +2580,7 @@ impl EvertyDeskApp {
                         .on_hover_text(self.text("Скопировать ID", "Copy ID"))
                         .clicked()
                     {
-                        ui.output_mut(|o| o.copied_text = self.config.local_id.clone());
+                        ui.ctx().copy_text(self.config.local_id.clone());
                     }
                 });
             });
@@ -2616,7 +2613,7 @@ impl EvertyDeskApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.checkbox(&mut self.show_host_password, show_label);
                     if icon_button(ui, "copy").on_hover_text(copy_pw_tip).clicked() {
-                        ui.output_mut(|o| o.copied_text = self.config.local_password.clone());
+                        ui.ctx().copy_text(self.config.local_password.clone());
                     }
                     if icon_button(ui, "refresh")
                         .on_hover_text(new_pw_tip)
@@ -2657,7 +2654,7 @@ impl EvertyDeskApp {
                     1.0,
                     egui::Color32::from_rgb(0xE3, 0xE6, 0xEC),
                 ))
-                .rounding(egui::Rounding::same(10.0));
+                .rounding(egui::Rounding::same(10));
                 if ui.add(button).clicked() {
                     if service_running {
                         self.stop_host_service();
@@ -2687,7 +2684,7 @@ impl EvertyDeskApp {
                             .button(self.text("Скопировать лог", "Copy log"))
                             .clicked()
                         {
-                            ui.output_mut(|o| o.copied_text = self.host_log.join("\n"));
+                            ui.ctx().copy_text(self.host_log.join("\n"));
                             self.host_status = "Host log copied".to_owned();
                         }
                         if ui.button(self.text("Очистить", "Clear")).clicked() {
@@ -3618,8 +3615,12 @@ impl EvertyDeskApp {
         // Draw a colored focus border around the remote screen when keyboard is captured.
         if self.remote_input_focused {
             let border_color = egui::Color32::from_rgb(45, 160, 230);
-            ui.painter()
-                .rect_stroke(response.rect, 0.0, egui::Stroke::new(2.0, border_color));
+            ui.painter().rect_stroke(
+                response.rect,
+                0.0,
+                egui::Stroke::new(2.0, border_color),
+                egui::StrokeKind::Inside,
+            );
         }
 
         // Draw remote cursor overlay on top of the video (PNG / screenshot mode only).
@@ -4086,6 +4087,7 @@ fn remote_texture_options() -> egui::TextureOptions {
         magnification: egui::TextureFilter::Nearest,
         minification: egui::TextureFilter::Linear,
         wrap_mode: egui::TextureWrapMode::ClampToEdge,
+        mipmap_mode: None,
     }
 }
 
@@ -4408,49 +4410,48 @@ fn configure_style(ctx: &egui::Context) {
     visuals.window_fill = panel;
     visuals.extreme_bg_color = input;
     visuals.faint_bg_color = card;
-    visuals.window_rounding = Rounding::same(20.0);
     visuals.window_stroke = Stroke::new(1.0, border);
 
     visuals.selection.bg_fill = Color32::from_rgb(0xB9, 0xD7, 0xFF);
     visuals.selection.stroke = Stroke::new(1.0, Color32::from_rgb(0x3D, 0x73, 0xB8));
 
-    let rounding = Rounding::same(12.0);
+    let rounding = Rounding::same(12);
     visuals.widgets.noninteractive.bg_fill = card;
     visuals.widgets.noninteractive.weak_bg_fill = card;
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, border);
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text_weak);
-    visuals.widgets.noninteractive.rounding = rounding;
+    visuals.widgets.noninteractive.corner_radius = rounding;
 
     visuals.widgets.inactive.bg_fill = input;
     visuals.widgets.inactive.weak_bg_fill = input;
     visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, border);
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, text_strong);
-    visuals.widgets.inactive.rounding = rounding;
+    visuals.widgets.inactive.corner_radius = rounding;
 
     visuals.widgets.hovered.bg_fill = Color32::from_rgb(0xFA, 0xFB, 0xFD);
     visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(0xFA, 0xFB, 0xFD);
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, border_hover);
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, text);
-    visuals.widgets.hovered.rounding = rounding;
+    visuals.widgets.hovered.corner_radius = rounding;
 
     visuals.widgets.active.bg_fill = Color32::from_rgb(0xF3, 0xF5, 0xF8);
     visuals.widgets.active.weak_bg_fill = Color32::from_rgb(0xF3, 0xF5, 0xF8);
     visuals.widgets.active.bg_stroke = Stroke::new(1.0, border_focus);
     visuals.widgets.active.fg_stroke = Stroke::new(1.0, text);
-    visuals.widgets.active.rounding = rounding;
+    visuals.widgets.active.corner_radius = rounding;
 
     visuals.widgets.open.bg_fill = card;
     visuals.widgets.open.bg_stroke = Stroke::new(1.0, border);
     visuals.widgets.open.fg_stroke = Stroke::new(1.0, text);
-    visuals.widgets.open.rounding = rounding;
+    visuals.widgets.open.corner_radius = rounding;
 
     ctx.set_visuals(visuals);
 
     let mut style = (*ctx.style()).clone();
     style.spacing.item_spacing = egui::vec2(12.0, 9.0);
     style.spacing.button_padding = egui::vec2(16.0, 9.0);
-    style.spacing.menu_margin = egui::Margin::same(8.0);
-    style.spacing.window_margin = egui::Margin::same(16.0);
+    style.spacing.menu_margin = egui::Margin::same(8);
+    style.spacing.window_margin = egui::Margin::same(16);
     style.spacing.interact_size.y = 34.0;
     ctx.set_style(style);
 }

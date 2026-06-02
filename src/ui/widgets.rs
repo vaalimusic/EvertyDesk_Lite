@@ -5,8 +5,8 @@ pub(crate) fn workspace_frame() -> egui::Frame {
     egui::Frame::none()
         .fill(egui::Color32::TRANSPARENT)
         .stroke(egui::Stroke::NONE)
-        .rounding(egui::Rounding::same(18.0))
-        .inner_margin(egui::Margin::same(0.0))
+        .rounding(egui::Rounding::same(18))
+        .inner_margin(egui::Margin::same(0))
 }
 
 pub(crate) fn card_frame() -> egui::Frame {
@@ -16,8 +16,8 @@ pub(crate) fn card_frame() -> egui::Frame {
             1.0,
             egui::Color32::from_rgb(0xE3, 0xE6, 0xEC),
         ))
-        .rounding(egui::Rounding::same(14.0))
-        .inner_margin(egui::Margin::same(16.0))
+        .rounding(egui::Rounding::same(14))
+        .inner_margin(egui::Margin::same(16))
 }
 
 pub(crate) fn settings_section(
@@ -31,8 +31,8 @@ pub(crate) fn settings_section(
             1.0,
             egui::Color32::from_rgb(0xE3, 0xE6, 0xEC),
         ))
-        .rounding(egui::Rounding::same(12.0))
-        .inner_margin(egui::Margin::same(14.0))
+        .rounding(egui::Rounding::same(12))
+        .inner_margin(egui::Margin::same(14))
         .show(ui, |ui| {
             ui.label(
                 egui::RichText::new(title)
@@ -58,7 +58,7 @@ pub(crate) fn settings_text_row(ui: &mut egui::Ui, label: &str, value: &mut Stri
                         .size(13.0)
                         .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
                 )
-                .wrap(false),
+                .truncate(),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let width = ui.available_width().min(360.0);
@@ -96,7 +96,7 @@ pub(crate) fn danger_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
             1.0,
             egui::Color32::from_rgb(0xF4, 0xB8, 0xBE),
         ))
-        .rounding(egui::Rounding::same(10.0)),
+        .rounding(egui::Rounding::same(10)),
     )
 }
 
@@ -109,11 +109,12 @@ pub(crate) fn primary_connect_button(ui: &mut egui::Ui, text: &str, icon: &str) 
         egui::Color32::from_rgb(0x12, 0xC9, 0x72)
     };
     ui.painter()
-        .rect_filled(rect, egui::Rounding::same(11.0), fill);
+        .rect_filled(rect, egui::Rounding::same(11), fill);
     ui.painter().rect_stroke(
         rect,
-        egui::Rounding::same(11.0),
+        egui::Rounding::same(11),
         egui::Stroke::new(1.0, egui::Color32::from_rgb(0x0A, 0xA8, 0x5E)),
+        egui::StrokeKind::Inside,
     );
 
     let icon_rect =
@@ -165,9 +166,13 @@ pub(crate) fn mode_segment_button(
         egui::Stroke::new(1.0, egui::Color32::from_rgb(0xDF, 0xE5, 0xEE))
     };
     ui.painter()
-        .rect_filled(rect, egui::Rounding::same(10.0), fill);
-    ui.painter()
-        .rect_stroke(rect, egui::Rounding::same(10.0), stroke);
+        .rect_filled(rect, egui::Rounding::same(10), fill);
+    ui.painter().rect_stroke(
+        rect,
+        egui::Rounding::same(10),
+        stroke,
+        egui::StrokeKind::Inside,
+    );
     let icon_rect = egui::Rect::from_center_size(
         egui::pos2(rect.min.x + 24.0, rect.center().y),
         egui::vec2(18.0, 18.0),
@@ -199,8 +204,8 @@ pub(crate) fn status_pill(ui: &mut egui::Ui, label: &str, dot: egui::Color32) {
             1.0,
             egui::Color32::from_rgb(0xE3, 0xE6, 0xEC),
         ))
-        .rounding(egui::Rounding::same(20.0))
-        .inner_margin(egui::Margin::symmetric(14.0, 8.0))
+        .rounding(egui::Rounding::same(20))
+        .inner_margin(egui::Margin::symmetric(14, 8))
         .show(ui, |ui| {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
             ui.painter().circle_filled(rect.center(), 5.0, dot);
@@ -244,9 +249,13 @@ pub(crate) fn compact_text_input(
         egui::Stroke::new(1.5, egui::Color32::from_rgb(0x9E, 0xAC, 0xBF))
     };
     ui.painter()
-        .rect_filled(rect, egui::Rounding::same(10.0), fill);
-    ui.painter()
-        .rect_stroke(rect, egui::Rounding::same(10.0), stroke);
+        .rect_filled(rect, egui::Rounding::same(10), fill);
+    ui.painter().rect_stroke(
+        rect,
+        egui::Rounding::same(10),
+        stroke,
+        egui::StrokeKind::Inside,
+    );
 
     let inner = ui.allocate_ui_at_rect(text_rect, |ui| {
         let edit = egui::TextEdit::singleline(value)
@@ -260,13 +269,13 @@ pub(crate) fn compact_text_input(
                     .map(egui::FontId::proportional)
                     .unwrap_or_else(|| egui::FontId::proportional(16.0)),
             )
-            .frame(false);
+            .frame(egui::Frame::NONE);
         ui.add_enabled(enabled, edit)
     });
     response |= inner.inner;
     response.context_menu(|ui| {
         if ui.button("Копировать").clicked() {
-            ui.output_mut(|o| o.copied_text = value.clone());
+            ui.ctx().copy_text(value.clone());
             ui.close_menu();
         }
         if ui.button("Вставить").clicked() {
@@ -293,11 +302,12 @@ pub(crate) fn icon_button(ui: &mut egui::Ui, icon: &str) -> egui::Response {
         egui::Color32::from_rgb(0xFF, 0xFF, 0xFF)
     };
     ui.painter()
-        .rect_filled(rect, egui::Rounding::same(10.0), fill);
+        .rect_filled(rect, egui::Rounding::same(10), fill);
     ui.painter().rect_stroke(
         rect,
-        egui::Rounding::same(10.0),
+        egui::Rounding::same(10),
         egui::Stroke::new(1.0, egui::Color32::from_rgb(0xE3, 0xE6, 0xEC)),
+        egui::StrokeKind::Inside,
     );
     draw_line_icon(
         ui.painter(),
@@ -329,7 +339,7 @@ pub(crate) fn language_button(ui: &mut egui::Ui, label: &str, active: bool) -> e
         .min_size(egui::vec2(56.0, 34.0))
         .fill(fill)
         .stroke(egui::Stroke::new(1.0, stroke))
-        .rounding(egui::Rounding::same(9.0)),
+        .rounding(egui::Rounding::same(9)),
     )
 }
 
@@ -353,9 +363,13 @@ pub(crate) fn nav_icon_button(
         egui::Stroke::NONE
     };
     ui.painter()
-        .rect_filled(rect, egui::Rounding::same(12.0), fill);
-    ui.painter()
-        .rect_stroke(rect, egui::Rounding::same(12.0), stroke);
+        .rect_filled(rect, egui::Rounding::same(12), fill);
+    ui.painter().rect_stroke(
+        rect,
+        egui::Rounding::same(12),
+        stroke,
+        egui::StrokeKind::Inside,
+    );
 
     let icon_rect =
         egui::Rect::from_min_size(rect.min + egui::vec2(13.0, 12.0), egui::vec2(20.0, 20.0));
@@ -399,7 +413,12 @@ fn draw_line_icon(p: &egui::Painter, rect: egui::Rect, icon: &str, color: egui::
         "monitor" => {
             let screen =
                 egui::Rect::from_center_size(c + egui::vec2(0.0, -2.0), egui::vec2(18.0, 13.0));
-            p.rect_stroke(screen, egui::Rounding::same(2.0), stroke);
+            p.rect_stroke(
+                screen,
+                egui::Rounding::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
             p.line_segment(
                 [
                     egui::pos2(c.x, screen.max.y),
@@ -428,8 +447,18 @@ fn draw_line_icon(p: &egui::Painter, rect: egui::Rect, icon: &str, color: egui::
                 egui::Rect::from_min_size(rect.min + egui::vec2(3.0, 1.0), egui::vec2(11.0, 13.0));
             let front =
                 egui::Rect::from_min_size(rect.min + egui::vec2(7.0, 5.0), egui::vec2(11.0, 13.0));
-            p.rect_stroke(back, egui::Rounding::same(1.5), stroke);
-            p.rect_stroke(front, egui::Rounding::same(1.5), stroke);
+            p.rect_stroke(
+                back,
+                egui::Rounding::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            p.rect_stroke(
+                front,
+                egui::Rounding::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
         }
         "refresh" => {
             p.circle_stroke(c, 7.0, stroke);
@@ -454,7 +483,12 @@ fn draw_line_icon(p: &egui::Painter, rect: egui::Rect, icon: &str, color: egui::
         }
         "console" => {
             let screen = egui::Rect::from_center_size(c, egui::vec2(19.0, 15.0));
-            p.rect_stroke(screen, egui::Rounding::same(2.0), stroke);
+            p.rect_stroke(
+                screen,
+                egui::Rounding::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
             p.line_segment(
                 [
                     screen.min + egui::vec2(4.0, 5.0),
@@ -525,6 +559,6 @@ pub(crate) fn secondary_button(ui: &mut egui::Ui, text: &str) -> egui::Response 
             1.0,
             egui::Color32::from_rgb(0xE3, 0xE6, 0xEC),
         ))
-        .rounding(egui::Rounding::same(10.0)),
+        .rounding(egui::Rounding::same(10)),
     )
 }

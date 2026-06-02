@@ -15,11 +15,14 @@ live-vpx   = ["dep:shiguredo_libvpx", "shiguredo_libvpx/source-build"]
 live-vpx-system = []
 # VP9 via Windows Media Foundation — no external libs, works on Win10 1803+ with MSVC
 live-vp9-mf = ["dep:windows"]
+# NVIDIA Video Codec SDK FFI probe. Disabled by default; the driver library is
+# loaded dynamically so portable builds do not require NVIDIA libs.
+live-nvenc-sdk = []
 
 [dependencies]
 arboard = "3.6"
 base64 = "0.22"
-eframe = { version = "0.27", default-features = false, features = [
+eframe = { version = "0.34", default-features = false, features = [
     "wgpu",          # Vulkan/DX12/Metal + software fallback — no OpenGL 2.0 required
     "glow",          # OpenGL fallback for conservative Linux desktops
     "x11",           # Linux X11 desktops, including Astra's classic desktop sessions

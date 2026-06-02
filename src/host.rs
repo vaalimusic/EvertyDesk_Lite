@@ -36,11 +36,11 @@ use crate::{
     rustdesk_proto::{
         decode_message, decode_peer_message, encode_message, encode_peer_message, login_response,
         misc, peer_message, rendezvous_message, video_frame, DisplayInfo, EncodedVideoFrame,
-        EncodedVideoFrames, Hash, IdPk, LoginResponse, Misc, PeerInfo, PeerMessage, RegisterPeer,
-        RegisterPk, RelayResponse, RendezvousMessage, RequestRelay, ShellMessage, ShellMessageKind,
-        SignedId, VideoFrame,
+        EncodedVideoFrames, Hash, IdPk, LoginResponse, Misc, PeerInfo, PeerMessage, PreferCodec,
+        RegisterPeer, RegisterPk, RelayResponse, RendezvousMessage, RequestRelay, ShellMessage,
+        ShellMessageKind, SignedId, SupportedDecoding, VideoFrame,
     },
-    settings::{AppConfig, EncoderPreference},
+    settings::{AppConfig, CodecPreference, EncoderPreference},
     transport::{connect_tcp, encode_frame_len, read_framed, send_framed},
 };
 use prost::Message as _;
@@ -1089,6 +1089,8 @@ fn relay_session_inner(
     send_peer_enc(&mut relay, &mut cipher, &login_ok)?;
 
     let target_fps = negotiated_target_fps(&login, config.display.target_fps);
+    let client_video = client_video_support(&login);
+    let codec_preference = config.display.codec;
     host_log(
         events,
         format!("Auth OK for {peer_id}. Starting capture at {target_fps} fps…"),
@@ -1127,6 +1129,8 @@ fn relay_session_inner(
             target_fps_v,
             out_rx,
             encoder_preference,
+            codec_preference,
+            client_video,
         );
     });
 
@@ -1164,6 +1168,8 @@ fn video_loop(
     target_fps: Arc<AtomicU32>,
     outgoing: Receiver<PeerMessage>,
     encoder_preference: EncoderPreference,
+    codec_preference: CodecPreference,
+    client_video: ClientVideoSupport,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -1188,8 +1194,8 @@ fn video_loop(
         match Encoder::with_api_config(api, cfg) {
             Ok(e) => Some(e),
             Err(_) => {
-                stop.store(true, Ordering::Relaxed);
-                return;
+                eprintln!("[host-video] OpenH264 init failed; software H264 fallback disabled");
+                None
             }
         }
     };
@@ -1197,10 +1203,27 @@ fn video_loop(
     let mut encoder: Option<()> = None;
     #[cfg(feature = "live-h264")]
     let mut yuv_frame = YuvFrame::default();
-    let active_encoder_backend = if cfg!(feature = "live-h264") {
-        "OpenH264 software"
-    } else {
-        "PNG fallback (live-h264 disabled)"
+    let desired_videotoolbox_codec =
+        choose_videotoolbox_codec(encoder_preference, codec_preference, client_video);
+    let mut videotoolbox_encoder: Option<crate::videotoolbox::FfmpegVideoToolboxEncoder> = None;
+    let mut videotoolbox_disabled = false;
+    let mut videotoolbox_empty_packets = 0_u32;
+    let desired_nvenc_codec =
+        choose_nvenc_codec(encoder_preference, codec_preference, client_video);
+    let mut nvenc_encoder: Option<crate::nvenc::FfmpegNvencEncoder> = None;
+    let mut nvenc_disabled = false;
+    let mut nvenc_empty_packets = 0_u32;
+    let active_encoder_backend = match (desired_videotoolbox_codec, desired_nvenc_codec) {
+        (Some(codec), _) => format!(
+            "VideoToolbox {} requested, ffmpeg adapter lazy-start",
+            codec.label()
+        ),
+        (None, Some(codec)) => format!(
+            "NVENC {} requested, ffmpeg adapter lazy-start",
+            codec.label()
+        ),
+        (None, None) if cfg!(feature = "live-h264") => "OpenH264 software".to_owned(),
+        (None, None) => "PNG fallback (live-h264 disabled)".to_owned(),
     };
     eprintln!(
         "[host-video] encoder policy: {}; active backend: {active_encoder_backend}",
@@ -1260,29 +1283,113 @@ fn video_loop(
             continue;
         }
 
-        let h264_bytes = encode_h264_frame(
-            #[cfg(feature = "live-h264")]
-            encoder.as_mut(),
-            #[cfg(not(feature = "live-h264"))]
-            &mut encoder,
-            #[cfg(feature = "live-h264")]
-            &mut yuv_frame,
-            cap_w,
-            cap_h,
-            &bgra,
-            decision.force_key,
-        );
+        let bitrate = h264_target_bitrate_bps(cap_w, cap_h, fps);
+        let tried_videotoolbox = desired_videotoolbox_codec.is_some() && !videotoolbox_disabled;
+        let mut tried_hardware = tried_videotoolbox;
+        let mut packet =
+            if let Some(codec) = desired_videotoolbox_codec.filter(|_| !videotoolbox_disabled) {
+                match encode_videotoolbox_frame(
+                    &mut videotoolbox_encoder,
+                    codec,
+                    cap_w,
+                    cap_h,
+                    fps,
+                    bitrate,
+                    &bgra,
+                ) {
+                    Ok(Some(packet)) => {
+                        videotoolbox_empty_packets = 0;
+                        Some(packet)
+                    }
+                    Ok(None) => {
+                        videotoolbox_empty_packets = videotoolbox_empty_packets.saturating_add(1);
+                        if videotoolbox_empty_packets > fps.min(15) {
+                            eprintln!(
+                                "[host-video] VideoToolbox {} produced no packets; falling back",
+                                codec.label()
+                            );
+                            videotoolbox_disabled = true;
+                        }
+                        None
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[host-video] VideoToolbox {} failed: {err}; falling back",
+                            codec.label()
+                        );
+                        videotoolbox_disabled = true;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
 
-        if let Some(packet) = h264_bytes {
+        let tried_nvenc = packet.is_none() && desired_nvenc_codec.is_some() && !nvenc_disabled;
+        tried_hardware |= tried_nvenc;
+        if packet.is_none() {
+            packet = if let Some(codec) = desired_nvenc_codec.filter(|_| !nvenc_disabled) {
+                match encode_nvenc_frame(
+                    &mut nvenc_encoder,
+                    codec,
+                    cap_w,
+                    cap_h,
+                    fps,
+                    bitrate,
+                    &bgra,
+                ) {
+                    Ok(Some(packet)) => {
+                        nvenc_empty_packets = 0;
+                        Some(packet)
+                    }
+                    Ok(None) => {
+                        nvenc_empty_packets = nvenc_empty_packets.saturating_add(1);
+                        if nvenc_empty_packets > fps.min(15) {
+                            eprintln!(
+                                "[host-video] NVENC {} produced no packets; falling back",
+                                codec.label()
+                            );
+                            nvenc_disabled = true;
+                        }
+                        None
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[host-video] NVENC {} failed: {err}; falling back",
+                            codec.label()
+                        );
+                        nvenc_disabled = true;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+        }
+
+        let hardware_disabled = videotoolbox_disabled || nvenc_disabled;
+        let packet = if packet.is_none() && (!tried_hardware || hardware_disabled) {
+            encode_h264_frame(
+                #[cfg(feature = "live-h264")]
+                encoder.as_mut(),
+                #[cfg(not(feature = "live-h264"))]
+                &mut encoder,
+                #[cfg(feature = "live-h264")]
+                &mut yuv_frame,
+                cap_w,
+                cap_h,
+                &bgra,
+                decision.force_key,
+            )
+            .map(EncodedPacket::h264)
+        } else {
+            packet
+        };
+
+        if let Some(packet) = packet {
             let frame_msg = PeerMessage {
                 union: Some(peer_message::Union::VideoFrame(VideoFrame {
-                    union: Some(video_frame::Union::H264s(EncodedVideoFrames {
-                        frames: vec![EncodedVideoFrame {
-                            data: packet.bytes,
-                            key: packet.key,
-                            ..Default::default()
-                        }],
-                    })),
+                    union: Some(packet.into_video_union()),
                     display: 0,
                 })),
             };
@@ -1359,6 +1466,56 @@ struct FrameDecision {
 struct FrameSkipStats {
     sent: u64,
     skipped_static: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ClientVideoSupport {
+    h264: bool,
+    h265: bool,
+    av1: bool,
+    prefer: PreferCodec,
+}
+
+impl Default for ClientVideoSupport {
+    fn default() -> Self {
+        Self {
+            h264: true,
+            h265: false,
+            av1: false,
+            prefer: PreferCodec::H264,
+        }
+    }
+}
+
+struct EncodedPacket {
+    codec: crate::nvenc::NvencCodec,
+    bytes: Vec<u8>,
+    key: bool,
+}
+
+impl EncodedPacket {
+    fn h264(packet: H264Packet) -> Self {
+        Self {
+            codec: crate::nvenc::NvencCodec::H264,
+            bytes: packet.bytes,
+            key: packet.key,
+        }
+    }
+
+    fn into_video_union(self) -> video_frame::Union {
+        let frames = EncodedVideoFrames {
+            frames: vec![EncodedVideoFrame {
+                data: self.bytes,
+                key: self.key,
+                ..Default::default()
+            }],
+        };
+        match self.codec {
+            crate::nvenc::NvencCodec::H264 => video_frame::Union::H264s(frames),
+            crate::nvenc::NvencCodec::H265 => video_frame::Union::H265s(frames),
+            crate::nvenc::NvencCodec::Av1 => video_frame::Union::Av1s(frames),
+        }
+    }
 }
 
 impl FrameChangeDetector {
@@ -1470,6 +1627,198 @@ impl FrameChangeDetector {
             Some(Duration::from_millis(50))
         }
     }
+}
+
+fn client_video_support(login: &crate::rustdesk_proto::LoginRequest) -> ClientVideoSupport {
+    let Some(SupportedDecoding {
+        ability_h264,
+        ability_h265,
+        ability_av1,
+        prefer,
+        ..
+    }) = login
+        .option
+        .as_ref()
+        .and_then(|option| option.supported_decoding.as_ref())
+    else {
+        return ClientVideoSupport::default();
+    };
+
+    ClientVideoSupport {
+        h264: *ability_h264 > 0,
+        h265: *ability_h265 > 0,
+        av1: *ability_av1 > 0,
+        prefer: PreferCodec::try_from(*prefer).unwrap_or(PreferCodec::Auto),
+    }
+}
+
+fn choose_videotoolbox_codec(
+    encoder_preference: EncoderPreference,
+    codec_preference: CodecPreference,
+    client: ClientVideoSupport,
+) -> Option<crate::nvenc::NvencCodec> {
+    if encoder_preference == EncoderPreference::Software {
+        return None;
+    }
+    let available = crate::videotoolbox::ffmpeg_videotoolbox_codecs();
+    if available.is_empty() {
+        return None;
+    }
+
+    let mut candidates = Vec::new();
+    match codec_preference {
+        CodecPreference::H265 => candidates.push(crate::nvenc::NvencCodec::H265),
+        CodecPreference::H264 => candidates.push(crate::nvenc::NvencCodec::H264),
+        CodecPreference::Auto => {
+            push_client_preferred_codec(&mut candidates, client.prefer);
+            candidates.extend([
+                crate::nvenc::NvencCodec::H264,
+                crate::nvenc::NvencCodec::H265,
+            ]);
+        }
+        CodecPreference::Av1 | CodecPreference::Vp9 => {
+            candidates.push(crate::nvenc::NvencCodec::H264);
+        }
+    }
+
+    candidates
+        .into_iter()
+        .find(|codec| available.contains(codec) && client_can_decode_hardware(client, *codec))
+}
+
+fn choose_nvenc_codec(
+    encoder_preference: EncoderPreference,
+    codec_preference: CodecPreference,
+    client: ClientVideoSupport,
+) -> Option<crate::nvenc::NvencCodec> {
+    if encoder_preference == EncoderPreference::Software {
+        return None;
+    }
+    let available = crate::nvenc::ffmpeg_nvenc_codecs();
+    if available.is_empty() {
+        return None;
+    }
+
+    let mut candidates = Vec::new();
+    match codec_preference {
+        CodecPreference::Av1 => candidates.push(crate::nvenc::NvencCodec::Av1),
+        CodecPreference::H265 => candidates.push(crate::nvenc::NvencCodec::H265),
+        CodecPreference::H264 => candidates.push(crate::nvenc::NvencCodec::H264),
+        CodecPreference::Auto => {
+            push_client_preferred_codec(&mut candidates, client.prefer);
+            candidates.extend([
+                crate::nvenc::NvencCodec::Av1,
+                crate::nvenc::NvencCodec::H265,
+                crate::nvenc::NvencCodec::H264,
+            ]);
+        }
+        CodecPreference::Vp9 => candidates.push(crate::nvenc::NvencCodec::H264),
+    }
+
+    candidates
+        .into_iter()
+        .find(|codec| available.contains(codec) && client_can_decode_hardware(client, *codec))
+}
+
+fn push_client_preferred_codec(
+    candidates: &mut Vec<crate::nvenc::NvencCodec>,
+    prefer: PreferCodec,
+) {
+    let codec = match prefer {
+        PreferCodec::Av1 => Some(crate::nvenc::NvencCodec::Av1),
+        PreferCodec::H265 => Some(crate::nvenc::NvencCodec::H265),
+        PreferCodec::H264 => Some(crate::nvenc::NvencCodec::H264),
+        _ => None,
+    };
+    if let Some(codec) = codec {
+        candidates.push(codec);
+    }
+}
+
+fn client_can_decode_hardware(client: ClientVideoSupport, codec: crate::nvenc::NvencCodec) -> bool {
+    match codec {
+        crate::nvenc::NvencCodec::H264 => client.h264,
+        crate::nvenc::NvencCodec::H265 => client.h265,
+        crate::nvenc::NvencCodec::Av1 => client.av1,
+    }
+}
+
+fn encode_videotoolbox_frame(
+    encoder: &mut Option<crate::videotoolbox::FfmpegVideoToolboxEncoder>,
+    codec: crate::nvenc::NvencCodec,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate: u32,
+    bgra: &[u8],
+) -> Result<Option<EncodedPacket>, String> {
+    let fps = fps.clamp(5, MAX_TARGET_FPS);
+    let recreate = encoder
+        .as_ref()
+        .map(|encoder| !encoder.matches(codec, width, height, fps))
+        .unwrap_or(true);
+    if recreate {
+        *encoder = Some(crate::videotoolbox::FfmpegVideoToolboxEncoder::new(
+            codec, width, height, fps, bitrate,
+        )?);
+        eprintln!(
+            "[host-video] VideoToolbox {} backend started at {}x{}@{}",
+            codec.label(),
+            width,
+            height,
+            fps
+        );
+    }
+
+    let Some(encoder) = encoder.as_mut() else {
+        return Ok(None);
+    };
+    encoder.encode_bgra(bgra).map(|packet| {
+        packet.map(|packet| EncodedPacket {
+            codec: packet.codec,
+            bytes: packet.bytes,
+            key: packet.key,
+        })
+    })
+}
+
+fn encode_nvenc_frame(
+    encoder: &mut Option<crate::nvenc::FfmpegNvencEncoder>,
+    codec: crate::nvenc::NvencCodec,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate: u32,
+    bgra: &[u8],
+) -> Result<Option<EncodedPacket>, String> {
+    let fps = fps.clamp(5, MAX_TARGET_FPS);
+    let recreate = encoder
+        .as_ref()
+        .map(|encoder| !encoder.matches(codec, width, height, fps))
+        .unwrap_or(true);
+    if recreate {
+        *encoder = Some(crate::nvenc::FfmpegNvencEncoder::new(
+            codec, width, height, fps, bitrate,
+        )?);
+        eprintln!(
+            "[host-video] NVENC {} backend started at {}x{}@{}",
+            codec.label(),
+            width,
+            height,
+            fps
+        );
+    }
+
+    let Some(encoder) = encoder.as_mut() else {
+        return Ok(None);
+    };
+    encoder.encode_bgra(bgra).map(|packet| {
+        packet.map(|packet| EncodedPacket {
+            codec: packet.codec,
+            bytes: packet.bytes,
+            key: packet.key,
+        })
+    })
 }
 
 /// Read a PeerMessage using the receive-only cipher half.

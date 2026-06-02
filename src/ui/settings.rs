@@ -731,7 +731,7 @@ fn settings_secret_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
                         .size(13.0)
                         .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
                 )
-                .wrap(false),
+                .truncate(),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let width = ui.available_width().min(360.0);
