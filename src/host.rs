@@ -1278,6 +1278,7 @@ fn video_loop(
 
     let mut frame_idx: u64 = 0;
     let mut last_frame = Instant::now();
+    let mut capture_bgra = Vec::new();
     let mut change_detector = FrameChangeDetector::default();
     let mut last_video_stats = Instant::now();
     let mut encode_stats = VideoEncodeTelemetry::new(active_encoder_backend);
@@ -1304,10 +1305,11 @@ fn video_loop(
         frame_idx += 1;
 
         let capture_started = Instant::now();
-        let Some((cap_w, cap_h, bgra)) = crate::capture::capture_screen() else {
+        let Some((cap_w, cap_h)) = crate::capture::capture_screen_into(&mut capture_bgra) else {
             thread::sleep(frame_budget);
             continue;
         };
+        let bgra = capture_bgra.as_slice();
         encode_stats.mark_capture_ms(elapsed_ms(capture_started));
         let bitrate = h264_target_bitrate_bps(cap_w, cap_h, fps);
 

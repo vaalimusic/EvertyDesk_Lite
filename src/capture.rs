@@ -7,92 +7,166 @@
 
 #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
 mod win {
-    use std::mem::size_of;
+    use std::{cell::RefCell, mem::size_of};
 
     use windows::Win32::{
         Foundation::HWND,
         Graphics::Gdi::{
             BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
             GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT,
-            DIB_RGB_COLORS, RGBQUAD, SRCCOPY,
+            DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, RGBQUAD, SRCCOPY,
         },
         UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN},
     };
 
-    pub fn capture() -> Option<(u32, u32, Vec<u8>)> {
-        unsafe { capture_inner() }
+    thread_local! {
+        static GDI_CAPTURE: RefCell<Option<GdiCapture>> = const { RefCell::new(None) };
     }
 
-    unsafe fn capture_inner() -> Option<(u32, u32, Vec<u8>)> {
+    pub fn capture_into(out: &mut Vec<u8>) -> Option<(u32, u32)> {
+        unsafe { capture_into_inner(out) }
+    }
+
+    unsafe fn capture_into_inner(out: &mut Vec<u8>) -> Option<(u32, u32)> {
         let width = GetSystemMetrics(SM_CXSCREEN);
         let height = GetSystemMetrics(SM_CYSCREEN);
         if width <= 0 || height <= 0 {
             return None;
         }
-        let (w, h) = (width as u32, height as u32);
 
-        // Screen DC (entire virtual desktop).
-        let hdc_screen = GetDC(HWND(0));
-        if hdc_screen.is_invalid() {
-            return None;
+        GDI_CAPTURE.with(|cell| {
+            let recreate = cell
+                .borrow()
+                .as_ref()
+                .map(|capture| !capture.matches(width, height))
+                .unwrap_or(true);
+            if recreate {
+                *cell.borrow_mut() = GdiCapture::new(width, height);
+            }
+
+            let result = cell
+                .borrow_mut()
+                .as_mut()
+                .and_then(|capture| capture.capture_into(out));
+            if result.is_none() {
+                *cell.borrow_mut() = None;
+            }
+            result
+        })
+    }
+
+    struct GdiCapture {
+        width: i32,
+        height: i32,
+        hdc_screen: HDC,
+        hdc_mem: HDC,
+        hbmp: HBITMAP,
+        old_bitmap: HGDIOBJ,
+        bitmap_info: BITMAPINFO,
+    }
+
+    impl GdiCapture {
+        unsafe fn new(width: i32, height: i32) -> Option<Self> {
+            let hdc_screen = GetDC(HWND(0));
+            if hdc_screen.is_invalid() {
+                return None;
+            }
+
+            let hdc_mem = CreateCompatibleDC(hdc_screen);
+            if hdc_mem.is_invalid() {
+                ReleaseDC(HWND(0), hdc_screen);
+                return None;
+            }
+
+            let hbmp = CreateCompatibleBitmap(hdc_screen, width, height);
+            if hbmp.is_invalid() {
+                let _ = DeleteDC(hdc_mem);
+                ReleaseDC(HWND(0), hdc_screen);
+                return None;
+            }
+
+            let old_bitmap = SelectObject(hdc_mem, hbmp);
+            let bitmap_info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    // Negative height → top-down (row 0 = top of screen).
+                    biHeight: -height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0 as u32,
+                    ..BITMAPINFOHEADER::default()
+                },
+                bmiColors: [RGBQUAD::default()],
+            };
+
+            Some(Self {
+                width,
+                height,
+                hdc_screen,
+                hdc_mem,
+                hbmp,
+                old_bitmap,
+                bitmap_info,
+            })
         }
 
-        // Memory DC + bitmap.
-        let hdc_mem = CreateCompatibleDC(hdc_screen);
-        let hbmp = CreateCompatibleBitmap(hdc_screen, width, height);
-        let hbmp_old = SelectObject(hdc_mem, hbmp);
+        fn matches(&self, width: i32, height: i32) -> bool {
+            self.width == width && self.height == height
+        }
 
-        // Copy screen → memory DC.
-        let _ = BitBlt(
-            hdc_mem,
-            0,
-            0,
-            width,
-            height,
-            hdc_screen,
-            0,
-            0,
-            SRCCOPY | CAPTUREBLT,
-        );
+        unsafe fn capture_into(&mut self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
+            let w = self.width as u32;
+            let h = self.height as u32;
+            let byte_len = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+            if out.len() != byte_len {
+                out.resize(byte_len, 0);
+            }
 
-        // Extract pixels as 32-bit BGRA (no palette).
-        let mut bi = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: width,
-                // Negative height → top-down (row 0 = top of screen).
-                biHeight: -height,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0 as u32,
-                ..BITMAPINFOHEADER::default()
-            },
-            bmiColors: [RGBQUAD::default()],
-        };
+            if !BitBlt(
+                self.hdc_mem,
+                0,
+                0,
+                self.width,
+                self.height,
+                self.hdc_screen,
+                0,
+                0,
+                SRCCOPY | CAPTUREBLT,
+            )
+            .as_bool()
+            {
+                return None;
+            }
 
-        let pixel_count = (w * h) as usize;
-        let mut buf = vec![0u8; pixel_count * 4];
+            let lines = GetDIBits(
+                self.hdc_mem,
+                self.hbmp,
+                0,
+                h,
+                Some(out.as_mut_ptr() as *mut _),
+                &mut self.bitmap_info,
+                DIB_RGB_COLORS,
+            );
+            if lines == 0 {
+                return None;
+            }
 
-        GetDIBits(
-            hdc_mem,
-            hbmp,
-            0,
-            h,
-            Some(buf.as_mut_ptr() as *mut _),
-            &mut bi,
-            DIB_RGB_COLORS,
-        );
+            // GDI gives us BGRA; that is already the native pixel order for our
+            // pipeline.
+            Some((w, h))
+        }
+    }
 
-        // Cleanup.
-        SelectObject(hdc_mem, hbmp_old);
-        let _ = DeleteObject(hbmp);
-        let _ = DeleteDC(hdc_mem);
-        ReleaseDC(HWND(0), hdc_screen);
-
-        // GDI gives us BGRA; that is already the native pixel order for our
-        // pipeline (we just leave it as BGRA — the H264 encoder gets YUV
-        // derived from it, not raw pixels).
-        Some((w, h, buf))
+    impl Drop for GdiCapture {
+        fn drop(&mut self) {
+            unsafe {
+                SelectObject(self.hdc_mem, self.old_bitmap);
+                let _ = DeleteObject(self.hbmp);
+                let _ = DeleteDC(self.hdc_mem);
+                ReleaseDC(HWND(0), self.hdc_screen);
+            }
+        }
     }
 }
 
@@ -101,11 +175,23 @@ mod win {
 /// Capture the primary display.  Returns `(width, height, bgra_pixels)`.
 #[allow(unused)]
 pub fn capture_screen() -> Option<(u32, u32, Vec<u8>)> {
+    let mut pixels = Vec::new();
+    let (width, height) = capture_screen_into(&mut pixels)?;
+    Some((width, height, pixels))
+}
+
+/// Capture the primary display into a caller-owned BGRA buffer.
+#[allow(unused)]
+pub fn capture_screen_into(pixels: &mut Vec<u8>) -> Option<(u32, u32)> {
     #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
-    return win::capture();
+    return win::capture_into(pixels);
 
     #[cfg(target_os = "linux")]
-    return linux_x11::capture();
+    {
+        let (width, height, data) = linux_x11::capture()?;
+        *pixels = data;
+        return Some((width, height));
+    }
 
     #[cfg(not(any(
         all(target_os = "windows", feature = "live-vp9-mf"),

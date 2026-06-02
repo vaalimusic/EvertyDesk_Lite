@@ -638,6 +638,8 @@ struct EvertyDeskApp {
     fps_last_at: Instant,
     fps_last_count: u64,
     display_fps: f32,
+    stream_input_fps: f32,
+    stream_input_kbps: u64,
     frame_bytes: usize,
     frame_queue_ms: u64,
     frame_decode_ms: u64,
@@ -863,6 +865,8 @@ impl EvertyDeskApp {
             fps_last_at: Instant::now(),
             fps_last_count: 0,
             display_fps: 0.0,
+            stream_input_fps: 0.0,
+            stream_input_kbps: 0,
             frame_bytes: 0,
             frame_queue_ms: 0,
             frame_decode_ms: 0,
@@ -947,6 +951,8 @@ impl EvertyDeskApp {
         self.fps_last_at = Instant::now();
         self.fps_last_count = 0;
         self.display_fps = 0.0;
+        self.stream_input_fps = 0.0;
+        self.stream_input_kbps = 0;
         self.wheel_accum = egui::Vec2::ZERO;
         self.selected_display = 0;
         self.remote_input_focused = false;
@@ -1105,6 +1111,7 @@ impl EvertyDeskApp {
                     self.last_live_frame_at = Some(Instant::now());
                     self.png_fallback_started_at = None;
                 }
+                self.update_render_fps();
                 self.last_frame_rgba = rgba;
                 let image =
                     ColorImage::from_rgba_unmultiplied([width, height], &self.last_frame_rgba);
@@ -1123,7 +1130,6 @@ impl EvertyDeskApp {
             SessionEvent::ScreenshotStats { received, pending } => {
                 self.screenshot_count = received;
                 self.screenshot_pending = pending;
-                self.update_fps(received);
             }
             SessionEvent::FrameMetrics {
                 bytes,
@@ -1136,6 +1142,20 @@ impl EvertyDeskApp {
                 self.frame_decode_ms = decode_ms;
                 self.frame_dropped = dropped;
                 self.auto_tune_stream();
+            }
+            SessionEvent::VideoPacketMetrics {
+                input_fps,
+                input_kbps,
+            } => {
+                self.stream_input_fps = input_fps;
+                self.stream_input_kbps = input_kbps;
+                if self.last_frame_codec != "PNG" && input_fps > 0.1 {
+                    if input_fps < 8.0 {
+                        self.stream_health = "низкий входящий поток: хост/сеть".to_owned();
+                    } else if self.display_fps + 3.0 < input_fps * 0.6 {
+                        self.stream_health = "декодер/отрисовка отстаёт".to_owned();
+                    }
+                }
             }
             SessionEvent::Displays(displays) => {
                 self.remote_displays = displays;
@@ -1279,6 +1299,11 @@ impl EvertyDeskApp {
         self.frame_queue_ms = 0;
         self.frame_decode_ms = 0;
         self.frame_dropped = 0;
+        self.fps_last_at = Instant::now();
+        self.fps_last_count = 0;
+        self.display_fps = 0.0;
+        self.stream_input_fps = 0.0;
+        self.stream_input_kbps = 0;
         self.last_stream_tune_at = None;
         self.png_fallback_started_at = None;
         self.last_live_frame_at = None;
@@ -1308,10 +1333,11 @@ impl EvertyDeskApp {
         self.status.clone()
     }
 
-    fn update_fps(&mut self, received: u64) {
+    fn update_render_fps(&mut self) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.fps_last_at);
         if elapsed >= Duration::from_millis(750) {
+            let received = self.live_frame_count + self.screenshot_frame_count;
             let frames = received.saturating_sub(self.fps_last_count);
             self.display_fps = frames as f32 / elapsed.as_secs_f32();
             self.fps_last_at = now;
@@ -3082,6 +3108,24 @@ impl EvertyDeskApp {
                         .color(fps_color),
                 );
                 ui.separator();
+                let input_color = if self.stream_input_fps >= 20.0 {
+                    egui::Color32::from_rgb(80, 200, 100)
+                } else if self.stream_input_fps >= 8.0 {
+                    egui::Color32::from_rgb(220, 180, 60)
+                } else {
+                    egui::Color32::from_rgb(220, 80, 80)
+                };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "in {:.1}/s {} kbps",
+                        self.stream_input_fps, self.stream_input_kbps
+                    ))
+                    .monospace()
+                    .size(11.0)
+                    .color(input_color),
+                )
+                .on_hover_text("Входящие live-video пакеты до декодера");
+                ui.separator();
 
                 let (codec_label, codec_color) = match self.last_frame_codec.as_str() {
                     "H264" | "H265" | "AV1" | "VP9" => (
@@ -3434,6 +3478,24 @@ impl EvertyDeskApp {
                             .size(11.0)
                             .color(fps_color),
                     );
+                    ui.separator();
+                    let input_color = if self.stream_input_fps >= 20.0 {
+                        egui::Color32::from_rgb(80, 200, 100)
+                    } else if self.stream_input_fps >= 8.0 {
+                        egui::Color32::from_rgb(220, 180, 60)
+                    } else {
+                        egui::Color32::from_rgb(220, 80, 80)
+                    };
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "in {:.1}/s {} kbps",
+                            self.stream_input_fps, self.stream_input_kbps
+                        ))
+                        .monospace()
+                        .size(11.0)
+                        .color(input_color),
+                    )
+                    .on_hover_text("Входящие live-video пакеты до декодера");
                     ui.separator();
                     // Codec badge: color shows quality:
                     //   H264 green  = live video, low latency
@@ -4013,6 +4075,8 @@ impl EvertyDeskApp {
             connected: self.connected,
             codec: self.last_frame_codec.clone(),
             fps: self.display_fps,
+            input_fps: self.stream_input_fps,
+            input_kbps: self.stream_input_kbps,
             latency_ms: self.latency_ms,
             frame_size: self.remote_size,
             frame_bytes: self.frame_bytes,
@@ -4154,6 +4218,8 @@ struct SupportReport {
     connected: bool,
     codec: String,
     fps: f32,
+    input_fps: f32,
+    input_kbps: u64,
     latency_ms: Option<u32>,
     frame_size: [usize; 2],
     frame_bytes: usize,
@@ -4280,6 +4346,8 @@ fn support_report_summary(report: &SupportReport, timestamp: u64) -> String {
          connected={}\n\
          codec={}\n\
          fps={:.1}\n\
+         input_fps={:.1}\n\
+         input_kbps={}\n\
          latency_ms={latency}\n\
          frame={}x{}\n\
          frame_bytes={}\n\
@@ -4295,6 +4363,8 @@ fn support_report_summary(report: &SupportReport, timestamp: u64) -> String {
         report.connected,
         report.codec,
         report.fps,
+        report.input_fps,
+        report.input_kbps,
         report.frame_size[0],
         report.frame_size[1],
         report.frame_bytes,

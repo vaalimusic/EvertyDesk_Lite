@@ -30,6 +30,10 @@ const RENDEZVOUS_PORT: u16 = 21116;
 const ONLINE_PORT: u16 = RENDEZVOUS_PORT - 1;
 const RELAY_PORT: u16 = 21117;
 const SESSION_TICK_MS: u64 = 16; // ~60 fps poll; keeps command latency ≤16 ms
+const RELAY_STREAM_ATTEMPTS: u8 = 3;
+const RELAY_BOOTSTRAP_WAIT_SECS: u64 = 12;
+const RELAY_AUTH_WAIT_SECS: u64 = 120;
+const RELAY_HANDSHAKE_POLL_MS: u64 = 500;
 
 #[derive(Clone, Debug)]
 pub struct ConnectionRequest {
@@ -66,6 +70,10 @@ pub enum SessionEvent {
         queue_ms: u64,
         decode_ms: u64,
         dropped: usize,
+    },
+    VideoPacketMetrics {
+        input_fps: f32,
+        input_kbps: u64,
     },
     Displays(Vec<RemoteDisplay>),
     Info(String),
@@ -225,7 +233,9 @@ enum DecoderInput {
 #[allow(dead_code)] // SkippedVideo is only used when live-vpx is disabled.
 enum FrameSource {
     Screenshot,
-    Video,
+    Video {
+        bytes: usize,
+    },
     /// Video frame arrived but we cannot decode it (e.g. VP9/VP8 without live-vpx).
     /// Counted separately so the session loop can warn the user.
     SkippedVideo {
@@ -355,6 +365,9 @@ impl TransportClient {
         let mut peer_messages_seen = 0_u32;
         let mut live_video_seen = false;
         let mut last_frame_received = Instant::now();
+        let mut video_metric_packets = 0_u64;
+        let mut video_metric_bytes = 0_u64;
+        let mut last_video_packet_metrics = Instant::now();
         let mut target_video_fps = initial_video_fps;
         let mut last_decoder_recovery: Option<Instant> = None;
         let mut last_adaptive_raise = Instant::now();
@@ -833,7 +846,23 @@ impl TransportClient {
                     screenshots_received += 1;
                     screenshot_pending = false;
                     last_frame_received = Instant::now();
-                    if source == FrameSource::Video {
+                    if let FrameSource::Video { bytes } = source {
+                        video_metric_packets = video_metric_packets.saturating_add(1);
+                        video_metric_bytes = video_metric_bytes.saturating_add(bytes as u64);
+                        let metric_elapsed = last_video_packet_metrics.elapsed();
+                        if metric_elapsed >= Duration::from_millis(750) {
+                            let secs = metric_elapsed.as_secs_f32().max(0.001);
+                            let input_fps = video_metric_packets as f32 / secs;
+                            let input_kbps =
+                                ((video_metric_bytes as f32 * 8.0) / secs / 1000.0).round() as u64;
+                            let _ = events.send(SessionEvent::VideoPacketMetrics {
+                                input_fps,
+                                input_kbps,
+                            });
+                            video_metric_packets = 0;
+                            video_metric_bytes = 0;
+                            last_video_packet_metrics = Instant::now();
+                        }
                         if !first_live_video_seen {
                             first_live_video_seen = true;
                             let _ = events.send(SessionEvent::Info(
@@ -997,14 +1026,15 @@ fn establish_session(
     let initial_video_fps = request.display.target_fps.clamp(5, 60) as i32;
     let codec_preference = request.display.codec;
 
-    // Relay connection: retry up to 3 times because the peer may not have arrived yet
-    // when we open the stream, causing an immediate EOF from the relay server.
+    // Relay connection: retry because the peer may not have joined the relay
+    // stream yet when the operator side opens it.
     let mut last_err = String::new();
-    for attempt in 0..3_u8 {
+    let max_retries = RELAY_STREAM_ATTEMPTS.saturating_sub(1);
+    for attempt in 0..RELAY_STREAM_ATTEMPTS {
         if attempt > 0 {
             progress(
                 88 + attempt * 2,
-                format!("Relay retry {attempt}/2 (peer not ready yet): {last_err}"),
+                format!("Relay retry {attempt}/{max_retries} (peer not ready yet): {last_err}"),
             );
         } else {
             progress(88, "Requesting relay reservation".to_owned());
@@ -1243,20 +1273,48 @@ fn read_initial_peer_stage(
     codec_preference: CodecPreference,
 ) -> Result<(String, Vec<RemoteDisplay>), String> {
     relay
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(Duration::from_millis(RELAY_HANDSHAKE_POLL_MS)))
         .map_err(|err| format!("Failed to set relay read timeout: {err}"))?;
     let mut sent_login = false;
+    let mut seen_peer_message = false;
     let wait_remote_accept = password.is_empty();
-    for _ in 0..120 {
+    let started = Instant::now();
+    let bootstrap_deadline = started + Duration::from_secs(RELAY_BOOTSTRAP_WAIT_SECS);
+    let auth_deadline = started + Duration::from_secs(RELAY_AUTH_WAIT_SECS);
+    loop {
         let payload = match read_framed(relay) {
             Ok(payload) => payload,
-            Err(err) if wait_remote_accept && sent_login && is_timeout_error(&err) => continue,
+            Err(err) if is_timeout_error(&err) => {
+                let now = Instant::now();
+                if !seen_peer_message {
+                    if now < bootstrap_deadline {
+                        continue;
+                    }
+                    return Err(format!(
+                        "Relay opened, but peer did not join within {RELAY_BOOTSTRAP_WAIT_SECS}s: {err}"
+                    ));
+                }
+                if now < auth_deadline {
+                    continue;
+                }
+                let stage = if wait_remote_accept && sent_login {
+                    "remote approval/login response"
+                } else if sent_login {
+                    "login response"
+                } else {
+                    "peer secure/login response"
+                };
+                return Err(format!(
+                    "Timed out waiting for {stage} after {RELAY_AUTH_WAIT_SECS}s: {err}"
+                ));
+            }
             Err(err) => {
                 return Err(format!(
                     "Relay opened, but no peer secure/login message arrived: {err}"
                 ));
             }
         };
+        seen_peer_message = true;
         let message = decode_peer_message(&payload)
             .map_err(|err| format!("Peer message decode failed: {err}"))?;
 
@@ -1349,7 +1407,6 @@ fn read_initial_peer_stage(
             }
         }
     }
-    Err("Login response timeout after peer handshake or remote approval".to_owned())
 }
 
 fn send_video_start_messages(
@@ -1652,17 +1709,19 @@ fn handle_session_message(
             let description = describe_video_frame(&frame);
             match frame.union {
                 Some(video_frame::Union::H264s(frames)) => {
+                    let bytes = encoded_frame_bytes(&frames);
+                    let sid = encoded_sid("h264", &frames);
                     queue_encoded_frame(
                         frame_tx,
                         DecoderInput::H264 {
-                            sid: encoded_sid("h264", &frames),
-                            bytes: encoded_frame_bytes(&frames),
+                            sid,
+                            bytes,
                             queued_at: Instant::now(),
                             frames,
                         },
                         events,
                     );
-                    Some(FrameSource::Video)
+                    Some(FrameSource::Video { bytes })
                 }
                 Some(video_frame::Union::Vp8s(frames)) => {
                     // Only count VP8 as live video if we can actually decode it.
@@ -1670,17 +1729,19 @@ fn handle_session_message(
                     // counting them as "live" would suppress screenshot refresh forever.
                     #[cfg(feature = "live-vpx")]
                     {
+                        let bytes = encoded_frame_bytes(&frames);
+                        let sid = encoded_sid("vp8", &frames);
                         queue_encoded_frame(
                             frame_tx,
                             DecoderInput::Vp8 {
-                                sid: encoded_sid("vp8", &frames),
-                                bytes: encoded_frame_bytes(&frames),
+                                sid,
+                                bytes,
                                 queued_at: Instant::now(),
                                 frames,
                             },
                             events,
                         );
-                        Some(FrameSource::Video)
+                        Some(FrameSource::Video { bytes })
                     }
                     #[cfg(not(feature = "live-vpx"))]
                     {
@@ -1699,17 +1760,19 @@ fn handle_session_message(
                         all(feature = "live-vp9-mf", target_os = "windows")
                     ))]
                     {
+                        let bytes = encoded_frame_bytes(&frames);
+                        let sid = encoded_sid("vp9", &frames);
                         queue_encoded_frame(
                             frame_tx,
                             DecoderInput::Vp9 {
-                                sid: encoded_sid("vp9", &frames),
-                                bytes: encoded_frame_bytes(&frames),
+                                sid,
+                                bytes,
                                 queued_at: Instant::now(),
                                 frames,
                             },
                             events,
                         );
-                        Some(FrameSource::Video)
+                        Some(FrameSource::Video { bytes })
                     }
                     #[cfg(not(any(
                         feature = "live-vpx",
@@ -1726,11 +1789,13 @@ fn handle_session_message(
                         if let Some((width, height)) =
                             decoder_dimensions(known_displays, current_display)
                         {
+                            let bytes = encoded_frame_bytes(&frames);
+                            let sid = encoded_sid("h265", &frames);
                             queue_encoded_frame(
                                 frame_tx,
                                 DecoderInput::H265 {
-                                    sid: encoded_sid("h265", &frames),
-                                    bytes: encoded_frame_bytes(&frames),
+                                    sid,
+                                    bytes,
                                     queued_at: Instant::now(),
                                     frames,
                                     width,
@@ -1738,7 +1803,7 @@ fn handle_session_message(
                                 },
                                 events,
                             );
-                            Some(FrameSource::Video)
+                            Some(FrameSource::Video { bytes })
                         } else {
                             let _ = (frame_tx, frames);
                             let _ = events.send(SessionEvent::Info(
@@ -1761,11 +1826,13 @@ fn handle_session_message(
                         if let Some((width, height)) =
                             decoder_dimensions(known_displays, current_display)
                         {
+                            let bytes = encoded_frame_bytes(&frames);
+                            let sid = encoded_sid("av1", &frames);
                             queue_encoded_frame(
                                 frame_tx,
                                 DecoderInput::Av1 {
-                                    sid: encoded_sid("av1", &frames),
-                                    bytes: encoded_frame_bytes(&frames),
+                                    sid,
+                                    bytes,
                                     queued_at: Instant::now(),
                                     frames,
                                     width,
@@ -1773,7 +1840,7 @@ fn handle_session_message(
                                 },
                                 events,
                             );
-                            Some(FrameSource::Video)
+                            Some(FrameSource::Video { bytes })
                         } else {
                             let _ = (frame_tx, frames);
                             let _ = events.send(SessionEvent::Info(
@@ -2201,6 +2268,7 @@ fn decode_frame_loop(
                     latest_event = Some(event);
                 }
                 Ok(None) => {}
+                Err(err) if decoder_needs_more_packets(&err) => {}
                 Err(err) => {
                     let _ = feedback.send(DecoderFeedback::DecodeFailed { codec });
                     let _ = events.send(SessionEvent::Info(format!("Frame decode failed: {err}")));
@@ -2287,6 +2355,10 @@ fn trim_video_backlog_to_keyframe(batch: &mut Vec<DecoderInput>) -> usize {
         }
     }
     before.saturating_sub(batch.len())
+}
+
+fn decoder_needs_more_packets(err: &str) -> bool {
+    err.contains("decoder needs more packets")
 }
 
 fn decode_one_frame(
@@ -2796,6 +2868,7 @@ fn is_timeout_error(err: &str) -> bool {
         || err.contains("WouldBlock")
         || err.contains("Resource temporarily unavailable")
         || err.contains("os error 11")
+        || err.contains("os error 35")
         || err.contains("10060")
         || err.contains("Попытка установить соединение")
 }
@@ -3239,5 +3312,20 @@ mod tests {
             )),
         };
         assert!(describe_video_frame(&frame).contains("H264"));
+    }
+
+    #[test]
+    fn timeout_detection_handles_macos_would_block() {
+        assert!(is_timeout_error(
+            "TCP read header failed: Resource temporarily unavailable (os error 35)"
+        ));
+    }
+
+    #[test]
+    fn decoder_buffering_is_not_decode_failure() {
+        assert!(decoder_needs_more_packets(
+            "H264 decoder needs more packets"
+        ));
+        assert!(decoder_needs_more_packets("VPX decoder needs more packets"));
     }
 }

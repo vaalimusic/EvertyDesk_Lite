@@ -127,6 +127,11 @@ $env:EVERTYDESK_ENABLE_AV1_MF="1"
   encode, and send phases.
 - Reduced frame-change detector memory copying by storing a sampled frame
   signature instead of cloning the whole previous BGRA frame.
+- Separated client-side incoming live-video packet rate from actually rendered
+  FPS, and stopped treating decoder buffering as a fatal decode failure.
+- Added a reusable host capture buffer and cached Windows GDI capture objects
+  to reduce per-frame allocation and DC/bitmap churn on the current Windows
+  host path.
 - Added codec preference tests for conservative H.264/H.265/AV1/VP9 fallback
   ordering.
 
@@ -204,9 +209,14 @@ Priority: high.
 - Treat 2-3 FPS during window dragging as a pipeline bug, not an acceptable
   fallback. Use telemetry first to identify whether the current bottleneck is
   capture, BGRA/NV12 conversion, encode, relay send, client decode, or render.
+- Diagnose low FPS by comparing client `fps` and `in`: low `in` means
+  host/capture/encode/relay bottleneck; high `in` with low `fps` means
+  client decode/render bottleneck.
 - Make BGRA -> NV12 conversion faster with row batching and optional SIMD.
 - Reuse capture buffers and platform capture objects; avoid per-frame
   allocation of device contexts, bitmaps, and full-frame scratch buffers.
+- Replace the remaining Windows GDI full-frame path with Desktop Duplication or
+  Windows Graphics Capture for true high-motion/game-grade streaming.
 - Add dirty-rectangle capture/encode where the host backend supports it.
 - Add adaptive bitrate from frame change density and measured relay throughput.
 - Add adaptive FPS floor/ceiling for static vs active screens.
