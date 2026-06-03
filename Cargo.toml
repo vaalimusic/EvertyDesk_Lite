@@ -19,6 +19,9 @@ live-vp9-mf = ["dep:windows"]
 # loaded dynamically so portable builds do not require NVIDIA libs.
 live-nvenc-sdk = []
 
+[build-dependencies]
+cc = "1"
+
 [dependencies]
 arboard = "3.6"
 base64 = "0.22"
@@ -57,6 +60,7 @@ windows = { version = "0.48", features = [
     # VP9 MFT decoder
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
+    "Win32_System_Ole",
     # Host: Desktop Duplication capture
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",

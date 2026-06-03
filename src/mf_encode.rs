@@ -6,14 +6,18 @@
 /// existing RustDesk-compatible video message path.
 #[cfg(all(feature = "live-vp9-mf", target_os = "windows"))]
 mod inner {
-    use std::sync::OnceLock;
+    use std::{mem::ManuallyDrop, sync::OnceLock};
 
     use crate::nvenc::{NvencCodec, NvencPacket};
     use windows::{
-        core::{Result as WResult, GUID},
+        core::{ComInterface, Result as WResult, GUID},
         Win32::{
-            Foundation::E_FAIL,
+            Foundation::{E_FAIL, VARIANT_TRUE},
             Media::MediaFoundation::{
+                eAVEncCommonRateControlMode_LowDelayVBR, CODECAPI_AVEncCommonLowLatency,
+                CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonQualityVsSpeed,
+                CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVGOPSize,
+                CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI,
                 IMFActivate, IMFSample, IMFTransform, MFCreateMediaType, MFCreateMemoryBuffer,
                 MFCreateSample, MFMediaType_Video, MFStartup, MFTEnumEx, MFVideoFormat_H264,
                 MFVideoFormat_H264_ES, MFVideoFormat_H265, MFVideoFormat_HEVC,
@@ -26,7 +30,10 @@ mod inner {
                 MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
                 MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
             },
-            System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED},
+            System::Com::{
+                CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED, VARIANT, VARIANT_0,
+                VARIANT_0_0, VARIANT_0_0_0, VT_BOOL, VT_UI4,
+            },
         },
     };
 
@@ -135,7 +142,7 @@ mod inner {
         pub fn encode_bgra(
             &mut self,
             bgra: &[u8],
-            _force_key: bool,
+            force_key: bool,
         ) -> Result<Option<NvencPacket>, String> {
             let expected = self
                 .source_width
@@ -154,6 +161,9 @@ mod inner {
                 bgra,
             );
             unsafe {
+                if force_key {
+                    request_keyframe(&self.transform);
+                }
                 self.run()
                     .map_err(|err| format!("MF encode {}: {err}", self.codec.label()))
             }
@@ -409,6 +419,11 @@ mod inner {
         in_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_ratio(1, 1))?;
         transform.SetInputType(0, &in_type, 0)?;
 
+        let tuning = tune_codec_api(transform, fps, bitrate);
+        if !tuning.is_empty() {
+            eprintln!("[mf-encode] CodecAPI tuning: {}", tuning.join(", "));
+        }
+
         let _ = transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
         let _ = transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
         refresh_output_info(transform)
@@ -483,6 +498,109 @@ mod inner {
     #[inline]
     fn pack_ratio(numerator: u32, denominator: u32) -> u64 {
         (u64::from(numerator) << 32) | u64::from(denominator)
+    }
+
+    unsafe fn tune_codec_api(
+        transform: &IMFTransform,
+        fps: u32,
+        bitrate: u32,
+    ) -> Vec<&'static str> {
+        let Ok(codec_api) = transform.cast::<ICodecAPI>() else {
+            return Vec::new();
+        };
+        let mut applied = Vec::new();
+
+        let low_latency = set_codec_api_bool(&codec_api, &CODECAPI_AVEncCommonLowLatency, true)
+            || set_codec_api_bool(&codec_api, &CODECAPI_AVLowLatencyMode, true);
+        if low_latency {
+            applied.push("low-latency");
+        }
+        if set_codec_api_u32(
+            &codec_api,
+            &CODECAPI_AVEncCommonRateControlMode,
+            eAVEncCommonRateControlMode_LowDelayVBR.0 as u32,
+        ) {
+            applied.push("low-delay-vbr");
+        }
+        if set_codec_api_u32(&codec_api, &CODECAPI_AVEncCommonMeanBitRate, bitrate) {
+            applied.push("bitrate");
+        }
+        if set_codec_api_u32(
+            &codec_api,
+            &CODECAPI_AVEncMPVGOPSize,
+            fps.clamp(5, 60).saturating_mul(2),
+        ) {
+            applied.push("gop");
+        }
+        if set_codec_api_u32(&codec_api, &CODECAPI_AVEncCommonQualityVsSpeed, 100) {
+            applied.push("speed");
+        }
+
+        applied
+    }
+
+    unsafe fn request_keyframe(transform: &IMFTransform) {
+        if let Ok(codec_api) = transform.cast::<ICodecAPI>() {
+            let _ = set_codec_api_bool(&codec_api, &CODECAPI_AVEncVideoForceKeyFrame, true);
+        }
+    }
+
+    unsafe fn set_codec_api_bool(codec_api: &ICodecAPI, api: &GUID, value: bool) -> bool {
+        if codec_api.IsSupported(api as *const _).is_err()
+            || codec_api.IsModifiable(api as *const _).is_err()
+        {
+            return false;
+        }
+        let variant = variant_bool(value);
+        codec_api
+            .SetValue(api as *const _, &variant as *const _)
+            .is_ok()
+    }
+
+    unsafe fn set_codec_api_u32(codec_api: &ICodecAPI, api: &GUID, value: u32) -> bool {
+        if codec_api.IsSupported(api as *const _).is_err()
+            || codec_api.IsModifiable(api as *const _).is_err()
+        {
+            return false;
+        }
+        let variant = variant_u32(value);
+        codec_api
+            .SetValue(api as *const _, &variant as *const _)
+            .is_ok()
+    }
+
+    fn variant_bool(value: bool) -> VARIANT {
+        VARIANT {
+            Anonymous: VARIANT_0 {
+                Anonymous: ManuallyDrop::new(VARIANT_0_0 {
+                    vt: VT_BOOL,
+                    wReserved1: 0,
+                    wReserved2: 0,
+                    wReserved3: 0,
+                    Anonymous: VARIANT_0_0_0 {
+                        boolVal: if value {
+                            VARIANT_TRUE
+                        } else {
+                            Default::default()
+                        },
+                    },
+                }),
+            },
+        }
+    }
+
+    fn variant_u32(value: u32) -> VARIANT {
+        VARIANT {
+            Anonymous: VARIANT_0 {
+                Anonymous: ManuallyDrop::new(VARIANT_0_0 {
+                    vt: VT_UI4,
+                    wReserved1: 0,
+                    wReserved2: 0,
+                    wReserved3: 0,
+                    Anonymous: VARIANT_0_0_0 { ulVal: value },
+                }),
+            },
+        }
     }
 
     fn bgra_to_nv12(

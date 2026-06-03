@@ -329,6 +329,7 @@ impl TransportClient {
         let min_video_fps = display_config
             .min_fps
             .clamp(5, display_config.target_fps.clamp(5, 60)) as i32;
+        let backlog_min_video_fps = backlog_recovery_min_fps(initial_video_fps, min_video_fps);
         let mut emit_progress = |pct, message: String| {
             let _ = events.send(SessionEvent::Progress(pct, message));
         };
@@ -416,8 +417,8 @@ impl TransportClient {
                             if cooldown_ready {
                                 let next_fps = lower_adaptive_fps(
                                     target_video_fps,
-                                    min_video_fps,
-                                    dropped >= 16,
+                                    backlog_min_video_fps,
+                                    false,
                                 );
                                 if next_fps < target_video_fps {
                                     target_video_fps = next_fps;
@@ -960,6 +961,16 @@ fn lower_adaptive_fps(current: i32, min_fps: i32, severe: bool) -> i32 {
         }
     }
     next.max(min_fps.clamp(5, 60))
+}
+
+fn backlog_recovery_min_fps(initial_fps: i32, min_fps: i32) -> i32 {
+    let initial = initial_fps.clamp(5, 60);
+    let min = min_fps.clamp(5, initial);
+    if initial >= 45 {
+        min.max(30).min(initial)
+    } else {
+        min
+    }
 }
 
 fn raise_adaptive_fps(current: i32, max_fps: i32) -> i32 {
@@ -1571,13 +1582,13 @@ fn preferred_codec(
         CodecPreference::H265 if h265_capable => PreferCodec::H265,
         CodecPreference::H264 if h264_capable => PreferCodec::H264,
         CodecPreference::Vp9 if vp9_capable => PreferCodec::Vp9,
-        CodecPreference::Auto if av1_capable => PreferCodec::Av1,
-        CodecPreference::Auto if h265_capable => PreferCodec::H265,
         CodecPreference::Auto if h264_capable => PreferCodec::H264,
+        CodecPreference::Auto if h265_capable => PreferCodec::H265,
+        CodecPreference::Auto if av1_capable => PreferCodec::Av1,
         CodecPreference::Auto if vp9_capable => PreferCodec::Vp9,
-        _ if av1_capable => PreferCodec::Av1,
-        _ if h265_capable => PreferCodec::H265,
         _ if h264_capable => PreferCodec::H264,
+        _ if h265_capable => PreferCodec::H265,
+        _ if av1_capable => PreferCodec::Av1,
         _ if vp9_capable => PreferCodec::Vp9,
         _ => PreferCodec::Auto,
     }
@@ -3319,13 +3330,21 @@ mod tests {
     }
 
     #[test]
-    fn auto_codec_prefers_modern_codecs_when_available() {
+    fn auto_codec_prefers_h264_for_interactive_stability() {
         assert_eq!(
             preferred_codec(CodecPreference::Auto, true, true, false, true) as i32,
-            PreferCodec::H265 as i32
+            PreferCodec::H264 as i32
         );
         assert_eq!(
             preferred_codec(CodecPreference::Auto, true, true, true, true) as i32,
+            PreferCodec::H264 as i32
+        );
+        assert_eq!(
+            preferred_codec(CodecPreference::Auto, false, true, true, true) as i32,
+            PreferCodec::H265 as i32
+        );
+        assert_eq!(
+            preferred_codec(CodecPreference::Auto, false, false, true, true) as i32,
             PreferCodec::Av1 as i32
         );
     }
@@ -3338,11 +3357,33 @@ mod tests {
         );
         assert_eq!(
             preferred_codec(CodecPreference::Av1, true, true, false, true) as i32,
-            PreferCodec::H265 as i32
+            PreferCodec::H264 as i32
         );
         assert_eq!(
             preferred_codec(CodecPreference::Vp9, true, false, false, false) as i32,
             PreferCodec::H264 as i32
+        );
+    }
+
+    #[test]
+    fn backlog_recovery_keeps_interactive_floor() {
+        assert_eq!(backlog_recovery_min_fps(60, 5), 30);
+        assert_eq!(
+            lower_adaptive_fps(60, backlog_recovery_min_fps(60, 5), false),
+            30
+        );
+        assert_eq!(
+            lower_adaptive_fps(30, backlog_recovery_min_fps(60, 5), false),
+            30
+        );
+    }
+
+    #[test]
+    fn backlog_recovery_respects_low_target_profiles() {
+        assert_eq!(backlog_recovery_min_fps(30, 10), 10);
+        assert_eq!(
+            lower_adaptive_fps(30, backlog_recovery_min_fps(30, 10), false),
+            20
         );
     }
 

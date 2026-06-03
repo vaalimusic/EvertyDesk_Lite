@@ -34,6 +34,8 @@ pub struct NvencEncoder {
     width: u32,
     height: u32,
     fps: u32,
+    #[cfg(all(nvenc_api_ffi, windows))]
+    inner: windows_nvenc::EncoderHandle,
 }
 
 impl NvencEncoder {
@@ -42,10 +44,30 @@ impl NvencEncoder {
         width: u32,
         height: u32,
         fps: u32,
-        _bitrate: u32,
+        bitrate: u32,
     ) -> Result<Self, String> {
-        let _ = (codec, width, height, fps);
-        Err("Direct NVENC encoder backend is not implemented yet".to_owned())
+        let width = width.max(2);
+        let height = height.max(2);
+        let fps = fps.clamp(5, 60);
+        let bitrate = bitrate.max(500_000);
+
+        #[cfg(all(nvenc_api_ffi, windows))]
+        {
+            let inner = windows_nvenc::EncoderHandle::new(codec, width, height, fps, bitrate)?;
+            return Ok(Self {
+                codec,
+                width,
+                height,
+                fps,
+                inner,
+            });
+        }
+
+        #[cfg(not(all(nvenc_api_ffi, windows)))]
+        {
+            let _ = (codec, width, height, fps, bitrate);
+            Err("Direct NVENC encoder backend is available only on Windows builds with live-nvenc-sdk".to_owned())
+        }
     }
 
     pub fn matches(&self, codec: NvencCodec, width: u32, height: u32, fps: u32) -> bool {
@@ -55,21 +77,262 @@ impl NvencEncoder {
             && self.fps == fps.clamp(5, 60)
     }
 
-    pub fn encode_bgra(&mut self, _bgra: &[u8]) -> Result<Option<NvencPacket>, String> {
-        Err("Direct NVENC encoder backend is not implemented yet".to_owned())
+    pub fn encode_bgra(
+        &mut self,
+        bgra: &[u8],
+        force_key: bool,
+    ) -> Result<Option<NvencPacket>, String> {
+        #[cfg(all(nvenc_api_ffi, windows))]
+        {
+            return self.inner.encode_bgra(self.codec, bgra, force_key);
+        }
+
+        #[cfg(not(all(nvenc_api_ffi, windows)))]
+        {
+            let _ = (bgra, force_key);
+            Err("Direct NVENC encoder backend is available only on Windows builds with live-nvenc-sdk".to_owned())
+        }
     }
 }
 
 pub fn nvenc_encoder_codecs() -> Vec<NvencCodec> {
+    #[cfg(all(nvenc_api_ffi, windows))]
+    {
+        return windows_nvenc::support()
+            .map(|support| support.codecs.clone())
+            .unwrap_or_default();
+    }
+
     Vec::new()
 }
 
 pub fn nvenc_encoder_names() -> Option<Vec<String>> {
+    #[cfg(all(nvenc_api_ffi, windows))]
+    {
+        return Some(
+            windows_nvenc::support()
+                .filter(|support| !support.codecs.is_empty())
+                .map(|support| vec![support.label()])
+                .unwrap_or_default(),
+        );
+    }
+
     Some(Vec::new())
 }
 
 pub fn nvenc_supported_platform() -> bool {
     cfg!(any(target_os = "linux", windows))
+}
+
+#[cfg(all(nvenc_api_ffi, windows))]
+mod windows_nvenc {
+    use std::{
+        ffi::{c_char, c_void},
+        ptr, slice,
+        sync::OnceLock,
+    };
+
+    use super::{NvencCodec, NvencPacket};
+
+    const STATUS_OK: i32 = 0;
+    const STATUS_NO_PACKET: i32 = 1;
+    const CODEC_ID_H264: i32 = 1;
+    const CODEC_ID_H265: i32 = 2;
+    const CODEC_MASK_H264: u32 = 1 << 0;
+    const CODEC_MASK_H265: u32 = 1 << 1;
+    const ERR_BUF_LEN: usize = 512;
+
+    #[derive(Clone, Debug)]
+    pub(super) struct NvencSupport {
+        pub codecs: Vec<NvencCodec>,
+        adapter_name: String,
+    }
+
+    impl NvencSupport {
+        pub fn label(&self) -> String {
+            let codecs = self
+                .codecs
+                .iter()
+                .map(|codec| codec.label())
+                .collect::<Vec<_>>()
+                .join("/");
+            format!("NVENC {codecs} ({})", self.adapter_name)
+        }
+    }
+
+    pub(super) struct EncoderHandle {
+        raw: *mut c_void,
+    }
+
+    impl EncoderHandle {
+        pub fn new(
+            codec: NvencCodec,
+            width: u32,
+            height: u32,
+            fps: u32,
+            bitrate: u32,
+        ) -> Result<Self, String> {
+            let mut raw = ptr::null_mut();
+            let mut err = vec![0_u8; ERR_BUF_LEN];
+            let status = unsafe {
+                everty_nvenc_create(
+                    codec_id(codec)?,
+                    width,
+                    height,
+                    fps,
+                    bitrate,
+                    &mut raw,
+                    err.as_mut_ptr() as *mut c_char,
+                    err.len(),
+                )
+            };
+            if status != STATUS_OK || raw.is_null() {
+                return Err(error_from_buf(&err, "NVENC create failed"));
+            }
+            Ok(Self { raw })
+        }
+
+        pub fn encode_bgra(
+            &mut self,
+            codec: NvencCodec,
+            bgra: &[u8],
+            force_key: bool,
+        ) -> Result<Option<NvencPacket>, String> {
+            let mut data = ptr::null();
+            let mut len = 0_usize;
+            let mut key = 0_i32;
+            let mut err = vec![0_u8; ERR_BUF_LEN];
+            let status = unsafe {
+                everty_nvenc_encode(
+                    self.raw,
+                    bgra.as_ptr(),
+                    bgra.len(),
+                    i32::from(force_key),
+                    &mut data,
+                    &mut len,
+                    &mut key,
+                    err.as_mut_ptr() as *mut c_char,
+                    err.len(),
+                )
+            };
+
+            match status {
+                STATUS_OK => {
+                    if len == 0 {
+                        return Ok(None);
+                    }
+                    if data.is_null() {
+                        return Err("NVENC returned a null packet pointer".to_owned());
+                    }
+                    let bytes = unsafe { slice::from_raw_parts(data, len).to_vec() };
+                    Ok(Some(NvencPacket {
+                        codec,
+                        bytes,
+                        key: key != 0 || force_key,
+                    }))
+                }
+                STATUS_NO_PACKET => Ok(None),
+                _ => Err(error_from_buf(&err, "NVENC encode failed")),
+            }
+        }
+    }
+
+    impl Drop for EncoderHandle {
+        fn drop(&mut self) {
+            unsafe {
+                everty_nvenc_destroy(self.raw);
+            }
+            self.raw = ptr::null_mut();
+        }
+    }
+
+    pub(super) fn support() -> Option<&'static NvencSupport> {
+        static SUPPORT: OnceLock<Option<NvencSupport>> = OnceLock::new();
+        SUPPORT.get_or_init(query_support).as_ref()
+    }
+
+    fn query_support() -> Option<NvencSupport> {
+        let mut mask = 0_u32;
+        let mut name = vec![0_u8; ERR_BUF_LEN];
+        let mut err = vec![0_u8; ERR_BUF_LEN];
+        let status = unsafe {
+            everty_nvenc_supported_codecs(
+                &mut mask,
+                name.as_mut_ptr() as *mut c_char,
+                name.len(),
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if status != STATUS_OK {
+            return None;
+        }
+
+        let mut codecs = Vec::new();
+        if mask & CODEC_MASK_H264 != 0 {
+            codecs.push(NvencCodec::H264);
+        }
+        if mask & CODEC_MASK_H265 != 0 {
+            codecs.push(NvencCodec::H265);
+        }
+
+        Some(NvencSupport {
+            codecs,
+            adapter_name: error_from_buf(&name, "NVIDIA GPU"),
+        })
+    }
+
+    fn codec_id(codec: NvencCodec) -> Result<i32, String> {
+        match codec {
+            NvencCodec::H264 => Ok(CODEC_ID_H264),
+            NvencCodec::H265 => Ok(CODEC_ID_H265),
+            NvencCodec::Av1 => {
+                Err("NVENC AV1 is not enabled until AV1 decode is stable".to_owned())
+            }
+        }
+    }
+
+    fn error_from_buf(buf: &[u8], fallback: &str) -> String {
+        let len = buf.iter().position(|byte| *byte == 0).unwrap_or(buf.len());
+        let message = String::from_utf8_lossy(&buf[..len]).trim().to_owned();
+        if message.is_empty() {
+            fallback.to_owned()
+        } else {
+            message
+        }
+    }
+
+    extern "C" {
+        fn everty_nvenc_supported_codecs(
+            mask: *mut u32,
+            name: *mut c_char,
+            name_len: usize,
+            err: *mut c_char,
+            err_len: usize,
+        ) -> i32;
+        fn everty_nvenc_create(
+            codec: i32,
+            width: u32,
+            height: u32,
+            fps: u32,
+            bitrate: u32,
+            out: *mut *mut c_void,
+            err: *mut c_char,
+            err_len: usize,
+        ) -> i32;
+        fn everty_nvenc_encode(
+            ctx: *mut c_void,
+            bgra: *const u8,
+            bgra_len: usize,
+            force_key: i32,
+            data: *mut *const u8,
+            len: *mut usize,
+            key: *mut i32,
+            err: *mut c_char,
+            err_len: usize,
+        ) -> i32;
+        fn everty_nvenc_destroy(ctx: *mut c_void);
+    }
 }
 
 pub fn nvencode_api_probe() -> &'static NvencodeApiProbe {

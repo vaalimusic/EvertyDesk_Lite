@@ -1374,8 +1374,10 @@ impl EvertyDeskApp {
             return;
         }
 
-        let queue_lag = self.frame_queue_ms >= 450 || self.frame_dropped >= 3;
-        let decode_lag = self.frame_decode_ms >= 45;
+        let stale_queue_lag = self.frame_queue_ms >= 450;
+        let dropped_backlog_lag = self.frame_dropped >= 12 && self.frame_queue_ms >= 180;
+        let queue_lag = stale_queue_lag || dropped_backlog_lag;
+        let decode_lag = self.frame_decode_ms >= 60;
         if queue_lag || decode_lag {
             self.stream_health = if queue_lag {
                 "очередь кадров: догоняем поток".to_owned()
@@ -1384,10 +1386,25 @@ impl EvertyDeskApp {
             };
             if cooldown_ready {
                 self.last_stream_tune_at = Some(Instant::now());
-                let next_fps = match self.video_fps {
-                    fps if fps > 20 => 20,
-                    fps if fps > 15 => 15,
-                    fps => fps,
+                let interactive_floor = if self.config.display.target_fps >= 45 {
+                    30
+                } else {
+                    self.config
+                        .display
+                        .min_fps
+                        .clamp(5, self.config.display.target_fps) as i32
+                };
+                let next_fps = if decode_lag {
+                    match self.video_fps {
+                        fps if fps > 30 => 30,
+                        fps if fps > 20 => 20,
+                        fps if fps > 15 => 15,
+                        fps => fps,
+                    }
+                } else if self.video_fps > interactive_floor {
+                    interactive_floor
+                } else {
+                    self.video_fps
                 };
                 if next_fps != self.video_fps {
                     self.video_fps = next_fps;

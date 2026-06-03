@@ -20,6 +20,9 @@ local build has a decoder path that is expected to survive real sessions.
   instead of staying on conservative defaults during high-motion sessions.
 - EvertyDesk hosts understand RustDesk `image_quality` and
   `custom_image_quality` options and use them to scale H.264 bitrate headroom.
+- Client adaptive streaming treats frame drops as a low-latency recovery signal
+  and keeps interactive sessions at 30 FPS or higher unless decoding itself is
+  overloaded.
 - AV1 decode probing exists, but AV1 is not advertised by default because the
   current Windows Media Foundation AV1 path can crash native MFTs on some
   streams.
@@ -42,6 +45,9 @@ It does not start an external encoder process. It:
 - receives BGRA frames from screen capture;
 - converts BGRA to NV12;
 - configures a Media Foundation encoder MFT;
+- applies best-effort CodecAPI tuning for low latency, low-delay VBR, bitrate,
+  GOP size, quality/speed, and explicit force-keyframe where the selected MFT
+  supports those controls;
 - emits H.264 or H.265 packets;
 - normalizes length-prefixed H.264/H.265 packets to Annex-B when needed;
 - falls back to OpenH264 when startup/output fails.
@@ -50,12 +56,13 @@ The host selection order is:
 
 1. Media Foundation H.264/H.265 when available and allowed by client capability.
 2. VideoToolbox H.264 on macOS hosts when available.
-3. Direct NVENC when that backend is implemented and available.
+3. Direct NVENC when the Windows backend is built and available.
 4. OpenH264 software H.264.
 5. Screenshot fallback when live video is unavailable.
 
-H.265 is selected only when both sides support it. H.264 remains the safest
-default path.
+H.265 and AV1 are advertised only when a decoder backend is available. Auto
+prefers H.264 first for interactive desktop latency; H.265/AV1 remain available
+through explicit codec preference or as fallback when H.264 is unavailable.
 
 Host sessions now emit periodic encode telemetry to logs:
 
@@ -103,19 +110,30 @@ frame pacing.
 
 ## NVENC
 
-The app currently detects NVIDIA support in two layers:
+The app detects NVIDIA support in two layers:
 
 - `NvEncodeAPI` runtime probe through a Rust FFI wrapper.
-- NVIDIA GPU presence through runtime diagnostics.
+- A Windows direct encoder probe that opens a D3D11-backed NVENC session and
+  checks real codec/input-format support.
 
-The direct NVENC encoder backend is still planned. The intended path is:
+The first direct NVENC encoder backend is now implemented for Windows builds
+with `live-nvenc-sdk`.
 
-- load `nvEncodeAPI64.dll` dynamically on Windows;
-- avoid hard-linking portable builds to the SDK;
-- start with CPU/NV12 H.264;
-- add H.265;
-- add AV1 only after AV1 decode is stable;
-- later add D3D11 interop for lower-copy capture/encode.
+It:
+
+- compiles a small Windows-only C++ shim against NVIDIA Video Codec SDK headers;
+- loads `nvEncodeAPI64.dll` or `nvEncodeAPI.dll` dynamically at runtime;
+- creates a D3D11 device on a NVIDIA DXGI adapter;
+- registers reusable BGRA D3D11 textures as NVENC input resources;
+- supports H.264 and H.265 when the GPU/driver reports them;
+- uses low-latency P1/ultra-low-latency settings, CBR, no B frames, and
+  explicit IDR/SPS/PPS output for forced keyframes;
+- returns encoded packets directly to the existing RustDesk-compatible video
+  frame path;
+- falls back to Media Foundation/OpenH264 when startup or encode fails.
+
+AV1 NVENC is intentionally not advertised yet because AV1 client decode is
+still guarded behind explicit testing.
 
 The NVIDIA Video Codec SDK can be discovered by the build script for headers
 and version diagnostics. Put it in the project root as `Video_Codec_SDK_*` or
@@ -125,7 +143,10 @@ set one of:
 - `NV_CODEC_SDK`
 - `NVIDIA_VIDEO_CODEC_SDK`
 
-The current accelerated Windows path is Media Foundation, not direct NVENC.
+The current NVENC path is still a CPU-BGRA to D3D11 texture upload path. The
+next performance step is to hand Desktop Duplication or Windows Graphics
+Capture textures to NVENC directly instead of round-tripping through the host
+BGRA buffer.
 
 ## macOS VideoToolbox
 
@@ -173,14 +194,16 @@ runtime libraries.
 
 ## Next Codec Tasks
 
-- Add Media Foundation CodecAPI controls for bitrate, GOP, low latency, and
-  force-keyframe.
+- Add runtime Media Foundation CodecAPI bitrate updates and UI-visible tuning
+  telemetry.
 - Add better SPS/PPS/VPS handling for H.264/H.265.
 - Add richer per-session codec telemetry history/graphs in the UI.
 - Validate Windows Desktop Duplication capture on a Windows host.
 - Add D3D11/async MFT support for true hardware Media Foundation paths.
 - Move macOS capture toward ScreenCaptureKit.
-- Add direct NVENC encoder backend.
+- Replace the Windows NVENC CPU-BGRA upload with direct capture texture
+  handoff.
+- Add Linux NVENC encode through direct NVENC API.
 - Add captured-packet tests for H.265 and AV1 decoder stability.
 - Add platform capture paths required for interactive/game-grade streaming:
   Desktop Duplication/Windows Graphics Capture, macOS ScreenCaptureKit, Linux

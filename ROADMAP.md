@@ -151,6 +151,13 @@ $env:EVERTYDESK_ENABLE_AV1_MF="1"
 - Added RustDesk-compatible video QoS negotiation: client login/sync now sends
   `ImageQuality::Best` with target FPS, and EvertyDesk hosts use received
   quality options to raise H.264 bitrate headroom for high-motion sessions.
+- Tuned client adaptive streaming so low-latency frame drops do not immediately
+  collapse an interactive 60 FPS target below 30 FPS.
+- Changed Auto codec negotiation to prefer H.264 for interactive stability,
+  while keeping H.265/AV1 available when explicitly requested or when H.264 is
+  unavailable.
+- Added best-effort Media Foundation CodecAPI tuning for low-latency mode,
+  low-delay VBR, bitrate, GOP size, quality/speed, and force-keyframe.
 - Added codec preference tests for conservative H.264/H.265/AV1/VP9 fallback
   ordering.
 
@@ -160,12 +167,8 @@ $env:EVERTYDESK_ENABLE_AV1_MF="1"
 
 Priority: high.
 
-- Add CodecAPI controls for:
-  - bitrate update;
-  - GOP/keyframe interval;
-  - explicit force-keyframe;
-  - quality/speed mode;
-  - low-latency mode where supported.
+- Add runtime Media Foundation CodecAPI bitrate update without recreating the
+  encoder.
 - Stop marking keyframes optimistically; rely on real IDR/IRAP detection or
   CodecAPI feedback.
 - Improve SPS/PPS/VPS handling for H.264/H.265 streams.
@@ -186,10 +189,10 @@ Priority: high.
   GDI as fallback for unsupported desktops, secure screens, and API resets.
 - Move Desktop Duplication from CPU readback toward zero-copy or low-copy
   D3D11 texture handoff into Media Foundation/NVENC.
-- Add direct NVENC backend through `NvEncodeAPI`, not through a helper process.
-- Use NVIDIA Video Codec SDK only as headers/FFI source, with runtime driver
-  loading.
-- Add NVENC H.264/H.265 first, AV1 only when client decode is stable.
+- Direct Windows NVENC backend through `NvEncodeAPI` and a Windows-only SDK
+  shim is added; keep improving it without adding a hard runtime dependency.
+- NVENC H.264/H.265 are wired first; AV1 remains disabled until client decode
+  is stable.
 - Add capability reporting that distinguishes:
   - software encode;
   - system MFT encode;
@@ -356,10 +359,12 @@ Priority: medium.
 
 ### Milestone D: Direct NVENC
 
-- Load `nvEncodeAPI64.dll` dynamically.
-- Create encoder session.
-- Encode H.264 from CPU/NV12 first.
-- Add D3D11 interop later.
+- Windows shim loads `nvEncodeAPI64.dll`/`nvEncodeAPI.dll` dynamically.
+- Windows shim creates a D3D11-backed NVENC session.
+- Encode H.264/H.265 from host BGRA frames through registered D3D11 textures.
+- Force IDR/SPS/PPS on keyframe requests.
+- Add direct Desktop Duplication/Windows Graphics Capture texture handoff.
+- Add Linux NVENC session/input-resource backend.
 - Keep fallback behavior identical to MF/OpenH264.
 
 ### Milestone E: Production Host Mode

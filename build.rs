@@ -26,6 +26,9 @@ fn main() {
         && matches!(target_os.as_str(), "linux" | "windows")
     {
         println!("cargo:rustc-cfg=nvenc_api_ffi");
+        if target_os == "windows" {
+            compile_nvenc_windows_shim(&sdk);
+        }
     }
 }
 
@@ -65,4 +68,20 @@ fn is_nv_codec_sdk(path: &PathBuf) -> bool {
 fn sdk_version(path: &PathBuf) -> Option<String> {
     let name = path.file_name()?.to_str()?;
     name.strip_prefix("Video_Codec_SDK_").map(str::to_owned)
+}
+
+fn compile_nvenc_windows_shim(sdk: &PathBuf) {
+    println!("cargo:rerun-if-changed=src/nvenc_shim.cpp");
+    println!("cargo:rerun-if-changed={}", sdk.join("Interface").display());
+    println!("cargo:rustc-link-lib=d3d11");
+    println!("cargo:rustc-link-lib=dxgi");
+
+    let mut build = cc::Build::new();
+    build
+        .cpp(true)
+        .file("src/nvenc_shim.cpp")
+        .include(sdk.join("Interface"));
+    build.flag_if_supported("/std:c++17");
+    build.flag_if_supported("-std=c++17");
+    build.compile("everty_nvenc_shim");
 }
