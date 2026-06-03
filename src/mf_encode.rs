@@ -25,10 +25,10 @@ mod inner {
                 MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE,
                 MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
                 MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
-                MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO, MFT_REGISTER_TYPE_INFO,
-                MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
-                MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-                MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
+                MFT_MESSAGE_COMMAND_FLUSH, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO,
+                MFT_REGISTER_TYPE_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE,
+                MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO,
+                MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
             },
             System::Com::{
                 CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED, VARIANT, VARIANT_0,
@@ -110,6 +110,10 @@ mod inner {
         nv12: Vec<u8>,
         frame_index: u64,
         first_packet: bool,
+        /// Cached parameter sets (SPS/PPS for H.264, VPS+SPS+PPS for H.265)
+        /// extracted from the first keyframe. Prepended to every subsequent
+        /// IDR/IRAP so that decoders that missed the first keyframe can recover.
+        param_sets: Vec<u8>,
     }
 
     unsafe impl Send for MfVideoEncoder {}
@@ -139,6 +143,31 @@ mod inner {
                 && self.fps == fps.clamp(5, 60)
         }
 
+        /// Update bitrate at runtime via CodecAPI — no encoder recreation needed.
+        /// Returns true if the value was applied, false if the encoder does not
+        /// support runtime bitrate changes (fallback: caller can recreate).
+        pub fn update_bitrate(&mut self, new_bitrate: u32) -> bool {
+            if self.bitrate == new_bitrate {
+                return true;
+            }
+            let ok = unsafe {
+                self.transform
+                    .cast::<ICodecAPI>()
+                    .map(|api| {
+                        set_codec_api_u32(&api, &CODECAPI_AVEncCommonMeanBitRate, new_bitrate)
+                    })
+                    .unwrap_or(false)
+            };
+            if ok {
+                self.bitrate = new_bitrate;
+            }
+            ok
+        }
+
+        pub fn current_bitrate(&self) -> u32 {
+            self.bitrate
+        }
+
         pub fn encode_bgra(
             &mut self,
             bgra: &[u8],
@@ -152,12 +181,12 @@ mod inner {
                 return Ok(None);
             }
 
-            bgra_to_nv12(
+            crate::colorconv::bgra_to_nv12(
                 &mut self.nv12,
-                self.width as usize,
-                self.height as usize,
                 self.source_width as usize,
                 self.source_height as usize,
+                self.width as usize,
+                self.height as usize,
                 bgra,
             );
             unsafe {
@@ -265,6 +294,7 @@ mod inner {
                                     nv12: Vec::new(),
                                     frame_index: 0,
                                     first_packet: true,
+                                    param_sets: Vec::new(),
                                 });
                             }
                             Err(err) => last_error = Some(err),
@@ -297,6 +327,8 @@ mod inner {
             self.transform.ProcessInput(0, &sample, 0)?;
             self.frame_index = self.frame_index.saturating_add(1);
 
+            // Drain all pending output packets from this input frame.
+            // Some MFTs (especially hardware) may produce >1 output per input.
             let mut latest = None;
             let mut retries = 0u32;
             loop {
@@ -305,17 +337,24 @@ mod inner {
                     None => return Ok(latest),
                 }
                 retries += 1;
-                if retries > 8 {
+                if retries > 16 {
                     return Ok(latest);
                 }
             }
         }
 
+        /// Single ProcessOutput call.  Returns Ok(None) when no data is ready.
+        /// Handles STREAM_CHANGE by refreshing output info and retrying once.
         unsafe fn process_output(&mut self) -> WResult<Option<NvencPacket>> {
+            // Allocate output sample when the MFT doesn't provide its own.
             let pre_sample: Option<IMFSample> = if self.provides_samples {
                 None
             } else {
-                let sz = self.output_buf_size.max(self.bitrate / 8).max(64 * 1024);
+                // Size: at least 1 second of bitrate, at least 128 KiB.
+                let sz = self
+                    .output_buf_size
+                    .max(self.bitrate / 8)
+                    .max(128 * 1024);
                 let buf = MFCreateMemoryBuffer(sz)?;
                 let sample = MFCreateSample()?;
                 sample.AddBuffer(&buf)?;
@@ -347,10 +386,19 @@ mod inner {
                     Ok(None)
                 }
                 Err(err) if err.code().0 == MF_E_TRANSFORM_STREAM_CHANGE => {
+                    // The MFT changed its output type (resolution, profile, etc.).
+                    // Refresh stream info and re-negotiate output type, then return
+                    // None for this call — the next frame will get a fresh output.
                     std::mem::ManuallyDrop::drop(&mut out_buf.pSample);
                     let info = refresh_output_info(&self.transform)?;
                     self.provides_samples = info.provides_samples;
                     self.output_buf_size = info.output_buf_size;
+                    // Re-apply output type to accept the new format.
+                    let _ = self.transform.ProcessMessage(
+                        MFT_MESSAGE_COMMAND_FLUSH, 0,
+                    );
+                    self.first_packet = true; // re-learn param sets after flush
+                    self.param_sets.clear();
                     Ok(None)
                 }
                 Err(err) => {
@@ -366,24 +414,49 @@ mod inner {
             let mut max_len = 0u32;
             let mut cur_len = 0u32;
             buf.Lock(&mut ptr, Some(&mut max_len), Some(&mut cur_len))?;
-            let bytes = if cur_len == 0 {
+            let raw = if cur_len == 0 {
                 Vec::new()
             } else {
                 std::slice::from_raw_parts(ptr, cur_len as usize).to_vec()
             };
             buf.Unlock()?;
 
-            if bytes.is_empty() {
+            if raw.is_empty() {
                 return Ok(None);
             }
 
-            let bytes = normalize_h26x_access_unit(&bytes);
-            let key = self.first_packet || h26x_is_key(self.codec, &bytes);
+            let bytes = normalize_h26x_access_unit(&raw);
+            let is_first = self.first_packet;
             self.first_packet = false;
+
+            let is_key = is_first || h26x_is_key(self.codec, &bytes);
+
+            // ── Parameter set caching and injection ───────────────────────────
+            // On the very first packet (or after a flush) extract and cache all
+            // non-VCL NAL units (SPS/PPS for H.264, VPS/SPS/PPS for H.265).
+            // On every subsequent keyframe, prepend the cached sets so that
+            // late-joining or recovering decoders get the headers they need.
+            if is_first {
+                self.param_sets = extract_param_sets(self.codec, &bytes);
+            }
+
+            let bytes = if is_key && !is_first && !self.param_sets.is_empty() {
+                // Prepend parameter sets only if they are not already present.
+                if !bytes.starts_with(&self.param_sets[..4.min(self.param_sets.len())]) {
+                    let mut out = self.param_sets.clone();
+                    out.extend_from_slice(&bytes);
+                    out
+                } else {
+                    bytes
+                }
+            } else {
+                bytes
+            };
+
             Ok(Some(NvencPacket {
                 codec: self.codec,
                 bytes,
-                key,
+                key: is_key,
             }))
         }
     }
@@ -603,76 +676,40 @@ mod inner {
         }
     }
 
-    fn bgra_to_nv12(
-        out: &mut Vec<u8>,
-        dst_width: usize,
-        dst_height: usize,
-        src_width: usize,
-        src_height: usize,
-        bgra: &[u8],
-    ) {
-        let y_len = dst_width * dst_height;
-        out.resize(y_len + y_len / 2, 0);
-
-        for by in (0..dst_height).step_by(2) {
-            for bx in (0..dst_width).step_by(2) {
-                let mut r_sum = 0_i32;
-                let mut g_sum = 0_i32;
-                let mut b_sum = 0_i32;
-
-                for dy in 0..2 {
-                    let y = by + dy;
-                    for dx in 0..2 {
-                        let x = bx + dx;
-                        let (r, g, b) = bgra_pixel_rgb_clamped(bgra, src_width, src_height, x, y);
-                        out[y * dst_width + x] = y_from_rgb(r, g, b);
-                        r_sum += r;
-                        g_sum += g;
-                        b_sum += b;
-                    }
+    /// Extract all non-VCL NAL units (parameter sets) from an Annex-B bitstream.
+    ///
+    /// H.264: SPS (7), PPS (8), SEI (6)
+    /// H.265: VPS (32), SPS (33), PPS (34)
+    ///
+    /// These are collected into a compact Annex-B blob that can be prepended to
+    /// every subsequent IDR/IRAP frame so late-joining decoders get the headers.
+    fn extract_param_sets(codec: NvencCodec, bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while let Some((nal_start, nal_end)) = next_annex_b_nal(bytes, pos) {
+            let nal = &bytes[nal_start..nal_end];
+            if !nal.is_empty() {
+                let is_param = match codec {
+                    NvencCodec::H264 => matches!(nal[0] & 0x1F, 6 | 7 | 8),
+                    NvencCodec::H265 => matches!((nal[0] >> 1) & 0x3F, 32 | 33 | 34 | 39 | 40),
+                    NvencCodec::Av1 => false,
+                };
+                if is_param {
+                    // Reconstruct Annex-B: find whether source used 3 or 4-byte start code.
+                    let sc_len = if nal_start >= 4
+                        && bytes[nal_start - 4..nal_start].starts_with(&[0, 0, 0, 1])
+                    {
+                        4
+                    } else {
+                        3
+                    };
+                    let sc_start = nal_start.saturating_sub(sc_len);
+                    out.extend_from_slice(&bytes[sc_start..nal_end]);
                 }
-
-                let r = (r_sum + 2) / 4;
-                let g = (g_sum + 2) / 4;
-                let b = (b_sum + 2) / 4;
-                let uv = y_len + (by / 2) * dst_width + bx;
-                out[uv] = u_from_rgb(r, g, b);
-                out[uv + 1] = v_from_rgb(r, g, b);
             }
+            pos = nal_end;
         }
-    }
-
-    #[inline(always)]
-    fn bgra_pixel_rgb_clamped(
-        bgra: &[u8],
-        width: usize,
-        height: usize,
-        x: usize,
-        y: usize,
-    ) -> (i32, i32, i32) {
-        let sx = x.min(width - 1);
-        let sy = y.min(height - 1);
-        let base = (sy * width + sx) * 4;
-        (
-            bgra[base + 2] as i32,
-            bgra[base + 1] as i32,
-            bgra[base] as i32,
-        )
-    }
-
-    #[inline(always)]
-    fn y_from_rgb(r: i32, g: i32, b: i32) -> u8 {
-        (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(16, 235) as u8
-    }
-
-    #[inline(always)]
-    fn u_from_rgb(r: i32, g: i32, b: i32) -> u8 {
-        (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(16, 240) as u8
-    }
-
-    #[inline(always)]
-    fn v_from_rgb(r: i32, g: i32, b: i32) -> u8 {
-        (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(16, 240) as u8
+        out
     }
 
     fn normalize_h26x_access_unit(bytes: &[u8]) -> Vec<u8> {

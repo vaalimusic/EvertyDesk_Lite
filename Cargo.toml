@@ -51,7 +51,7 @@ dryoc = "0.7"
 [target.'cfg(target_os = "linux")'.dependencies]
 font8x8 = "0.3"
 minifb = { version = "0.28", default-features = false, features = ["x11"] }
-x11rb = { version = "0.13", features = ["xtest"] }
+x11rb = { version = "0.13", features = ["xtest", "shm"] }
 
 [target.'cfg(windows)'.dependencies]
 font8x8 = "0.3"

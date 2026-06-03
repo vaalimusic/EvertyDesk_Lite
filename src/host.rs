@@ -1340,10 +1340,46 @@ fn video_loop(
 
     let mut frame_idx: u64 = 0;
     let mut last_frame = Instant::now();
-    let mut capture_bgra = Vec::new();
     let mut change_detector = FrameChangeDetector::default();
     let mut last_video_stats = Instant::now();
     let mut encode_stats = VideoEncodeTelemetry::new(active_encoder_backend);
+
+    // ── Async capture: a dedicated thread fills a double-buffer so encoding
+    // and screen capture overlap.  Each slot is (width, height, bgra_pixels).
+    type CaptureSlot = Arc<Mutex<Option<(u32, u32, Vec<u8>)>>>;
+    let cap_slot: CaptureSlot = Arc::new(Mutex::new(None));
+    let cap_stop = stop.clone();
+    let cap_fps = target_fps.clone();
+    let cap_slot_bg = cap_slot.clone();
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        loop {
+            if cap_stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let fps = cap_fps.load(Ordering::Relaxed).clamp(5, MAX_TARGET_FPS);
+            // Capture as fast as the target fps; the encoder thread will read
+            // the latest available frame instead of waiting for capture.
+            if let Some((w, h)) = crate::capture::capture_screen_into(&mut buf) {
+                if let Ok(mut slot) = cap_slot_bg.lock() {
+                    match slot.as_mut() {
+                        Some(existing) => {
+                            // Reuse the pixel buffer allocation if the size matches.
+                            if existing.0 == w && existing.1 == h {
+                                std::mem::swap(&mut existing.2, &mut buf);
+                            } else {
+                                *slot = Some((w, h, buf.clone()));
+                            }
+                        }
+                        None => *slot = Some((w, h, buf.clone())),
+                    }
+                }
+            }
+            // Brief yield so the capture thread doesn't monopolise a core.
+            let budget = Duration::from_micros(1_000_000 / fps.max(1) as u64);
+            thread::sleep(budget.saturating_sub(Duration::from_micros(500)));
+        }
+    });
 
     while !stop.load(Ordering::Relaxed) {
         while let Ok(message) = outgoing.try_recv() {
@@ -1359,16 +1395,24 @@ fn video_loop(
 
         let fps = target_fps.load(Ordering::Relaxed).clamp(5, MAX_TARGET_FPS);
         let frame_budget = frame_budget(fps);
-        if last_frame.elapsed() < frame_budget {
-            thread::sleep(Duration::from_millis(2));
+        let elapsed = last_frame.elapsed();
+        if elapsed < frame_budget {
+            let remaining = frame_budget - elapsed;
+            if remaining > Duration::from_micros(1_500) {
+                thread::sleep(remaining - Duration::from_micros(500));
+            } else {
+                std::hint::spin_loop();
+            }
             continue;
         }
         last_frame = Instant::now();
         frame_idx += 1;
 
+        // Pull the most-recently-captured frame from the capture thread.
         let capture_started = Instant::now();
-        let Some((cap_w, cap_h)) = crate::capture::capture_screen_into(&mut capture_bgra) else {
-            thread::sleep(frame_budget);
+        let capture_result = cap_slot.lock().ok().and_then(|mut slot| slot.take());
+        let Some((cap_w, cap_h, capture_bgra)) = capture_result else {
+            thread::sleep(Duration::from_millis(1));
             continue;
         };
         let bgra = capture_bgra.as_slice();
@@ -1794,7 +1838,8 @@ fn h264_target_bitrate_bps(width: u32, height: u32, fps: u32, quality_milli: u32
 struct FrameChangeDetector {
     width: u32,
     height: u32,
-    last_sample_bgr: Vec<u8>,
+    /// FNV-1a hash of the last sent frame (computed by crate::colorconv::frame_signature).
+    last_hash: u64,
     last_sent_at: Option<Instant>,
     consecutive_static_skips: u32,
     sent_since_log: u64,
@@ -2062,7 +2107,7 @@ impl FrameChangeDetector {
     fn mark_sent(&mut self, width: u32, height: u32, bgra: &[u8]) {
         self.width = width;
         self.height = height;
-        self.update_sample(width, height, bgra);
+        self.last_hash = crate::colorconv::frame_signature(bgra, width as usize, height as usize);
         self.last_sent_at = Some(Instant::now());
         self.consecutive_static_skips = 0;
         self.sent_since_log = self.sent_since_log.saturating_add(1);
@@ -2079,54 +2124,11 @@ impl FrameChangeDetector {
     }
 
     fn frame_changed(&self, width: u32, height: u32, bgra: &[u8]) -> bool {
-        const PIXEL_DIFF_THRESHOLD: u32 = 24;
-        const MIN_SMALL_CHANGE_SAMPLES: usize = 8;
-        const MIN_LARGE_CHANGE_SAMPLES: usize = 24;
-
-        if self.last_sample_bgr.is_empty() {
+        if self.last_hash == 0 {
             return true;
         }
-
-        let width = width as usize;
-        let height = height as usize;
-        if width == 0 || height == 0 {
-            return false;
-        }
-
-        let pixels = width.saturating_mul(height);
-        let step = frame_sample_step(pixels);
-        let mut total = 0usize;
-        let mut changed = 0usize;
-        let mut sample = 0usize;
-
-        for y in (0..height).step_by(step) {
-            let row = y * width * 4;
-            for x in (0..width).step_by(step) {
-                let offset = row + x * 4;
-                if offset + 2 >= bgra.len() || sample + 2 >= self.last_sample_bgr.len() {
-                    return true;
-                }
-                total += 1;
-                let db = bgra[offset].abs_diff(self.last_sample_bgr[sample]) as u32;
-                let dg = bgra[offset + 1].abs_diff(self.last_sample_bgr[sample + 1]) as u32;
-                let dr = bgra[offset + 2].abs_diff(self.last_sample_bgr[sample + 2]) as u32;
-                if db + dg + dr >= PIXEL_DIFF_THRESHOLD {
-                    changed += 1;
-                }
-                sample += 3;
-            }
-        }
-
-        if total == 0 {
-            return false;
-        }
-        if sample != self.last_sample_bgr.len() {
-            return true;
-        }
-
-        let ratio_per_10k = changed.saturating_mul(10_000) / total;
-        changed >= MIN_LARGE_CHANGE_SAMPLES
-            || (changed >= MIN_SMALL_CHANGE_SAMPLES && ratio_per_10k >= 1)
+        let sig = crate::colorconv::frame_signature(bgra, width as usize, height as usize);
+        sig != self.last_hash
     }
 
     fn static_backoff_delay(&self, fps: u32) -> Option<Duration> {
@@ -2140,45 +2142,6 @@ impl FrameChangeDetector {
         }
     }
 
-    fn update_sample(&mut self, width: u32, height: u32, bgra: &[u8]) {
-        self.last_sample_bgr.clear();
-        let width = width as usize;
-        let height = height as usize;
-        if width == 0 || height == 0 {
-            return;
-        }
-        let step = frame_sample_step(width.saturating_mul(height));
-        let sample_w = width.div_ceil(step);
-        let sample_h = height.div_ceil(step);
-        self.last_sample_bgr
-            .reserve(sample_w.saturating_mul(sample_h).saturating_mul(3));
-        for y in (0..height).step_by(step) {
-            let row = y * width * 4;
-            for x in (0..width).step_by(step) {
-                let offset = row + x * 4;
-                if offset + 2 >= bgra.len() {
-                    return;
-                }
-                self.last_sample_bgr.extend_from_slice(&[
-                    bgra[offset],
-                    bgra[offset + 1],
-                    bgra[offset + 2],
-                ]);
-            }
-        }
-    }
-}
-
-fn frame_sample_step(pixels: usize) -> usize {
-    if pixels >= 8_000_000 {
-        12
-    } else if pixels >= 3_000_000 {
-        8
-    } else if pixels >= 1_000_000 {
-        6
-    } else {
-        4
-    }
 }
 
 fn client_video_support(login: &crate::rustdesk_proto::LoginRequest) -> ClientVideoSupport {
@@ -2342,30 +2305,42 @@ fn encode_mf_frame(
     let fps = fps.clamp(5, MAX_TARGET_FPS);
     let recreate = encoder
         .as_ref()
-        .map(|encoder| !encoder.matches(codec, width, height, fps))
+        .map(|enc| !enc.matches(codec, width, height, fps))
         .unwrap_or(true);
+
     if recreate {
         *encoder = Some(crate::mf_encode::MfVideoEncoder::new(
             codec, width, height, fps, bitrate,
         )?);
         eprintln!(
-            "[host-video] Media Foundation {} backend started at {}x{}@{}",
-            codec.label(),
-            width,
-            height,
-            fps
+            "[host-video] MF {} encoder started at {}x{}@{} bitrate={}",
+            codec.label(), width, height, fps, bitrate
         );
+    } else if let Some(enc) = encoder.as_mut() {
+        // Update bitrate at runtime — avoids tearing down and restarting the
+        // encoder when the operator changes quality mid-session.
+        if enc.current_bitrate() != bitrate {
+            if !enc.update_bitrate(bitrate) {
+                eprintln!(
+                    "[host-video] MF {} bitrate update failed, recreating encoder",
+                    codec.label()
+                );
+                *encoder = Some(crate::mf_encode::MfVideoEncoder::new(
+                    codec, width, height, fps, bitrate,
+                )?);
+            }
+        }
     }
 
     let Some(encoder) = encoder.as_mut() else {
         return Ok(None);
     };
     encoder.encode_bgra(bgra, force_key).map(|packet| {
-        packet.map(|packet| EncodedPacket {
+        packet.map(|p| EncodedPacket {
             backend: VideoEncoderBackend::MediaFoundation,
-            codec: packet.codec,
-            bytes: packet.bytes,
-            key: packet.key,
+            codec: p.codec,
+            bytes: p.bytes,
+            key: p.key,
         })
     })
 }
@@ -2383,30 +2358,37 @@ fn encode_videotoolbox_frame(
     let fps = fps.clamp(5, MAX_TARGET_FPS);
     let recreate = encoder
         .as_ref()
-        .map(|encoder| !encoder.matches(codec, width, height, fps))
+        .map(|enc| !enc.matches(codec, width, height, fps))
         .unwrap_or(true);
+
     if recreate {
         *encoder = Some(crate::videotoolbox::VideoToolboxEncoder::new(
             codec, width, height, fps, bitrate,
         )?);
         eprintln!(
-            "[host-video] VideoToolbox {} backend started at {}x{}@{}",
-            codec.label(),
-            width,
-            height,
-            fps
+            "[host-video] VideoToolbox {} encoder started at {}x{}@{} bitrate={}",
+            codec.label(), width, height, fps, bitrate
         );
+    } else if let Some(enc) = encoder.as_mut() {
+        if enc.current_bitrate() != bitrate {
+            if !enc.update_bitrate(bitrate) {
+                eprintln!("[host-video] VideoToolbox bitrate update failed, recreating");
+                *encoder = Some(crate::videotoolbox::VideoToolboxEncoder::new(
+                    codec, width, height, fps, bitrate,
+                )?);
+            }
+        }
     }
 
     let Some(encoder) = encoder.as_mut() else {
         return Ok(None);
     };
     encoder.encode_bgra(bgra, force_key).map(|packet| {
-        packet.map(|packet| EncodedPacket {
+        packet.map(|p| EncodedPacket {
             backend: VideoEncoderBackend::VideoToolbox,
-            codec: packet.codec,
-            bytes: packet.bytes,
-            key: packet.key,
+            codec: p.codec,
+            bytes: p.bytes,
+            key: p.key,
         })
     })
 }
@@ -2424,30 +2406,32 @@ fn encode_nvenc_frame(
     let fps = fps.clamp(5, MAX_TARGET_FPS);
     let recreate = encoder
         .as_ref()
-        .map(|encoder| !encoder.matches(codec, width, height, fps))
+        .map(|enc| !enc.matches(codec, width, height, fps))
         .unwrap_or(true);
+
     if recreate {
         *encoder = Some(crate::nvenc::NvencEncoder::new(
             codec, width, height, fps, bitrate,
         )?);
         eprintln!(
-            "[host-video] NVENC {} backend started at {}x{}@{}",
-            codec.label(),
-            width,
-            height,
-            fps
+            "[host-video] NVENC {} encoder started at {}x{}@{} bitrate={}",
+            codec.label(), width, height, fps, bitrate
         );
+    } else if let Some(enc) = encoder.as_mut() {
+        if enc.current_bitrate() != bitrate {
+            enc.update_bitrate(bitrate);
+        }
     }
 
     let Some(encoder) = encoder.as_mut() else {
         return Ok(None);
     };
     encoder.encode_bgra(bgra, force_key).map(|packet| {
-        packet.map(|packet| EncodedPacket {
+        packet.map(|p| EncodedPacket {
             backend: VideoEncoderBackend::Nvenc,
-            codec: packet.codec,
-            bytes: packet.bytes,
-            key: packet.key,
+            codec: p.codec,
+            bytes: p.bytes,
+            key: p.key,
         })
     })
 }
@@ -2528,6 +2512,7 @@ fn encode_h264_frame(
 }
 
 // ── YUV conversion ────────────────────────────────────────────────────────────
+// All pixel math lives in crate::colorconv (optimized, unchecked, row-batched).
 
 #[cfg(feature = "live-h264")]
 #[derive(Default)]
@@ -2558,147 +2543,24 @@ impl openh264::formats::YUVSource for YuvFrame {
     fn strides(&self) -> (usize, usize, usize) {
         (self.width, self.width / 2, self.width / 2)
     }
-    fn y(&self) -> &[u8] {
-        &self.y
-    }
-    fn u(&self) -> &[u8] {
-        &self.u
-    }
-    fn v(&self) -> &[u8] {
-        &self.v
-    }
+    fn y(&self) -> &[u8] { &self.y }
+    fn u(&self) -> &[u8] { &self.u }
+    fn v(&self) -> &[u8] { &self.v }
 }
 
-/// BGRA (GDI output) → planar YUV420 (BT.601 limited range).
+/// BGRA → planar I420.  Delegates to `crate::colorconv` for the fast path.
 #[cfg(feature = "live-h264")]
 fn bgra_to_yuv420_into(out: &mut YuvFrame, w: usize, h: usize, bgra: &[u8]) {
     if w == 0 || h == 0 || bgra.len() < w.saturating_mul(h).saturating_mul(4) {
         return;
     }
     out.resize(w, h);
-
     let dst_w = out.width;
     let dst_h = out.height;
-    if dst_w == w && dst_h == h {
-        bgra_to_yuv420_even_into(out, w, h, bgra);
-        return;
-    }
-
-    bgra_to_yuv420_padded_into(out, w, h, bgra);
-}
-
-#[cfg(feature = "live-h264")]
-fn bgra_to_yuv420_even_into(out: &mut YuvFrame, w: usize, h: usize, bgra: &[u8]) {
-    for by in (0..h).step_by(2) {
-        let bgra_row0 = by * w * 4;
-        let bgra_row1 = (by + 1) * w * 4;
-        let y_row0 = by * w;
-        let y_row1 = (by + 1) * w;
-        let chroma_row = (by / 2) * (w / 2);
-
-        for bx in (0..w).step_by(2) {
-            let p00 = bgra_row0 + bx * 4;
-            let p01 = p00 + 4;
-            let p10 = bgra_row1 + bx * 4;
-            let p11 = p10 + 4;
-
-            let (r00, g00, b00) = bgra_pixel_rgb_at(bgra, p00);
-            let (r01, g01, b01) = bgra_pixel_rgb_at(bgra, p01);
-            let (r10, g10, b10) = bgra_pixel_rgb_at(bgra, p10);
-            let (r11, g11, b11) = bgra_pixel_rgb_at(bgra, p11);
-
-            out.y[y_row0 + bx] = y_from_rgb(r00, g00, b00);
-            out.y[y_row0 + bx + 1] = y_from_rgb(r01, g01, b01);
-            out.y[y_row1 + bx] = y_from_rgb(r10, g10, b10);
-            out.y[y_row1 + bx + 1] = y_from_rgb(r11, g11, b11);
-
-            let r = (r00 + r01 + r10 + r11 + 2) / 4;
-            let g = (g00 + g01 + g10 + g11 + 2) / 4;
-            let b = (b00 + b01 + b10 + b11 + 2) / 4;
-            let chroma = chroma_row + bx / 2;
-            out.u[chroma] = u_from_rgb(r, g, b);
-            out.v[chroma] = v_from_rgb(r, g, b);
-        }
-    }
-}
-
-#[cfg(feature = "live-h264")]
-fn bgra_to_yuv420_padded_into(out: &mut YuvFrame, w: usize, h: usize, bgra: &[u8]) {
-    let dst_w = out.width;
-    let dst_h = out.height;
-    for by in (0..dst_h).step_by(2) {
-        for bx in (0..dst_w).step_by(2) {
-            let mut r_sum = 0_i32;
-            let mut g_sum = 0_i32;
-            let mut b_sum = 0_i32;
-
-            for dy in 0..2 {
-                let y = by + dy;
-                for dx in 0..2 {
-                    let x = bx + dx;
-                    let (r, g, b) = bgra_pixel_rgb_clamped(bgra, w, h, x, y);
-                    out.y[y * dst_w + x] = y_from_rgb(r, g, b);
-                    r_sum += r;
-                    g_sum += g;
-                    b_sum += b;
-                }
-            }
-
-            let r = (r_sum + 2) / 4;
-            let g = (g_sum + 2) / 4;
-            let b = (b_sum + 2) / 4;
-            let chroma = (by / 2) * (dst_w / 2) + (bx / 2);
-            out.u[chroma] = u_from_rgb(r, g, b);
-            out.v[chroma] = v_from_rgb(r, g, b);
-        }
-    }
-}
-
-#[cfg(feature = "live-h264")]
-#[inline(always)]
-fn bgra_pixel_rgb_clamped(
-    bgra: &[u8],
-    width: usize,
-    height: usize,
-    x: usize,
-    y: usize,
-) -> (i32, i32, i32) {
-    let sx = x.min(width - 1);
-    let sy = y.min(height - 1);
-    let base = (sy * width + sx) * 4;
-    (
-        bgra[base + 2] as i32,
-        bgra[base + 1] as i32,
-        bgra[base] as i32,
-    )
-}
-
-#[cfg(feature = "live-h264")]
-#[inline(always)]
-fn bgra_pixel_rgb_at(bgra: &[u8], base: usize) -> (i32, i32, i32) {
-    (
-        bgra[base + 2] as i32,
-        bgra[base + 1] as i32,
-        bgra[base] as i32,
-    )
-}
-
-#[cfg(feature = "live-h264")]
-#[inline(always)]
-fn y_from_rgb(r: i32, g: i32, b: i32) -> u8 {
-    (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(16, 235) as u8
-}
-
-#[cfg(feature = "live-h264")]
-#[inline(always)]
-fn u_from_rgb(r: i32, g: i32, b: i32) -> u8 {
-    (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(16, 240) as u8
-}
-
-#[cfg(feature = "live-h264")]
-#[inline(always)]
-fn v_from_rgb(r: i32, g: i32, b: i32) -> u8 {
-    (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(16, 240) as u8
+    crate::colorconv::bgra_to_i420(
+        &mut out.y, &mut out.u, &mut out.v,
+        w, h, dst_w, dst_h, bgra,
+    );
 }
 
 #[cfg(test)]

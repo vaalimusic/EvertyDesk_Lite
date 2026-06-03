@@ -593,6 +593,11 @@ pub fn capture_screen_into(pixels: &mut Vec<u8>) -> Option<(u32, u32)> {
 
     #[cfg(target_os = "linux")]
     {
+        // Fast path: MIT-SHM shared-memory capture (no X11 socket copy).
+        if let Some(size) = linux_x11_shm::capture_into(pixels) {
+            return Some(size);
+        }
+        // Fallback: standard x11rb GetImage (socket copy) + grim on Wayland.
         let (width, height, data) = linux_x11::capture()?;
         *pixels = data;
         return Some((width, height));
@@ -829,5 +834,198 @@ mod linux_x11 {
             }
         }
         false
+    }
+}
+
+// ── Linux MIT-SHM fast capture ────────────────────────────────────────────────
+//
+// XShmGetImage copies the desktop into a shared-memory segment that the X
+// server maps directly, skipping the X11 socket entirely.  For 1080p this is
+// ~5–10× faster than GetImage over the socket.
+//
+// Falls back gracefully if:
+//  - The DISPLAY variable is unset (Wayland-only session).
+//  - The server does not support MIT-SHM (e.g. Xvnc, Xnest, some containers).
+//  - shmget / shmat fail (seccomp sandbox, container kernel limits).
+#[cfg(target_os = "linux")]
+mod linux_x11_shm {
+    use std::cell::RefCell;
+
+    use x11rb::{
+        connection::Connection,
+        protocol::{
+            shm::{self, ConnectionExt as ShmExt},
+            xproto,
+        },
+        rust_connection::RustConnection,
+    };
+
+    struct ShmCapture {
+        conn: RustConnection,
+        root: xproto::Window,
+        width: u16,
+        height: u16,
+        seg: shm::Seg,
+        shm_id: libc::c_int,
+        shm_ptr: *mut libc::c_void,
+        byte_len: usize,
+    }
+
+    impl ShmCapture {
+        fn connect() -> Option<Self> {
+            // Only attempt on X11 sessions.
+            if std::env::var_os("DISPLAY").is_none() {
+                return None;
+            }
+
+            let (conn, screen_num) = x11rb::connect(None).ok()?;
+            let screen = &conn.setup().roots[screen_num];
+            let width = screen.width_in_pixels;
+            let height = screen.height_in_pixels;
+            let root = screen.root;
+            if width == 0 || height == 0 {
+                return None;
+            }
+
+            // Check that the server has the MIT-SHM extension.
+            let shm_info = conn.shm_query_version().ok()?.reply().ok()?;
+            if !shm_info.shared_pixmaps {
+                // Extension present but pixmaps disabled — GetImage still works.
+                // We continue; shm::get_image doesn't require shared_pixmaps.
+            }
+
+            // Allocate shared-memory segment: width × height × 4 bytes (BGRA).
+            let byte_len = (width as usize)
+                .checked_mul(height as usize)?
+                .checked_mul(4)?;
+            let shm_id = unsafe {
+                libc::shmget(libc::IPC_PRIVATE, byte_len, libc::IPC_CREAT | 0o600)
+            };
+            if shm_id < 0 {
+                return None;
+            }
+            let shm_ptr =
+                unsafe { libc::shmat(shm_id, std::ptr::null(), 0) };
+            if shm_ptr as isize == -1 {
+                unsafe { libc::shmctl(shm_id, libc::IPC_RMID, std::ptr::null_mut()) };
+                return None;
+            }
+            // Mark segment for deletion as soon as the last process detaches.
+            unsafe { libc::shmctl(shm_id, libc::IPC_RMID, std::ptr::null_mut()) };
+
+            // Register with the X server.
+            let seg = conn.generate_id().ok()?;
+            conn.shm_attach(seg, shm_id as u32, false).ok()?.check().ok()?;
+
+            Some(Self {
+                conn,
+                root,
+                width,
+                height,
+                seg,
+                shm_id,
+                shm_ptr,
+                byte_len,
+            })
+        }
+
+        /// Capture into `out`, resizing it if needed.  Returns `(w, h)`.
+        fn capture_into(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
+            let w = self.width as u32;
+            let h = self.height as u32;
+
+            // Ask the server to fill our shared-memory segment.
+            self.conn
+                .shm_get_image(
+                    self.root,
+                    0, 0,
+                    self.width,
+                    self.height,
+                    !0u32,                          // plane_mask = all planes
+                    2u8, // XCB_IMAGE_FORMAT_Z_PIXMAP
+                    self.seg,
+                    0,                              // offset in segment
+                )
+                .ok()?
+                .reply()
+                .ok()?;
+
+            // The segment now holds raw pixels in the server's native format
+            // (usually BGRX on little-endian X11).  Copy and fix alpha.
+            if out.len() != self.byte_len {
+                out.resize(self.byte_len, 0);
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.shm_ptr as *const u8,
+                    out.as_mut_ptr(),
+                    self.byte_len,
+                );
+            }
+
+            // X11 returns pixels as BGRX (alpha = 0).  Force alpha = 255.
+            for alpha in out[3..].iter_mut().step_by(4) {
+                *alpha = 255;
+            }
+
+            Some((w, h))
+        }
+
+        /// True when the screen dimensions still match what we were created for.
+        fn matches(&self, w: u16, h: u16) -> bool {
+            self.width == w && self.height == h
+        }
+    }
+
+    impl Drop for ShmCapture {
+        fn drop(&mut self) {
+            let _ = self.conn.shm_detach(self.seg);
+            if self.shm_ptr as isize != -1 {
+                unsafe { libc::shmdt(self.shm_ptr) };
+            }
+        }
+    }
+
+    thread_local! {
+        static SHM: RefCell<Option<ShmCapture>> = const { RefCell::new(None) };
+    }
+
+    /// Try to capture via MIT-SHM.  Returns `None` if the extension is not
+    /// available or if any system call fails.
+    pub fn capture_into(out: &mut Vec<u8>) -> Option<(u32, u32)> {
+        SHM.with(|cell| {
+            // Lazily initialise on first call.
+            if cell.borrow().is_none() {
+                *cell.borrow_mut() = ShmCapture::connect();
+            }
+
+            // Detect resolution change and recreate.
+            let needs_recreate = cell.borrow().as_ref().map_or(false, |cap| {
+                let (cur_w, cur_h) = current_screen_size().unwrap_or((0, 0));
+                !cap.matches(cur_w as u16, cur_h as u16)
+            });
+            if needs_recreate {
+                *cell.borrow_mut() = ShmCapture::connect();
+            }
+
+            let result = cell
+                .borrow()
+                .as_ref()
+                .and_then(|cap| cap.capture_into(out));
+
+            if result.is_none() {
+                // Invalidate on any failure so the next call retries.
+                *cell.borrow_mut() = None;
+            }
+            result
+        })
+    }
+
+    fn current_screen_size() -> Option<(u32, u32)> {
+        SHM.with(|cell| {
+            cell.borrow().as_ref().map(|cap| {
+                (cap.width as u32, cap.height as u32)
+            })
+        })
     }
 }

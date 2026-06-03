@@ -275,6 +275,7 @@ mod macos {
         width: u32,
         height: u32,
         fps: u32,
+        bitrate: u32,
         session: VTCompressionSessionRef,
         sink: Box<PacketSink>,
         frame_index: i64,
@@ -308,6 +309,28 @@ mod macos {
                 && self.width == width.max(2)
                 && self.height == height.max(2)
                 && self.fps == fps.clamp(5, 60)
+        }
+
+        pub fn current_bitrate(&self) -> u32 {
+            self.bitrate
+        }
+
+        /// Update the encode bitrate at runtime via VTSessionSetProperty.
+        pub fn update_bitrate(&mut self, new_bitrate: u32) -> bool {
+            if self.bitrate == new_bitrate {
+                return true;
+            }
+            let ok = unsafe {
+                set_i32_property(
+                    self.session,
+                    kVTCompressionPropertyKey_AverageBitRate,
+                    new_bitrate as i32,
+                ) == 0
+            };
+            if ok {
+                self.bitrate = new_bitrate;
+            }
+            ok
         }
 
         pub fn encode_bgra(
@@ -453,6 +476,7 @@ mod macos {
                 width,
                 height,
                 fps,
+                bitrate,
                 session,
                 sink,
                 frame_index: 0,

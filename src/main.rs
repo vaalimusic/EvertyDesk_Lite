@@ -5,6 +5,7 @@
 
 mod address_book;
 mod capture;
+mod colorconv;
 mod crypto;
 mod host;
 mod llm;

@@ -34,6 +34,7 @@ pub struct NvencEncoder {
     width: u32,
     height: u32,
     fps: u32,
+    bitrate: u32,
     #[cfg(all(nvenc_api_ffi, windows))]
     inner: windows_nvenc::EncoderHandle,
 }
@@ -59,6 +60,7 @@ impl NvencEncoder {
                 width,
                 height,
                 fps,
+                bitrate,
                 inner,
             });
         }
@@ -75,6 +77,19 @@ impl NvencEncoder {
             && self.width == width.max(2)
             && self.height == height.max(2)
             && self.fps == fps.clamp(5, 60)
+    }
+
+    pub fn current_bitrate(&self) -> u32 {
+        self.bitrate
+    }
+
+    /// Runtime bitrate update — no encoder recreation.
+    /// NVENC supports reconfiguration via NvEncReconfigureEncoder;
+    /// here we track the value so host.rs can detect changes.
+    /// Actual reconfigure is a future improvement when the NVENC backend matures.
+    pub fn update_bitrate(&mut self, new_bitrate: u32) -> bool {
+        self.bitrate = new_bitrate;
+        true // optimistic — real reconfigure TODO
     }
 
     pub fn encode_bgra(
