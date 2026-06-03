@@ -193,7 +193,22 @@ mod macos {
             pixel_buffer: CVPixelBufferRef,
             unlock_flags: u64,
         ) -> OSStatus;
+        // Biplanar (NV12) accessors
+        fn CVPixelBufferGetBaseAddressOfPlane(
+            pixel_buffer: CVPixelBufferRef,
+            plane_index: usize,
+        ) -> *const u8;
+        fn CVPixelBufferGetBytesPerRowOfPlane(
+            pixel_buffer: CVPixelBufferRef,
+            plane_index: usize,
+        ) -> usize;
+        fn CVPixelBufferGetPlaneCount(pixel_buffer: CVPixelBufferRef) -> usize;
     }
+
+    // kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ('420v') — limited range
+    const K_CV_PIXEL_FORMAT_420V: OSType = 0x3432_3076;
+    // kCVPixelFormatType_420YpCbCr8BiPlanarFullRange  ('420f') — full range
+    const K_CV_PIXEL_FORMAT_420F: OSType = 0x3432_3066;
 
     #[link(name = "VideoToolbox", kind = "framework")]
     extern "C" {
@@ -864,12 +879,21 @@ mod macos {
         }
     }
 
+    /// Convert a CVPixelBuffer to a heap-allocated RGBA frame.
+    ///
+    /// Handles three formats that VT hardware decoders actually produce:
+    ///   - `K_CV_PIXEL_FORMAT_TYPE_32_BGRA` ('BGRA') — swap B/R channels
+    ///   - `K_CV_PIXEL_FORMAT_420V` ('420v')  — NV12 limited-range YUV
+    ///   - `K_CV_PIXEL_FORMAT_420F` ('420f')  — NV12 full-range YUV
+    ///
+    /// Hardware VT decoders on Apple Silicon and Intel Macs often output 420v/420f
+    /// even when BGRA pixel-buffer attributes are requested.  Without this handling
+    /// `rgba_from_bgra_pixel_buffer` would silently return `None` for every P-frame,
+    /// forcing a fallback to the slow OpenH264 software decoder.
     unsafe fn rgba_from_bgra_pixel_buffer(
         pixel_buffer: CVPixelBufferRef,
     ) -> Option<(usize, usize, Vec<u8>)> {
-        if CVPixelBufferGetPixelFormatType(pixel_buffer) != K_CV_PIXEL_FORMAT_TYPE_32_BGRA {
-            return None;
-        }
+        let fmt = CVPixelBufferGetPixelFormatType(pixel_buffer);
         let width = CVPixelBufferGetWidth(pixel_buffer);
         let height = CVPixelBufferGetHeight(pixel_buffer);
         if width == 0 || height == 0 {
@@ -878,29 +902,80 @@ mod macos {
         if CVPixelBufferLockBaseAddress(pixel_buffer, 0) != 0 {
             return None;
         }
+
+        let result = match fmt {
+            K_CV_PIXEL_FORMAT_TYPE_32_BGRA => {
+                rgba_from_bgra_locked(pixel_buffer, width, height)
+            }
+            K_CV_PIXEL_FORMAT_420V | K_CV_PIXEL_FORMAT_420F => {
+                rgba_from_nv12_locked(pixel_buffer, width, height)
+            }
+            _ => {
+                eprintln!("[vt-decode] unexpected pixel format 0x{fmt:08X}");
+                None
+            }
+        };
+
+        let _ = CVPixelBufferUnlockBaseAddress(pixel_buffer, 0);
+        result
+    }
+
+    /// BGRA pixel buffer → RGBA (locked, caller must unlock).
+    unsafe fn rgba_from_bgra_locked(
+        pixel_buffer: CVPixelBufferRef,
+        width: usize,
+        height: usize,
+    ) -> Option<(usize, usize, Vec<u8>)> {
         let base = CVPixelBufferGetBaseAddress(pixel_buffer) as *const u8;
         let stride = CVPixelBufferGetBytesPerRow(pixel_buffer);
         let row_bytes = width.checked_mul(4)?;
+        if base.is_null() || stride < row_bytes {
+            return None;
+        }
         let frame_bytes = row_bytes.checked_mul(height)?;
         let mut rgba = vec![0_u8; frame_bytes];
-        if !base.is_null() && stride >= row_bytes {
-            for y in 0..height {
-                let src = slice::from_raw_parts(base.add(y * stride), row_bytes);
-                let dst = &mut rgba[y * row_bytes..(y + 1) * row_bytes];
-                for (bgra, rgba) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
-                    rgba[0] = bgra[2];
-                    rgba[1] = bgra[1];
-                    rgba[2] = bgra[0];
-                    rgba[3] = bgra[3];
-                }
+        for y in 0..height {
+            let src = slice::from_raw_parts(base.add(y * stride), row_bytes);
+            let dst = &mut rgba[y * row_bytes..(y + 1) * row_bytes];
+            for (b, r) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+                r[0] = b[2]; // R ← B[2]
+                r[1] = b[1]; // G ← G[1]
+                r[2] = b[0]; // B ← B[0]
+                r[3] = 255;
             }
         }
-        let _ = CVPixelBufferUnlockBaseAddress(pixel_buffer, 0);
-        if base.is_null() || stride < row_bytes {
-            None
-        } else {
-            Some((width, height, rgba))
+        Some((width, height, rgba))
+    }
+
+    /// NV12 (biplanar Y + interleaved UV) pixel buffer → RGBA (locked).
+    unsafe fn rgba_from_nv12_locked(
+        pixel_buffer: CVPixelBufferRef,
+        width: usize,
+        height: usize,
+    ) -> Option<(usize, usize, Vec<u8>)> {
+        // Plane 0 = Y (luma), plane 1 = CbCr (interleaved chroma)
+        if CVPixelBufferGetPlaneCount(pixel_buffer) < 2 {
+            return None;
         }
+        let y_ptr = CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 0);
+        let uv_ptr = CVPixelBufferGetBaseAddressOfPlane(pixel_buffer, 1);
+        if y_ptr.is_null() || uv_ptr.is_null() {
+            return None;
+        }
+        let y_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, 0);
+        let uv_stride = CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, 1);
+        if y_stride < width || uv_stride < width {
+            return None;
+        }
+
+        let y_len = y_stride * height;
+        let uv_len = uv_stride * (height / 2).max(1);
+        let y_plane = slice::from_raw_parts(y_ptr, y_len);
+        let uv_plane = slice::from_raw_parts(uv_ptr, uv_len);
+
+        let mut rgba = Vec::with_capacity(width * height * 4);
+        crate::colorconv::nv12_to_rgba(&mut rgba, width, height, y_plane, uv_plane, y_stride, uv_stride);
+        Some((width, height, rgba))
     }
 
     fn h264_nals(packet: &[u8]) -> Vec<&[u8]> {

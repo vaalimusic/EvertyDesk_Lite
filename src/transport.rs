@@ -2243,6 +2243,10 @@ fn decode_frame_loop(
     } else {
         None
     };
+    // How many consecutive frames VT has returned "needs more packets".
+    // VT is allowed a few startup frames; after VT_FAIL_LIMIT it is disabled.
+    let mut h264_vt_fail_streak: u32 = 0;
+    const VT_FAIL_LIMIT: u32 = 5;
 
     #[cfg(feature = "live-vpx")]
     let mut vp8 = VpxDecoder::new(DecoderConfig::new(DecoderCodec::Vp8)).ok();
@@ -2326,6 +2330,15 @@ fn decode_frame_loop(
                 .as_millis()
                 .min(u128::from(u64::MAX)) as u64;
             let started = Instant::now();
+            // If VT has failed too many times in a row, disable it so we don't
+            // keep attempting hardware decode and silently falling through to
+            // the slow OpenH264 software path on every single frame.
+            if h264_vt_fail_streak >= VT_FAIL_LIMIT {
+                if h264_vt.is_some() {
+                    eprintln!("[decoder] VT failed {VT_FAIL_LIMIT} frames in a row — disabling, using OpenH264");
+                    h264_vt = None;
+                }
+            }
             match decode_one_frame(
                 frame,
                 &mut h264_vt,
@@ -2338,6 +2351,7 @@ fn decode_frame_loop(
                 &mut av1_mf,
             ) {
                 Ok(Some(event)) => {
+                    h264_vt_fail_streak = 0;
                     let decode_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                     let _ = events.send(SessionEvent::FrameMetrics {
                         bytes,
@@ -2353,8 +2367,17 @@ fn decode_frame_loop(
                     dropped_frames = 0;
                     latest_event = Some(event);
                 }
-                Ok(None) => {}
-                Err(err) if decoder_needs_more_packets(&err) => {}
+                Ok(None) => {
+                    // VT returned no frame — may be startup buffering.
+                    if codec == "H264" && h264_vt.is_some() {
+                        h264_vt_fail_streak = h264_vt_fail_streak.saturating_add(1);
+                    }
+                }
+                Err(err) if decoder_needs_more_packets(&err) => {
+                    if codec == "H264" && h264_vt.is_some() {
+                        h264_vt_fail_streak = h264_vt_fail_streak.saturating_add(1);
+                    }
+                }
                 Err(err) => {
                     let _ = feedback.send(DecoderFeedback::DecodeFailed { codec });
                     let _ = events.send(SessionEvent::Info(format!("Frame decode failed: {err}")));
@@ -2425,7 +2448,9 @@ impl DecoderInput {
 }
 
 fn trim_video_backlog_to_keyframe(batch: &mut Vec<DecoderInput>) -> usize {
-    const MAX_VIDEO_BACKLOG: usize = 8;
+    // Keep at most 3 frames per batch. Remote desktop latency matters more
+    // than smooth playback: always show the most recent frame quickly.
+    const MAX_VIDEO_BACKLOG: usize = 3;
     if batch.len() <= MAX_VIDEO_BACKLOG {
         return 0;
     }
@@ -2490,18 +2515,23 @@ fn decode_one_frame(
                             rgba,
                         }));
                     }
-                    Ok(None) => None,
-                    Err(err) if decoder_needs_more_packets(&err) => None,
+                    // VT alive but produced no output yet (startup buffering).
+                    // Return Ok(None) — do NOT fall through to OpenH264.
+                    Ok(None) => return Ok(None),
+                    Err(err) if decoder_needs_more_packets(&err) => return Ok(None),
                     Err(err) => Some(err),
                 }
             } else {
                 None
             };
+
+            // Only reach here when VT is disabled (None) or returned a real error.
             if let Some(err) = vt_error.as_ref() {
-                eprintln!("[decoder] VideoToolbox H264 failed, falling back: {err}");
+                eprintln!("[decoder] VideoToolbox H264 error, disabling: {err}");
                 *h264_vt = None;
             }
 
+            // OpenH264 software fallback — only used when VT is None.
             #[cfg(feature = "live-h264")]
             {
                 decode_h264_rgba(h264.as_mut(), frames).map(|(width, height, rgba)| {
@@ -2520,7 +2550,7 @@ fn decode_one_frame(
                 let _ = frames;
                 if let Some(err) = vt_error {
                     Err(format!(
-                        "H264 frame received, but VideoToolbox failed and this build was compiled without live-h264: {err}"
+                        "H264 frame received but VideoToolbox failed and live-h264 is not compiled: {err}"
                     ))
                 } else {
                     Ok(None)

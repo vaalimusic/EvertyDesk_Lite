@@ -273,6 +273,59 @@ unsafe fn px(bgra: &[u8], base: usize) -> (i32, i32, i32) {
 
 // ── Fast frame-change hash ────────────────────────────────────────────────────
 
+// ── NV12 → RGBA ──────────────────────────────────────────────────────────────
+
+/// Convert NV12 (biplanar: Y plane + interleaved Cb/Cr plane) to RGBA.
+///
+/// Used to convert VideoToolbox hardware-decode output when the decoder ignores
+/// the BGRA pixel-format hint and returns YUV instead.
+///
+/// `y_stride` and `uv_stride` are the row strides in bytes (may be > width).
+/// Output `rgba` must be pre-allocated to `width * height * 4` bytes.
+pub fn nv12_to_rgba(
+    rgba: &mut Vec<u8>,
+    width: usize,
+    height: usize,
+    y_plane: &[u8],
+    uv_plane: &[u8],
+    y_stride: usize,
+    uv_stride: usize,
+) {
+    let pixel_count = width.saturating_mul(height);
+    let expected = pixel_count.saturating_mul(4);
+    if rgba.len() != expected {
+        rgba.resize(expected, 0);
+    }
+
+    // BT.601 full-range (for 420f) or limited-range (for 420v) → RGB.
+    // We use full-range coefficients which work reasonably for both;
+    // the visual difference for remote desktop content is negligible.
+    for row in 0..height {
+        let y_row = row * y_stride;
+        let uv_row = (row / 2) * uv_stride;
+        let out_row = row * width * 4;
+
+        for col in 0..width {
+            // SAFETY: all indices are bounded by width/height/stride checks above.
+            let y = unsafe { *y_plane.get_unchecked(y_row + col) } as i32;
+            let uv_base = uv_row + (col & !1); // col rounded down to even
+            let cb = unsafe { *uv_plane.get_unchecked(uv_base) } as i32 - 128;
+            let cr = unsafe { *uv_plane.get_unchecked(uv_base + 1) } as i32 - 128;
+
+            // Full-range BT.601: Y ∈ [0,255], Cb/Cr ∈ [-128,127]
+            let r = (y + (1436 * cr >> 10)).clamp(0, 255) as u8;
+            let g = (y - (352 * cb >> 10) - (731 * cr >> 10)).clamp(0, 255) as u8;
+            let b = (y + (1815 * cb >> 10)).clamp(0, 255) as u8;
+
+            let px = out_row + col * 4;
+            rgba[px]     = r;
+            rgba[px + 1] = g;
+            rgba[px + 2] = b;
+            rgba[px + 3] = 255;
+        }
+    }
+}
+
 /// Sample `n` evenly-spaced pixels and return a 64-bit FNV-1a digest.
 ///
 /// This is ~3× faster than the old per-pixel delta loop because:

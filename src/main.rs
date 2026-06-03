@@ -1495,7 +1495,17 @@ impl EvertyDeskApp {
             || self.terminal_ai_rx.is_some()
             || self.host_state.is_online()
         {
-            ctx.request_repaint_after(Duration::from_millis(33));
+            // Poll faster when live video is streaming to reduce decode→render lag.
+        let repaint_ms = if self.connected
+            && self.last_live_frame_at
+                .map(|t| t.elapsed() < Duration::from_secs(3))
+                .unwrap_or(false)
+        {
+            16 // ~60fps poll when stream is active
+        } else {
+            33 // ~30fps otherwise
+        };
+        ctx.request_repaint_after(Duration::from_millis(repaint_ms));
         }
 
         let software_backend = egui_software_backend_active();
