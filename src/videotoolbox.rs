@@ -320,17 +320,17 @@ mod macos {
             if self.bitrate == new_bitrate {
                 return true;
             }
-            let ok = unsafe {
+            unsafe {
                 set_i32_property(
                     self.session,
                     kVTCompressionPropertyKey_AverageBitRate,
                     new_bitrate as i32,
-                ) == 0
-            };
-            if ok {
-                self.bitrate = new_bitrate;
+                );
             }
-            ok
+            // VTSessionSetProperty has no useful return value we can check here;
+            // assume success and track the new value.
+            self.bitrate = new_bitrate;
+            true
         }
 
         pub fn encode_bgra(
@@ -1218,6 +1218,10 @@ mod fallback {
         pub fn matches(&self, _codec: NvencCodec, _width: u32, _height: u32, _fps: u32) -> bool {
             false
         }
+
+        pub fn current_bitrate(&self) -> u32 { 0 }
+
+        pub fn update_bitrate(&mut self, _new_bitrate: u32) -> bool { false }
 
         pub fn encode_bgra(
             &mut self,

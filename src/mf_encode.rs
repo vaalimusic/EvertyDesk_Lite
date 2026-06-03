@@ -864,6 +864,10 @@ mod fallback {
             false
         }
 
+        pub fn current_bitrate(&self) -> u32 { 0 }
+
+        pub fn update_bitrate(&mut self, _new_bitrate: u32) -> bool { false }
+
         pub fn encode_bgra(
             &mut self,
             _bgra: &[u8],
