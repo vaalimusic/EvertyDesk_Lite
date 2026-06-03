@@ -374,6 +374,10 @@ impl TransportClient {
         let mut last_decoder_recovery: Option<Instant> = None;
         let mut last_adaptive_raise = Instant::now();
         let mut stable_decoded_frames = 0_u32;
+        // Quality starts at Balanced for fast encoder warm-up, raised to Best
+        // after the stream has been stable for a few seconds.
+        let mut current_quality = ImageQuality::Balanced;
+        let mut quality_raise_sent = false;
         let mut h264_decode_failures = 0_u32;
         let mut vp9_decode_failures = 0_u32;
         let mut h265_decode_failures = 0_u32;
@@ -547,6 +551,32 @@ impl TransportClient {
                             "AV1" => av1_decode_failures = 0,
                             _ => {}
                         }
+                        // Raise quality from Balanced to Best after stream stabilises.
+                        if !quality_raise_sent
+                            && live_video_seen
+                            && queue_ms <= 200
+                            && decode_ms <= 60
+                            && last_live_bootstrap.elapsed() >= Duration::from_secs(3)
+                        {
+                            quality_raise_sent = true;
+                            current_quality = ImageQuality::Best;
+                            let msg = PeerMessage {
+                                union: Some(peer_message::Union::Misc(Misc {
+                                    union: Some(misc::Union::Option(
+                                        video_option_message_quality(
+                                            target_video_fps,
+                                            codec_preference,
+                                            ImageQuality::Best,
+                                        ),
+                                    )),
+                                })),
+                            };
+                            let _ = send_framed(&mut relay, &encode_peer_message(&msg));
+                            let _ = events.send(SessionEvent::Info(
+                                "Stream stable — raised quality to Best".to_owned(),
+                            ));
+                        }
+
                         if adaptive_quality
                             && target_video_fps < initial_video_fps
                             && queue_ms <= 120
@@ -1532,8 +1562,19 @@ fn send_codec_sync_options(
 }
 
 fn video_option_message(fps: i32, codec_preference: CodecPreference) -> OptionMessage {
+    // Start at Balanced quality so the host encoder can warm up quickly.
+    // A large IDR at Best quality delays the first frame significantly, especially
+    // over relay.  We raise to Best after the stream stabilises.
+    video_option_message_quality(fps, codec_preference, ImageQuality::Balanced)
+}
+
+fn video_option_message_quality(
+    fps: i32,
+    codec_preference: CodecPreference,
+    quality: ImageQuality,
+) -> OptionMessage {
     OptionMessage {
-        image_quality: ImageQuality::Best as i32,
+        image_quality: quality as i32,
         custom_image_quality: 0,
         supported_decoding: Some(supported_decoding(codec_preference)),
         custom_fps: fps.clamp(5, 60),

@@ -3721,14 +3721,17 @@ impl EvertyDeskApp {
         // embeds cursor pixels directly in the captured frame, so the separate
         // cursor overlay is redundant.  Additionally, CursorId switch messages
         // currently fail to parse (proto wire-type mismatch in RustDesk 1.4.6),
-        // which leaves the overlay stuck on the first shape (I-beam).
-        // → Hide the overlay while VP9 is active; show the normal OS cursor.
-        let live_vp9_active = self
+        // Hide the OS cursor and draw the remote cursor overlay whenever we have
+        // a remote cursor image, regardless of codec (H264, VP9, PNG).
+        // Previously this only worked in non-VP9 mode; the variable was
+        // mis-named and caused the cursor to be invisible during H264 streaming.
+        let live_video_active = self
             .last_live_frame_at
             .map(|t| t.elapsed() < Duration::from_secs(2))
             .unwrap_or(false);
+        let _ = live_video_active; // kept for future use
 
-        let hover_cursor = if self.cursor_texture.is_some() && !live_vp9_active {
+        let hover_cursor = if self.cursor_texture.is_some() {
             egui::CursorIcon::None
         } else {
             egui::CursorIcon::Default
@@ -3775,9 +3778,8 @@ impl EvertyDeskApp {
             );
         }
 
-        // Draw remote cursor overlay on top of the video (PNG / screenshot mode only).
-        // Skipped during live VP9 — see live_vp9_active comment above.
-        if !live_vp9_active {
+        // Draw remote cursor overlay on top of the video for all codecs.
+        {
             if let Some((cursor_tex, hotx, hoty)) = &self.cursor_texture {
                 let cursor_px = cursor_tex.size_vec2();
                 let draw_pos = if let Some(rpos) = self.cursor_pos {
@@ -3801,7 +3803,7 @@ impl EvertyDeskApp {
                     egui::Color32::WHITE,
                 );
             }
-        } // end !live_vp9_active
+        } // end cursor overlay
 
         if self.connected {
             // Mouse movement
@@ -3811,6 +3813,9 @@ impl EvertyDeskApp {
             if let Some(pos) = pointer_pos.filter(|pos| response.rect.contains(*pos)) {
                 let local = pos - response.rect.min;
                 let (x, y) = self.remote_point_from_local(local.x / scale, local.y / scale);
+                // Update cursor overlay position immediately from local input.
+                // This makes the cursor feel responsive even at low video fps.
+                self.cursor_pos = Some(egui::pos2(x as f32, y as f32));
                 if self.last_mouse_pos != Some((x, y)) {
                     self.last_mouse_pos = Some((x, y));
                     self.send_command(SessionCommand::MouseMove { x, y });
