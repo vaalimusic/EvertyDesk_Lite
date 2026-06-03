@@ -62,7 +62,7 @@ impl LiveVideoMode {
 }
 
 pub fn h264_available() -> bool {
-    cfg!(feature = "live-h264")
+    cfg!(feature = "live-h264") || crate::videotoolbox::videotoolbox_h264_decoder_available()
 }
 
 pub fn h265_available() -> bool {

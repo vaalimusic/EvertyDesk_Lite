@@ -32,6 +32,7 @@ const RELAY_PORT: u16 = 21117;
 const SESSION_TICK_MS: u64 = 16; // ~60 fps poll; keeps command latency ≤16 ms
 const RELAY_STREAM_ATTEMPTS: u8 = 3;
 const RELAY_BOOTSTRAP_WAIT_SECS: u64 = 12;
+const RELAY_RESPONSE_BOOTSTRAP_WAIT_SECS: u64 = 30;
 const RELAY_AUTH_WAIT_SECS: u64 = 120;
 const RELAY_HANDSHAKE_POLL_MS: u64 = 500;
 
@@ -1019,6 +1020,7 @@ fn establish_session(
     let rendezvous = describe_rendezvous_response(&decoded)?;
 
     progress(85, "Rendezvous protobuf response decoded".to_owned());
+    let relay_uuid_from_rendezvous = rendezvous.relay_uuid.clone();
     let relay_server = rendezvous
         .relay_server
         .unwrap_or_else(|| request.server.relay_server.clone());
@@ -1031,7 +1033,13 @@ fn establish_session(
     let mut last_err = String::new();
     let max_retries = RELAY_STREAM_ATTEMPTS.saturating_sub(1);
     for attempt in 0..RELAY_STREAM_ATTEMPTS {
-        if attempt > 0 {
+        let use_rendezvous_uuid = attempt == 0 && relay_uuid_from_rendezvous.is_some();
+        if use_rendezvous_uuid {
+            progress(
+                88,
+                "Using relay reservation from rendezvous response".to_owned(),
+            );
+        } else if attempt > 0 {
             progress(
                 88 + attempt * 2,
                 format!("Relay retry {attempt}/{max_retries} (peer not ready yet): {last_err}"),
@@ -1040,13 +1048,24 @@ fn establish_session(
             progress(88, "Requesting relay reservation".to_owned());
         }
 
-        let relay_uuid = request_relay_reservation(
-            &request.server.id_server,
-            &request.remote_id,
-            &relay_server,
-            &request.server.public_key,
-            secure_relay,
-        )?;
+        let relay_uuid = if use_rendezvous_uuid {
+            relay_uuid_from_rendezvous
+                .clone()
+                .expect("checked by use_rendezvous_uuid")
+        } else {
+            request_relay_reservation(
+                &request.server.id_server,
+                &request.remote_id,
+                &relay_server,
+                &request.server.public_key,
+                secure_relay,
+            )?
+        };
+        let bootstrap_wait_secs = if use_rendezvous_uuid {
+            RELAY_RESPONSE_BOOTSTRAP_WAIT_SECS
+        } else {
+            RELAY_BOOTSTRAP_WAIT_SECS
+        };
 
         progress(92, "Opening relay stream".to_owned());
         let mut relay_stream = open_relay_stream(
@@ -1064,6 +1083,8 @@ fn establish_session(
             &request.remote_id,
             initial_video_fps,
             codec_preference,
+            bootstrap_wait_secs,
+            progress,
         ) {
             Ok((peer_stage, displays)) => return Ok((relay_stream, peer_stage, displays)),
             Err(err) => last_err = err,
@@ -1271,6 +1292,8 @@ fn read_initial_peer_stage(
     remote_id: &str,
     fps: i32,
     codec_preference: CodecPreference,
+    bootstrap_wait_secs: u64,
+    progress: &mut impl FnMut(u8, String),
 ) -> Result<(String, Vec<RemoteDisplay>), String> {
     relay
         .set_read_timeout(Some(Duration::from_millis(RELAY_HANDSHAKE_POLL_MS)))
@@ -1279,19 +1302,49 @@ fn read_initial_peer_stage(
     let mut seen_peer_message = false;
     let wait_remote_accept = password.is_empty();
     let started = Instant::now();
-    let bootstrap_deadline = started + Duration::from_secs(RELAY_BOOTSTRAP_WAIT_SECS);
+    let bootstrap_deadline = started + Duration::from_secs(bootstrap_wait_secs);
     let auth_deadline = started + Duration::from_secs(RELAY_AUTH_WAIT_SECS);
+    let mut last_wait_progress = started;
     loop {
         let payload = match read_framed(relay) {
             Ok(payload) => payload,
             Err(err) if is_timeout_error(&err) => {
                 let now = Instant::now();
+                if now.duration_since(last_wait_progress) >= Duration::from_secs(3) {
+                    if seen_peer_message {
+                        let stage = if wait_remote_accept && sent_login {
+                            "Waiting for remote approval/login response"
+                        } else if sent_login {
+                            "Waiting for login response"
+                        } else {
+                            "Waiting for peer secure/login response"
+                        };
+                        progress(
+                            96,
+                            format!(
+                                "{stage} ({}s/{}s)",
+                                now.duration_since(started).as_secs(),
+                                RELAY_AUTH_WAIT_SECS
+                            ),
+                        );
+                    } else {
+                        progress(
+                            96,
+                            format!(
+                                "Waiting for host to join relay ({}s/{}s)",
+                                now.duration_since(started).as_secs(),
+                                bootstrap_wait_secs
+                            ),
+                        );
+                    }
+                    last_wait_progress = now;
+                }
                 if !seen_peer_message {
                     if now < bootstrap_deadline {
                         continue;
                     }
                     return Err(format!(
-                        "Relay opened, but peer did not join within {RELAY_BOOTSTRAP_WAIT_SECS}s: {err}"
+                        "Relay opened, but peer did not join within {bootstrap_wait_secs}s: {err}"
                     ));
                 }
                 if now < auth_deadline {
@@ -2159,6 +2212,13 @@ fn decode_frame_loop(
     );
     #[cfg(not(feature = "live-h264"))]
     let mut h264 = ();
+    let mut h264_vt = if crate::videotoolbox::videotoolbox_h264_decoder_available() {
+        eprintln!("[decoder] macOS VideoToolbox H264 decoder ready");
+        Some(crate::videotoolbox::VideoToolboxH264Decoder::new())
+    } else {
+        None
+    };
+
     #[cfg(feature = "live-vpx")]
     let mut vp8 = VpxDecoder::new(DecoderConfig::new(DecoderCodec::Vp8)).ok();
     #[cfg(not(feature = "live-vpx"))]
@@ -2243,6 +2303,7 @@ fn decode_frame_loop(
             let started = Instant::now();
             match decode_one_frame(
                 frame,
+                &mut h264_vt,
                 &mut h264,
                 &mut vp8,
                 &mut vp9,
@@ -2363,6 +2424,7 @@ fn decoder_needs_more_packets(err: &str) -> bool {
 
 fn decode_one_frame(
     frame: DecoderInput,
+    h264_vt: &mut Option<crate::videotoolbox::VideoToolboxH264Decoder>,
     #[cfg(feature = "live-h264")] h264: &mut Option<openh264::decoder::Decoder>,
     #[cfg(not(feature = "live-h264"))] _h264: &mut (),
     #[cfg(feature = "live-vpx")] vp8: &mut Option<VpxDecoder>,
@@ -2392,6 +2454,29 @@ fn decode_one_frame(
             })
         }),
         DecoderInput::H264 { sid, frames, .. } => {
+            let vt_error = if let Some(decoder) = h264_vt.as_mut() {
+                match decoder.decode_packets(frames.frames.iter().map(|frame| frame.data.clone())) {
+                    Ok(Some((width, height, rgba))) => {
+                        return Ok(Some(SessionEvent::Frame {
+                            sid,
+                            codec: "H264".to_owned(),
+                            width,
+                            height,
+                            rgba,
+                        }));
+                    }
+                    Ok(None) => None,
+                    Err(err) if decoder_needs_more_packets(&err) => None,
+                    Err(err) => Some(err),
+                }
+            } else {
+                None
+            };
+            if let Some(err) = vt_error.as_ref() {
+                eprintln!("[decoder] VideoToolbox H264 failed, falling back: {err}");
+                *h264_vt = None;
+            }
+
             #[cfg(feature = "live-h264")]
             {
                 decode_h264_rgba(h264.as_mut(), frames).map(|(width, height, rgba)| {
@@ -2408,7 +2493,13 @@ fn decode_one_frame(
             {
                 let _ = sid;
                 let _ = frames;
-                Err("H264 frame received, but this build was compiled without live-h264".to_owned())
+                if let Some(err) = vt_error {
+                    Err(format!(
+                        "H264 frame received, but VideoToolbox failed and this build was compiled without live-h264: {err}"
+                    ))
+                } else {
+                    Ok(None)
+                }
             }
         }
         DecoderInput::Vp8 { sid, frames, .. } => {
@@ -3050,6 +3141,7 @@ fn build_login_request(
 
 struct RendezvousInfo {
     relay_server: Option<String>,
+    relay_uuid: Option<String>,
     has_signed_pk: bool,
 }
 
@@ -3068,6 +3160,7 @@ fn describe_rendezvous_response(message: &RendezvousMessage) -> Result<Rendezvou
             Ok(RendezvousInfo {
                 relay_server: (!response.relay_server.is_empty())
                     .then(|| response.relay_server.clone()),
+                relay_uuid: None,
                 has_signed_pk: !response.pk.is_empty(),
             })
         }
@@ -3078,6 +3171,7 @@ fn describe_rendezvous_response(message: &RendezvousMessage) -> Result<Rendezvou
                 Ok(RendezvousInfo {
                     relay_server: (!response.relay_server.is_empty())
                         .then(|| response.relay_server.clone()),
+                    relay_uuid: (!response.uuid.is_empty()).then(|| response.uuid.clone()),
                     has_signed_pk: false,
                 })
             }
@@ -3319,6 +3413,22 @@ mod tests {
         assert!(is_timeout_error(
             "TCP read header failed: Resource temporarily unavailable (os error 35)"
         ));
+    }
+
+    #[test]
+    fn relay_response_keeps_server_uuid() {
+        let message = RendezvousMessage {
+            union: Some(rendezvous_message::Union::RelayResponse(
+                crate::rustdesk_proto::RelayResponse {
+                    uuid: "relay-uuid".to_owned(),
+                    relay_server: "relay.example.test".to_owned(),
+                    ..Default::default()
+                },
+            )),
+        };
+        let info = describe_rendezvous_response(&message).unwrap();
+        assert_eq!(info.relay_uuid.as_deref(), Some("relay-uuid"));
+        assert_eq!(info.relay_server.as_deref(), Some("relay.example.test"));
     }
 
     #[test]

@@ -15,12 +15,16 @@ mod macos {
     type CFTypeRef = *const c_void;
     type CMBlockBufferRef = *const c_void;
     type CMFormatDescriptionRef = *const c_void;
+    type CMItemCount = isize;
     type CMSampleBufferRef = *const c_void;
     type CVPixelBufferRef = *mut c_void;
     type OSStatus = i32;
     type OSType = u32;
     type VTCompressionSessionRef = *mut c_void;
     type VTEncodeInfoFlags = u32;
+    type VTDecodeFrameFlags = u32;
+    type VTDecodeInfoFlags = u32;
+    type VTDecompressionSessionRef = *mut c_void;
 
     const K_CM_VIDEO_CODEC_TYPE_H264: OSType = 0x6176_6331; // 'avc1'
     const K_CV_PIXEL_FORMAT_TYPE_32_BGRA: OSType = 0x4247_5241; // 'BGRA'
@@ -64,8 +68,25 @@ mod macos {
         sample_buffer: CMSampleBufferRef,
     );
 
+    type VTDecompressionOutputCallback = unsafe extern "C" fn(
+        decompression_output_refcon: *mut c_void,
+        source_frame_refcon: *mut c_void,
+        status: OSStatus,
+        info_flags: VTDecodeInfoFlags,
+        image_buffer: CVPixelBufferRef,
+        presentation_time_stamp: CMTime,
+        presentation_duration: CMTime,
+    );
+
+    #[repr(C)]
+    struct VTDecompressionOutputCallbackRecord {
+        decompression_output_callback: Option<VTDecompressionOutputCallback>,
+        decompression_output_refcon: *mut c_void,
+    }
+
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
+        static kCFAllocatorNull: CFAllocatorRef;
         static kCFBooleanTrue: CFBooleanRef;
         static kCFBooleanFalse: CFBooleanRef;
 
@@ -93,6 +114,17 @@ mod macos {
     extern "C" {
         static kCMSampleAttachmentKey_NotSync: CFStringRef;
 
+        fn CMBlockBufferCreateWithMemoryBlock(
+            structure_allocator: CFAllocatorRef,
+            memory_block: *mut c_void,
+            block_length: usize,
+            block_allocator: CFAllocatorRef,
+            custom_block_source: *const c_void,
+            offset_to_data: usize,
+            data_length: usize,
+            flags: u32,
+            block_buffer_out: *mut CMBlockBufferRef,
+        ) -> OSStatus;
         fn CMBlockBufferCopyDataBytes(
             the_buffer: CMBlockBufferRef,
             offset_to_data: usize,
@@ -107,6 +139,25 @@ mod macos {
             sbuf: CMSampleBufferRef,
             create_if_necessary: Boolean,
         ) -> CFArrayRef;
+        fn CMSampleBufferCreateReady(
+            allocator: CFAllocatorRef,
+            data_buffer: CMBlockBufferRef,
+            format_description: CMFormatDescriptionRef,
+            num_samples: CMItemCount,
+            num_sample_timing_entries: CMItemCount,
+            sample_timing_array: *const c_void,
+            num_sample_size_entries: CMItemCount,
+            sample_size_array: *const usize,
+            sample_buffer_out: *mut CMSampleBufferRef,
+        ) -> OSStatus;
+        fn CMVideoFormatDescriptionCreateFromH264ParameterSets(
+            allocator: CFAllocatorRef,
+            parameter_set_count: usize,
+            parameter_set_pointers: *const *const u8,
+            parameter_set_sizes: *const usize,
+            nal_unit_header_length: i32,
+            format_description_out: *mut CMFormatDescriptionRef,
+        ) -> OSStatus;
         fn CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
             video_desc: CMFormatDescriptionRef,
             parameter_set_index: usize,
@@ -119,6 +170,8 @@ mod macos {
 
     #[link(name = "CoreVideo", kind = "framework")]
     extern "C" {
+        static kCVPixelBufferPixelFormatTypeKey: CFStringRef;
+
         fn CVPixelBufferCreate(
             allocator: CFAllocatorRef,
             width: usize,
@@ -129,6 +182,9 @@ mod macos {
         ) -> OSStatus;
         fn CVPixelBufferGetBaseAddress(pixel_buffer: CVPixelBufferRef) -> *mut c_void;
         fn CVPixelBufferGetBytesPerRow(pixel_buffer: CVPixelBufferRef) -> usize;
+        fn CVPixelBufferGetHeight(pixel_buffer: CVPixelBufferRef) -> usize;
+        fn CVPixelBufferGetPixelFormatType(pixel_buffer: CVPixelBufferRef) -> OSType;
+        fn CVPixelBufferGetWidth(pixel_buffer: CVPixelBufferRef) -> usize;
         fn CVPixelBufferLockBaseAddress(
             pixel_buffer: CVPixelBufferRef,
             lock_flags: u64,
@@ -151,6 +207,7 @@ mod macos {
         static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
         static kVTProfileLevel_H264_Baseline_AutoLevel: CFStringRef;
         static kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: CFStringRef;
+        static kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: CFStringRef;
 
         fn VTCompressionSessionCompleteFrames(
             session: VTCompressionSessionRef,
@@ -184,10 +241,33 @@ mod macos {
             property_key: CFStringRef,
             property_value: CFTypeRef,
         ) -> OSStatus;
+        fn VTDecompressionSessionCreate(
+            allocator: CFAllocatorRef,
+            video_format_description: CMFormatDescriptionRef,
+            video_decoder_specification: CFDictionaryRef,
+            destination_image_buffer_attributes: CFDictionaryRef,
+            output_callback: *const VTDecompressionOutputCallbackRecord,
+            decompression_session_out: *mut VTDecompressionSessionRef,
+        ) -> OSStatus;
+        fn VTDecompressionSessionDecodeFrame(
+            session: VTDecompressionSessionRef,
+            sample_buffer: CMSampleBufferRef,
+            decode_flags: VTDecodeFrameFlags,
+            source_frame_refcon: *mut c_void,
+            info_flags_out: *mut VTDecodeInfoFlags,
+        ) -> OSStatus;
+        fn VTDecompressionSessionInvalidate(session: VTDecompressionSessionRef);
+        fn VTDecompressionSessionWaitForAsynchronousFrames(
+            session: VTDecompressionSessionRef,
+        ) -> OSStatus;
     }
 
     struct PacketSink {
         packets: Mutex<Vec<NvencPacket>>,
+    }
+
+    struct DecodeSink {
+        frame: Mutex<Option<(usize, usize, Vec<u8>)>>,
     }
 
     pub struct VideoToolboxEncoder {
@@ -405,6 +485,187 @@ mod macos {
         Some(vec!["H264 VideoToolbox".to_owned()])
     }
 
+    pub fn videotoolbox_h264_decoder_available() -> bool {
+        true
+    }
+
+    pub struct VideoToolboxH264Decoder {
+        session: VTDecompressionSessionRef,
+        sink: Box<DecodeSink>,
+        sps: Vec<u8>,
+        pps: Vec<u8>,
+    }
+
+    unsafe impl Send for VideoToolboxH264Decoder {}
+
+    impl VideoToolboxH264Decoder {
+        pub fn new() -> Self {
+            Self {
+                session: ptr::null_mut(),
+                sink: Box::new(DecodeSink {
+                    frame: Mutex::new(None),
+                }),
+                sps: Vec::new(),
+                pps: Vec::new(),
+            }
+        }
+
+        pub fn decode_packets<I>(
+            &mut self,
+            packets: I,
+        ) -> Result<Option<(usize, usize, Vec<u8>)>, String>
+        where
+            I: IntoIterator<Item = Vec<u8>>,
+        {
+            let mut decoded = None;
+            for packet in packets {
+                if packet.is_empty() {
+                    continue;
+                }
+                if let Some(frame) = self.decode_packet(&packet)? {
+                    decoded = Some(frame);
+                }
+            }
+            Ok(decoded)
+        }
+
+        fn decode_packet(
+            &mut self,
+            packet: &[u8],
+        ) -> Result<Option<(usize, usize, Vec<u8>)>, String> {
+            let nals = h264_nals(packet);
+            if nals.is_empty() {
+                return Ok(None);
+            }
+
+            let mut sample = Vec::new();
+            let mut parameter_sets_changed = false;
+            for nal in nals {
+                if nal.is_empty() {
+                    continue;
+                }
+                match nal[0] & 0x1f {
+                    7 => {
+                        if self.sps.as_slice() != nal {
+                            self.sps.clear();
+                            self.sps.extend_from_slice(nal);
+                            parameter_sets_changed = true;
+                        }
+                    }
+                    8 => {
+                        if self.pps.as_slice() != nal {
+                            self.pps.clear();
+                            self.pps.extend_from_slice(nal);
+                            parameter_sets_changed = true;
+                        }
+                    }
+                    9 => {}
+                    _ => append_avcc_nal(&mut sample, nal)?,
+                }
+            }
+
+            if sample.is_empty() {
+                return Ok(None);
+            }
+            if self.sps.is_empty() || self.pps.is_empty() {
+                return Err("VideoToolbox H264 decoder needs more packets".to_owned());
+            }
+            if self.session.is_null() || parameter_sets_changed {
+                unsafe {
+                    self.recreate_session()?;
+                }
+            }
+
+            self.sink
+                .frame
+                .lock()
+                .map_err(|_| "VideoToolbox decode sink poisoned".to_owned())?
+                .take();
+
+            unsafe {
+                let sample_buffer = create_h264_sample_buffer(&sample, &self.sps, &self.pps)?;
+                let mut info_flags = 0;
+                let status = VTDecompressionSessionDecodeFrame(
+                    self.session,
+                    sample_buffer,
+                    0,
+                    ptr::null_mut(),
+                    &mut info_flags,
+                );
+                CFRelease(sample_buffer as CFTypeRef);
+                if status != 0 {
+                    return Err(format!("VTDecompressionSessionDecodeFrame status={status}"));
+                }
+                let status = VTDecompressionSessionWaitForAsynchronousFrames(self.session);
+                if status != 0 {
+                    return Err(format!(
+                        "VTDecompressionSessionWaitForAsynchronousFrames status={status}"
+                    ));
+                }
+            }
+
+            self.sink
+                .frame
+                .lock()
+                .map_err(|_| "VideoToolbox decode sink poisoned".to_owned())?
+                .take()
+                .ok_or_else(|| "VideoToolbox H264 decoder needs more packets".to_owned())
+                .map(Some)
+        }
+
+        unsafe fn recreate_session(&mut self) -> Result<(), String> {
+            if !self.session.is_null() {
+                VTDecompressionSessionInvalidate(self.session);
+                CFRelease(self.session as CFTypeRef);
+                self.session = ptr::null_mut();
+            }
+
+            let format = create_h264_format_description(&self.sps, &self.pps)?;
+            let decoder_spec = create_hardware_decoder_specification();
+            let (attrs, attrs_value) = create_bgra_pixel_buffer_attributes();
+            let callback = VTDecompressionOutputCallbackRecord {
+                decompression_output_callback: Some(decompression_output_callback),
+                decompression_output_refcon: (&mut *self.sink as *mut DecodeSink).cast(),
+            };
+            let status = VTDecompressionSessionCreate(
+                ptr::null(),
+                format,
+                decoder_spec,
+                attrs,
+                &callback,
+                &mut self.session,
+            );
+            if !attrs.is_null() {
+                CFRelease(attrs as CFTypeRef);
+            }
+            if !attrs_value.is_null() {
+                CFRelease(attrs_value as CFTypeRef);
+            }
+            if !decoder_spec.is_null() {
+                CFRelease(decoder_spec as CFTypeRef);
+            }
+            CFRelease(format as CFTypeRef);
+
+            if status != 0 || self.session.is_null() {
+                self.session = ptr::null_mut();
+                return Err(format!("VTDecompressionSessionCreate status={status}"));
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for VideoToolboxH264Decoder {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.session.is_null() {
+                    VTDecompressionSessionInvalidate(self.session);
+                    CFRelease(self.session as CFTypeRef);
+                    self.session = ptr::null_mut();
+                }
+            }
+        }
+    }
+
     unsafe fn create_bgra_pixel_buffer(
         width: u32,
         height: u32,
@@ -451,6 +712,255 @@ mod macos {
             return Err(format!("CVPixelBufferUnlockBaseAddress status={status}"));
         }
         Ok(pixel_buffer)
+    }
+
+    unsafe fn create_h264_format_description(
+        sps: &[u8],
+        pps: &[u8],
+    ) -> Result<CMFormatDescriptionRef, String> {
+        let parameter_sets = [sps.as_ptr(), pps.as_ptr()];
+        let parameter_set_sizes = [sps.len(), pps.len()];
+        let mut format = ptr::null();
+        let status = CMVideoFormatDescriptionCreateFromH264ParameterSets(
+            ptr::null(),
+            parameter_sets.len(),
+            parameter_sets.as_ptr(),
+            parameter_set_sizes.as_ptr(),
+            4,
+            &mut format,
+        );
+        if status != 0 || format.is_null() {
+            return Err(format!(
+                "CMVideoFormatDescriptionCreateFromH264ParameterSets status={status}"
+            ));
+        }
+        Ok(format)
+    }
+
+    unsafe fn create_h264_sample_buffer(
+        avcc_sample: &[u8],
+        sps: &[u8],
+        pps: &[u8],
+    ) -> Result<CMSampleBufferRef, String> {
+        let format = create_h264_format_description(sps, pps)?;
+        let mut block = ptr::null();
+        let status = CMBlockBufferCreateWithMemoryBlock(
+            ptr::null(),
+            avcc_sample.as_ptr() as *mut c_void,
+            avcc_sample.len(),
+            kCFAllocatorNull,
+            ptr::null(),
+            0,
+            avcc_sample.len(),
+            0,
+            &mut block,
+        );
+        if status != 0 || block.is_null() {
+            CFRelease(format as CFTypeRef);
+            return Err(format!(
+                "CMBlockBufferCreateWithMemoryBlock status={status}"
+            ));
+        }
+
+        let sample_size = avcc_sample.len();
+        let mut sample_buffer = ptr::null();
+        let status = CMSampleBufferCreateReady(
+            ptr::null(),
+            block,
+            format,
+            1,
+            0,
+            ptr::null(),
+            1,
+            &sample_size,
+            &mut sample_buffer,
+        );
+        CFRelease(block as CFTypeRef);
+        CFRelease(format as CFTypeRef);
+        if status != 0 || sample_buffer.is_null() {
+            return Err(format!("CMSampleBufferCreateReady status={status}"));
+        }
+        Ok(sample_buffer)
+    }
+
+    unsafe fn create_bgra_pixel_buffer_attributes() -> (CFDictionaryRef, CFNumberRef) {
+        let pixel_format = K_CV_PIXEL_FORMAT_TYPE_32_BGRA as i32;
+        let value = CFNumberCreate(
+            ptr::null(),
+            K_CF_NUMBER_SINT32_TYPE,
+            (&pixel_format as *const i32).cast(),
+        );
+        if value.is_null() {
+            return (ptr::null(), ptr::null());
+        }
+        let keys = [kCVPixelBufferPixelFormatTypeKey as *const c_void];
+        let values = [value as *const c_void];
+        let dict = CFDictionaryCreate(
+            ptr::null(),
+            keys.as_ptr(),
+            values.as_ptr(),
+            1,
+            ptr::null(),
+            ptr::null(),
+        );
+        (dict, value)
+    }
+
+    unsafe fn create_hardware_decoder_specification() -> CFDictionaryRef {
+        let keys =
+            [kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder as *const c_void];
+        let values = [kCFBooleanTrue as *const c_void];
+        CFDictionaryCreate(
+            ptr::null(),
+            keys.as_ptr(),
+            values.as_ptr(),
+            1,
+            ptr::null(),
+            ptr::null(),
+        )
+    }
+
+    unsafe extern "C" fn decompression_output_callback(
+        decompression_output_refcon: *mut c_void,
+        _source_frame_refcon: *mut c_void,
+        status: OSStatus,
+        _info_flags: VTDecodeInfoFlags,
+        image_buffer: CVPixelBufferRef,
+        _presentation_time_stamp: CMTime,
+        _presentation_duration: CMTime,
+    ) {
+        if status != 0 || decompression_output_refcon.is_null() || image_buffer.is_null() {
+            return;
+        }
+        let sink = &*(decompression_output_refcon as *const DecodeSink);
+        if let Some(frame) = rgba_from_bgra_pixel_buffer(image_buffer) {
+            if let Ok(mut slot) = sink.frame.lock() {
+                *slot = Some(frame);
+            }
+        }
+    }
+
+    unsafe fn rgba_from_bgra_pixel_buffer(
+        pixel_buffer: CVPixelBufferRef,
+    ) -> Option<(usize, usize, Vec<u8>)> {
+        if CVPixelBufferGetPixelFormatType(pixel_buffer) != K_CV_PIXEL_FORMAT_TYPE_32_BGRA {
+            return None;
+        }
+        let width = CVPixelBufferGetWidth(pixel_buffer);
+        let height = CVPixelBufferGetHeight(pixel_buffer);
+        if width == 0 || height == 0 {
+            return None;
+        }
+        if CVPixelBufferLockBaseAddress(pixel_buffer, 0) != 0 {
+            return None;
+        }
+        let base = CVPixelBufferGetBaseAddress(pixel_buffer) as *const u8;
+        let stride = CVPixelBufferGetBytesPerRow(pixel_buffer);
+        let row_bytes = width.checked_mul(4)?;
+        let frame_bytes = row_bytes.checked_mul(height)?;
+        let mut rgba = vec![0_u8; frame_bytes];
+        if !base.is_null() && stride >= row_bytes {
+            for y in 0..height {
+                let src = slice::from_raw_parts(base.add(y * stride), row_bytes);
+                let dst = &mut rgba[y * row_bytes..(y + 1) * row_bytes];
+                for (bgra, rgba) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+                    rgba[0] = bgra[2];
+                    rgba[1] = bgra[1];
+                    rgba[2] = bgra[0];
+                    rgba[3] = bgra[3];
+                }
+            }
+        }
+        let _ = CVPixelBufferUnlockBaseAddress(pixel_buffer, 0);
+        if base.is_null() || stride < row_bytes {
+            None
+        } else {
+            Some((width, height, rgba))
+        }
+    }
+
+    fn h264_nals(packet: &[u8]) -> Vec<&[u8]> {
+        let starts = annex_b_start_codes(packet);
+        if starts.is_empty() {
+            return avcc_nals(packet);
+        }
+
+        let mut nals = Vec::new();
+        for (idx, (start, code_len)) in starts.iter().copied().enumerate() {
+            let nal_start = start + code_len;
+            let nal_end = starts
+                .get(idx + 1)
+                .map(|(next, _)| *next)
+                .unwrap_or(packet.len());
+            if nal_start < nal_end {
+                nals.push(trim_zero_padding(&packet[nal_start..nal_end]));
+            }
+        }
+        nals.retain(|nal| !nal.is_empty());
+        nals
+    }
+
+    fn annex_b_start_codes(packet: &[u8]) -> Vec<(usize, usize)> {
+        let mut starts = Vec::new();
+        let mut i = 0usize;
+        while i + 3 <= packet.len() {
+            if packet[i] == 0 && packet[i + 1] == 0 && packet[i + 2] == 1 {
+                starts.push((i, 3));
+                i += 3;
+            } else if i + 4 <= packet.len()
+                && packet[i] == 0
+                && packet[i + 1] == 0
+                && packet[i + 2] == 0
+                && packet[i + 3] == 1
+            {
+                starts.push((i, 4));
+                i += 4;
+            } else {
+                i += 1;
+            }
+        }
+        starts
+    }
+
+    fn avcc_nals(packet: &[u8]) -> Vec<&[u8]> {
+        let mut nals = Vec::new();
+        let mut pos = 0usize;
+        while pos + 4 <= packet.len() {
+            let len = u32::from_be_bytes([
+                packet[pos],
+                packet[pos + 1],
+                packet[pos + 2],
+                packet[pos + 3],
+            ]) as usize;
+            pos += 4;
+            let Some(end) = pos.checked_add(len) else {
+                return Vec::new();
+            };
+            if len == 0 || end > packet.len() {
+                return Vec::new();
+            }
+            nals.push(&packet[pos..end]);
+            pos = end;
+        }
+        if nals.is_empty() && !packet.is_empty() {
+            nals.push(packet);
+        }
+        nals
+    }
+
+    fn trim_zero_padding(mut nal: &[u8]) -> &[u8] {
+        while nal.last() == Some(&0) {
+            nal = &nal[..nal.len() - 1];
+        }
+        nal
+    }
+
+    fn append_avcc_nal(out: &mut Vec<u8>, nal: &[u8]) -> Result<(), String> {
+        let len =
+            u32::try_from(nal.len()).map_err(|_| "VideoToolbox H264 NAL too large".to_owned())?;
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(nal);
+        Ok(())
     }
 
     unsafe extern "C" fn compression_output_callback(
@@ -665,6 +1175,7 @@ mod fallback {
     use crate::nvenc::{NvencCodec, NvencPacket};
 
     pub struct VideoToolboxEncoder;
+    pub struct VideoToolboxH264Decoder;
 
     impl VideoToolboxEncoder {
         pub fn new(
@@ -693,7 +1204,27 @@ mod fallback {
         }
     }
 
+    impl VideoToolboxH264Decoder {
+        pub fn new() -> Self {
+            Self
+        }
+
+        pub fn decode_packets<I>(
+            &mut self,
+            _packets: I,
+        ) -> Result<Option<(usize, usize, Vec<u8>)>, String>
+        where
+            I: IntoIterator<Item = Vec<u8>>,
+        {
+            Err("VideoToolbox H264 decoder is macOS-only".to_owned())
+        }
+    }
+
     pub fn videotoolbox_supported_platform() -> bool {
+        false
+    }
+
+    pub fn videotoolbox_h264_decoder_available() -> bool {
         false
     }
 
@@ -708,11 +1239,11 @@ mod fallback {
 
 #[cfg(not(target_os = "macos"))]
 pub use fallback::{
-    videotoolbox_codecs, videotoolbox_encoder_names, videotoolbox_supported_platform,
-    VideoToolboxEncoder,
+    videotoolbox_codecs, videotoolbox_encoder_names, videotoolbox_h264_decoder_available,
+    videotoolbox_supported_platform, VideoToolboxEncoder, VideoToolboxH264Decoder,
 };
 #[cfg(target_os = "macos")]
 pub use macos::{
-    videotoolbox_codecs, videotoolbox_encoder_names, videotoolbox_supported_platform,
-    VideoToolboxEncoder,
+    videotoolbox_codecs, videotoolbox_encoder_names, videotoolbox_h264_decoder_available,
+    videotoolbox_supported_platform, VideoToolboxEncoder, VideoToolboxH264Decoder,
 };

@@ -24,9 +24,32 @@ use std::{
 };
 
 static APPROVALS: OnceLock<Mutex<std::collections::HashMap<String, bool>>> = OnceLock::new();
+static RECENT_RELAY_EVENTS: OnceLock<Mutex<std::collections::HashMap<String, Instant>>> =
+    OnceLock::new();
 
 fn approvals() -> &'static Mutex<std::collections::HashMap<String, bool>> {
     APPROVALS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn recent_relay_events() -> &'static Mutex<std::collections::HashMap<String, Instant>> {
+    RECENT_RELAY_EVENTS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn relay_event_seen_recently(key: String, window: Duration) -> bool {
+    let Ok(mut events) = recent_relay_events().lock() else {
+        return false;
+    };
+    let now = Instant::now();
+    events.retain(|_, seen| now.duration_since(*seen) < Duration::from_secs(10));
+    if events
+        .get(&key)
+        .is_some_and(|seen| now.duration_since(*seen) < window)
+    {
+        true
+    } else {
+        events.insert(key, now);
+        false
+    }
 }
 
 use sha2::{Digest, Sha256};
@@ -636,6 +659,14 @@ fn handle_rendezvous_msg(
 
         // Relay-based incoming connection request.
         Some(rendezvous_message::Union::RequestRelay(req)) => {
+            let dedupe_key = format!("request-relay:{}:{}", req.id, req.uuid);
+            if relay_event_seen_recently(dedupe_key, Duration::from_millis(500)) {
+                host_log(
+                    events,
+                    format!("Duplicate RequestRelay ignored uuid={}", req.uuid),
+                );
+                return None;
+            }
             let relay = if req.relay_server.is_empty() {
                 config.server.relay_server.clone()
             } else {
@@ -679,6 +710,11 @@ fn handle_rendezvous_msg(
         // We always go through the relay (firewall-proof), regardless of the
         // direct-punch hint, so it works on any network.
         Some(rendezvous_message::Union::PunchHole(ph)) => {
+            let dedupe_key = format!("punch-hole:{:?}", ph.socket_addr);
+            if relay_event_seen_recently(dedupe_key, Duration::from_millis(500)) {
+                host_log(events, "Duplicate PunchHole ignored".to_owned());
+                return None;
+            }
             let relay_server = if ph.relay_server.is_empty() {
                 config.server.relay_server.clone()
             } else {
@@ -697,6 +733,11 @@ fn handle_rendezvous_msg(
 
         // LAN peer asking for local address — just relay it too (universal).
         Some(rendezvous_message::Union::FetchLocalAddr(fla)) => {
+            let dedupe_key = format!("fetch-local:{:?}", fla.socket_addr);
+            if relay_event_seen_recently(dedupe_key, Duration::from_millis(500)) {
+                host_log(events, "Duplicate FetchLocalAddr ignored".to_owned());
+                return None;
+            }
             let relay_server = if fla.relay_server.is_empty() {
                 config.server.relay_server.clone()
             } else {

@@ -98,6 +98,9 @@ $env:EVERTYDESK_ENABLE_AV1_MF="1"
 - Direct macOS VideoToolbox H.264 encoder backend added.
 - macOS VideoToolbox encode path emits Annex-B H.264 packets and keeps
   OpenH264 fallback when startup/output fails.
+- Direct macOS VideoToolbox H.264 client decoder backend added.
+- macOS H.264 decode now tries VideoToolbox first and falls back to OpenH264
+  when available.
 - Codec negotiation only selects H.265 when both sides report support.
 - Fallback to OpenH264 if a hardware/native encoder fails to start or produces
   no packets.
@@ -143,6 +146,8 @@ $env:EVERTYDESK_ENABLE_AV1_MF="1"
 - Added a macOS CoreGraphics capture path for the main display.
 - Added a macOS VideoToolbox H.264 host encoder backend with SPS/PPS keyframe
   packaging and OpenH264 fallback.
+- Added a macOS VideoToolbox H.264 client decoder backend for RustDesk-style
+  Annex-B packets.
 - Added codec preference tests for conservative H.264/H.265/AV1/VP9 fallback
   ordering.
 
@@ -193,7 +198,6 @@ Priority: high.
 Priority: medium.
 
 - Extend the native macOS VideoToolbox path:
-  - add H.264 hardware decode on macOS clients;
   - add H.265 only after decoder stability is proven;
   - replace CoreGraphics capture with ScreenCaptureKit for high-motion work.
 - Linux VA-API path for Intel/AMD where available.
@@ -343,7 +347,7 @@ Priority: medium.
 
 - CoreGraphics capture works as the compatibility baseline.
 - VideoToolbox H.264 encode survives long host sessions.
-- macOS client adds VideoToolbox H.264 decode.
+- macOS client uses VideoToolbox H.264 decode before OpenH264 fallback.
 - ScreenCaptureKit replaces the high-motion capture path.
 - Telemetry shows capture, encode, decode, render, and packet timing.
 

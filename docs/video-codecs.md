@@ -6,14 +6,15 @@ local build has a decoder path that is expected to survive real sessions.
 
 ## Current Runtime Behavior
 
-- H.264 is available through OpenH264 when `live-h264` is enabled.
+- H.264 is available through OpenH264 when `live-h264` is enabled and through
+  VideoToolbox H.264 decode on macOS.
 - VP9 is available through libvpx, system libvpx, or Windows Media Foundation,
   depending on build features.
 - H.265 decode is available through Windows Media Foundation on Windows builds
   with `live-vp9-mf`.
 - macOS hosts have a native H.264 encode path through VideoToolbox and a
-  CoreGraphics main-display capture path. macOS clients still decode H.264
-  through the existing software decoder path for now.
+  CoreGraphics main-display capture path. macOS clients try VideoToolbox H.264
+  decode first and fall back to OpenH264 when available.
 - AV1 decode probing exists, but AV1 is not advertised by default because the
   current Windows Media Foundation AV1 path can crash native MFTs on some
   streams.
@@ -123,20 +124,22 @@ The current accelerated Windows path is Media Foundation, not direct NVENC.
 
 ## macOS VideoToolbox
 
-VideoToolbox is the first native macOS hardware encoder backend.
+VideoToolbox is the first native macOS hardware video backend.
 
 Current behavior:
 
 - uses `VTCompressionSession`;
-- supports H.264 first;
+- uses `VTDecompressionSession` for H.264 client decode;
+- supports H.264 first for encode and decode;
 - requests hardware acceleration and real-time encode mode;
 - emits Annex-B H.264 packets with SPS/PPS on keyframes;
+- accepts Annex-B H.264 packets from RustDesk-compatible hosts and converts
+  them into VideoToolbox sample buffers;
 - keeps OpenH264 fallback;
 - keeps application startup independent from optional hardware availability.
 
 Remaining work:
 
-- add VideoToolbox H.264 decode on macOS clients;
 - add H.265 only after cross-platform client decode is stable;
 - move capture from CoreGraphics toward ScreenCaptureKit;
 - validate long sessions and failure fallback on Intel and Apple Silicon Macs.
@@ -169,7 +172,6 @@ runtime libraries.
   force-keyframe.
 - Add better SPS/PPS/VPS handling for H.264/H.265.
 - Add richer per-session codec telemetry history/graphs in the UI.
-- Add VideoToolbox H.264 decode on macOS clients.
 - Validate Windows Desktop Duplication capture on a Windows host.
 - Add D3D11/async MFT support for true hardware Media Foundation paths.
 - Move macOS capture toward ScreenCaptureKit.
