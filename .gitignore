@@ -1,5 +1,4 @@
 /target/
-/rustdesk-master/
 
 # Local runtime/build artifacts
 *.pdb
