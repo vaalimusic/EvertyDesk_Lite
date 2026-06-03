@@ -284,8 +284,21 @@ pub struct LoginRequest {
     pub my_platform: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum ImageQuality {
+    NotSet = 0,
+    Low = 2,
+    Balanced = 3,
+    Best = 4,
+}
+
 #[derive(Clone, PartialEq, Message)]
 pub struct OptionMessage {
+    #[prost(enumeration = "ImageQuality", tag = "1")]
+    pub image_quality: i32,
+    #[prost(int32, tag = "6")]
+    pub custom_image_quality: i32,
     #[prost(message, optional, tag = "10")]
     pub supported_decoding: Option<SupportedDecoding>,
     #[prost(int32, tag = "11")]

@@ -59,9 +59,9 @@ use crate::{
     rustdesk_proto::{
         decode_message, decode_peer_message, encode_message, encode_peer_message, login_response,
         misc, peer_message, rendezvous_message, video_frame, DisplayInfo, EncodedVideoFrame,
-        EncodedVideoFrames, Hash, IdPk, LoginResponse, Misc, PeerInfo, PeerMessage, PreferCodec,
-        RegisterPeer, RegisterPk, RelayResponse, RendezvousMessage, RequestRelay, ShellMessage,
-        ShellMessageKind, SignedId, SupportedDecoding, VideoFrame,
+        EncodedVideoFrames, Hash, IdPk, ImageQuality, LoginResponse, Misc, PeerInfo, PeerMessage,
+        PreferCodec, RegisterPeer, RegisterPk, RelayResponse, RendezvousMessage, RequestRelay,
+        ShellMessage, ShellMessageKind, SignedId, SupportedDecoding, VideoFrame,
     },
     settings::{AppConfig, CodecPreference, EncoderPreference},
     transport::{connect_tcp, encode_frame_len, read_framed, send_framed},
@@ -74,6 +74,10 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(28);
 const READ_TIMEOUT_SHORT: Duration = Duration::from_millis(300);
 const READ_TIMEOUT_AUTH: Duration = Duration::from_secs(10);
 const MAX_TARGET_FPS: u32 = 60;
+const DEFAULT_QUALITY_MILLI: u32 = 1_000;
+const LOW_QUALITY_MILLI: u32 = 700;
+const BALANCED_QUALITY_MILLI: u32 = 1_000;
+const BEST_QUALITY_MILLI: u32 = 1_800;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -1134,11 +1138,15 @@ fn relay_session_inner(
     send_peer_enc(&mut relay, &mut cipher, &login_ok)?;
 
     let target_fps = negotiated_target_fps(&login, config.display.target_fps);
+    let quality_milli = negotiated_quality_milli(&login);
     let client_video = client_video_support(&login);
     let codec_preference = config.display.codec;
     host_log(
         events,
-        format!("Auth OK for {peer_id}. Starting capture at {target_fps} fps…"),
+        format!(
+            "Auth OK for {peer_id}. Starting capture at {target_fps} fps, quality={}%",
+            quality_milli / 10
+        ),
     );
     let _ = events.send(HostEvent::SessionStarted {
         peer_id: peer_id.to_owned(),
@@ -1160,11 +1168,13 @@ fn relay_session_inner(
         .map_err(|e| format!("try_clone relay stream: {e}"))?;
     let stop = Arc::new(AtomicBool::new(false));
     let shared_target_fps = Arc::new(AtomicU32::new(target_fps));
+    let shared_quality_milli = Arc::new(AtomicU32::new(quality_milli));
     let (out_tx, out_rx) = mpsc::channel::<PeerMessage>();
 
     // ── Video thread ──────────────────────────────────────────────────────────
     let stop_v = stop.clone();
     let target_fps_v = shared_target_fps.clone();
+    let quality_milli_v = shared_quality_milli.clone();
     let encoder_preference = config.display.encoder;
     let video_events = events.clone();
     let video_handle = thread::spawn(move || {
@@ -1173,6 +1183,7 @@ fn relay_session_inner(
             send_cipher,
             stop_v,
             target_fps_v,
+            quality_milli_v,
             out_rx,
             video_events,
             encoder_preference,
@@ -1188,7 +1199,13 @@ fn relay_session_inner(
     let mut shell: Option<ShellRuntime> = None;
     while !stop.load(Ordering::Relaxed) {
         match recv_peer_rc(&mut relay, &mut recv_cipher) {
-            Ok(Some(msg)) => handle_client_input(msg, &out_tx, &mut shell, &shared_target_fps),
+            Ok(Some(msg)) => handle_client_input(
+                msg,
+                &out_tx,
+                &mut shell,
+                &shared_target_fps,
+                &shared_quality_milli,
+            ),
             Ok(None) => {}
             Err(ref e) if is_timeout(e) => {}
             Err(_) => break, // disconnected
@@ -1213,6 +1230,7 @@ fn video_loop(
     mut send_cipher: Option<crate::crypto::SendCipher>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     target_fps: Arc<AtomicU32>,
+    quality_milli: Arc<AtomicU32>,
     outgoing: Receiver<PeerMessage>,
     events: Sender<HostEvent>,
     encoder_preference: EncoderPreference,
@@ -1229,7 +1247,8 @@ fn video_loop(
         };
         let initial_fps = target_fps.load(Ordering::Relaxed).clamp(5, MAX_TARGET_FPS);
         let (screen_w, screen_h) = crate::capture::screen_size().unwrap_or((1920, 1080));
-        let bitrate = h264_target_bitrate_bps(screen_w, screen_h, initial_fps);
+        let initial_quality = quality_milli.load(Ordering::Relaxed);
+        let bitrate = h264_target_bitrate_bps(screen_w, screen_h, initial_fps, initial_quality);
         let cfg = EncoderConfig::new()
             .usage_type(UsageType::ScreenContentRealTime)
             .rate_control_mode(RateControlMode::Bitrate)
@@ -1297,22 +1316,24 @@ fn video_loop(
     host_log(
         &events,
         format!(
-            "Video client decode: h264={} h265={} av1={} prefer={:?}; requested codec={:?}; target_fps={}",
+            "Video client decode: h264={} h265={} av1={} prefer={:?}; requested codec={:?}; target_fps={} quality={}%",
             client_video.h264,
             client_video.h265,
             client_video.av1,
             client_video.prefer,
             codec_preference,
-            target_fps.load(Ordering::Relaxed).clamp(5, MAX_TARGET_FPS)
+            target_fps.load(Ordering::Relaxed).clamp(5, MAX_TARGET_FPS),
+            quality_milli.load(Ordering::Relaxed) / 10
         ),
     );
 
     let _ = events.send(HostEvent::VideoTelemetry {
         summary: format!(
-            "planned={} codec_pref={} fps={}",
+            "planned={} codec_pref={} fps={} quality={}%",
             active_encoder_backend,
             codec_preference.label(),
-            target_fps.load(Ordering::Relaxed).clamp(5, MAX_TARGET_FPS)
+            target_fps.load(Ordering::Relaxed).clamp(5, MAX_TARGET_FPS),
+            quality_milli.load(Ordering::Relaxed) / 10
         ),
         fallback_reason: None,
     });
@@ -1352,7 +1373,8 @@ fn video_loop(
         };
         let bgra = capture_bgra.as_slice();
         encode_stats.mark_capture_ms(elapsed_ms(capture_started));
-        let bitrate = h264_target_bitrate_bps(cap_w, cap_h, fps);
+        let quality = quality_milli.load(Ordering::Relaxed);
+        let bitrate = h264_target_bitrate_bps(cap_w, cap_h, fps, quality);
 
         // Encode at native resolution (downscaling broke decoding on the phone
         // when the stream size differed from the announced DisplayInfo).
@@ -1608,6 +1630,27 @@ fn negotiated_target_fps(login: &crate::rustdesk_proto::LoginRequest, configured
     requested.min(host_limit)
 }
 
+fn negotiated_quality_milli(login: &crate::rustdesk_proto::LoginRequest) -> u32 {
+    login
+        .option
+        .as_ref()
+        .and_then(option_quality_milli)
+        .unwrap_or(DEFAULT_QUALITY_MILLI)
+}
+
+fn option_quality_milli(option: &crate::rustdesk_proto::OptionMessage) -> Option<u32> {
+    match ImageQuality::try_from(option.image_quality).unwrap_or(ImageQuality::NotSet) {
+        ImageQuality::Best => Some(BEST_QUALITY_MILLI),
+        ImageQuality::Balanced => Some(BALANCED_QUALITY_MILLI),
+        ImageQuality::Low => Some(LOW_QUALITY_MILLI),
+        ImageQuality::NotSet if option.custom_image_quality > 0 => {
+            let raw = ((option.custom_image_quality >> 8) & 0x0fff) as u32;
+            (raw > 0).then(|| (raw * 20).clamp(LOW_QUALITY_MILLI, 4_000))
+        }
+        ImageQuality::NotSet => None,
+    }
+}
+
 fn wait_for_approval(peer_id: &str, timeout: Duration) -> Option<bool> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -1729,14 +1772,21 @@ fn elapsed_ms(start: Instant) -> u64 {
 }
 
 #[cfg_attr(not(feature = "live-h264"), allow(dead_code))]
-fn h264_target_bitrate_bps(width: u32, height: u32, fps: u32) -> u32 {
+fn h264_target_bitrate_bps(width: u32, height: u32, fps: u32, quality_milli: u32) -> u32 {
     const MIN_BPS: u64 = 800_000;
-    const MAX_BPS: u64 = 14_000_000;
+    const DEFAULT_MAX_BPS: u64 = 14_000_000;
+    const PERFORMANCE_MAX_BPS: u64 = 40_000_000;
     const SCREEN_CONTENT_MILLI_BPP: u64 = 55;
 
     let pixels = u64::from(width.max(1)) * u64::from(height.max(1));
     let fps = u64::from(fps.clamp(5, MAX_TARGET_FPS));
-    ((pixels * fps * SCREEN_CONTENT_MILLI_BPP) / 1000).clamp(MIN_BPS, MAX_BPS) as u32
+    let quality = u64::from(quality_milli.clamp(LOW_QUALITY_MILLI, 4_000));
+    let max_bps = if quality_milli > DEFAULT_QUALITY_MILLI {
+        PERFORMANCE_MAX_BPS
+    } else {
+        DEFAULT_MAX_BPS
+    };
+    ((pixels * fps * SCREEN_CONTENT_MILLI_BPP * quality) / 1_000_000).clamp(MIN_BPS, max_bps) as u32
 }
 
 #[derive(Default)]
@@ -2698,14 +2748,25 @@ mod video_quality_tests {
 
     #[test]
     fn h264_bitrate_scales_with_resolution() {
-        let small = h264_target_bitrate_bps(1280, 720, 30);
-        let full_hd = h264_target_bitrate_bps(1920, 1080, 30);
-        let ultra_hd = h264_target_bitrate_bps(3840, 2160, 60);
+        let small = h264_target_bitrate_bps(1280, 720, 30, DEFAULT_QUALITY_MILLI);
+        let full_hd = h264_target_bitrate_bps(1920, 1080, 30, DEFAULT_QUALITY_MILLI);
+        let ultra_hd = h264_target_bitrate_bps(3840, 2160, 60, DEFAULT_QUALITY_MILLI);
 
         assert!(small >= 800_000);
         assert!(full_hd > small);
         assert!(ultra_hd > full_hd);
         assert!(ultra_hd <= 14_000_000);
+    }
+
+    #[test]
+    fn h264_bitrate_uses_best_quality_headroom() {
+        let balanced = h264_target_bitrate_bps(1920, 1080, 60, BALANCED_QUALITY_MILLI);
+        let best = h264_target_bitrate_bps(1920, 1080, 60, BEST_QUALITY_MILLI);
+        let ultra_hd_best = h264_target_bitrate_bps(3840, 2160, 60, BEST_QUALITY_MILLI);
+
+        assert!(best > balanced);
+        assert!(ultra_hd_best > 14_000_000);
+        assert!(ultra_hd_best <= 40_000_000);
     }
 
     #[cfg(feature = "live-h264")]
@@ -2730,6 +2791,7 @@ fn handle_client_input(
     outgoing: &Sender<PeerMessage>,
     shell: &mut Option<ShellRuntime>,
     target_fps: &AtomicU32,
+    quality_milli: &AtomicU32,
 ) {
     match msg.union {
         Some(peer_message::Union::MouseEvent(ev)) => inject_mouse(ev),
@@ -2740,6 +2802,9 @@ fn handle_client_input(
             if option.custom_fps > 0 {
                 let fps = (option.custom_fps as u32).clamp(5, MAX_TARGET_FPS);
                 target_fps.store(fps, Ordering::Relaxed);
+            }
+            if let Some(quality) = option_quality_milli(&option) {
+                quality_milli.store(quality, Ordering::Relaxed);
             }
         }
         Some(peer_message::Union::Shell(shell_msg)) => {

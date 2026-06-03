@@ -18,8 +18,8 @@ use crate::{
     rustdesk_proto::{
         decode_message, decode_peer_message, encode_message, encode_peer_message, misc,
         peer_message, rendezvous_message, video_frame, Chroma, CodecAbility, ConnType, ControlKey,
-        CursorData, EncodedVideoFrames, KeyEvent, KeyboardMode, LoginRequest, Misc, MouseEvent,
-        NatType, OnlineRequest, OptionMessage, PeerMessage, PreferCodec, PublicKey,
+        CursorData, EncodedVideoFrames, ImageQuality, KeyEvent, KeyboardMode, LoginRequest, Misc,
+        MouseEvent, NatType, OnlineRequest, OptionMessage, PeerMessage, PreferCodec, PublicKey,
         PunchHoleFailure, PunchHoleRequest, RendezvousMessage, RequestRelay, ScreenshotRequest,
         ShellMessage, ShellMessageKind, SupportedDecoding, SwitchDisplay,
     },
@@ -1511,13 +1511,22 @@ fn send_codec_sync_options(
 ) -> Result<(), String> {
     let message = PeerMessage {
         union: Some(peer_message::Union::Misc(Misc {
-            union: Some(misc::Union::Option(OptionMessage {
-                supported_decoding: Some(supported_decoding(codec_preference)),
-                custom_fps: fps.clamp(5, 60),
-            })),
+            union: Some(misc::Union::Option(video_option_message(
+                fps,
+                codec_preference,
+            ))),
         })),
     };
     send_framed(relay, &encode_peer_message(&message))
+}
+
+fn video_option_message(fps: i32, codec_preference: CodecPreference) -> OptionMessage {
+    OptionMessage {
+        image_quality: ImageQuality::Best as i32,
+        custom_image_quality: 0,
+        supported_decoding: Some(supported_decoding(codec_preference)),
+        custom_fps: fps.clamp(5, 60),
+    }
 }
 
 fn supported_decoding(codec_preference: CodecPreference) -> SupportedDecoding {
@@ -1973,17 +1982,22 @@ fn handle_session_message(
                 Some(misc::Union::Option(opt)) => {
                     if let Some(dec) = &opt.supported_decoding {
                         eprintln!(
-                            "[session] Server codec reply: prefer={} h264={} h265={} av1={} vp9={} vp8={} fps={}",
+                            "[session] Server codec reply: prefer={} h264={} h265={} av1={} vp9={} vp8={} quality={} custom_quality={} fps={}",
                             dec.prefer,
                             dec.ability_h264,
                             dec.ability_h265,
                             dec.ability_av1,
                             dec.ability_vp9,
                             dec.ability_vp8,
+                            opt.image_quality,
+                            opt.custom_image_quality,
                             opt.custom_fps
                         );
                     } else {
-                        eprintln!("[session] Server Misc::Option (no decoding info)");
+                        eprintln!(
+                            "[session] Server Misc::Option (quality={} custom_quality={} fps={}, no decoding info)",
+                            opt.image_quality, opt.custom_image_quality, opt.custom_fps
+                        );
                     }
                 }
                 Some(misc::Union::SwitchDisplay(sd)) => {
@@ -3128,10 +3142,7 @@ fn build_login_request(
             password: password_hash,
             my_id: "evertydesk-lite".to_owned(),
             my_name: "EvertyDesk Lite".to_owned(),
-            option: Some(OptionMessage {
-                supported_decoding: Some(supported_decoding(codec_preference)),
-                custom_fps: fps.clamp(5, 60),
-            }),
+            option: Some(video_option_message(fps, codec_preference)),
             video_ack_required: false,
             version: "1.4.6".to_owned(),
             my_platform: std::env::consts::OS.to_owned(),
@@ -3277,7 +3288,11 @@ mod tests {
         };
         assert_eq!(login.password.len(), 32);
         assert_eq!(login.username, "123");
-        assert_eq!(login.option.unwrap().custom_fps, 60);
+        let option = login.option.unwrap();
+        assert_eq!(option.custom_fps, 60);
+        assert_eq!(option.image_quality, ImageQuality::Best as i32);
+        assert_eq!(option.custom_image_quality, 0);
+        assert!(option.supported_decoding.is_some());
     }
 
     #[test]

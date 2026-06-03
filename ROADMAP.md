@@ -148,6 +148,9 @@ $env:EVERTYDESK_ENABLE_AV1_MF="1"
   packaging and OpenH264 fallback.
 - Added a macOS VideoToolbox H.264 client decoder backend for RustDesk-style
   Annex-B packets.
+- Added RustDesk-compatible video QoS negotiation: client login/sync now sends
+  `ImageQuality::Best` with target FPS, and EvertyDesk hosts use received
+  quality options to raise H.264 bitrate headroom for high-motion sessions.
 - Added codec preference tests for conservative H.264/H.265/AV1/VP9 fallback
   ordering.
 

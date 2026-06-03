@@ -15,6 +15,11 @@ local build has a decoder path that is expected to survive real sessions.
 - macOS hosts have a native H.264 encode path through VideoToolbox and a
   CoreGraphics main-display capture path. macOS clients try VideoToolbox H.264
   decode first and fall back to OpenH264 when available.
+- Client login and codec-sync messages now send RustDesk-compatible
+  `ImageQuality::Best` plus `custom_fps`, so RustDesk hosts can lift VIDEO_QOS
+  instead of staying on conservative defaults during high-motion sessions.
+- EvertyDesk hosts understand RustDesk `image_quality` and
+  `custom_image_quality` options and use them to scale H.264 bitrate headroom.
 - AV1 decode probing exists, but AV1 is not advertised by default because the
   current Windows Media Foundation AV1 path can crash native MFTs on some
   streams.
