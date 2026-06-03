@@ -1405,6 +1405,7 @@ fn video_loop(
                     fps,
                     bitrate,
                     &bgra,
+                    decision.force_key,
                 ) {
                     Ok(Some(packet)) => {
                         videotoolbox_empty_packets = 0;
@@ -2285,6 +2286,7 @@ fn encode_videotoolbox_frame(
     fps: u32,
     bitrate: u32,
     bgra: &[u8],
+    force_key: bool,
 ) -> Result<Option<EncodedPacket>, String> {
     let fps = fps.clamp(5, MAX_TARGET_FPS);
     let recreate = encoder
@@ -2307,7 +2309,7 @@ fn encode_videotoolbox_frame(
     let Some(encoder) = encoder.as_mut() else {
         return Ok(None);
     };
-    encoder.encode_bgra(bgra).map(|packet| {
+    encoder.encode_bgra(bgra, force_key).map(|packet| {
         packet.map(|packet| EncodedPacket {
             backend: VideoEncoderBackend::VideoToolbox,
             codec: packet.codec,

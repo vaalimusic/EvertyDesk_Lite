@@ -1,6 +1,6 @@
 # EvertyDesk Lite: technical plan
 
-Status date: 2026-06-02.
+Status date: 2026-06-03.
 
 This document tracks what is already implemented and what remains to turn
 EvertyDesk Lite from a compact RustDesk-compatible client into a fast,
@@ -95,6 +95,9 @@ $env:EVERTYDESK_ENABLE_AV1_MF="1"
 - H.264/H.265 Media Foundation encode detection.
 - H.264/H.265 direct encode path uses BGRA -> NV12 -> MFT encoder.
 - No external encoder executable is required for the new Windows MF encode path.
+- Direct macOS VideoToolbox H.264 encoder backend added.
+- macOS VideoToolbox encode path emits Annex-B H.264 packets and keeps
+  OpenH264 fallback when startup/output fails.
 - Codec negotiation only selects H.265 when both sides report support.
 - Fallback to OpenH264 if a hardware/native encoder fails to start or produces
   no packets.
@@ -107,6 +110,8 @@ $env:EVERTYDESK_ENABLE_AV1_MF="1"
 - Frame change detector to skip static frames.
 - Static-frame backoff to reduce CPU/network use.
 - Target FPS negotiation.
+- First Windows Desktop Duplication capture prototype with GDI fallback.
+- First macOS CoreGraphics main-display capture path.
 - Screenshot fallback remains alive when live video is unsupported.
 - Build variants for Windows and Linux codec availability.
 - `cargo check`, `cargo test`, and `cargo check --no-default-features` pass.
@@ -132,6 +137,12 @@ $env:EVERTYDESK_ENABLE_AV1_MF="1"
 - Added a reusable host capture buffer and cached Windows GDI capture objects
   to reduce per-frame allocation and DC/bitmap churn on the current Windows
   host path.
+- Added a Windows DXGI/D3D11 Desktop Duplication capture path before GDI
+  fallback. It currently copies the duplicated desktop texture into the
+  existing BGRA buffer path so the old encoder/fallback behavior stays intact.
+- Added a macOS CoreGraphics capture path for the main display.
+- Added a macOS VideoToolbox H.264 host encoder backend with SPS/PPS keyframe
+  packaging and OpenH264 fallback.
 - Added codec preference tests for conservative H.264/H.265/AV1/VP9 fallback
   ordering.
 
@@ -163,8 +174,10 @@ Priority: high.
 
 - Implement async/D3D11 Media Foundation MFT support.
 - Move from CPU BGRA -> NV12 conversion toward GPU/D3D11 texture paths.
-- Investigate Desktop Duplication API capture on Windows for zero-copy or
-  low-copy capture.
+- Validate the Desktop Duplication prototype on a Windows/MSVC host and keep
+  GDI as fallback for unsupported desktops, secure screens, and API resets.
+- Move Desktop Duplication from CPU readback toward zero-copy or low-copy
+  D3D11 texture handoff into Media Foundation/NVENC.
 - Add direct NVENC backend through `NvEncodeAPI`, not through a helper process.
 - Use NVIDIA Video Codec SDK only as headers/FFI source, with runtime driver
   loading.
@@ -179,7 +192,10 @@ Priority: high.
 
 Priority: medium.
 
-- Native VideoToolbox backend for macOS through `VTCompressionSession`.
+- Extend the native macOS VideoToolbox path:
+  - add H.264 hardware decode on macOS clients;
+  - add H.265 only after decoder stability is proven;
+  - replace CoreGraphics capture with ScreenCaptureKit for high-motion work.
 - Linux VA-API path for Intel/AMD where available.
 - Linux NVENC path through direct NVENC API.
 - Keep all platform hardware backends optional.
@@ -215,8 +231,8 @@ Priority: high.
 - Make BGRA -> NV12 conversion faster with row batching and optional SIMD.
 - Reuse capture buffers and platform capture objects; avoid per-frame
   allocation of device contexts, bitmaps, and full-frame scratch buffers.
-- Replace the remaining Windows GDI full-frame path with Desktop Duplication or
-  Windows Graphics Capture for true high-motion/game-grade streaming.
+- Promote the Windows Desktop Duplication path from prototype to production and
+  use Windows Graphics Capture where Desktop Duplication is not enough.
 - Add dirty-rectangle capture/encode where the host backend supports it.
 - Add adaptive bitrate from frame change density and measured relay throughput.
 - Add adaptive FPS floor/ceiling for static vs active screens.
@@ -317,12 +333,21 @@ Priority: medium.
 
 ### Milestone B: Low-Latency Windows Capture Path
 
-- Desktop Duplication API capture prototype.
+- Desktop Duplication API capture prototype added.
+- Windows host build/runtime validation for the DXGI capture path.
 - Faster BGRA/NV12 conversion.
 - Encoder latency and packet-size metrics.
 - Adaptive FPS and bitrate tuning.
 
-### Milestone C: Direct NVENC
+### Milestone C: macOS Native Video Path
+
+- CoreGraphics capture works as the compatibility baseline.
+- VideoToolbox H.264 encode survives long host sessions.
+- macOS client adds VideoToolbox H.264 decode.
+- ScreenCaptureKit replaces the high-motion capture path.
+- Telemetry shows capture, encode, decode, render, and packet timing.
+
+### Milestone D: Direct NVENC
 
 - Load `nvEncodeAPI64.dll` dynamically.
 - Create encoder session.
@@ -330,7 +355,7 @@ Priority: medium.
 - Add D3D11 interop later.
 - Keep fallback behavior identical to MF/OpenH264.
 
-### Milestone D: Production Host Mode
+### Milestone E: Production Host Mode
 
 - Windows service mode.
 - Linux systemd mode.

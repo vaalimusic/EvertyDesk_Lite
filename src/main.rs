@@ -344,7 +344,7 @@ fn run_gui(renderer: eframe::Renderer) -> eframe::Result<()> {
         APP_NAME,
         options,
         Box::new(|cc| {
-            cc.egui_ctx.set_pixels_per_point(1.0);
+            configure_ui_scale(&cc.egui_ctx);
             configure_style(&cc.egui_ctx);
             eprintln!(
                 "[EvertyDesk] Build codecs: {}",
@@ -3250,6 +3250,7 @@ impl EvertyDeskApp {
         let viewport_id = egui::ViewportId::from_hash_of("evertydesk-lite-remote-viewer");
         let builder = egui::ViewportBuilder::default()
             .with_title(title)
+            .with_resizable(true)
             .with_inner_size([1100.0, 760.0])
             .with_min_inner_size([720.0, 480.0]);
 
@@ -3645,10 +3646,11 @@ impl EvertyDeskApp {
     }
 
     fn remote_screen_ui(&mut self, ui: &mut egui::Ui) {
-        let available = ui.available_width();
+        let available_size = ui.available_size_before_wrap();
+        let available_width = available_size.x.max(1.0);
         let Some(texture) = self.remote_texture.clone() else {
             ui.allocate_ui(
-                egui::vec2(available, ui.available_height().max(360.0)),
+                egui::vec2(available_width, available_size.y.max(360.0)),
                 |ui| {
                     ui.centered_and_justified(|ui| {
                         ui.spinner();
@@ -3663,9 +3665,11 @@ impl EvertyDeskApp {
         if w == 0 || h == 0 {
             return;
         }
-        let max_height = ui.available_height().max(360.0);
+        let max_height = available_size.y.max(360.0);
         let scale = if self.fit_to_window {
-            (available / w as f32).min(max_height / h as f32).min(1.0)
+            (available_width / w as f32)
+                .min(max_height / h as f32)
+                .clamp(0.05, 4.0)
         } else {
             1.0
         };
@@ -4560,6 +4564,16 @@ fn egui_key_to_text(key: egui::Key) -> Option<String> {
         _ => return None,
     };
     Some(ch.to_string())
+}
+
+fn configure_ui_scale(ctx: &egui::Context) {
+    let default_zoom = if cfg!(target_os = "macos") { 1.08 } else { 1.0 };
+    let zoom = std::env::var("EVERTYDESK_UI_SCALE")
+        .ok()
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .unwrap_or(default_zoom)
+        .clamp(0.75, 1.75);
+    ctx.set_zoom_factor(zoom);
 }
 
 fn configure_style(ctx: &egui::Context) {

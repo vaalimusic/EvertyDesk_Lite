@@ -11,6 +11,9 @@ local build has a decoder path that is expected to survive real sessions.
   depending on build features.
 - H.265 decode is available through Windows Media Foundation on Windows builds
   with `live-vp9-mf`.
+- macOS hosts have a native H.264 encode path through VideoToolbox and a
+  CoreGraphics main-display capture path. macOS clients still decode H.264
+  through the existing software decoder path for now.
 - AV1 decode probing exists, but AV1 is not advertised by default because the
   current Windows Media Foundation AV1 path can crash native MFTs on some
   streams.
@@ -40,9 +43,10 @@ It does not start an external encoder process. It:
 The host selection order is:
 
 1. Media Foundation H.264/H.265 when available and allowed by client capability.
-2. Platform-specific direct hardware backend placeholders.
-3. OpenH264 software H.264.
-4. Screenshot fallback when live video is unavailable.
+2. VideoToolbox H.264 on macOS hosts when available.
+3. Direct NVENC when that backend is implemented and available.
+4. OpenH264 software H.264.
+5. Screenshot fallback when live video is unavailable.
 
 H.265 is selected only when both sides support it. H.264 remains the safest
 default path.
@@ -60,6 +64,36 @@ Host sessions now emit periodic encode telemetry to logs:
 The latest host video telemetry is also surfaced in the Host UI and in
 headless host output. Full per-interval details remain copyable from the host
 diagnostics log.
+
+## Windows Capture
+
+The Windows host path now tries Desktop Duplication first and falls back to the
+cached GDI capture path if DXGI/D3D11 is unavailable, reset, or incompatible
+with the current desktop.
+
+Current Desktop Duplication behavior:
+
+- creates a D3D11 device and `IDXGIOutputDuplication`;
+- acquires the primary output frame;
+- copies it through a staging texture into the existing BGRA frame buffer;
+- keeps existing encoder fallback behavior unchanged.
+
+This is a low-copy capture prototype, not the final GPU pipeline. The next
+Windows performance step is to validate it on a real Windows/MSVC host, then
+pass D3D11 textures into async Media Foundation or NVENC without full CPU
+readback.
+
+## macOS Capture
+
+The macOS host path now has a first native capture backend:
+
+- captures the main display through CoreGraphics;
+- writes BGRA directly into the existing reusable host frame buffer;
+- feeds the same encoder selection/fallback pipeline as other platforms.
+
+This is a compatibility capture path. The next performance step for macOS is
+ScreenCaptureKit so high-motion sessions can use lower-copy capture and better
+frame pacing.
 
 ## NVENC
 
@@ -89,15 +123,23 @@ The current accelerated Windows path is Media Foundation, not direct NVENC.
 
 ## macOS VideoToolbox
 
-VideoToolbox is the planned native macOS hardware encoder backend.
+VideoToolbox is the first native macOS hardware encoder backend.
 
-Target behavior:
+Current behavior:
 
-- use `VTCompressionSession`;
-- support H.264 first;
-- add H.265 when client decode is stable;
-- keep OpenH264 fallback;
-- keep application startup independent from optional hardware availability.
+- uses `VTCompressionSession`;
+- supports H.264 first;
+- requests hardware acceleration and real-time encode mode;
+- emits Annex-B H.264 packets with SPS/PPS on keyframes;
+- keeps OpenH264 fallback;
+- keeps application startup independent from optional hardware availability.
+
+Remaining work:
+
+- add VideoToolbox H.264 decode on macOS clients;
+- add H.265 only after cross-platform client decode is stable;
+- move capture from CoreGraphics toward ScreenCaptureKit;
+- validate long sessions and failure fallback on Intel and Apple Silicon Macs.
 
 ## Linux Hardware Encode
 
@@ -127,7 +169,10 @@ runtime libraries.
   force-keyframe.
 - Add better SPS/PPS/VPS handling for H.264/H.265.
 - Add richer per-session codec telemetry history/graphs in the UI.
+- Add VideoToolbox H.264 decode on macOS clients.
+- Validate Windows Desktop Duplication capture on a Windows host.
 - Add D3D11/async MFT support for true hardware Media Foundation paths.
+- Move macOS capture toward ScreenCaptureKit.
 - Add direct NVENC encoder backend.
 - Add captured-packet tests for H.265 and AV1 decoder stability.
 - Add platform capture paths required for interactive/game-grade streaming:

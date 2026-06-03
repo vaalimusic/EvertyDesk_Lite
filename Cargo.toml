@@ -57,6 +57,11 @@ windows = { version = "0.48", features = [
     # VP9 MFT decoder
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
+    # Host: Desktop Duplication capture
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
     # Host: GDI screen capture
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
