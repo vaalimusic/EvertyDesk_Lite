@@ -10,13 +10,13 @@
 mod win {
     use std::{cell::RefCell, mem::size_of};
 
-    use windows::core::{Error as WinError, Interface, HRESULT};
+    use windows::core::{ComInterface, Error as WinError, HRESULT};
     use windows::Win32::{
         Foundation::{HMODULE, HWND},
         Graphics::Gdi::{
-            BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
-            GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT,
-            DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, RGBQUAD, SRCCOPY,
+            BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreatedHDC, DeleteDC, DeleteObject,
+            GetDC, GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+            CAPTUREBLT, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, RGBQUAD, SRCCOPY,
         },
         Graphics::{
             Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0},
@@ -133,7 +133,7 @@ mod win {
             let mut device = None;
             let mut context = None;
             D3D11CreateDevice(
-                Option::<IDXGIAdapter>::None,
+                Option::<&IDXGIAdapter>::None,
                 D3D_DRIVER_TYPE_HARDWARE,
                 HMODULE(0),
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT,
@@ -295,7 +295,7 @@ mod win {
         width: i32,
         height: i32,
         hdc_screen: HDC,
-        hdc_mem: HDC,
+        hdc_mem: CreatedHDC,
         hbmp: HBITMAP,
         old_bitmap: HGDIOBJ,
         bitmap_info: BITMAPINFO,
