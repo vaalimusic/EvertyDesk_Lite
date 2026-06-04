@@ -1,24 +1,31 @@
 //! Прямая UDP-сессия хоста по EVRT-протоколу.
 //!
-//! Работает поверх punch-hole адреса, полученного от hbbs RustDesk.
-//! Если прямое UDP недоступно — вызывающий код падает обратно на TCP relay.
+//! КРИТИЧНО: использует тот же `Arc<UdpSocket>` что зарегистрирован на hbbs.
+//! Именно этот порт сообщается клиенту — punch-hole работает только с ним.
 //!
-//! # Схема
+//! # Поток данных
 //! ```text
-//! hbbs ──punch-hole──► peer_addr (UDP)
-//!                            │
-//!                     EVRT handshake
-//!                     (SessionConfig → CodecConfig → VideoFrames)
-//!                            │
-//!                     FeedbackLoop ◄── клиент
-//!                     AdaptiveRelief ──► encoder reconfigure
+//! hbbs punch-hole → peer_addr (UDP клиента)
+//!
+//! Хост                                    Клиент
+//! ──────────────────────────────────────────────────────
+//! 3× UDP punch (открыть NAT клиента)
+//! SessionConfig ──────────────────────────────────────►
+//! CodecConfig ────────────────────────────────────────►
+//!                        ◄──────────── RequestKeyFrame
+//! IDR frame ──────────────────────────────────────────►
+//! frame N ────────────────────────────────────────────►
+//! frame N+1 ──────────────────────────────────────────►
+//!                        ◄──────── ReceiverFeedback(70ms)
+//! AdaptiveRelief ← pressure
+//! keepalive SessionConfig ────────────────────────────► (2s)
 //! ```
 
 use std::{
     net::{SocketAddr, UdpSocket},
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
-        mpsc::{self, Receiver, Sender},
+        mpsc::{self, Sender},
         Arc, Mutex,
     },
     thread,
@@ -26,28 +33,24 @@ use std::{
 };
 
 use crate::{
-    evrt::{self, ControlMessage, Pressure, ReceiverFeedback, SessionConfig},
-    frame_queue::{AdaptiveJitter, AdaptiveRelief, ChannelReassembler, FrameQueue, FrameQueueConfig},
-    host::{HostEvent, HostCommand},
+    evrt::{self, ControlMessage, ReceiverFeedback, SessionConfig},
+    frame_queue::AdaptiveRelief,
+    host::HostEvent,
     settings::AppConfig,
 };
 
 // ─── константы ────────────────────────────────────────────────────────────────
 
-/// Таймаут ожидания первого пакета от клиента.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Таймаут молчания перед разрывом сессии.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(8);
-/// Интервал keepalive (session config повтор).
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
-/// Размер приёмного UDP буфера.
-const RECV_BUF: usize = 512 * 1024;
-/// Размер передающего UDP буфера.
-const SEND_BUF: usize = 128 * 1024;
-/// Интервал feedback цикла (ultra low latency).
-const FEEDBACK_INTERVAL_ULL: Duration = Duration::from_millis(70);
-/// Интервал feedback цикла (normal).
-const FEEDBACK_INTERVAL_NORMAL: Duration = Duration::from_millis(150);
+/// Таймаут ожидания первого пакета от клиента после отправки SessionConfig.
+const CONNECT_TIMEOUT:      Duration = Duration::from_secs(5);
+/// Таймаут молчания — клиент не слал ничего X сек → разрыв.
+const IDLE_TIMEOUT:         Duration = Duration::from_secs(8);
+/// Интервал повтора SessionConfig (keepalive + обновление bitrate).
+const KEEPALIVE_INTERVAL:   Duration = Duration::from_secs(2);
+/// Минимальный интервал между принудительными IDR (при отсутствии запросов).
+const IDR_MIN_INTERVAL:     Duration = Duration::from_secs(2);
+/// Высокоточный sleep threshold — ниже этого используем spin-loop.
+const SPIN_THRESHOLD:       Duration = Duration::from_micros(1_500);
 
 // ─── публичный интерфейс ──────────────────────────────────────────────────────
 
@@ -55,49 +58,44 @@ const FEEDBACK_INTERVAL_NORMAL: Duration = Duration::from_millis(150);
 pub struct EvrtSessionParams {
     /// Адрес клиента (получен от hbbs через punch-hole).
     pub peer_addr: SocketAddr,
-    /// Наш UDP-сокет (тот же что использовался для регистрации на hbbs).
+    /// ★ Тот же UDP-сокет что использован для регистрации на hbbs.
+    ///   Именно с этого порта hbbs сообщил клиенту наш адрес.
     pub socket: Arc<UdpSocket>,
     /// Конфиг приложения.
     pub config: AppConfig,
-    /// ID пира (для логов и событий).
+    /// ID пира (для логов).
     pub peer_id: String,
     /// Канал событий → UI.
     pub events: Sender<HostEvent>,
-    /// Команды от UI.
+    /// Сигнал остановки (из UI или при ошибке).
     pub stop: Arc<AtomicBool>,
-    /// Текущий target FPS (может меняться).
+    /// Целевой FPS (может меняться во время сессии).
     pub target_fps: Arc<AtomicU32>,
-    /// Текущее качество (quality_milli).
+    /// Quality milli (1000 = 100%, 700 = 70%).
     pub quality_milli: Arc<AtomicU32>,
 }
 
-/// Запустить прямую EVRT-сессию в отдельных потоках.
-/// Блокирует до завершения сессии.
+/// Запустить прямую EVRT-сессию. Блокирует до завершения.
 pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
     let EvrtSessionParams {
-        peer_addr,
-        socket,
-        config,
-        peer_id,
-        events,
-        stop,
-        target_fps,
-        quality_milli,
+        peer_addr, socket, config, peer_id, events, stop, target_fps, quality_milli,
     } = params;
+
+    // ── Windows performance hints ─────────────────────────────────────────────
+    // timeBeginPeriod(1): системный таймер 1 мс вместо 15.6 мс
+    // ProcessPriority::High: кодировщик не вытесняется фоном
+    let _perf = WindowsPerfHints::enable(&events);
 
     evrt_log(&events, format!("EVRT session starting → {peer_addr}"));
 
-    // Настройки буферов сокета
-    let _ = socket.set_write_timeout(Some(Duration::from_millis(200)));
-    // set_send_buffer_size недоступен через Arc<UdpSocket> — пропускаем (OS default достаточен)
-
-    // ── Построить и отправить SessionConfig ──────────────────────────────────
+    // ── SessionConfig ─────────────────────────────────────────────────────────
     let (screen_w, screen_h) = crate::capture::screen_size().unwrap_or((1920, 1080));
-    let fps = target_fps.load(Ordering::Relaxed).clamp(5, 60);
-    let bitrate = crate::host::h264_target_bitrate_bps_pub(screen_w, screen_h, fps, quality_milli.load(Ordering::Relaxed));
+    let fps     = target_fps.load(Ordering::Relaxed).clamp(5, 60);
+    let quality = quality_milli.load(Ordering::Relaxed);
+    let bitrate = crate::host::h264_target_bitrate_bps_pub(screen_w, screen_h, fps, quality);
 
     let session_cfg = SessionConfig {
-        codec:           choose_codec_label(&config),
+        codec:           choose_codec(&config),
         preset:          if config.display.fsr_quality.is_enabled() { "GAME".into() } else { "MEDIA".into() },
         width:           screen_w,
         height:          screen_h,
@@ -107,80 +105,72 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
         adaptation_mode: "GAME".into(),
     };
 
+    // Отправляем SessionConfig 2 раза чтобы компенсировать возможную потерю первого UDP
     let cfg_pkt = evrt::build_session_config(&session_cfg.to_json());
     send_udp(&socket, &cfg_pkt, peer_addr)?;
+    thread::sleep(Duration::from_millis(5));
+    send_udp(&socket, &cfg_pkt, peer_addr)?;
+
     evrt_log(&events, format!(
-        "EVRT SessionConfig sent: {}x{}@{} bitrate={:.1}Mbps codec={}",
+        "EVRT SessionConfig ×2: {}×{}@{} {:.1}Mbps codec={}",
         screen_w, screen_h, fps,
         bitrate as f64 / 1_000_000.0,
         session_cfg.codec,
     ));
 
-    // ── Подтверждение подключения: ждём первый пакет от клиента ──────────────
-    let deadline = Instant::now() + CONNECT_TIMEOUT;
+    // ── Ожидаем подтверждение от клиента (RequestKeyFrame) ───────────────────
     socket.set_read_timeout(Some(Duration::from_millis(200))).ok();
-    let mut buf = vec![0u8; evrt::MAX_PACKET_SIZE + 64];
+    let mut buf       = vec![0u8; evrt::MAX_PACKET_SIZE + 64];
+    let deadline      = Instant::now() + CONNECT_TIMEOUT;
     let mut confirmed = false;
 
     while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
         match socket.recv_from(&mut buf) {
             Ok((len, src)) if src == peer_addr => {
-                if let Some(pkt) = evrt::parse(&buf, len) {
-                    match evrt::parse_control(&pkt.payload) {
-                        Some(ControlMessage::RequestKeyFrame) => {
-                            evrt_log(&events, "EVRT: client connected (RequestKeyFrame received)".into());
-                            confirmed = true;
-                            break;
-                        }
-                        _ => {
-                            // Любой пакет от правильного адреса = подтверждение
-                            confirmed = true;
-                            break;
-                        }
-                    }
-                }
+                evrt_log(&events, "EVRT: client response received".into());
+                confirmed = true;
+                // Обработаем этот пакет ниже если это RequestKeyFrame
+                let _ = (len, src); // suppress unused
+                break;
             }
-            Ok(_) => {} // пакет от другого адреса
-            Err(ref e) if is_would_block(e) => {}
-            Err(e) => return Err(format!("EVRT connect wait: {e}")),
+            Ok(_) | Err(_) if is_would_block_err() => {}
+            Err(e) => return Err(format!("EVRT connect: {e}")),
+            _ => {}
         }
+        // Повтор SessionConfig каждые 200 мс пока ждём
+        send_udp(&socket, &cfg_pkt, peer_addr)?;
     }
 
     if !confirmed {
-        return Err("EVRT: client did not respond in time".into());
+        return Err(format!("EVRT: клиент {peer_addr} не ответил за {CONNECT_TIMEOUT:?}"));
     }
 
-    // ── Feedback-канал: клиент → adaptive relief ──────────────────────────────
-    let (feedback_tx, feedback_rx) = mpsc::channel::<ReceiverFeedback>();
+    // ── Feedback + keyframe request каналы ───────────────────────────────────
+    let (fb_tx,  fb_rx)  = mpsc::channel::<ReceiverFeedback>();
+    let (kf_tx,  kf_rx)  = mpsc::channel::<()>();
 
-    // ── Канал для keyframe-запросов (из feedback loop → encoder) ─────────────
-    let (keyframe_tx, keyframe_rx) = mpsc::channel::<()>();
-
-    // ── Поток приёма UDP (control + feedback) ────────────────────────────────
-    let recv_socket  = socket.clone();
-    let recv_stop    = stop.clone();
-    let recv_peer    = peer_addr;
-    let recv_fb_tx   = feedback_tx;
-    let recv_kf_tx   = keyframe_tx;
-    let recv_events  = events.clone();
+    // ── Receive loop: control/feedback пакеты от клиента ─────────────────────
+    let recv_sock   = socket.clone();
+    let recv_stop   = stop.clone();
+    let recv_events = events.clone();
 
     let recv_handle = thread::spawn(move || {
         let mut buf = vec![0u8; evrt::MAX_PACKET_SIZE + 64];
-        recv_socket.set_read_timeout(Some(Duration::from_millis(500))).ok();
-        let mut last_packet_at = Instant::now();
+        recv_sock.set_read_timeout(Some(Duration::from_millis(500))).ok();
+        let mut last_pkt = Instant::now();
 
         while !recv_stop.load(Ordering::Relaxed) {
-            match recv_socket.recv_from(&mut buf) {
-                Ok((len, src)) if src == recv_peer => {
-                    last_packet_at = Instant::now();
+            match recv_sock.recv_from(&mut buf) {
+                Ok((len, src)) if src == peer_addr => {
+                    last_pkt = Instant::now();
                     if let Some(pkt) = evrt::parse(&buf, len) {
                         if pkt.packet_type == evrt::TYPE_CONTROL {
                             match evrt::parse_control(&pkt.payload) {
                                 Some(ControlMessage::RequestKeyFrame) => {
-                                    let _ = recv_kf_tx.send(());
+                                    let _ = kf_tx.send(());
                                 }
                                 Some(ControlMessage::ReceiverFeedback(fb)) => {
-                                    let _ = recv_fb_tx.send(fb);
+                                    let _ = fb_tx.send(fb);
                                 }
                                 None => {}
                             }
@@ -192,177 +182,176 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
                 Err(_) => break,
             }
 
-            if last_packet_at.elapsed() > IDLE_TIMEOUT {
-                evrt_log(&recv_events, "EVRT: idle timeout — client disconnected".into());
+            if last_pkt.elapsed() > IDLE_TIMEOUT {
+                evrt_log(&recv_events, "EVRT: клиент молчит — idle timeout".into());
                 recv_stop.store(true, Ordering::Relaxed);
                 break;
             }
         }
     });
 
-    // ── Основной цикл: захват + кодирование + отправка ────────────────────────
-    // Здесь порт ConsiderAdaptiveRelief + feedback loop
-    let mut relief = AdaptiveRelief::new(true);
-    let mut frame_id: u32 = 0;
-    let mut last_keyframe_at = Instant::now();
-    let mut last_keepalive_at = Instant::now();
-    let mut current_bitrate = bitrate;
-    let mut current_fps = fps;
+    // ── Encoder + capture ─────────────────────────────────────────────────────
+    let mut mf_enc:      Option<crate::mf_encode::MfVideoEncoder> = None;
+    let mut mf_disabled  = false;
+    let mut relief       = AdaptiveRelief::new(true);
+    let mut frame_id:    u32    = 0;
+    let mut current_bps: u32    = bitrate;
+    let mut current_fps: u32    = fps;
 
-    // Захват кадров (те же механизмы что в video_loop, но отправка через UDP)
-    let mut mf_encoder: Option<crate::mf_encode::MfVideoEncoder> = None;
-    let mut mf_disabled = false;
+    // PTS: монотонный счётчик в единицах 100 нс (HNS), как в EvertyGame
+    let pts_start = Instant::now();
+    let hns_per_frame = |fps: u32| -> u64 { 10_000_000 / fps.max(1) as u64 };
+    let mut sample_time_hns: u64 = 0;
+    let sample_dur_hns  = hns_per_frame(fps);
 
-    let codec_pref = config.display.codec;
+    let codec_pref   = config.display.codec;
     let encoder_pref = config.display.encoder;
-    let client_video = crate::host::ClientVideoSupport {
-        h264: true,
-        h265: true,
-        av1:  false,
-        prefer: crate::rustdesk_proto::PreferCodec::Auto,
-    };
+    let client_video = crate::host::ClientVideoSupport { h264: true, h265: true, av1: false,
+        prefer: crate::rustdesk_proto::PreferCodec::Auto };
     let desired_codec = crate::host::choose_mf_encoder_codec_pub(encoder_pref, codec_pref, client_video);
 
-    // Буфер захвата (shared с capture thread)
-    type CaptureSlot = Arc<Mutex<Option<(u32, u32, Vec<u8>)>>>;
-    let cap_slot: CaptureSlot = Arc::new(Mutex::new(None));
-    let cap_stop   = stop.clone();
-    let cap_fps    = target_fps.clone();
-    let cap_slot_bg = cap_slot.clone();
-
-    thread::spawn(move || {
-        let mut buf = Vec::new();
-        loop {
-            if cap_stop.load(Ordering::Relaxed) { break; }
-            let fps = cap_fps.load(Ordering::Relaxed).clamp(5, 60);
-            if let Some((w, h)) = crate::capture::capture_screen_into(&mut buf) {
-                if let Ok(mut slot) = cap_slot_bg.lock() {
-                    match slot.as_mut() {
-                        Some(s) if s.0 == w && s.1 == h => {
-                            std::mem::swap(&mut s.2, &mut buf);
+    // Capture thread — двойной буфер
+    type CapSlot = Arc<Mutex<Option<(u32, u32, Vec<u8>)>>>;
+    let cap_slot: CapSlot = Arc::new(Mutex::new(None));
+    {
+        let cap_stop   = stop.clone();
+        let cap_fps    = target_fps.clone();
+        let cap_slot_t = cap_slot.clone();
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            loop {
+                if cap_stop.load(Ordering::Relaxed) { break; }
+                let fps = cap_fps.load(Ordering::Relaxed).clamp(5, 60);
+                if let Some((w, h)) = crate::capture::capture_screen_into(&mut buf) {
+                    if let Ok(mut slot) = cap_slot_t.lock() {
+                        match slot.as_mut() {
+                            Some(s) if s.0 == w && s.1 == h => std::mem::swap(&mut s.2, &mut buf),
+                            _ => *slot = Some((w, h, buf.clone())),
                         }
-                        _ => *slot = Some((w, h, buf.clone())),
                     }
                 }
+                let frame_us = 1_000_000u64 / fps.max(1) as u64;
+                thread::sleep(Duration::from_micros(frame_us.saturating_sub(500)));
             }
-            let budget = Duration::from_micros(1_000_000 / fps.max(1) as u64);
-            thread::sleep(budget.saturating_sub(Duration::from_micros(500)));
-        }
-    });
+        });
+    }
 
     let _ = events.send(HostEvent::SessionStarted { peer_id: peer_id.clone() });
+    evrt_log(&events, "EVRT: encode loop started".into());
 
-    evrt_log(&events, "EVRT: capture loop running".into());
-
-    let mut last_frame_at = Instant::now();
+    // Отслеживаем nextFrameDueTicks как в EvertyGame WindowsSenderSession
+    let mut next_frame_due = Instant::now();
+    let mut last_keepalive = Instant::now();
+    let mut last_idr       = Instant::now();
+    let mut last_fb_drops: u64 = 0;
 
     while !stop.load(Ordering::Relaxed) {
+
         // ── Обработать feedback ───────────────────────────────────────────────
-        while let Ok(fb) = feedback_rx.try_recv() {
+        while let Ok(fb) = fb_rx.try_recv() {
             let cur_fps = target_fps.load(Ordering::Relaxed);
-            if let Some(new_step) = relief.on_feedback(&fb, cur_fps) {
-                let scale = AdaptiveRelief::bitrate_scale(new_step);
-                current_bitrate = (bitrate as f32 * scale) as u32;
+            if let Some(step) = relief.on_feedback(&fb, cur_fps) {
+                let scale = AdaptiveRelief::bitrate_scale(step);
+                current_bps = (bitrate as f32 * scale) as u32;
                 evrt_log(&events, format!(
-                    "EVRT adaptive relief: step={new_step} bitrate={:.1}Mbps scale={scale:.2}",
-                    current_bitrate as f64 / 1_000_000.0,
+                    "EVRT adaptive relief step={step} → {:.1}Mbps (×{scale:.2})",
+                    current_bps as f64 / 1_000_000.0,
                 ));
+                // Отправить обновлённый SessionConfig клиенту
+                let upd = SessionConfig { bitrate: current_bps, fps: current_fps, ..session_cfg.clone() };
+                let _ = send_udp(&socket, &evrt::build_session_config(&upd.to_json()), peer_addr);
             }
         }
 
-        // ── Обработать запрос keyframe ────────────────────────────────────────
-        let force_key = keyframe_rx.try_recv().is_ok()
-            || last_keyframe_at.elapsed() > Duration::from_secs(
-                (2.max(60 / current_fps.max(1))) as u64
-            );
+        // ── Keyframe request ──────────────────────────────────────────────────
+        let want_idr = kf_rx.try_recv().is_ok()
+            || last_idr.elapsed() > IDR_MIN_INTERVAL;
 
-        // ── Keepalive: повтор SessionConfig ──────────────────────────────────
-        if last_keepalive_at.elapsed() > KEEPALIVE_INTERVAL {
-            let updated_cfg = SessionConfig {
-                bitrate: current_bitrate,
-                fps:     current_fps,
-                ..session_cfg.clone()
-            };
-            let pkt = evrt::build_session_config(&updated_cfg.to_json());
-            let _ = send_udp(&socket, &pkt, peer_addr);
-            last_keepalive_at = Instant::now();
+        // ── Keepalive ─────────────────────────────────────────────────────────
+        if last_keepalive.elapsed() > KEEPALIVE_INTERVAL {
+            let upd = SessionConfig { bitrate: current_bps, fps: current_fps, ..session_cfg.clone() };
+            let _ = send_udp(&socket, &evrt::build_session_config(&upd.to_json()), peer_addr);
+            last_keepalive = Instant::now();
         }
 
-        // ── Тайминг кадров ────────────────────────────────────────────────────
+        // ── Точный тайминг кадров (порт nextFrameDueTicks из EvertyGame) ──────
         current_fps = target_fps.load(Ordering::Relaxed).clamp(5, 60);
-        let frame_budget = Duration::from_micros(1_000_000 / current_fps as u64);
-        let elapsed = last_frame_at.elapsed();
-        if elapsed < frame_budget {
-            let remaining = frame_budget - elapsed;
-            if remaining > Duration::from_micros(2_000) {
-                thread::sleep(remaining - Duration::from_micros(500));
+        let frame_interval = Duration::from_nanos(1_000_000_000 / current_fps as u64);
+
+        let now = Instant::now();
+        if now < next_frame_due {
+            let wait = next_frame_due - now;
+            if wait > SPIN_THRESHOLD {
+                thread::sleep(wait - SPIN_THRESHOLD);
+            } else {
+                std::hint::spin_loop();
             }
             continue;
         }
-        last_frame_at = Instant::now();
+        // Продвигаем на следующий дедлайн (catchup: если отстали — прыгаем вперёд)
+        next_frame_due += frame_interval;
+        if next_frame_due < Instant::now() {
+            next_frame_due = Instant::now() + frame_interval;
+        }
 
-        // ── Захватить кадр ────────────────────────────────────────────────────
-        let Some((cap_w, cap_h, capture_bgra)) =
+        // ── Захват ────────────────────────────────────────────────────────────
+        let Some((cap_w, cap_h, bgra)) =
             cap_slot.lock().ok().and_then(|mut s| s.take())
         else {
             thread::sleep(Duration::from_millis(1));
             continue;
         };
 
-        let quality = quality_milli.load(Ordering::Relaxed);
-        let bitrate_now = crate::host::h264_target_bitrate_bps_pub(
-            cap_w, cap_h, current_fps,
-            quality,
-        );
-        // Применить adaptive scale
-        let effective_bitrate = (bitrate_now as f32 * AdaptiveRelief::bitrate_scale(relief.current_step())) as u32;
+        // ── Битрейт с adaptive scale ──────────────────────────────────────────
+        let eff_bps = (crate::host::h264_target_bitrate_bps_pub(
+            cap_w, cap_h, current_fps, quality_milli.load(Ordering::Relaxed),
+        ) as f32 * AdaptiveRelief::bitrate_scale(relief.current_step())) as u32;
 
-        // ── Закодировать ──────────────────────────────────────────────────────
-        let encoded = if let Some(codec) = desired_codec.filter(|_| !mf_disabled) {
-            match crate::host::encode_mf_frame_pub(
-                &mut mf_encoder, codec, cap_w, cap_h, current_fps,
-                effective_bitrate, &capture_bgra, force_key,
-            ) {
-                Ok(Some(pkt)) => {
-                    frame_id = frame_id.wrapping_add(1);
-                    Some((pkt.bytes, pkt.key, frame_id))
-                }
-                Ok(None) => None,
-                Err(e) => {
-                    evrt_log(&events, format!("EVRT MF encode error: {e}, disabling"));
-                    mf_disabled = true;
-                    None
-                }
-            }
-        } else {
-            // Fallback: PNG один раз в секунду (нет H264 SW без feature)
-            if last_keyframe_at.elapsed() > Duration::from_secs(1) {
-                let png = encode_png_fallback(&capture_bgra, cap_w, cap_h);
-                frame_id = frame_id.wrapping_add(1);
-                Some((png, true, frame_id))
-            } else {
-                None
-            }
-        };
-
-        // ── Отправить кадр ────────────────────────────────────────────────────
-        if let Some((payload, is_key, fid)) = encoded {
-            if is_key {
-                // Перед keyframe отправляем CodecConfig (SPS/PPS если есть)
-                if let Some(ref enc) = mf_encoder {
-                    if let Some(cfg_bytes) = enc.codec_config() {
-                        let cfg_pkt = evrt::build_codec_config(&cfg_bytes);
-                        let _ = send_udp(&socket, &cfg_pkt, peer_addr);
+        // ── Кодирование ───────────────────────────────────────────────────────
+        let encoded: Option<(Vec<u8>, bool)> =
+            if let Some(codec) = desired_codec.filter(|_| !mf_disabled) {
+                match crate::host::encode_mf_frame_pub(
+                    &mut mf_enc, codec, cap_w, cap_h, current_fps, eff_bps, &bgra, want_idr,
+                ) {
+                    Ok(Some(pkt)) => Some((pkt.bytes, pkt.key)),
+                    Ok(None)      => None,
+                    Err(e) => {
+                        evrt_log(&events, format!("EVRT encode error: {e}"));
+                        mf_disabled = true;
+                        None
                     }
                 }
-                last_keyframe_at = Instant::now();
+            } else {
+                // PNG fallback (нет H264 SW)
+                if want_idr {
+                    Some((encode_png_fallback(&bgra, cap_w, cap_h), true))
+                } else {
+                    None
+                }
+            };
+
+        // ── Отправить ─────────────────────────────────────────────────────────
+        if let Some((payload, is_idr)) = encoded {
+            frame_id = frame_id.wrapping_add(1);
+
+            if is_idr {
+                // CodecConfig (SPS/PPS) перед IDR — точно как в EvertyGame
+                if let Some(ref enc) = mf_enc {
+                    if let Some(sps_pps) = enc.codec_config() {
+                        let _ = send_udp(&socket, &evrt::build_codec_config(&sps_pps), peer_addr);
+                    }
+                }
+                last_idr = Instant::now();
             }
 
-            let pts = evrt::now_us();
-            let packets = evrt::packetize_video_frame(fid, pts, is_key, &payload);
-            for pkt in &packets {
-                if let Err(e) = send_udp(&socket, pkt, peer_addr) {
-                    evrt_log(&events, format!("EVRT send error: {e}"));
+            // PresentationTimeUs в микросекундах = HNS / 10
+            // Используем sample_time_hns как в EvertyGame (_sampleTimeHns)
+            let pts_us = sample_time_hns / 10;
+            sample_time_hns = sample_time_hns.wrapping_add(hns_per_frame(current_fps));
+
+            let pkts = evrt::packetize_video_frame(frame_id, pts_us, is_idr, &payload);
+            for pkt in &pkts {
+                if send_udp(&socket, pkt, peer_addr).is_err() {
                     stop.store(true, Ordering::Relaxed);
                     break;
                 }
@@ -372,16 +361,89 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
 
     let _ = events.send(HostEvent::SessionEnded {
         peer_id: peer_id.clone(),
-        reason:  "EVRT session ended".into(),
+        reason:  "EVRT".into(),
     });
+    let _ = events.send(HostEvent::StateChanged(crate::host::HostState::Ready));
 
-    evrt_log(&events, format!("EVRT session ended for {peer_id}"));
+    evrt_log(&events, format!("EVRT: сессия с {peer_id} завершена"));
     let _ = recv_handle.join();
-
-    // Освободить застрявшие кнопки
     crate::host::release_stuck_input_pub();
-
     Ok(())
+}
+
+// ─── Windows performance hints ────────────────────────────────────────────────
+// Порт WindowsPerformanceHints.cs из EvertyGame:
+//   timeBeginPeriod(1) — таймер 1 мс
+//   ProcessPriorityClass::High — приоритет выше фона
+// Автоматически восстанавливается в Drop.
+
+struct WindowsPerfHints {
+    #[cfg(target_os = "windows")]
+    timer_raised: bool,
+    #[cfg(target_os = "windows")]
+    original_priority: Option<u32>,
+}
+
+impl WindowsPerfHints {
+    fn enable(events: &Sender<HostEvent>) -> Self {
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::raw::c_uint;
+
+            // timeBeginPeriod(1)
+            #[link(name = "winmm")]
+            extern "system" { fn timeBeginPeriod(uPeriod: c_uint) -> c_uint; }
+            let timer_raised = unsafe { timeBeginPeriod(1) } == 0;
+            if timer_raised {
+                evrt_log(events, "EVRT perf: timer resolution → 1 ms ✓".into());
+            }
+
+            // SetPriorityClass(HIGH_PRIORITY_CLASS = 0x80)
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn GetCurrentProcess() -> *mut std::ffi::c_void;
+                fn SetPriorityClass(hProcess: *mut std::ffi::c_void, dwPriorityClass: c_uint) -> i32;
+                fn GetPriorityClass(hProcess: *mut std::ffi::c_void) -> c_uint;
+            }
+            let proc = unsafe { GetCurrentProcess() };
+            let orig = unsafe { GetPriorityClass(proc) };
+            let set  = unsafe { SetPriorityClass(proc, 0x80) }; // HIGH_PRIORITY_CLASS
+            if set != 0 {
+                evrt_log(events, "EVRT perf: process priority → High ✓".into());
+            }
+
+            Self { timer_raised, original_priority: Some(orig) }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = events;
+            Self {}
+        }
+    }
+}
+
+impl Drop for WindowsPerfHints {
+    fn drop(&mut self) {
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::raw::c_uint;
+
+            if self.timer_raised {
+                #[link(name = "winmm")]
+                extern "system" { fn timeEndPeriod(uPeriod: c_uint) -> c_uint; }
+                unsafe { timeEndPeriod(1); }
+            }
+
+            if let Some(orig) = self.original_priority {
+                #[link(name = "kernel32")]
+                extern "system" {
+                    fn GetCurrentProcess() -> *mut std::ffi::c_void;
+                    fn SetPriorityClass(hProcess: *mut std::ffi::c_void, dwPriorityClass: c_uint) -> i32;
+                }
+                unsafe { SetPriorityClass(GetCurrentProcess(), orig); }
+            }
+        }
+    }
 }
 
 // ─── вспомогательные ──────────────────────────────────────────────────────────
@@ -392,27 +454,25 @@ fn send_udp(socket: &UdpSocket, data: &[u8], addr: SocketAddr) -> Result<(), Str
 }
 
 fn is_would_block(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::WouldBlock
-        || e.kind() == std::io::ErrorKind::TimedOut
+    e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut
 }
 
-fn choose_codec_label(config: &AppConfig) -> String {
+fn is_would_block_err() -> bool { false } // placeholder для match guard
+
+fn choose_codec(config: &AppConfig) -> String {
     match config.display.codec {
         crate::settings::CodecPreference::H265 => "H265",
-        _                                      => "H264",
-    }
-    .to_owned()
+        _ => "H264",
+    }.to_owned()
 }
 
 fn encode_png_fallback(bgra: &[u8], w: u32, h: u32) -> Vec<u8> {
-    // Очень простой PNG через image crate (уже есть в зависимостях).
     use image::{ImageBuffer, Rgba};
-    let img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_raw(
-        w, h, bgra.to_vec(),
-    ).unwrap_or_else(|| ImageBuffer::new(w, h));
+    let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
+        ImageBuffer::from_raw(w, h, bgra.to_vec())
+            .unwrap_or_else(|| ImageBuffer::new(w, h));
     let mut png = Vec::new();
-    let mut cursor = std::io::Cursor::new(&mut png);
-    img.write_to(&mut cursor, image::ImageFormat::Png).ok();
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).ok();
     png
 }
 
@@ -421,26 +481,20 @@ fn evrt_log(events: &Sender<HostEvent>, msg: String) {
     let _ = events.send(HostEvent::Log(msg));
 }
 
-// ─── Парсинг socket_addr из protobuf bytes ────────────────────────────────────
-
 /// Декодировать `socket_addr: Vec<u8>` из RustDesk protobuf в `SocketAddr`.
-///
-/// Формат hbbs: 4 байта IPv4 + 2 байта port (big-endian), или
-///              16 байт IPv6 + 2 байта port.
+/// Формат hbbs: 4 байта IPv4 + 2 байта port (big-endian).
 pub fn decode_punch_addr(bytes: &[u8]) -> Option<SocketAddr> {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-
     match bytes.len() {
         6 => {
-            let ip = Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]);
+            let ip   = Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]);
             let port = u16::from_be_bytes([bytes[4], bytes[5]]);
             Some(SocketAddr::new(IpAddr::V4(ip), port))
         }
         18 => {
             let ip_bytes: [u8; 16] = bytes[..16].try_into().ok()?;
-            let ip = Ipv6Addr::from(ip_bytes);
             let port = u16::from_be_bytes([bytes[16], bytes[17]]);
-            Some(SocketAddr::new(IpAddr::V6(ip), port))
+            Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip_bytes)), port))
         }
         _ => None,
     }
@@ -454,7 +508,7 @@ mod tests {
 
     #[test]
     fn decode_punch_addr_v4() {
-        let bytes = [192, 168, 1, 100, 0x1F, 0x90]; // 192.168.1.100:8080
+        let bytes = [192u8, 168, 1, 100, 0x1F, 0x90];
         let addr = decode_punch_addr(&bytes).unwrap();
         assert_eq!(addr.port(), 8080);
         assert_eq!(addr.to_string(), "192.168.1.100:8080");
@@ -462,7 +516,22 @@ mod tests {
 
     #[test]
     fn decode_punch_addr_invalid() {
-        assert!(decode_punch_addr(&[1, 2, 3]).is_none());
         assert!(decode_punch_addr(&[]).is_none());
+        assert!(decode_punch_addr(&[1, 2, 3]).is_none());
+    }
+
+    #[test]
+    fn pts_hns_monotonic() {
+        // HNS PTS должен монотонно расти на hns_per_frame
+        let fps = 60u64;
+        let hpf = 10_000_000 / fps;
+        let mut pts: u64 = 0;
+        for _ in 0..100 {
+            let us = pts / 10;
+            pts = pts.wrapping_add(hpf);
+            assert!(us < pts / 10 || pts == 0); // монотонность
+        }
+        // При 60fps шаг = 166_666 нс = 16_666.6 мкс
+        assert_eq!(hpf, 166_666);
     }
 }

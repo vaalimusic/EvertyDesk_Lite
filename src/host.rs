@@ -425,7 +425,9 @@ fn registration_loop(
     } else {
         "0.0.0.0:0".to_owned()
     };
-    let socket = match UdpSocket::bind(&bind_addr) {
+    // Оборачиваем в Arc — тот же сокет передаётся в EVRT-сессии.
+    // Это критично: punch-hole работает только с портом, который зарегистрирован на hbbs.
+    let socket = Arc::new(match UdpSocket::bind(&bind_addr) {
         Ok(s) => s,
         Err(e) => {
             if config.udp_bind_port > 0 {
@@ -444,7 +446,7 @@ fn registration_loop(
                 return LoopResult::Error(format!("UDP bind: {e}"));
             }
         }
-    };
+    });
     socket.set_read_timeout(Some(READ_TIMEOUT_SHORT)).ok();
 
     // Log the local port so the user can verify the firewall rule covers it.
@@ -630,7 +632,7 @@ fn registration_loop(
                         }
                         other => {
                             let msg2 = RendezvousMessage { union: other };
-                            if let Some(r) = handle_rendezvous_msg(msg2, config, events) {
+                            if let Some(r) = handle_rendezvous_msg(msg2, config, events, &socket) {
                                 return r;
                             }
                         }
@@ -650,6 +652,7 @@ fn handle_rendezvous_msg(
     msg: RendezvousMessage,
     config: &AppConfig,
     events: &Sender<HostEvent>,
+    reg_socket: &Arc<UdpSocket>,
 ) -> Option<LoopResult> {
     match msg.union {
         Some(rendezvous_message::Union::RegisterPeerResponse(r)) => {
@@ -734,41 +737,30 @@ fn handle_rendezvous_msg(
                 ),
             );
 
-            // ── Попытка прямого EVRT UDP ──────────────────────────────────────
+            // ── Попытка прямого EVRT UDP через тот же сокет что зарегистрирован на hbbs ─
             if !ph.force_relay {
                 if let Some(peer_addr) =
                     crate::evrt_session::decode_punch_addr(&ph.socket_addr)
                 {
-                    host_log(events, format!("PunchHole: trying direct EVRT UDP → {peer_addr}"));
+                    host_log(events, format!(
+                        "PunchHole: EVRT direct → {peer_addr} (используем reg-сокет)",
+                    ));
                     let cfg   = config.clone();
                     let evs   = events.clone();
                     let stop  = Arc::new(AtomicBool::new(false));
                     let fps   = Arc::new(AtomicU32::new(cfg.display.target_fps.clamp(5, 60)));
                     let qual  = Arc::new(AtomicU32::new(1_000));
                     let relay = relay_server.clone();
+                    // ★ Используем тот же сокет что зарегистрирован на hbbs.
+                    //   Именно с этого порта hbbs сообщил клиенту наш адрес.
+                    let udp   = reg_socket.clone();
 
-                    // Передаём UDP-сокет регистрационного цикла через Arc
-                    // (сокет создаётся выше в registration_loop — здесь нет прямого доступа,
-                    // поэтому создаём новый временный на случайном порту для EVRT).
                     thread::spawn(move || {
-                        let udp = match std::net::UdpSocket::bind("0.0.0.0:0") {
-                            Ok(s) => Arc::new(s),
-                            Err(e) => {
-                                let _ = evs.send(HostEvent::Log(
-                                    format!("EVRT: UDP bind failed: {e}, falling back to relay"),
-                                ));
-                                // Fallback: запустить TCP relay
-                                handle_relay_session(
-                                    cfg, evs, "(punch)".to_owned(), relay, String::new(),
-                                );
-                                return;
-                            }
-                        };
-
-                        // Punch: отправляем пустой UDP пакет чтобы открыть NAT-дырку
-                        let _ = udp.send_to(&[0u8], peer_addr);
-                        thread::sleep(Duration::from_millis(50));
-                        let _ = udp.send_to(&[0u8], peer_addr); // повтор
+                        // Punch: 3× UDP чтобы открыть дыру в NAT клиента
+                        for _ in 0..3 {
+                            let _ = udp.send_to(&[0u8], peer_addr);
+                            thread::sleep(Duration::from_millis(30));
+                        }
 
                         let params = crate::evrt_session::EvrtSessionParams {
                             peer_addr,
@@ -787,7 +779,6 @@ fn handle_rendezvous_msg(
                                 let _ = evs.send(HostEvent::Log(
                                     format!("EVRT direct failed ({e}), falling back to relay"),
                                 ));
-                                // Fallback: TCP relay
                                 handle_relay_session(
                                     cfg, evs, "(punch-fallback)".to_owned(), relay, String::new(),
                                 );
