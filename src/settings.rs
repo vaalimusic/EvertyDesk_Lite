@@ -96,6 +96,55 @@ impl EncoderPreference {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FsrQualitySetting {
+    /// FSR выключен — захват в нативном разрешении.
+    #[default]
+    Off,
+    /// Нативное разрешение + только RCAS обострение.
+    Native,
+    /// 77% от нативного → апскейл 1.3×.
+    UltraQuality,
+    /// 67% от нативного → апскейл 1.5× (рекомендуется).
+    Quality,
+    /// 59% от нативного → апскейл 1.7×.
+    Balanced,
+    /// 50% от нативного → апскейл 2×.
+    Performance,
+}
+
+impl FsrQualitySetting {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off          => "Выключен",
+            Self::Native       => "Native (только RCAS)",
+            Self::UltraQuality => "Ultra Quality (1.3×)",
+            Self::Quality      => "Quality (1.5×)",
+            Self::Balanced     => "Balanced (1.7×)",
+            Self::Performance  => "Performance (2×)",
+        }
+    }
+
+    /// Конвертация в enum из крейта fsr.
+    pub fn to_fsr_quality(self) -> Option<crate::fsr::FsrQuality> {
+        match self {
+            Self::Off          => None,
+            Self::Native       => Some(crate::fsr::FsrQuality::Native),
+            Self::UltraQuality => Some(crate::fsr::FsrQuality::UltraQuality),
+            Self::Quality      => Some(crate::fsr::FsrQuality::Quality),
+            Self::Balanced     => Some(crate::fsr::FsrQuality::Balanced),
+            Self::Performance  => Some(crate::fsr::FsrQuality::Performance),
+        }
+    }
+
+    pub fn is_enabled(self) -> bool {
+        self != Self::Off
+    }
+}
+
+fn default_fsr_sharpness() -> f32 { 0.875 }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DisplayConfig {
     #[serde(default)]
@@ -108,6 +157,16 @@ pub struct DisplayConfig {
     pub adaptive_quality: bool,
     #[serde(default = "default_min_fps")]
     pub min_fps: u32,
+
+    /// AMD FidelityFX Super Resolution — режим качества апскейла.
+    /// `Off` = FSR не используется (нативный захват).
+    #[serde(default)]
+    pub fsr_quality: FsrQualitySetting,
+
+    /// Сила обострения RCAS: 0.0 = максимум, 1.0 = выключено.
+    /// Применяется только когда `fsr_quality != Off`.
+    #[serde(default = "default_fsr_sharpness")]
+    pub fsr_sharpness: f32,
 }
 
 impl Default for DisplayConfig {
@@ -118,6 +177,8 @@ impl Default for DisplayConfig {
             target_fps: default_target_fps(),
             adaptive_quality: default_adaptive_quality(),
             min_fps: default_min_fps(),
+            fsr_quality: FsrQualitySetting::Off,
+            fsr_sharpness: default_fsr_sharpness(),
         }
     }
 }

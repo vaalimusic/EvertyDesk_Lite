@@ -7,6 +7,7 @@ mod address_book;
 mod capture;
 mod colorconv;
 mod crypto;
+mod fsr;
 mod host;
 mod llm;
 mod mf_encode;
@@ -678,6 +679,14 @@ struct EvertyDeskApp {
     show_settings: bool,
     /// Editable copy of config while the settings window is open.
     settings_draft: Option<AppConfig>,
+
+    // ── FSR (клиентская сторона) ──────────────────────────────────────────────
+    /// Адаптер FSR — апскейлит входящий видео-поток перед отображением.
+    /// `None` = FSR выключен (нативное разрешение от хоста).
+    fsr_viewer: Option<crate::fsr::FsrAdapter>,
+    /// Нативное разрешение хоста (объявляется в PeerInfo / SessionEvent::Displays).
+    /// FSR апскейлит каждый входящий кадр до этого разрешения.
+    fsr_native_size: Option<(u32, u32)>,
 }
 
 struct CursorCacheEntry {
@@ -888,6 +897,18 @@ impl EvertyDeskApp {
             host_pending_peer: None,
             show_settings: false,
             settings_draft: None,
+
+            // FSR: включается из config.display.fsr_quality
+            fsr_viewer: {
+                let cfg = AppConfig::load_or_create();
+                cfg.display.fsr_quality.to_fsr_quality().map(|q| {
+                    crate::fsr::FsrAdapter::new(crate::fsr::FsrConfig {
+                        quality:   q,
+                        sharpness: cfg.display.fsr_sharpness,
+                    })
+                })
+            },
+            fsr_native_size: None,
         }
     }
 
@@ -924,6 +945,7 @@ impl EvertyDeskApp {
         self.remote_texture = None;
         self.remote_size = [0, 0];
         self.last_frame_rgba.clear();
+        self.fsr_native_size = None; // сбросить при новом подключении
         self.clipboard_status = None;
         self.screenshot_status = None;
         self.log_status = None;
@@ -1113,9 +1135,48 @@ impl EvertyDeskApp {
                     self.png_fallback_started_at = None;
                 }
                 self.update_render_fps();
-                self.last_frame_rgba = rgba;
-                let image =
-                    ColorImage::from_rgba_unmultiplied([width, height], &self.last_frame_rgba);
+
+                // ── FSR на стороне клиента ─────────────────────────────────
+                // Если FSR включён и хост шлёт кадры в пониженном разрешении,
+                // апскейлим обратно до нативного (fsr_native_size) перед
+                // созданием текстуры — никаких изменений в протоколе не нужно.
+                let (final_rgba, final_w, final_h) = if let Some(ref mut fsr) = self.fsr_viewer {
+                    let (native_w, native_h) = self
+                        .fsr_native_size
+                        .unwrap_or((width as u32, height as u32));
+
+                    // Конвертируем RGBA → BGRA для FSR (FSR работает с BGRA)
+                    let mut bgra = vec![0u8; rgba.len()];
+                    for i in (0..rgba.len()).step_by(4) {
+                        bgra[i]     = rgba[i + 2]; // B
+                        bgra[i + 1] = rgba[i + 1]; // G
+                        bgra[i + 2] = rgba[i];     // R
+                        bgra[i + 3] = rgba[i + 3]; // A
+                    }
+
+                    let upscaled_bgra = fsr
+                        .process_bgra(&bgra, width as u32, height as u32, native_w, native_h)
+                        .to_owned();
+
+                    // BGRA → RGBA обратно
+                    let mut out_rgba = vec![0u8; upscaled_bgra.len()];
+                    for i in (0..upscaled_bgra.len()).step_by(4) {
+                        out_rgba[i]     = upscaled_bgra[i + 2]; // R
+                        out_rgba[i + 1] = upscaled_bgra[i + 1]; // G
+                        out_rgba[i + 2] = upscaled_bgra[i];     // B
+                        out_rgba[i + 3] = 255;
+                    }
+
+                    (out_rgba, native_w as usize, native_h as usize)
+                } else {
+                    (rgba, width, height)
+                };
+
+                self.last_frame_rgba = final_rgba;
+                let image = ColorImage::from_rgba_unmultiplied(
+                    [final_w, final_h],
+                    &self.last_frame_rgba,
+                );
                 self.remote_size = image.size;
                 self.pending_image = Some(image);
                 self.last_screenshot_sid = sid;
@@ -1159,6 +1220,14 @@ impl EvertyDeskApp {
                 }
             }
             SessionEvent::Displays(displays) => {
+                // Запоминаем нативное разрешение хоста для FSR апскейла.
+                // Используем первый (primary) дисплей.
+                if let Some(primary) = displays.first() {
+                    if primary.width > 0 && primary.height > 0 {
+                        self.fsr_native_size =
+                            Some((primary.width as u32, primary.height as u32));
+                    }
+                }
                 self.remote_displays = displays;
                 if !self
                     .remote_displays

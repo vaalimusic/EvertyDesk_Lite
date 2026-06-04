@@ -6,6 +6,11 @@ edition = "2021"
 [features]
 default = ["live-h264", "live-vp9-mf"]
 live-h264  = ["dep:openh264"]
+# FSR: параллельная обработка строк через rayon (быстрее на многоядерных CPU)
+# Подключи rayon в [dependencies] и включи фичу: cargo build --features fsr-parallel
+fsr-parallel = []
+# FSR: GPU-ускорение через D3D11 Compute Shaders (только Windows)
+fsr-gpu      = ["dep:windows"]
 # `source-build` compiles libvpx from source — works on any distro (incl. Astra),
 # unlike the prebuilt path that only knows specific distributions. Needs
 # build-essential + nasm + cmake (same tools openh264 already uses).

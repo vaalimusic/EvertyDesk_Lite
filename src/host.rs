@@ -1171,6 +1171,24 @@ fn relay_session_inner(
     let shared_quality_milli = Arc::new(AtomicU32::new(quality_milli));
     let (out_tx, out_rx) = mpsc::channel::<PeerMessage>();
 
+    // ── FSR адаптер (опционально) ─────────────────────────────────────────────
+    let fsr_adapter = config.display.fsr_quality
+        .to_fsr_quality()
+        .map(|q| crate::fsr::FsrAdapter::new(crate::fsr::FsrConfig {
+            quality:   q,
+            sharpness: config.display.fsr_sharpness,
+        }));
+    if let Some(ref a) = fsr_adapter {
+        host_log(
+            events,
+            format!(
+                "FSR включён: {} | sharpness={:.3}",
+                a.config.quality.label(),
+                a.config.sharpness,
+            ),
+        );
+    }
+
     // ── Video thread ──────────────────────────────────────────────────────────
     let stop_v = stop.clone();
     let target_fps_v = shared_target_fps.clone();
@@ -1189,6 +1207,7 @@ fn relay_session_inner(
             encoder_preference,
             codec_preference,
             client_video,
+            fsr_adapter,
         );
     });
 
@@ -1236,6 +1255,7 @@ fn video_loop(
     encoder_preference: EncoderPreference,
     codec_preference: CodecPreference,
     client_video: ClientVideoSupport,
+    mut fsr: Option<crate::fsr::FsrAdapter>,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -1415,17 +1435,48 @@ fn video_loop(
             thread::sleep(Duration::from_millis(1));
             continue;
         };
-        let bgra = capture_bgra.as_slice();
         encode_stats.mark_capture_ms(elapsed_ms(capture_started));
+
+        // ── FSR: апскейл до нативного разрешения если включён ────────────────
+        // Захват делается в пониженном разрешении (cap_w × cap_h), FSR апскейлит
+        // обратно до нативного (enc_w × enc_h) с EASU + RCAS обострением.
+        let (enc_w, enc_h, fsr_bgra_owned);
+        let bgra: &[u8] = if let Some(ref mut fsr_adapter) = fsr {
+            let (native_w, native_h) = crate::capture::screen_size().unwrap_or((cap_w, cap_h));
+            if cap_w != native_w || cap_h != native_h {
+                fsr_bgra_owned = fsr_adapter
+                    .process_bgra(capture_bgra.as_slice(), cap_w, cap_h, native_w, native_h)
+                    .to_owned();
+                enc_w = native_w;
+                enc_h = native_h;
+                fsr_bgra_owned.as_slice()
+            } else {
+                // Native режим — только RCAS (нет апскейла)
+                fsr_bgra_owned = fsr_adapter
+                    .process_bgra(capture_bgra.as_slice(), cap_w, cap_h, cap_w, cap_h)
+                    .to_owned();
+                enc_w = cap_w;
+                enc_h = cap_h;
+                fsr_bgra_owned.as_slice()
+            }
+        } else {
+            fsr_bgra_owned = Vec::new(); // FSR выключен — owned-буфер не нужен, только заглушка
+            #[allow(unused_variables)]
+            let _ = &fsr_bgra_owned;
+            enc_w = cap_w;
+            enc_h = cap_h;
+            capture_bgra.as_slice()
+        };
+
         let quality = quality_milli.load(Ordering::Relaxed);
-        let bitrate = h264_target_bitrate_bps(cap_w, cap_h, fps, quality);
+        let bitrate = h264_target_bitrate_bps(enc_w, enc_h, fps, quality);
 
         // Encode at native resolution (downscaling broke decoding on the phone
         // when the stream size differed from the announced DisplayInfo).
         let key_interval = u64::from(fps.max(1) * 2);
         let periodic_key = frame_idx % key_interval == 1;
         let change_started = Instant::now();
-        let decision = change_detector.decide(cap_w, cap_h, &bgra, periodic_key);
+        let decision = change_detector.decide(enc_w, enc_h, bgra, periodic_key);
         encode_stats.mark_change_ms(elapsed_ms(change_started));
         if !decision.send {
             if let Some(delay) = change_detector.static_backoff_delay(fps) {
@@ -1449,8 +1500,8 @@ fn video_loop(
             match encode_mf_frame(
                 &mut mf_encoder,
                 codec,
-                cap_w,
-                cap_h,
+                enc_w,
+                enc_h,
                 fps,
                 bitrate,
                 &bgra,
@@ -1507,8 +1558,8 @@ fn video_loop(
                 match encode_videotoolbox_frame(
                     &mut videotoolbox_encoder,
                     codec,
-                    cap_w,
-                    cap_h,
+                    enc_w,
+                    enc_h,
                     fps,
                     bitrate,
                     &bgra,
@@ -1563,8 +1614,8 @@ fn video_loop(
                 match encode_nvenc_frame(
                     &mut nvenc_encoder,
                     codec,
-                    cap_w,
-                    cap_h,
+                    enc_w,
+                    enc_h,
                     fps,
                     bitrate,
                     &bgra,
@@ -1621,8 +1672,8 @@ fn video_loop(
                 &mut encoder,
                 #[cfg(feature = "live-h264")]
                 &mut yuv_frame,
-                cap_w,
-                cap_h,
+                enc_w,
+                enc_h,
                 &bgra,
                 decision.force_key,
             )
@@ -1633,7 +1684,7 @@ fn video_loop(
         encode_stats.mark_encode_ms(elapsed_ms(encode_started));
 
         if let Some(packet) = packet {
-            encode_stats.mark_sent(&packet, cap_w, cap_h);
+            encode_stats.mark_sent(&packet, enc_w, enc_h);
             let send_started = Instant::now();
             let frame_msg = PeerMessage {
                 union: Some(peer_message::Union::VideoFrame(VideoFrame {
@@ -1649,7 +1700,7 @@ fn video_loop(
                 break;
             }
             encode_stats.mark_send_ms(elapsed_ms(send_started));
-            change_detector.mark_sent(cap_w, cap_h, &bgra);
+            change_detector.mark_sent(enc_w, enc_h, &bgra);
         }
         maybe_log_video_telemetry(
             &events,
