@@ -710,6 +710,11 @@ pub mod misc {
         RefreshVideoDisplay(i32),
         #[prost(uint32, tag = "35")]
         SelectedSid(u32),
+        /// EVRT: хост сообщает свой UDP порт для прямого стриминга.
+        /// Клиент получает → punch-hole → переключается на EVRT UDP.
+        /// tag 100 — вне диапазона стандартных RustDesk полей.
+        #[prost(uint32, tag = "100")]
+        EvrtUdpPort(u32),
     }
 }
 

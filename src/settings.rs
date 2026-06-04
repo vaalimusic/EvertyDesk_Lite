@@ -374,10 +374,14 @@ pub struct AppConfig {
     #[serde(default)]
     pub ui: UiConfig,
     /// Optional: bind the hbbs UDP socket to this specific local port.
-    /// Useful when `--bind-port` is passed on the CLI so we can reuse the
-    /// port that was previously registered with the ID server.
     #[serde(default)]
     pub udp_bind_port: u16,
+
+    /// Порт для выделенного EVRT UDP сокета (прямой стриминг).
+    /// 0 = случайный свободный порт.
+    /// Рекомендуется зафиксировать (например 45123) чтобы открыть правило файрвола.
+    #[serde(default)]
+    pub evrt_udp_port: u16,
     /// Optional: 32-byte Ed25519 public key (raw bytes) to send in
     /// RegisterPk instead of the SHA-256 derived fake key.  Set by
     /// `--use-everty-keys` to pick up the key from the installed EvertyDesk.
@@ -423,6 +427,7 @@ impl AppConfig {
             llm: LlmConfig::default(),
             ui: UiConfig::default(),
             udp_bind_port: 0,
+            evrt_udp_port: 0,
             host_pk: Vec::new(),
             host_sign_pk: sign_pk,
             host_sign_sk: sign_sk,

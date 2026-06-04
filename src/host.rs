@@ -1200,6 +1200,31 @@ fn relay_session_inner(
     };
     send_peer_enc(&mut relay, &mut cipher, &login_ok)?;
 
+    // ── 4а. EVRT: открываем выделенный UDP сокет и сообщаем порт клиенту ─────
+    //
+    // Отдельный сокет — не hbbs-порт. Это решает проблему конкуренции:
+    //   hbbs-сокет: только heartbeats/регистрация
+    //   evrt-сокет: только видео/feedback
+    //
+    // Клиент получает порт → punch-hole → EVRT сессия.
+    // Если UDP не поднялся за 2 сек — клиент остаётся на TCP relay.
+    let evrt_socket = try_open_evrt_socket(config, events);
+
+    if let Some((ref sock, evrt_port)) = evrt_socket {
+        let misc = PeerMessage {
+            union: Some(peer_message::Union::Misc(Misc {
+                union: Some(misc::Union::EvrtUdpPort(evrt_port as u32)),
+            })),
+        };
+        match send_peer_enc(&mut relay, &mut cipher, &misc) {
+            Ok(()) => host_log(
+                events,
+                format!("EVRT: Misc{{EvrtUdpPort={evrt_port}}} sent → клиент"),
+            ),
+            Err(e) => host_log(events, format!("EVRT: Misc send failed: {e}")),
+        }
+    }
+
     let target_fps = negotiated_target_fps(&login, config.display.target_fps);
     let quality_milli = negotiated_quality_milli(&login);
     let client_video = client_video_support(&login);
@@ -1252,7 +1277,60 @@ fn relay_session_inner(
         );
     }
 
-    // ── Video thread ──────────────────────────────────────────────────────────
+    // ── EVRT UDP сессия (параллельно с TCP relay) ─────────────────────────────
+    // Запускаем EVRT поверх выделенного UDP сокета если он открылся.
+    // EVRT и TCP relay работают параллельно — клиент переключится на UDP
+    // как только получит первый EVRT кадр. TCP relay используется как fallback.
+    if let Some((evrt_sock, evrt_port)) = evrt_socket {
+        let evrt_cfg    = config.clone();
+        let evrt_events = events.clone();
+        let evrt_stop   = stop.clone();
+        let evrt_fps    = shared_target_fps.clone();
+        let evrt_qual   = shared_quality_milli.clone();
+        let evrt_pid    = peer_id.to_owned();
+
+        host_log(events, format!("EVRT: запускаем UDP сессию на порту {evrt_port}"));
+
+        thread::spawn(move || {
+            // Ждём первого punch от клиента (до 5 сек)
+            let mut buf     = vec![0u8; crate::evrt::MAX_PACKET_SIZE + 64];
+            let deadline    = std::time::Instant::now() + Duration::from_secs(5);
+            evrt_sock.set_read_timeout(Some(Duration::from_millis(300))).ok();
+            let mut peer_addr = None;
+
+            while std::time::Instant::now() < deadline
+                && !evrt_stop.load(Ordering::Relaxed)
+            {
+                if let Ok((_, src)) = evrt_sock.recv_from(&mut buf) {
+                    host_log(&evrt_events, format!("EVRT: punch от {src}"));
+                    peer_addr = Some(src);
+                    break;
+                }
+            }
+
+            let Some(peer_addr) = peer_addr else {
+                host_log(&evrt_events, "EVRT: клиент не прислал punch, используем TCP relay".into());
+                return;
+            };
+
+            let params = crate::evrt_session::EvrtSessionParams {
+                peer_addr,
+                socket:        evrt_sock,
+                config:        evrt_cfg,
+                peer_id:       evrt_pid,
+                events:        evrt_events,
+                stop:          evrt_stop,
+                target_fps:    evrt_fps,
+                quality_milli: evrt_qual,
+            };
+
+            if let Err(e) = crate::evrt_session::run_evrt_session(params) {
+                eprintln!("[evrt] сессия завершилась: {e}");
+            }
+        });
+    }
+
+    // ── Video thread (TCP relay — fallback пока EVRT не подключился) ─────────
     let stop_v = stop.clone();
     let target_fps_v = shared_target_fps.clone();
     let quality_milli_v = shared_quality_milli.clone();
@@ -1294,10 +1372,33 @@ fn relay_session_inner(
         }
     }
     stop.store(true, Ordering::Relaxed);
+
+    // Обрываем TCP соединение — это разблокирует send_framed в video_loop
+    // который мог зависнуть ожидая дренажа буфера на Windows.
+    let _ = relay.shutdown(std::net::Shutdown::Both);
+
     if let Some(mut shell) = shell.take() {
         shell.stop();
     }
-    let _ = video_handle.join();
+
+    // video_handle.join() с таймаутом 2 сек.
+    // На Windows MF-энкодер иногда блокируется при cleanup — не ждём вечно.
+    // Если поток не завершился — просто отпускаем (он завершится когда сможет).
+    {
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        thread::spawn(move || {
+            let _ = video_handle.join();
+            let _ = done_tx.send(());
+        });
+        match done_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(()) => {} // нормальное завершение
+            Err(_) => {
+                // Поток не завершился за 2 сек — логируем и продолжаем.
+                // Код возврата 0xcfffffff больше не будет блокировать UI.
+                eprintln!("[host] video thread join timeout — detaching (MF encoder cleanup)");
+            }
+        }
+    }
 
     // Release any mouse buttons that may be stuck down (the session could end
     // mid-click), so the local desktop stays usable.
@@ -4377,4 +4478,34 @@ pub fn encode_mf_frame_pub(
 /// Публичная обёртка release_stuck_input — нужна для `evrt_session.rs`.
 pub fn release_stuck_input_pub() {
     release_stuck_input();
+}
+
+// ─── EVRT socket helper ───────────────────────────────────────────────────────
+
+/// Открыть выделенный UDP сокет для EVRT-сессии.
+///
+/// Порт берётся из конфига (`evrt_udp_port`) или выбирается случайный.
+/// Возвращает `None` если bind не удался.
+pub fn try_open_evrt_socket(
+    config: &AppConfig,
+    events: &Sender<HostEvent>,
+) -> Option<(Arc<UdpSocket>, u16)> {
+    // Порт из конфига или случайный
+    let bind_addr = if config.evrt_udp_port > 0 {
+        format!("0.0.0.0:{}", config.evrt_udp_port)
+    } else {
+        "0.0.0.0:0".to_owned()
+    };
+
+    match UdpSocket::bind(&bind_addr) {
+        Ok(sock) => {
+            let port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
+            host_log(events, format!("EVRT: UDP сокет открыт на порту {port}"));
+            Some((Arc::new(sock), port))
+        }
+        Err(e) => {
+            host_log(events, format!("EVRT: не удалось открыть UDP сокет: {e}"));
+            None
+        }
+    }
 }

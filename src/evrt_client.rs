@@ -1,3 +1,13 @@
+// =============================================================================
+// EVRT Protocol — разработан Артуром Валиевым (Artur Valiev)
+// Оригинальная реализация: EvertyGame (C#, https://github.com/djvaliev)
+// Rust-порт для EvertyDesk Lite выполнен на основе оригинальных алгоритмов.
+//
+// Протокол, алгоритмы адаптивной буферизации, система давления (pressure),
+// логика FeedbackLoop и LatestAccessUnitQueue — интеллектуальная собственность
+// Артура Валиева, разработанная в течение нескольких лет работы над EvertyGame.
+// =============================================================================
+
 //! EVRT клиент — прямое UDP подключение к хосту.
 //!
 //! # Как работает
@@ -123,6 +133,12 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
         session_cfg.codec,
         session_cfg.bitrate as f64 / 1_000_000.0,
     )));
+    // ★ Уведомляем UI — EVRT активен
+    let _ = events.send(SessionEvent::EvrtStatus {
+        active:    true,
+        host_addr: host_addr.ip().to_string(),
+        port:      host_addr.port(),
+    });
 
     // ── Внутреннее состояние для метрик ──────────────────────────────────────
     let last_arrival_us  = Arc::new(AtomicU64::new(0));
@@ -291,6 +307,16 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
         let pkt = evrt::build_receiver_feedback(&fb);
         let _ = socket.send_to(&pkt, host_addr);
 
+        // ★ Метрики → UI (каждый тик feedback loop)
+        let _ = events.send(SessionEvent::EvrtMetrics {
+            pressure:         pressure.as_str().to_owned(),
+            arrival_delta_ms: arr_delta,
+            decode_delta_ms:  dec_delta,
+            jitter_ms,
+            bitrate_mbps:     0.0, // хост сообщает в SessionConfig keepalive
+            fps:              fps_decoded,
+        });
+
         // Если critical + задержка растёт → запрос keyframe
         if pressure == Pressure::Critical && queued > 0 {
             let kf = evrt::build_request_key_frame();
@@ -302,6 +328,13 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
     queue.close();
     let _ = recv_handle.join();
     let _ = decode_handle.join();
+
+    // ★ Уведомляем UI — EVRT завершён
+    let _ = events.send(SessionEvent::EvrtStatus {
+        active:    false,
+        host_addr: host_addr.ip().to_string(),
+        port:      host_addr.port(),
+    });
 
     evrt_log(&events, "EVRT client session ended".into());
     EvrtConnectResult::Ok

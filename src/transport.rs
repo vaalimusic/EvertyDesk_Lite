@@ -103,6 +103,21 @@ pub enum SessionEvent {
     ShellOutput(String),
     ShellClosed,
     ShellError(String),
+    /// EVRT прямое UDP соединение установлено / разорвано.
+    EvrtStatus {
+        active:    bool,
+        host_addr: String,
+        port:      u16,
+    },
+    /// EVRT метрики в реальном времени.
+    EvrtMetrics {
+        pressure:         String,  // "normal" / "high" / "critical"
+        arrival_delta_ms: i32,
+        decode_delta_ms:  i32,
+        jitter_ms:        u32,
+        bitrate_mbps:     f32,
+        fps:              u32,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -308,7 +323,7 @@ impl TransportClient {
         request: ConnectionRequest,
         mut progress: impl FnMut(u8, String),
     ) -> Result<ConnectionState, String> {
-        let (_relay_stream, peer_stage, _displays) =
+        let (_relay_stream, peer_stage, _displays, _evrt_port) =
             establish_session(request.clone(), &mut progress)?;
 
         progress(99, format!("Login stage: {peer_stage}"));
@@ -373,7 +388,8 @@ impl TransportClient {
             }
         }
 
-        let (mut relay, peer_stage, displays) = match establish_session(request, &mut emit_progress)
+        let (mut relay, peer_stage, displays, evrt_host_port) =
+            match establish_session(request.clone(), &mut emit_progress)
         {
             Ok(session) => session,
             Err(err) => {
@@ -384,10 +400,52 @@ impl TransportClient {
 
         eprintln!("[session] Connected: {peer_stage}");
         eprintln!("[session] Displays from login: {}", displays.len());
+        if let Some(port) = evrt_host_port {
+            eprintln!("[session] EVRT host UDP port: {port}");
+        }
         let _ = events.send(SessionEvent::Connected(peer_stage));
         let mut known_displays = displays;
         if !known_displays.is_empty() {
             let _ = events.send(SessionEvent::Displays(known_displays.clone()));
+        }
+
+        // ★ EVRT: если хост сообщил UDP порт — пробуем прямое соединение.
+        //
+        // Правильный IP хоста берём из PunchHoleResponse.socket_addr (hbbs знает
+        // внешний адрес хоста). Заменяем порт на evrt_port из Misc.
+        // Запускаем в фоне: если за 4 сек не ответил → остаёмся на TCP relay.
+        if let Some(evrt_port) = evrt_host_port {
+            // Получаем внешний IP хоста от hbbs (force_relay=false)
+            let host_addr = establish_session_info(&request, &mut |_, _| {})
+                .ok()
+                .and_then(|info| info.peer_udp_addr)
+                .and_then(|bytes| crate::evrt_session::decode_punch_addr(&bytes))
+                .map(|mut addr| { addr.set_port(evrt_port); addr });
+
+            if let Some(host_addr) = host_addr {
+                let evrt_events = events.clone();
+                let evrt_stop   = std::sync::Arc::new(
+                    std::sync::atomic::AtomicBool::new(false),
+                );
+                let evrt_ull = display_config.target_fps >= 60;
+
+                eprintln!("[evrt-client] прямой UDP → {host_addr} (IP от hbbs, порт {evrt_port})");
+
+                thread::spawn(move || {
+                    if let Ok(udp) = std::net::UdpSocket::bind("0.0.0.0:0") {
+                        let udp = std::sync::Arc::new(udp);
+                        crate::evrt_client::try_evrt_before_relay(
+                            &udp,
+                            host_addr,
+                            &evrt_events,
+                            evrt_stop,
+                            evrt_ull,
+                        );
+                    }
+                });
+            } else {
+                eprintln!("[evrt-client] не удалось получить внешний IP хоста — TCP relay");
+            }
         }
         let (frame_tx, frame_rx) = mpsc::channel::<DecoderInput>();
         let (decoder_feedback_tx, decoder_feedback_rx) = mpsc::channel::<DecoderFeedback>();
@@ -1084,7 +1142,7 @@ fn establish_session_info(
 fn establish_session(
     request: ConnectionRequest,
     progress: &mut impl FnMut(u8, String),
-) -> Result<(TcpStream, String, Vec<RemoteDisplay>), String> {
+) -> Result<(TcpStream, String, Vec<RemoteDisplay>, Option<u16>), String> {
     progress(5, "Validating input".to_owned());
     if request.remote_id.is_empty() {
         return Err("Enter remote ID".to_owned());
@@ -1196,7 +1254,9 @@ fn establish_session(
             bootstrap_wait_secs,
             progress,
         ) {
-            Ok((peer_stage, displays)) => return Ok((relay_stream, peer_stage, displays)),
+            Ok((peer_stage, displays, evrt_port)) => {
+                return Ok((relay_stream, peer_stage, displays, evrt_port));
+            }
             Err(err) => last_err = err,
         }
     }
@@ -1404,13 +1464,14 @@ fn read_initial_peer_stage(
     codec_preference: CodecPreference,
     bootstrap_wait_secs: u64,
     progress: &mut impl FnMut(u8, String),
-) -> Result<(String, Vec<RemoteDisplay>), String> {
+) -> Result<(String, Vec<RemoteDisplay>, Option<u16>), String> {
     relay
         .set_read_timeout(Some(Duration::from_millis(RELAY_HANDSHAKE_POLL_MS)))
         .map_err(|err| format!("Failed to set relay read timeout: {err}"))?;
     let mut sent_login = false;
     let mut seen_peer_message = false;
     let wait_remote_accept = password.is_empty();
+    let mut evrt_port: Option<u16> = None;
     let started = Instant::now();
     let bootstrap_deadline = started + Duration::from_secs(bootstrap_wait_secs);
     let auth_deadline = started + Duration::from_secs(RELAY_AUTH_WAIT_SECS);
@@ -1515,6 +1576,7 @@ fn read_initial_peer_stage(
                 return Ok((
                     format!("{login}; screenshot/control channel ready"),
                     displays,
+                    evrt_port,
                 ));
             }
             Some(peer_message::Union::PeerInfo(info)) => {
@@ -1529,13 +1591,22 @@ fn read_initial_peer_stage(
                 return Ok((
                     format!("{login}; screenshot/control channel ready"),
                     displays,
+                    evrt_port,
                 ));
             }
             Some(peer_message::Union::PublicKey(_)) => {}
             Some(peer_message::Union::TestDelay(delay)) => {
                 echo_test_delay(relay, delay)?;
             }
-            Some(peer_message::Union::Misc(_)) => {}
+            Some(peer_message::Union::Misc(misc_msg)) => {
+                // ★ EVRT: хост сообщает свой UDP порт для прямого стриминга
+                if let Some(misc::Union::EvrtUdpPort(port)) = misc_msg.union {
+                    if port > 0 && port <= 65535 {
+                        evrt_port = Some(port as u16);
+                        eprintln!("[evrt-client] EvrtUdpPort={port} получен");
+                    }
+                }
+            }
             Some(peer_message::Union::Shell(_)) => {}
             Some(peer_message::Union::MouseEvent(_))
             | Some(peer_message::Union::KeyEvent(_))
@@ -1551,6 +1622,7 @@ fn read_initial_peer_stage(
                         describe_video_frame(&frame)
                     ),
                     Vec::new(),
+                    evrt_port,
                 ));
             }
             Some(peer_message::Union::LoginRequest(_)) => {

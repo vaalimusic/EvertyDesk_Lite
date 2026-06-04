@@ -802,6 +802,7 @@ fn default_config_from(config: &AppConfig) -> AppConfig {
         local_password: config.local_password.clone(),
         ui: config.ui.clone(),
         udp_bind_port: 0,
+        evrt_udp_port: 0,
         host_pk: Vec::new(),
         host_sign_pk: config.host_sign_pk.clone(),
         host_sign_sk: config.host_sign_sk.clone(),

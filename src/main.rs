@@ -657,6 +657,22 @@ struct EvertyDeskApp {
     last_live_frame_at: Option<Instant>,
     stream_health: String,
     wheel_accum: egui::Vec2,
+
+    // ── EVRT статус ───────────────────────────────────────────────────────────
+    /// EVRT прямой UDP активен
+    evrt_active: bool,
+    /// Адрес хоста для EVRT
+    evrt_host_addr: String,
+    /// Давление (normal/high/critical)
+    evrt_pressure: String,
+    /// Задержка прибытия пакетов (мс)
+    evrt_arrival_delta_ms: i32,
+    /// Задержка декодирования (мс)
+    evrt_decode_delta_ms: i32,
+    /// Jitter буфер (мс)
+    evrt_jitter_ms: u32,
+    /// FPS EVRT
+    evrt_fps: u32,
     /// Cache of remote cursor images by cursor ID (RGBA + hotspot).
     cursor_cache: HashMap<u64, CursorCacheEntry>,
     /// Pending cursor image to be loaded into a texture in the next frame.
@@ -890,6 +906,13 @@ impl EvertyDeskApp {
             last_live_frame_at: None,
             stream_health: "ожидание кадра".to_owned(),
             wheel_accum: egui::Vec2::ZERO,
+            evrt_active: false,
+            evrt_host_addr: String::new(),
+            evrt_pressure: "normal".to_owned(),
+            evrt_arrival_delta_ms: -1,
+            evrt_decode_delta_ms: -1,
+            evrt_jitter_ms: 0,
+            evrt_fps: 0,
             cursor_cache: HashMap::new(),
             pending_cursor: None,
             cursor_texture: None,
@@ -1309,6 +1332,29 @@ impl EvertyDeskApp {
                     .push_str(&format!("\r\n[console error] {err}\r\n"));
             }
             SessionEvent::Info(message) => self.log(message),
+            SessionEvent::EvrtStatus { active, host_addr, port } => {
+                self.evrt_active = active;
+                self.evrt_host_addr = if active {
+                    format!("{host_addr}:{port}")
+                } else {
+                    String::new()
+                };
+                if active {
+                    self.stream_health = format!("EVRT UDP прямой → {host_addr}:{port}");
+                    self.log(format!("✓ EVRT прямое UDP соединение: {host_addr}:{port}"));
+                } else {
+                    self.evrt_pressure = "normal".to_owned();
+                }
+            }
+            SessionEvent::EvrtMetrics {
+                pressure, arrival_delta_ms, decode_delta_ms, jitter_ms, fps, ..
+            } => {
+                self.evrt_pressure         = pressure;
+                self.evrt_arrival_delta_ms = arrival_delta_ms;
+                self.evrt_decode_delta_ms  = decode_delta_ms;
+                self.evrt_jitter_ms        = jitter_ms;
+                self.evrt_fps              = fps;
+            }
             SessionEvent::Failed(err) => {
                 self.busy = false;
                 self.connected = false;
@@ -3286,6 +3332,31 @@ impl EvertyDeskApp {
                         .size(11.0)
                         .color(stream_health_color(&self.stream_health)),
                 );
+
+                // ── EVRT бейдж ────────────────────────────────────────────────
+                if self.evrt_active {
+                    ui.separator();
+                    let pressure_color = match self.evrt_pressure.as_str() {
+                        "critical" => egui::Color32::from_rgb(220, 70, 70),
+                        "high"     => egui::Color32::from_rgb(220, 170, 50),
+                        _          => egui::Color32::from_rgb(50, 200, 120),
+                    };
+                    ui.label(
+                        egui::RichText::new("⚡ EVRT")
+                            .strong()
+                            .size(12.0)
+                            .color(pressure_color),
+                    )
+                    .on_hover_ui(|ui| {
+                        ui.label(format!("Прямой UDP: {}", self.evrt_host_addr));
+                        ui.separator();
+                        ui.label(format!("Давление:  {}", self.evrt_pressure));
+                        ui.label(format!("Δ прибытие: {} мс", self.evrt_arrival_delta_ms));
+                        ui.label(format!("Δ декод:    {} мс", self.evrt_decode_delta_ms));
+                        ui.label(format!("Jitter:     {} мс", self.evrt_jitter_ms));
+                        ui.label(format!("FPS:        {}", self.evrt_fps));
+                    });
+                }
 
                 for status in [
                     self.clipboard_status.as_deref(),
