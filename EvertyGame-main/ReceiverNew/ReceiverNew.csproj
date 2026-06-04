@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="LibVLCSharp.WinForms" Version="3.9.6" />
+    <PackageReference Include="NAudio" Version="2.2.1" />
+    <PackageReference Include="Nefarius.ViGEm.Client" Version="1.21.256" />
+    <PackageReference Include="VideoLAN.LibVLC.Windows" Version="3.0.23" />
+    <PackageReference Include="Vortice.Direct3D11" Version="3.8.3" />
+    <PackageReference Include="Vortice.DXGI" Version="3.8.3" />
+    <PackageReference Include="Vortice.MediaFoundation" Version="3.8.3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\receiver-native\ControlPlaneAgent.cs" Link="Shared\ControlPlaneAgent.cs" />
+    <Compile Include="..\receiver-native\EvrtPacketizer.cs" Link="Shared\EvrtPacketizer.cs" />
+    <Compile Include="..\receiver-native\GlobalUsings.cs" Link="Shared\GlobalUsings.cs" />
+    <Compile Include="..\receiver-native\LatencyPulseOverlayController.cs" Link="Shared\LatencyPulseOverlayController.cs" />
+    <Compile Include="..\receiver-native\MediaFoundationRuntime.cs" Link="Shared\MediaFoundationRuntime.cs" />
+    <Compile Include="..\receiver-native\Protocol.cs" Link="Shared\Protocol.cs" />
+    <Compile Include="..\receiver-native\ReceiverTrace.cs" Link="Shared\ReceiverTrace.cs" />
+    <Compile Include="..\receiver-native\RelayTransportRoute.cs" Link="Shared\RelayTransportRoute.cs" />
+    <Compile Include="..\receiver-native\WindowsRemoteInputInjector.cs" Link="Shared\WindowsRemoteInputInjector.cs" />
+    <Compile Include="..\receiver-native\WindowsSenderEncoderBackend.cs" Link="Shared\WindowsSenderEncoderBackend.cs" />
+    <Compile Include="..\receiver-native\WindowsSenderPreset.cs" Link="Shared\WindowsSenderPreset.cs" />
+    <Compile Include="..\receiver-native\WindowsSenderSession.cs" Link="Shared\WindowsSenderSession.cs" />
+    <Compile Include="..\receiver-native\WindowsVideoCodec.cs" Link="Shared\WindowsVideoCodec.cs" />
+    <Compile Include="..\receiver-native\WindowsVirtualGamepadInjector.cs" Link="Shared\WindowsVirtualGamepadInjector.cs" />
+  </ItemGroup>
+
+</Project>

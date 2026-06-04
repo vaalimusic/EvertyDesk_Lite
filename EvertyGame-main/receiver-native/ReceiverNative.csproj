@@ -1,0 +1,37 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <NativeNvencBridgeProject>$(MSBuildProjectDirectory)\nvenc-bridge\everty_nvenc_bridge.vcxproj</NativeNvencBridgeProject>
+    <NativeNvencBridgeOutput>$(MSBuildProjectDirectory)\nvenc-bridge\bin\$(Configuration)\x64\everty_nvenc_bridge.dll</NativeNvencBridgeOutput>
+    <NativeMsBuildPath Condition="Exists('C:\Program Files\Microsoft Visual Studio\18\Insiders\MSBuild\Current\Bin\MSBuild.exe')">C:\Program Files\Microsoft Visual Studio\18\Insiders\MSBuild\Current\Bin\MSBuild.exe</NativeMsBuildPath>
+    <NativeMsBuildPath Condition="'$(NativeMsBuildPath)' == ''">msbuild</NativeMsBuildPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="LibVLCSharp.WinForms" Version="3.9.6" />
+    <PackageReference Include="NAudio" Version="2.2.1" />
+    <PackageReference Include="Nefarius.ViGEm.Client" Version="1.21.256" />
+    <PackageReference Include="VideoLAN.LibVLC.Windows" Version="3.0.23" />
+    <PackageReference Include="Vortice.Direct3D11" Version="3.8.3" />
+    <PackageReference Include="Vortice.DXGI" Version="3.8.3" />
+    <PackageReference Include="Vortice.MediaFoundation" Version="3.8.3" />
+  </ItemGroup>
+
+  <Target Name="BuildNativeNvencBridge" BeforeTargets="Build" Condition="$([System.IO.File]::Exists('$(NativeNvencBridgeProject)'))">
+    <Exec Command="&quot;$(NativeMsBuildPath)&quot; &quot;$(NativeNvencBridgeProject)&quot; /p:Configuration=$(Configuration) /p:Platform=x64 /t:Build" />
+    <Copy SourceFiles="$(NativeNvencBridgeOutput)"
+          DestinationFiles="$(OutputPath)everty_nvenc_bridge.dll"
+          SkipUnchangedFiles="true"
+          Condition="$([System.IO.File]::Exists('$(NativeNvencBridgeOutput)'))" />
+  </Target>
+
+</Project>

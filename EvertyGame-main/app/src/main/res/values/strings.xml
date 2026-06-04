@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Everty Sender</string>
+    <string name="touch_latency_sprint_service_name">Everty Touch Latency Sprint</string>
+    <string name="touch_latency_sprint_service_description">Triggers a short low-latency sender sprint on touch and scroll interactions.</string>
+</resources>

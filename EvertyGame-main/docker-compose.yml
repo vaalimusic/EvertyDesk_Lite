@@ -1,0 +1,44 @@
+services:
+  control-plane:
+    build:
+      context: .
+      dockerfile: control-plane/Dockerfile
+    environment:
+      ASPNETCORE_URLS: ${ASPNETCORE_URLS:-http://+:5180}
+      EVERTY_CONTROL_PLANE_STATE_PATH: ${EVERTY_CONTROL_PLANE_STATE_PATH:-/data/state.json}
+      EVERTY_CONTROL_PLANE_ACCESS_TOKEN_HOURS: ${EVERTY_CONTROL_PLANE_ACCESS_TOKEN_HOURS:-12}
+      EVERTY_CONTROL_PLANE_REFRESH_TOKEN_DAYS: ${EVERTY_CONTROL_PLANE_REFRESH_TOKEN_DAYS:-30}
+      EVERTY_CONTROL_PLANE_MAX_REQUEST_BODY_BYTES: ${EVERTY_CONTROL_PLANE_MAX_REQUEST_BODY_BYTES:-1048576}
+      EVERTY_CONTROL_PLANE_DEMO_AUTH_ENABLED: ${EVERTY_CONTROL_PLANE_DEMO_AUTH_ENABLED:-true}
+      EVERTY_CONTROL_PLANE_OPERATOR_KEY: ${EVERTY_CONTROL_PLANE_OPERATOR_KEY:-local-dev-operator-key}
+      EVERTY_CONTROL_PLANE_PAYMENT_PROVIDER: ${EVERTY_CONTROL_PLANE_PAYMENT_PROVIDER:-manual}
+      EVERTY_CONTROL_PLANE_PAYMENT_PROVIDER_ENDPOINT: ${EVERTY_CONTROL_PLANE_PAYMENT_PROVIDER_ENDPOINT:-}
+      EVERTY_CONTROL_PLANE_PAYMENT_PROVIDER_API_KEY: ${EVERTY_CONTROL_PLANE_PAYMENT_PROVIDER_API_KEY:-}
+    ports:
+      - "${EVERTY_CONTROL_PLANE_PORT:-5180}:5180"
+    volumes:
+      - control-plane-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:5180/api/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  relay-node:
+    build:
+      context: .
+      dockerfile: relay-node/Dockerfile
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    environment:
+      EVERTY_RELAY_CONTROL_PLANE: ${EVERTY_RELAY_CONTROL_PLANE:-http://control-plane:5180}
+      EVERTY_RELAY_DISPLAY_NAME: ${EVERTY_RELAY_DISPLAY_NAME:-Docker Relay}
+      EVERTY_RELAY_REGION: ${EVERTY_RELAY_REGION:-local}
+      EVERTY_RELAY_PUBLIC_ADDRESS: ${EVERTY_RELAY_PUBLIC_ADDRESS:-127.0.0.1}
+      EVERTY_RELAY_UDP_PORT: ${EVERTY_RELAY_UDP_PORT:-6200}
+    ports:
+      - "${EVERTY_RELAY_HOST_UDP_PORT:-6200}:${EVERTY_RELAY_UDP_PORT:-6200}/udp"
+
+volumes:
+  control-plane-data:
