@@ -75,8 +75,9 @@ pub struct PipelineConfig {
     pub peer_id:      String,
     pub events:       Sender<HostEvent>,
     pub relay_stream: std::net::TcpStream,
+    /// Шифрование исходящего TCP потока (видео).
+    /// RecvCipher остаётся в relay_session_inner для расшифровки управляющих сообщений.
     pub send_cipher:  Option<crate::crypto::SendCipher>,
-    pub recv_cipher:  Option<crate::crypto::RecvCipher>,
     pub evrt_socket:  Option<Arc<UdpSocket>>,
     pub cmd_rx:       Receiver<PipelineCmd>,
     pub peer_msg_rx:  Receiver<crate::rustdesk_proto::PeerMessage>,
@@ -87,7 +88,7 @@ pub struct PipelineConfig {
 pub fn run(cfg: PipelineConfig) {
     let PipelineConfig {
         app_config, peer_id, events,
-        relay_stream, send_cipher, recv_cipher: _,
+        relay_stream, send_cipher,
         evrt_socket, cmd_rx, peer_msg_rx: _,
     } = cfg;
 
@@ -222,10 +223,7 @@ fn encode_loop(
     evrt_active: Arc<Mutex<Option<SocketAddr>>>,
     idr_rx:      Receiver<()>,
 ) {
-    use crate::host::{
-        choose_mf_encoder_codec_pub, encode_mf_frame_pub,
-        h264_target_bitrate_bps_pub, ClientVideoSupport,
-    };
+    use crate::host::{h264_target_bitrate_bps_pub, ClientVideoSupport, MultiEncoder};
     use crate::rustdesk_proto::PreferCodec;
 
     log(&events, "Encoder loop started".into());
@@ -233,12 +231,12 @@ fn encode_loop(
     let client_video = ClientVideoSupport {
         h264: true, h265: true, av1: false, prefer: PreferCodec::Auto,
     };
-    let desired_codec = choose_mf_encoder_codec_pub(
+
+    // ★ Единый каскад энкодеров: MF → VideoToolbox → NVENC → OpenH264 → PNG
+    let mut encoder = MultiEncoder::new(
         config.display.encoder, config.display.codec, client_video,
     );
-
-    let mut mf_enc:     Option<crate::mf_encode::MfVideoEncoder> = None;
-    let mut mf_disabled = false;
+    log(&events, format!("Encoder каскад: {}", encoder.backend_label()));
 
     // FSR
     let mut fsr = config.display.fsr_quality
@@ -332,55 +330,26 @@ fn encode_loop(
         let quality  = quality_ms.load(Ordering::Relaxed);
         let eff_bps  = h264_target_bitrate_bps_pub(enc_w, enc_h, fps, quality);
 
-        // Кодирование
-        let encoded: Option<(Vec<u8>, bool, Option<Vec<u8>>)> =
-            if let Some(codec) = desired_codec.filter(|_| !mf_disabled) {
-                match encode_mf_frame_pub(
-                    &mut mf_enc, codec, enc_w, enc_h, fps, eff_bps, bgra, want_idr,
-                ) {
-                    Ok(Some(pkt)) => {
-                        let sps = if pkt.key {
-                            mf_enc.as_ref().and_then(|e| e.codec_config())
-                        } else {
-                            None
-                        };
-                        Some((pkt.bytes, pkt.key, sps))
-                    }
-                    Ok(None) => None,
-                    Err(e) => {
-                        log(&events, format!("Encode error: {e} — MF disabled"));
-                        mf_disabled = true;
-                        None
-                    }
-                }
-            } else if want_idr {
-                Some((encode_png(&bgra_raw, cap_w, cap_h), true, None))
-            } else {
-                None
-            };
-
-        let Some((bytes, is_idr, sps_pps)) = encoded else { continue };
+        // ── Кодирование через единый каскад ───────────────────────────────────
+        let Some(out) = encoder.encode(enc_w, enc_h, fps, eff_bps, bgra, want_idr)
+        else { continue };
 
         frame_id = frame_id.wrapping_add(1);
         let pts_us = sample_hns / 10;
         sample_hns = sample_hns.wrapping_add(hns_per_frame(fps));
 
+        let is_idr = out.key;
         if is_idr { last_idr = Instant::now(); }
 
-        let codec_label: &'static str = match desired_codec {
-            Some(c) if c == crate::nvenc::NvencCodec::H265 => "H265",
-            _ => "H264",
-        };
-
         let frame = EncodedFrame {
-            bytes:    Arc::new(bytes),
+            bytes:    Arc::new(out.bytes),
             is_idr,
             frame_id,
             pts_us,
-            sps_pps:  sps_pps.map(Arc::new),
+            sps_pps:  out.sps_pps.map(Arc::new),
             width:    enc_w,
             height:   enc_h,
-            codec:    codec_label,
+            codec:    out.codec,
         };
 
         // ── Dispatch ──────────────────────────────────────────────────────────
@@ -536,16 +505,6 @@ fn evrt_send_loop(
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
-
-fn encode_png(bgra: &[u8], w: u32, h: u32) -> Vec<u8> {
-    use image::{ImageBuffer, Rgba};
-    let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
-        ImageBuffer::from_raw(w, h, bgra.to_vec())
-            .unwrap_or_else(|| ImageBuffer::new(w, h));
-    let mut out = Vec::new();
-    img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).ok();
-    out
-}
 
 fn log(events: &Sender<HostEvent>, msg: String) {
     eprintln!("[pipeline] {msg}");

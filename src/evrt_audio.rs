@@ -19,6 +19,10 @@
 //! Формат: PCM 16-bit stereo 48000 Hz (совместим с любым устройством).
 //! Фрейм: 480 сэмплов (10 мс при 48kHz) = 1920 байт → всегда влезает в один UDP пакет.
 
+// Полная API-поверхность EVRT-протокола: часть методов — публичный
+// интерфейс для будущего использования (enhancement layer, audio config, jitter API).
+#![allow(dead_code)]
+
 use std::{
     net::{SocketAddr, UdpSocket},
     sync::{

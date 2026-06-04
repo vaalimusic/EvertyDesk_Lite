@@ -1200,7 +1200,7 @@ fn relay_session_inner(
     //
     // Заменяет старую схему двух параллельных систем (video_loop + evrt_session).
     // Один MF энкодер, нет конкуренции, нет двойного захвата.
-    let (send_cipher, recv_cipher) = match cipher.take() {
+    let (send_cipher, mut recv_cipher) = match cipher.take() {
         Some(c) => { let (s, r) = c.into_halves(); (Some(s), Some(r)) }
         None    => (None, None),
     };
@@ -1214,13 +1214,14 @@ fn relay_session_inner(
     // Канал исходящих PeerMessage (shell output, etc.)
     let (peer_msg_tx, peer_msg_rx) = mpsc::channel::<PeerMessage>();
 
+    // recv_cipher НЕ идёт в pipeline — остаётся в input loop этого треда
+    // для расшифровки MouseEvent/KeyEvent от клиента.
     let pipeline_cfg = crate::video_pipeline::PipelineConfig {
         app_config:   config.clone(),
         peer_id:      peer_id.to_owned(),
         events:       events.clone(),
         relay_stream: write_stream,
         send_cipher,
-        recv_cipher,
         evrt_socket:  evrt_socket.map(|(s, _)| s),
         cmd_rx,
         peer_msg_rx,
@@ -1240,12 +1241,13 @@ fn relay_session_inner(
 
     // ── Input loop (этот тред) — читает TCP, шлёт команды в pipeline ─────────
     let _ = relay.set_read_timeout(Some(Duration::from_secs(1)));
-    let mut recv_cipher2: Option<crate::crypto::RecvCipher> = None; // cipher ушёл в pipeline
+    // recv_cipher здесь — используется для расшифровки входящих
+    // MouseEvent/KeyEvent от клиента. send_cipher ушёл в pipeline.
     let mut shell: Option<ShellRuntime> = None;
-    let (out_tx, _out_rx) = mpsc::channel::<PeerMessage>(); // legacy compat
+    let (peer_out_tx, _peer_out_rx) = mpsc::channel::<PeerMessage>();
 
     while !stop.load(Ordering::Relaxed) {
-        match recv_peer_rc2(&mut relay, &mut recv_cipher2) {
+        match recv_peer_rc(&mut relay, &mut recv_cipher) {
             Ok(Some(msg)) => handle_client_input_pipeline(
                 msg,
                 &cmd_tx,
@@ -1288,476 +1290,6 @@ fn relay_session_inner(
     Ok(())
 }
 
-/// Capture + encode + stream loop, run on its own thread.
-fn video_loop(
-    mut stream: TcpStream,
-    mut send_cipher: Option<crate::crypto::SendCipher>,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    target_fps: Arc<AtomicU32>,
-    quality_milli: Arc<AtomicU32>,
-    outgoing: Receiver<PeerMessage>,
-    events: Sender<HostEvent>,
-    encoder_preference: EncoderPreference,
-    codec_preference: CodecPreference,
-    client_video: ClientVideoSupport,
-    mut fsr: Option<crate::fsr::FsrAdapter>,
-) {
-    use std::sync::atomic::Ordering;
-
-    #[cfg(feature = "live-h264")]
-    let mut encoder = {
-        use openh264::encoder::{
-            BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode,
-            SpsPpsStrategy, UsageType,
-        };
-        let initial_fps = target_fps.load(Ordering::Relaxed).clamp(5, MAX_TARGET_FPS);
-        let (screen_w, screen_h) = crate::capture::screen_size().unwrap_or((1920, 1080));
-        let initial_quality = quality_milli.load(Ordering::Relaxed);
-        let bitrate = h264_target_bitrate_bps(screen_w, screen_h, initial_fps, initial_quality);
-        let cfg = EncoderConfig::new()
-            .usage_type(UsageType::ScreenContentRealTime)
-            .rate_control_mode(RateControlMode::Bitrate)
-            .bitrate(BitRate::from_bps(bitrate))
-            .max_frame_rate(FrameRate::from_hz(MAX_TARGET_FPS as f32))
-            .sps_pps_strategy(SpsPpsStrategy::IncreasingId)
-            .intra_frame_period(IntraFramePeriod::from_num_frames(MAX_TARGET_FPS * 2))
-            .num_threads(0);
-        let api = openh264::OpenH264API::from_source();
-        match Encoder::with_api_config(api, cfg) {
-            Ok(e) => Some(e),
-            Err(_) => {
-                eprintln!("[host-video] OpenH264 init failed; software H264 fallback disabled");
-                None
-            }
-        }
-    };
-    #[cfg(not(feature = "live-h264"))]
-    let mut encoder: Option<()> = None;
-    #[cfg(feature = "live-h264")]
-    let mut yuv_frame = YuvFrame::default();
-    let desired_mf_codec =
-        choose_mf_encoder_codec(encoder_preference, codec_preference, client_video);
-    let mut mf_encoder: Option<crate::mf_encode::MfVideoEncoder> = None;
-    let mut mf_disabled = false;
-    let mut mf_empty_packets = 0_u32;
-    let desired_videotoolbox_codec =
-        choose_videotoolbox_codec(encoder_preference, codec_preference, client_video);
-    let mut videotoolbox_encoder: Option<crate::videotoolbox::VideoToolboxEncoder> = None;
-    let mut videotoolbox_disabled = false;
-    let mut videotoolbox_empty_packets = 0_u32;
-    let desired_nvenc_codec =
-        choose_nvenc_codec(encoder_preference, codec_preference, client_video);
-    let mut nvenc_encoder: Option<crate::nvenc::NvencEncoder> = None;
-    let mut nvenc_disabled = false;
-    let mut nvenc_empty_packets = 0_u32;
-    let active_encoder_backend = match (
-        desired_mf_codec,
-        desired_videotoolbox_codec,
-        desired_nvenc_codec,
-    ) {
-        (Some(codec), _, _) => format!(
-            "Media Foundation {} requested, direct backend lazy-start",
-            codec.label()
-        ),
-        (None, Some(codec), _) => format!(
-            "VideoToolbox {} requested, direct backend lazy-start",
-            codec.label()
-        ),
-        (None, None, Some(codec)) => format!(
-            "NVENC {} requested, direct backend lazy-start",
-            codec.label()
-        ),
-        (None, None, None) if cfg!(feature = "live-h264") => "OpenH264 software".to_owned(),
-        (None, None, None) => "PNG fallback (live-h264 disabled)".to_owned(),
-    };
-    host_log(
-        &events,
-        format!(
-            "Video encoder policy: {}; active backend: {active_encoder_backend}",
-            crate::video::selected_encoder_label(encoder_preference),
-        ),
-    );
-
-    host_log(
-        &events,
-        format!(
-            "Video client decode: h264={} h265={} av1={} prefer={:?}; requested codec={:?}; target_fps={} quality={}%",
-            client_video.h264,
-            client_video.h265,
-            client_video.av1,
-            client_video.prefer,
-            codec_preference,
-            target_fps.load(Ordering::Relaxed).clamp(5, MAX_TARGET_FPS),
-            quality_milli.load(Ordering::Relaxed) / 10
-        ),
-    );
-
-    let _ = events.send(HostEvent::VideoTelemetry {
-        summary: format!(
-            "planned={} codec_pref={} fps={} quality={}%",
-            active_encoder_backend,
-            codec_preference.label(),
-            target_fps.load(Ordering::Relaxed).clamp(5, MAX_TARGET_FPS),
-            quality_milli.load(Ordering::Relaxed) / 10
-        ),
-        fallback_reason: None,
-    });
-
-    let mut frame_idx: u64 = 0;
-    let mut last_frame = Instant::now();
-    let mut change_detector = FrameChangeDetector::default();
-    let mut last_video_stats = Instant::now();
-    let mut encode_stats = VideoEncodeTelemetry::new(active_encoder_backend);
-
-    // ── Async capture: a dedicated thread fills a double-buffer so encoding
-    // and screen capture overlap.  Each slot is (width, height, bgra_pixels).
-    type CaptureSlot = Arc<Mutex<Option<(u32, u32, Vec<u8>)>>>;
-    let cap_slot: CaptureSlot = Arc::new(Mutex::new(None));
-    let cap_stop = stop.clone();
-    let cap_fps = target_fps.clone();
-    let cap_slot_bg = cap_slot.clone();
-    thread::spawn(move || {
-        let mut buf = Vec::new();
-        loop {
-            if cap_stop.load(Ordering::Relaxed) {
-                break;
-            }
-            let fps = cap_fps.load(Ordering::Relaxed).clamp(5, MAX_TARGET_FPS);
-            // Capture as fast as the target fps; the encoder thread will read
-            // the latest available frame instead of waiting for capture.
-            if let Some((w, h)) = crate::capture::capture_screen_into(&mut buf) {
-                if let Ok(mut slot) = cap_slot_bg.lock() {
-                    match slot.as_mut() {
-                        Some(existing) => {
-                            // Reuse the pixel buffer allocation if the size matches.
-                            if existing.0 == w && existing.1 == h {
-                                std::mem::swap(&mut existing.2, &mut buf);
-                            } else {
-                                *slot = Some((w, h, buf.clone()));
-                            }
-                        }
-                        None => *slot = Some((w, h, buf.clone())),
-                    }
-                }
-            }
-            // Brief yield so the capture thread doesn't monopolise a core.
-            let budget = Duration::from_micros(1_000_000 / fps.max(1) as u64);
-            thread::sleep(budget.saturating_sub(Duration::from_micros(500)));
-        }
-    });
-
-    while !stop.load(Ordering::Relaxed) {
-        while let Ok(message) = outgoing.try_recv() {
-            let mut payload = encode_peer_message(&message);
-            if let Some(c) = send_cipher.as_mut() {
-                payload = c.encrypt(&payload);
-            }
-            if send_framed(&mut stream, &payload).is_err() {
-                stop.store(true, Ordering::Relaxed);
-                return;
-            }
-        }
-
-        let fps = target_fps.load(Ordering::Relaxed).clamp(5, MAX_TARGET_FPS);
-        let frame_budget = frame_budget(fps);
-        let elapsed = last_frame.elapsed();
-        if elapsed < frame_budget {
-            let remaining = frame_budget - elapsed;
-            if remaining > Duration::from_micros(1_500) {
-                thread::sleep(remaining - Duration::from_micros(500));
-            } else {
-                std::hint::spin_loop();
-            }
-            continue;
-        }
-        last_frame = Instant::now();
-        frame_idx += 1;
-
-        // Pull the most-recently-captured frame from the capture thread.
-        let capture_started = Instant::now();
-        let capture_result = cap_slot.lock().ok().and_then(|mut slot| slot.take());
-        let Some((cap_w, cap_h, capture_bgra)) = capture_result else {
-            thread::sleep(Duration::from_millis(1));
-            continue;
-        };
-        encode_stats.mark_capture_ms(elapsed_ms(capture_started));
-
-        // ── FSR: апскейл до нативного разрешения если включён ────────────────
-        // Захват делается в пониженном разрешении (cap_w × cap_h), FSR апскейлит
-        // обратно до нативного (enc_w × enc_h) с EASU + RCAS обострением.
-        let (enc_w, enc_h, fsr_bgra_owned);
-        let bgra: &[u8] = if let Some(ref mut fsr_adapter) = fsr {
-            let (native_w, native_h) = crate::capture::screen_size().unwrap_or((cap_w, cap_h));
-            if cap_w != native_w || cap_h != native_h {
-                fsr_bgra_owned = fsr_adapter
-                    .process_bgra(capture_bgra.as_slice(), cap_w, cap_h, native_w, native_h)
-                    .to_owned();
-                enc_w = native_w;
-                enc_h = native_h;
-                fsr_bgra_owned.as_slice()
-            } else {
-                // Native режим — только RCAS (нет апскейла)
-                fsr_bgra_owned = fsr_adapter
-                    .process_bgra(capture_bgra.as_slice(), cap_w, cap_h, cap_w, cap_h)
-                    .to_owned();
-                enc_w = cap_w;
-                enc_h = cap_h;
-                fsr_bgra_owned.as_slice()
-            }
-        } else {
-            fsr_bgra_owned = Vec::new(); // FSR выключен — owned-буфер не нужен, только заглушка
-            #[allow(unused_variables)]
-            let _ = &fsr_bgra_owned;
-            enc_w = cap_w;
-            enc_h = cap_h;
-            capture_bgra.as_slice()
-        };
-
-        let quality = quality_milli.load(Ordering::Relaxed);
-        let bitrate = h264_target_bitrate_bps(enc_w, enc_h, fps, quality);
-
-        // Encode at native resolution (downscaling broke decoding on the phone
-        // when the stream size differed from the announced DisplayInfo).
-        let key_interval = u64::from(fps.max(1) * 2);
-        let periodic_key = frame_idx % key_interval == 1;
-        let change_started = Instant::now();
-        let decision = change_detector.decide(enc_w, enc_h, bgra, periodic_key);
-        encode_stats.mark_change_ms(elapsed_ms(change_started));
-        if !decision.send {
-            if let Some(delay) = change_detector.static_backoff_delay(fps) {
-                thread::sleep(delay);
-            }
-            maybe_log_video_telemetry(
-                &events,
-                &mut encode_stats,
-                &mut change_detector,
-                &mut last_video_stats,
-                fps,
-                bitrate,
-            );
-            continue;
-        }
-
-        let encode_started = Instant::now();
-        let tried_mf = desired_mf_codec.is_some() && !mf_disabled;
-        let mut tried_hardware = tried_mf;
-        let mut packet = if let Some(codec) = desired_mf_codec.filter(|_| !mf_disabled) {
-            match encode_mf_frame(
-                &mut mf_encoder,
-                codec,
-                enc_w,
-                enc_h,
-                fps,
-                bitrate,
-                &bgra,
-                decision.force_key,
-            ) {
-                Ok(Some(packet)) => {
-                    mf_empty_packets = 0;
-                    Some(packet)
-                }
-                Ok(None) => {
-                    mf_empty_packets = mf_empty_packets.saturating_add(1);
-                    encode_stats.mark_empty(VideoEncoderBackend::MediaFoundation, codec);
-                    if mf_empty_packets > fps.min(15) {
-                        let reason = format!(
-                            "Media Foundation {} produced no packets for {} frames",
-                            codec.label(),
-                            mf_empty_packets
-                        );
-                        report_video_fallback(
-                            &events,
-                            &mut encode_stats,
-                            VideoEncoderBackend::MediaFoundation,
-                            codec,
-                            reason,
-                        );
-                        mf_disabled = true;
-                    }
-                    None
-                }
-                Err(err) => {
-                    let reason = format!("Media Foundation {} failed: {err}", codec.label());
-                    report_video_fallback(
-                        &events,
-                        &mut encode_stats,
-                        VideoEncoderBackend::MediaFoundation,
-                        codec,
-                        reason,
-                    );
-                    mf_disabled = true;
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        let tried_videotoolbox =
-            packet.is_none() && desired_videotoolbox_codec.is_some() && !videotoolbox_disabled;
-        tried_hardware |= tried_videotoolbox;
-        if packet.is_none() {
-            packet = if let Some(codec) =
-                desired_videotoolbox_codec.filter(|_| !videotoolbox_disabled)
-            {
-                match encode_videotoolbox_frame(
-                    &mut videotoolbox_encoder,
-                    codec,
-                    enc_w,
-                    enc_h,
-                    fps,
-                    bitrate,
-                    &bgra,
-                    decision.force_key,
-                ) {
-                    Ok(Some(packet)) => {
-                        videotoolbox_empty_packets = 0;
-                        Some(packet)
-                    }
-                    Ok(None) => {
-                        videotoolbox_empty_packets = videotoolbox_empty_packets.saturating_add(1);
-                        encode_stats.mark_empty(VideoEncoderBackend::VideoToolbox, codec);
-                        if videotoolbox_empty_packets > fps.min(15) {
-                            let reason = format!(
-                                "VideoToolbox {} produced no packets for {} frames",
-                                codec.label(),
-                                videotoolbox_empty_packets
-                            );
-                            report_video_fallback(
-                                &events,
-                                &mut encode_stats,
-                                VideoEncoderBackend::VideoToolbox,
-                                codec,
-                                reason,
-                            );
-                            videotoolbox_disabled = true;
-                        }
-                        None
-                    }
-                    Err(err) => {
-                        let reason = format!("VideoToolbox {} failed: {err}", codec.label());
-                        report_video_fallback(
-                            &events,
-                            &mut encode_stats,
-                            VideoEncoderBackend::VideoToolbox,
-                            codec,
-                            reason,
-                        );
-                        videotoolbox_disabled = true;
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-        }
-
-        let tried_nvenc = packet.is_none() && desired_nvenc_codec.is_some() && !nvenc_disabled;
-        tried_hardware |= tried_nvenc;
-        if packet.is_none() {
-            packet = if let Some(codec) = desired_nvenc_codec.filter(|_| !nvenc_disabled) {
-                match encode_nvenc_frame(
-                    &mut nvenc_encoder,
-                    codec,
-                    enc_w,
-                    enc_h,
-                    fps,
-                    bitrate,
-                    &bgra,
-                    decision.force_key,
-                ) {
-                    Ok(Some(packet)) => {
-                        nvenc_empty_packets = 0;
-                        Some(packet)
-                    }
-                    Ok(None) => {
-                        nvenc_empty_packets = nvenc_empty_packets.saturating_add(1);
-                        encode_stats.mark_empty(VideoEncoderBackend::Nvenc, codec);
-                        if nvenc_empty_packets > fps.min(15) {
-                            let reason = format!(
-                                "NVENC {} produced no packets for {} frames",
-                                codec.label(),
-                                nvenc_empty_packets
-                            );
-                            report_video_fallback(
-                                &events,
-                                &mut encode_stats,
-                                VideoEncoderBackend::Nvenc,
-                                codec,
-                                reason,
-                            );
-                            nvenc_disabled = true;
-                        }
-                        None
-                    }
-                    Err(err) => {
-                        let reason = format!("NVENC {} failed: {err}", codec.label());
-                        report_video_fallback(
-                            &events,
-                            &mut encode_stats,
-                            VideoEncoderBackend::Nvenc,
-                            codec,
-                            reason,
-                        );
-                        nvenc_disabled = true;
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-        }
-
-        let hardware_disabled = mf_disabled || videotoolbox_disabled || nvenc_disabled;
-        let packet = if packet.is_none() && (!tried_hardware || hardware_disabled) {
-            encode_h264_frame(
-                #[cfg(feature = "live-h264")]
-                encoder.as_mut(),
-                #[cfg(not(feature = "live-h264"))]
-                &mut encoder,
-                #[cfg(feature = "live-h264")]
-                &mut yuv_frame,
-                enc_w,
-                enc_h,
-                &bgra,
-                decision.force_key,
-            )
-            .map(EncodedPacket::h264)
-        } else {
-            packet
-        };
-        encode_stats.mark_encode_ms(elapsed_ms(encode_started));
-
-        if let Some(packet) = packet {
-            encode_stats.mark_sent(&packet, enc_w, enc_h);
-            let send_started = Instant::now();
-            let frame_msg = PeerMessage {
-                union: Some(peer_message::Union::VideoFrame(VideoFrame {
-                    union: Some(packet.into_video_union()),
-                    display: 0,
-                })),
-            };
-            let mut payload = encode_peer_message(&frame_msg);
-            if let Some(c) = send_cipher.as_mut() {
-                payload = c.encrypt(&payload);
-            }
-            if send_framed(&mut stream, &payload).is_err() {
-                break;
-            }
-            encode_stats.mark_send_ms(elapsed_ms(send_started));
-            change_detector.mark_sent(enc_w, enc_h, &bgra);
-        }
-        maybe_log_video_telemetry(
-            &events,
-            &mut encode_stats,
-            &mut change_detector,
-            &mut last_video_stats,
-            fps,
-            bitrate,
-        );
-    }
-    stop.store(true, Ordering::Relaxed);
-}
 
 fn negotiated_target_fps(login: &crate::rustdesk_proto::LoginRequest, configured_fps: u32) -> u32 {
     let host_limit = configured_fps.clamp(5, MAX_TARGET_FPS);
@@ -1805,101 +1337,13 @@ fn wait_for_approval(peer_id: &str, timeout: Duration) -> Option<bool> {
     None
 }
 
+#[allow(dead_code)] // orphaned: telemetry от старого video_loop
 fn frame_budget(target_fps: u32) -> Duration {
     let fps = target_fps.clamp(5, MAX_TARGET_FPS) as u64;
     Duration::from_micros(1_000_000 / fps)
 }
 
-fn report_video_fallback(
-    events: &Sender<HostEvent>,
-    encode_stats: &mut VideoEncodeTelemetry,
-    backend: VideoEncoderBackend,
-    codec: crate::nvenc::NvencCodec,
-    reason: String,
-) {
-    encode_stats.mark_fallback(backend, codec, reason.clone());
-    let summary = format!(
-        "fallback backend={} codec={} reason={}",
-        backend.label(),
-        codec.label(),
-        reason
-    );
-    host_log(events, format!("Video {summary}; trying next backend"));
-    let _ = events.send(HostEvent::VideoTelemetry {
-        summary,
-        fallback_reason: Some(reason),
-    });
-}
-
-fn maybe_log_video_telemetry(
-    events: &Sender<HostEvent>,
-    encode_stats: &mut VideoEncodeTelemetry,
-    change_detector: &mut FrameChangeDetector,
-    last_video_stats: &mut Instant,
-    fps: u32,
-    bitrate: u32,
-) {
-    const TELEMETRY_INTERVAL: Duration = Duration::from_secs(10);
-    if last_video_stats.elapsed() < TELEMETRY_INTERVAL {
-        return;
-    }
-
-    let frame_stats = change_detector.take_stats();
-    let encode = encode_stats.reset_interval();
-    let backend = encode
-        .active_backend
-        .map(VideoEncoderBackend::label)
-        .unwrap_or("none");
-    let codec = encode
-        .active_codec
-        .map(crate::nvenc::NvencCodec::label)
-        .unwrap_or("none");
-    let avg_packet = if encode.sent_packets == 0 {
-        0
-    } else {
-        encode.sent_bytes / encode.sent_packets
-    };
-    let capture_avg = avg_ms(encode.capture_ms_total, encode.timing_samples);
-    let change_avg = avg_ms(encode.change_ms_total, encode.timing_samples);
-    let encode_avg = avg_ms(encode.encode_ms_total, encode.timing_samples);
-    let send_avg = avg_ms(encode.send_ms_total, encode.sent_packets);
-    let fallback = encode.last_fallback_reason.as_deref().unwrap_or("none");
-
-    let summary = format!(
-        "planned=\"{}\" active_backend={} codec={} size={}x{} fps={} bitrate={} sent={} skipped_static={} packets={} keyframes={} bytes={} avg_packet={} capture_avg={} capture_max={} change_avg={} change_max={} encode_avg={} encode_max={} send_avg={} send_max={} empty_outputs={} fallbacks={} last_fallback=\"{}\"",
-        encode_stats.planned_backend,
-        backend,
-        codec,
-        encode.width,
-        encode.height,
-        fps,
-        bitrate,
-        frame_stats.sent,
-        frame_stats.skipped_static,
-        encode.sent_packets,
-        encode.keyframes,
-        encode.sent_bytes,
-        avg_packet,
-        capture_avg,
-        encode.capture_ms_max,
-        change_avg,
-        encode.change_ms_max,
-        encode_avg,
-        encode.encode_ms_max,
-        send_avg,
-        encode.send_ms_max,
-        encode.empty_outputs,
-        encode.fallback_count,
-        fallback,
-    );
-    host_log(events, format!("Video telemetry: {summary}"));
-    let _ = events.send(HostEvent::VideoTelemetry {
-        summary,
-        fallback_reason: encode.last_fallback_reason,
-    });
-    *last_video_stats = Instant::now();
-}
-
+#[allow(dead_code)] // orphaned: telemetry от старого video_loop
 fn avg_ms(total: u64, count: u64) -> u64 {
     if count == 0 {
         0
@@ -1908,6 +1352,7 @@ fn avg_ms(total: u64, count: u64) -> u64 {
     }
 }
 
+#[allow(dead_code)] // orphaned: telemetry от старого video_loop
 fn elapsed_ms(start: Instant) -> u64 {
     start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
@@ -1931,6 +1376,7 @@ fn h264_target_bitrate_bps(width: u32, height: u32, fps: u32, quality_milli: u32
 }
 
 #[derive(Default)]
+#[allow(dead_code)] // orphaned: telemetry от старого video_loop
 struct FrameChangeDetector {
     width: u32,
     height: u32,
@@ -1942,11 +1388,13 @@ struct FrameChangeDetector {
     skipped_static_since_log: u64,
 }
 
+#[allow(dead_code)] // orphaned: telemetry от старого video_loop
 struct FrameDecision {
     send: bool,
     force_key: bool,
 }
 
+#[allow(dead_code)] // orphaned: telemetry от старого video_loop
 struct FrameSkipStats {
     sent: u64,
     skipped_static: u64,
@@ -1972,6 +1420,7 @@ impl VideoEncoderBackend {
 }
 
 #[derive(Default)]
+#[allow(dead_code)] // orphaned: telemetry от старого video_loop
 struct VideoEncodeTelemetry {
     planned_backend: String,
     active_backend: Option<VideoEncoderBackend>,
@@ -2745,52 +2194,6 @@ mod video_quality_tests {
 }
 
 // ── Input injection ───────────────────────────────────────────────────────────
-
-fn handle_client_input(
-    msg: PeerMessage,
-    outgoing: &Sender<PeerMessage>,
-    shell: &mut Option<ShellRuntime>,
-    target_fps: &AtomicU32,
-    quality_milli: &AtomicU32,
-) {
-    match msg.union {
-        Some(peer_message::Union::MouseEvent(ev)) => inject_mouse(ev),
-        Some(peer_message::Union::KeyEvent(ev)) => inject_key(ev),
-        Some(peer_message::Union::Misc(Misc {
-            union: Some(misc::Union::Option(option)),
-        })) => {
-            if option.custom_fps > 0 {
-                let fps = (option.custom_fps as u32).clamp(5, MAX_TARGET_FPS);
-                target_fps.store(fps, Ordering::Relaxed);
-            }
-            if let Some(quality) = option_quality_milli(&option) {
-                quality_milli.store(quality, Ordering::Relaxed);
-            }
-        }
-        Some(peer_message::Union::Shell(shell_msg)) => {
-            handle_shell_message(shell_msg, outgoing, shell);
-        }
-        _ => {}
-    }
-}
-
-/// Версия recv_peer_rc без cipher — для нового pipeline input loop.
-/// Cipher теперь находится внутри pipeline, а не в input loop.
-fn recv_peer_rc2(
-    stream: &mut std::net::TcpStream,
-    _cipher: &mut Option<crate::crypto::RecvCipher>,
-) -> Result<Option<PeerMessage>, String> {
-    // Без шифрования на этом уровне — pipeline сам обрабатывает cipher.
-    // Читаем framed пакет и декодируем как PeerMessage (plain).
-    use crate::transport::read_framed;
-    let payload = read_framed(stream)?;
-    if payload.is_empty() {
-        return Ok(None);
-    }
-    let msg = crate::rustdesk_proto::decode_peer_message(&payload)
-        .map_err(|e| format!("decode: {e}"))?;
-    Ok(Some(msg))
-}
 
 /// Версия handle_client_input для нового pipeline — шлёт команды через канал.
 fn handle_client_input_pipeline(
@@ -4412,6 +3815,200 @@ pub fn encode_mf_frame_pub(
 /// Публичная обёртка release_stuck_input — нужна для `evrt_session.rs`.
 pub fn release_stuck_input_pub() {
     release_stuck_input();
+}
+
+// ─── MultiEncoder — единый каскад энкодеров для video_pipeline ─────────────────
+//
+// Инкапсулирует полную цепочку fallback'ов:
+//   Media Foundation (Windows) → VideoToolbox (macOS) → NVENC → OpenH264 → PNG
+//
+// Это восстанавливает мультибэкендность, которая была в старом video_loop.
+// pipeline создаёт один MultiEncoder и вызывает encode() на каждый кадр.
+
+/// Результат кодирования: байты + флаг IDR + опциональные SPS/PPS + кодек.
+pub struct EncodedOutput {
+    pub bytes:   Vec<u8>,
+    pub key:     bool,
+    pub sps_pps: Option<Vec<u8>>,
+    pub codec:   &'static str,
+}
+
+/// Единый энкодер с каскадом аппаратных/программных бэкендов.
+pub struct MultiEncoder {
+    // Выбранные кодеки для каждого бэкенда (None = бэкенд недоступен)
+    desired_mf:  Option<crate::nvenc::NvencCodec>,
+    desired_vt:  Option<crate::nvenc::NvencCodec>,
+    desired_nv:  Option<crate::nvenc::NvencCodec>,
+
+    // Состояния энкодеров (lazy-init)
+    mf:  Option<crate::mf_encode::MfVideoEncoder>,
+    vt:  Option<crate::videotoolbox::VideoToolboxEncoder>,
+    nv:  Option<crate::nvenc::NvencEncoder>,
+
+    // Disabled-флаги: после ошибки бэкенд выключается
+    mf_disabled: bool,
+    vt_disabled: bool,
+    nv_disabled: bool,
+
+    // OpenH264 software fallback
+    #[cfg(feature = "live-h264")]
+    sw:  Option<openh264::encoder::Encoder>,
+    #[cfg(feature = "live-h264")]
+    yuv: YuvFrame,
+}
+
+impl MultiEncoder {
+    /// Создать энкодер, выбрав доступные бэкенды по preference и возможностям клиента.
+    pub fn new(
+        encoder_pref: EncoderPreference,
+        codec_pref:   CodecPreference,
+        client:       ClientVideoSupport,
+    ) -> Self {
+        let desired_mf = choose_mf_encoder_codec(encoder_pref, codec_pref, client);
+        let desired_vt = choose_videotoolbox_codec(encoder_pref, codec_pref, client);
+        let desired_nv = choose_nvenc_codec(encoder_pref, codec_pref, client);
+
+        #[cfg(feature = "live-h264")]
+        let sw = build_openh264_encoder();
+
+        Self {
+            desired_mf, desired_vt, desired_nv,
+            mf: None, vt: None, nv: None,
+            mf_disabled: false, vt_disabled: false, nv_disabled: false,
+            #[cfg(feature = "live-h264")]
+            sw,
+            #[cfg(feature = "live-h264")]
+            yuv: YuvFrame::default(),
+        }
+    }
+
+    /// Краткое описание активной цепочки бэкендов (для логов).
+    pub fn backend_label(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(c) = self.desired_mf { parts.push(format!("MF/{}", c.label())); }
+        if let Some(c) = self.desired_vt { parts.push(format!("VT/{}", c.label())); }
+        if let Some(c) = self.desired_nv { parts.push(format!("NVENC/{}", c.label())); }
+        #[cfg(feature = "live-h264")]
+        if self.sw.is_some() { parts.push("OpenH264".to_owned()); }
+        parts.push("PNG".to_owned());
+        parts.join(" → ")
+    }
+
+    /// Закодировать один кадр BGRA. Проходит каскад до первого успеха.
+    /// `force_key` запрашивает IDR.
+    pub fn encode(
+        &mut self,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate: u32,
+        bgra: &[u8],
+        force_key: bool,
+    ) -> Option<EncodedOutput> {
+        // 1. Media Foundation (Windows)
+        if let Some(codec) = self.desired_mf.filter(|_| !self.mf_disabled) {
+            match encode_mf_frame(&mut self.mf, codec, width, height, fps, bitrate, bgra, force_key) {
+                Ok(Some(pkt)) => {
+                    let sps = if pkt.key {
+                        self.mf.as_ref().and_then(|e| e.codec_config())
+                    } else { None };
+                    return Some(EncodedOutput {
+                        bytes: pkt.bytes, key: pkt.key, sps_pps: sps,
+                        codec: codec_label(codec),
+                    });
+                }
+                Ok(None) => {}
+                Err(_) => self.mf_disabled = true,
+            }
+        }
+
+        // 2. VideoToolbox (macOS)
+        if let Some(codec) = self.desired_vt.filter(|_| !self.vt_disabled) {
+            match encode_videotoolbox_frame(&mut self.vt, codec, width, height, fps, bitrate, bgra, force_key) {
+                Ok(Some(pkt)) => {
+                    return Some(EncodedOutput {
+                        bytes: pkt.bytes, key: pkt.key, sps_pps: None,
+                        codec: codec_label(codec),
+                    });
+                }
+                Ok(None) => {}
+                Err(_) => self.vt_disabled = true,
+            }
+        }
+
+        // 3. NVENC
+        if let Some(codec) = self.desired_nv.filter(|_| !self.nv_disabled) {
+            match encode_nvenc_frame(&mut self.nv, codec, width, height, fps, bitrate, bgra, force_key) {
+                Ok(Some(pkt)) => {
+                    return Some(EncodedOutput {
+                        bytes: pkt.bytes, key: pkt.key, sps_pps: None,
+                        codec: codec_label(codec),
+                    });
+                }
+                Ok(None) => {}
+                Err(_) => self.nv_disabled = true,
+            }
+        }
+
+        // 4. OpenH264 software
+        #[cfg(feature = "live-h264")]
+        {
+            if let Some(pkt) = encode_h264_frame(
+                self.sw.as_mut(), &mut self.yuv, width, height, bgra, force_key,
+            ) {
+                return Some(EncodedOutput {
+                    bytes: pkt.bytes, key: pkt.key, sps_pps: None, codec: "H264",
+                });
+            }
+        }
+
+        // 5. PNG fallback (только на keyframe чтобы не спамить большими кадрами)
+        if force_key {
+            return Some(EncodedOutput {
+                bytes: encode_png_fallback(bgra, width, height),
+                key: true, sps_pps: None, codec: "PNG",
+            });
+        }
+
+        None
+    }
+}
+
+fn codec_label(codec: crate::nvenc::NvencCodec) -> &'static str {
+    match codec {
+        crate::nvenc::NvencCodec::H265 => "H265",
+        crate::nvenc::NvencCodec::Av1  => "AV1",
+        crate::nvenc::NvencCodec::H264 => "H264",
+    }
+}
+
+#[cfg(feature = "live-h264")]
+fn build_openh264_encoder() -> Option<openh264::encoder::Encoder> {
+    use openh264::encoder::{
+        BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod,
+        RateControlMode, SpsPpsStrategy, UsageType,
+    };
+    let cfg = EncoderConfig::new()
+        .usage_type(UsageType::ScreenContentRealTime)
+        .rate_control_mode(RateControlMode::Bitrate)
+        .bitrate(BitRate::from_bps(8_000_000))
+        .max_frame_rate(FrameRate::from_hz(MAX_TARGET_FPS as f32))
+        .sps_pps_strategy(SpsPpsStrategy::IncreasingId)
+        .intra_frame_period(IntraFramePeriod::from_num_frames(MAX_TARGET_FPS * 2))
+        .num_threads(0);
+    let api = openh264::OpenH264API::from_source();
+    Encoder::with_api_config(api, cfg).ok()
+}
+
+/// PNG fallback кодирование (используется MultiEncoder и pipeline).
+pub fn encode_png_fallback(bgra: &[u8], w: u32, h: u32) -> Vec<u8> {
+    use image::{ImageBuffer, Rgba};
+    let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
+        ImageBuffer::from_raw(w, h, bgra.to_vec())
+            .unwrap_or_else(|| ImageBuffer::new(w, h));
+    let mut out = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).ok();
+    out
 }
 
 // ─── EVRT socket helper ───────────────────────────────────────────────────────

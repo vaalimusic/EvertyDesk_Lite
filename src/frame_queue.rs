@@ -26,6 +26,10 @@
 //!                       drop old    wait jitter
 //! ```
 
+// Полная API-поверхность EVRT-протокола: часть методов — публичный
+// интерфейс для будущего использования (enhancement layer, audio config, jitter API).
+#![allow(dead_code)]
+
 use std::{
     collections::VecDeque,
     sync::{Arc, Condvar, Mutex},
