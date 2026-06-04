@@ -191,10 +191,17 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
     let recv_arrival    = last_arrival_us.clone();
     let recv_delta      = arrival_delta_ms.clone();
 
+    // Аудио-плеер (shared между receive loop и audio thread)
+    let audio_player = Arc::new(std::sync::Mutex::new(
+        crate::evrt_audio::AudioPlayer::new()
+    ));
+
     let recv_handle = thread::spawn(move || {
-        let mut reassembler = ChannelReassembler::new();
-        let mut buf  = vec![0u8; evrt::MAX_PACKET_SIZE + 64];
-        let mut last_pkt_at = Instant::now();
+        let mut reassembler       = ChannelReassembler::new();
+        let mut audio_re          = crate::evrt_audio::AudioReassembler::new();
+        let mut buf               = vec![0u8; evrt::MAX_PACKET_SIZE + 64];
+        let mut last_pkt_at       = Instant::now();
+        let audio_player_recv     = audio_player.clone();
         recv_socket.set_read_timeout(Some(Duration::from_millis(500))).ok();
 
         while !recv_stop.load(Ordering::Relaxed) {
@@ -221,7 +228,6 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
                                 }
                             }
                             evrt::TYPE_SESSION_CONFIG => {
-                                // Обновлённый конфиг — просто логируем
                                 if let Some(cfg) = SessionConfig::from_json(&pkt.payload) {
                                     evrt_log(&recv_events, format!(
                                         "EVRT: SessionConfig update {:.1}Mbps @{}fps",
@@ -229,6 +235,36 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
                                         cfg.fps,
                                     ));
                                 }
+                            }
+                            // ── Аудио ────────────────────────────────────────
+                            evrt::TYPE_AUDIO_CONFIG => {
+                                if let Some(audio_cfg) =
+                                    crate::evrt_audio::AudioConfig::from_json(&pkt.payload)
+                                {
+                                    evrt_log(&recv_events, format!(
+                                        "EVRT Audio: {}Hz {}ch {}bit",
+                                        audio_cfg.sample_rate,
+                                        audio_cfg.channels,
+                                        audio_cfg.bits_per_sample,
+                                    ));
+                                    if let Ok(mut player) = audio_player_recv.lock() {
+                                        player.init(&audio_cfg);
+                                    }
+                                }
+                            }
+                            evrt::TYPE_AUDIO_FRAME => {
+                                if let Some(pcm) = audio_re.on_packet(&pkt) {
+                                    if let Ok(mut player) = audio_player_recv.lock() {
+                                        player.play(&pcm);
+                                    }
+                                }
+                            }
+                            // ── ROI — логируем для диагностики ───────────────
+                            evrt::TYPE_ROI_METADATA => {
+                                // ROI используется для оптимизации рендеринга.
+                                // Сейчас просто принимаем — можно добавить
+                                // подсветку изменённой области в UI.
+                                let _ = evrt::RoiRect::from_json(&pkt.payload);
                             }
                             _ => {}
                         }

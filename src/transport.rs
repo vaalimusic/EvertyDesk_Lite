@@ -323,7 +323,7 @@ impl TransportClient {
         request: ConnectionRequest,
         mut progress: impl FnMut(u8, String),
     ) -> Result<ConnectionState, String> {
-        let (_relay_stream, peer_stage, _displays, _evrt_port) =
+        let (_relay_stream, peer_stage, _displays, _evrt_addr) =
             establish_session(request.clone(), &mut progress)?;
 
         progress(99, format!("Login stage: {peer_stage}"));
@@ -388,7 +388,7 @@ impl TransportClient {
             }
         }
 
-        let (mut relay, peer_stage, displays, evrt_host_port) =
+        let (mut relay, peer_stage, displays, evrt_host_addr) =
             match establish_session(request.clone(), &mut emit_progress)
         {
             Ok(session) => session,
@@ -399,9 +399,9 @@ impl TransportClient {
         };
 
         eprintln!("[session] Connected: {peer_stage}");
-        eprintln!("[session] Displays from login: {}", displays.len());
-        if let Some(port) = evrt_host_port {
-            eprintln!("[session] EVRT host UDP port: {port}");
+        eprintln!("[session] Displays: {}", displays.len());
+        if let Some(ref addr) = evrt_host_addr {
+            eprintln!("[session] EVRT host addr (один запрос hbbs): {addr}");
         }
         let _ = events.send(SessionEvent::Connected(peer_stage));
         let mut known_displays = displays;
@@ -409,43 +409,29 @@ impl TransportClient {
             let _ = events.send(SessionEvent::Displays(known_displays.clone()));
         }
 
-        // ★ EVRT: если хост сообщил UDP порт — пробуем прямое соединение.
-        //
-        // Правильный IP хоста берём из PunchHoleResponse.socket_addr (hbbs знает
-        // внешний адрес хоста). Заменяем порт на evrt_port из Misc.
-        // Запускаем в фоне: если за 4 сек не ответил → остаёмся на TCP relay.
-        if let Some(evrt_port) = evrt_host_port {
-            // Получаем внешний IP хоста от hbbs (force_relay=false)
-            let host_addr = establish_session_info(&request, &mut |_, _| {})
-                .ok()
-                .and_then(|info| info.peer_udp_addr)
-                .and_then(|bytes| crate::evrt_session::decode_punch_addr(&bytes))
-                .map(|mut addr| { addr.set_port(evrt_port); addr });
+        // ★ EVRT: адрес хоста получен за ОДИН запрос к hbbs.
+        // IP из PunchHoleResponse.socket_addr, порт из Misc{EvrtUdpPort}.
+        if let Some(host_addr) = evrt_host_addr {
+            let evrt_events = events.clone();
+            let evrt_stop   = std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            );
+            let evrt_ull = display_config.target_fps >= 60;
 
-            if let Some(host_addr) = host_addr {
-                let evrt_events = events.clone();
-                let evrt_stop   = std::sync::Arc::new(
-                    std::sync::atomic::AtomicBool::new(false),
-                );
-                let evrt_ull = display_config.target_fps >= 60;
+            eprintln!("[evrt-client] прямой UDP → {host_addr}");
 
-                eprintln!("[evrt-client] прямой UDP → {host_addr} (IP от hbbs, порт {evrt_port})");
-
-                thread::spawn(move || {
-                    if let Ok(udp) = std::net::UdpSocket::bind("0.0.0.0:0") {
-                        let udp = std::sync::Arc::new(udp);
-                        crate::evrt_client::try_evrt_before_relay(
-                            &udp,
-                            host_addr,
-                            &evrt_events,
-                            evrt_stop,
-                            evrt_ull,
-                        );
-                    }
-                });
-            } else {
-                eprintln!("[evrt-client] не удалось получить внешний IP хоста — TCP relay");
-            }
+            thread::spawn(move || {
+                if let Ok(udp) = std::net::UdpSocket::bind("0.0.0.0:0") {
+                    let udp = std::sync::Arc::new(udp);
+                    crate::evrt_client::try_evrt_before_relay(
+                        &udp,
+                        host_addr,
+                        &evrt_events,
+                        evrt_stop,
+                        evrt_ull,
+                    );
+                }
+            });
         }
         let (frame_tx, frame_rx) = mpsc::channel::<DecoderInput>();
         let (decoder_feedback_tx, decoder_feedback_rx) = mpsc::channel::<DecoderFeedback>();
@@ -1142,7 +1128,7 @@ fn establish_session_info(
 fn establish_session(
     request: ConnectionRequest,
     progress: &mut impl FnMut(u8, String),
-) -> Result<(TcpStream, String, Vec<RemoteDisplay>, Option<u16>), String> {
+) -> Result<(TcpStream, String, Vec<RemoteDisplay>, Option<std::net::SocketAddr>), String> {
     progress(5, "Validating input".to_owned());
     if request.remote_id.is_empty() {
         return Err("Enter remote ID".to_owned());
@@ -1160,7 +1146,12 @@ fn establish_session(
     progress(45, "Connecting to Relay server".to_owned());
     let _relay = connect_tcp(&request.server.relay_server, RELAY_PORT)?;
 
-    progress(60, "Sending RustDesk PunchHoleRequest protobuf".to_owned());
+    // ── Один запрос к hbbs с force_relay=false ───────────────────────────────
+    // Это даёт нам сразу:
+    //   • peer_udp_addr — внешний UDP-адрес хоста (для EVRT punch-hole)
+    //   • relay_server / relay_uuid — для TCP relay fallback
+    // Один RTT к hbbs вместо двух.
+    progress(60, "Sending RustDesk PunchHoleRequest (EVRT probe)".to_owned());
     let message = RendezvousMessage {
         union: Some(rendezvous_message::Union::PunchHoleRequest(
             PunchHoleRequest {
@@ -1171,7 +1162,7 @@ fn establish_session(
                 token: String::new(),
                 version: "1.4.6".to_owned(),
                 udp_port: 0,
-                force_relay: true,
+                force_relay: false, // ← false: hbbs отдаёт peer_udp_addr
                 upnp_port: 0,
                 socket_addr_v6: Vec::new(),
             },
@@ -1185,7 +1176,37 @@ fn establish_session(
         .map_err(|err| format!("Failed to set read timeout: {err}"))?;
     let response = read_framed(&mut rendezvous)?;
     let decoded = decode_message(&response).map_err(|err| format!("Decode failed: {err}"))?;
-    let rendezvous = describe_rendezvous_response(&decoded)?;
+    let rendezvous_info = describe_rendezvous_response(&decoded);
+
+    // Если force_relay=false не сработал (некоторые hbbs конфиги) → ретрай с force_relay=true
+    let rendezvous = match rendezvous_info {
+        Ok(info) => info,
+        Err(_) => {
+            progress(82, "EVRT probe failed, retrying with force_relay=true".to_owned());
+            let mut rendezvous2 = connect_tcp(&request.server.id_server, RENDEZVOUS_PORT)?;
+            let msg2 = RendezvousMessage {
+                union: Some(rendezvous_message::Union::PunchHoleRequest(
+                    PunchHoleRequest {
+                        id: request.remote_id.clone(),
+                        nat_type: NatType::UnknownNat as i32,
+                        licence_key: request.server.public_key.clone(),
+                        conn_type: ConnType::DefaultConn as i32,
+                        token: String::new(),
+                        version: "1.4.6".to_owned(),
+                        udp_port: 0,
+                        force_relay: true,
+                        upnp_port: 0,
+                        socket_addr_v6: Vec::new(),
+                    },
+                )),
+            };
+            send_framed(&mut rendezvous2, &encode_message(&msg2))?;
+            rendezvous2.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let resp2 = read_framed(&mut rendezvous2)?;
+            let dec2 = decode_message(&resp2).map_err(|e| format!("Decode failed: {e}"))?;
+            describe_rendezvous_response(&dec2)?
+        }
+    };
 
     progress(85, "Rendezvous protobuf response decoded".to_owned());
     let relay_uuid_from_rendezvous = rendezvous.relay_uuid.clone();
@@ -1254,8 +1275,15 @@ fn establish_session(
             bootstrap_wait_secs,
             progress,
         ) {
-            Ok((peer_stage, displays, evrt_port)) => {
-                return Ok((relay_stream, peer_stage, displays, evrt_port));
+            Ok((peer_stage, displays, evrt_port_from_misc)) => {
+                // Если хост прислал EVRT порт в Misc — используем его.
+                // IP берём из peer_udp_addr который hbbs вернул нам за ОДИН запрос.
+                let evrt_host_addr = evrt_port_from_misc.and_then(|port| {
+                    rendezvous.peer_udp_addr.as_ref()
+                        .and_then(|b| crate::evrt_session::decode_punch_addr(b))
+                        .map(|mut addr| { addr.set_port(port); addr })
+                });
+                return Ok((relay_stream, peer_stage, displays, evrt_host_addr));
             }
             Err(err) => last_err = err,
         }
@@ -3712,4 +3740,19 @@ mod tests {
         ));
         assert!(decoder_needs_more_packets("VPX decoder needs more packets"));
     }
+}
+
+// ─── Pub helpers for video_pipeline ──────────────────────────────────────────
+
+/// Публичный алиас encode_peer_message для video_pipeline.
+pub fn encode_peer_message_raw(msg: &crate::rustdesk_proto::PeerMessage) -> Vec<u8> {
+    crate::rustdesk_proto::encode_peer_message(msg)
+}
+
+/// Публичный алиас send_framed для video_pipeline.
+pub fn send_framed_raw(
+    stream: &mut std::net::TcpStream,
+    payload: &[u8],
+) -> Result<(), String> {
+    send_framed(stream, payload)
 }

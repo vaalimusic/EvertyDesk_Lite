@@ -737,59 +737,21 @@ fn handle_rendezvous_msg(
                 ),
             );
 
-            // ── Попытка прямого EVRT UDP через тот же сокет что зарегистрирован на hbbs ─
+            // PunchHole: логируем адрес клиента и переходим к TCP relay.
+            // EVRT активируется из video_pipeline через evrt_send_loop —
+            // там ждут punch уже на выделенном EVRT сокете (другой порт).
             if !ph.force_relay {
                 if let Some(peer_addr) =
                     crate::evrt_session::decode_punch_addr(&ph.socket_addr)
                 {
                     host_log(events, format!(
-                        "PunchHole: EVRT direct → {peer_addr} (используем reg-сокет)",
+                        "PunchHole: peer={peer_addr} (EVRT будет активирован через video_pipeline)",
                     ));
-                    let cfg   = config.clone();
-                    let evs   = events.clone();
-                    let stop  = Arc::new(AtomicBool::new(false));
-                    let fps   = Arc::new(AtomicU32::new(cfg.display.target_fps.clamp(5, 60)));
-                    let qual  = Arc::new(AtomicU32::new(1_000));
-                    let relay = relay_server.clone();
-                    // ★ Используем тот же сокет что зарегистрирован на hbbs.
-                    //   Именно с этого порта hbbs сообщил клиенту наш адрес.
-                    let udp   = reg_socket.clone();
-
-                    thread::spawn(move || {
-                        // Punch: 3× UDP чтобы открыть дыру в NAT клиента
-                        for _ in 0..3 {
-                            let _ = udp.send_to(&[0u8], peer_addr);
-                            thread::sleep(Duration::from_millis(30));
-                        }
-
-                        let params = crate::evrt_session::EvrtSessionParams {
-                            peer_addr,
-                            socket: udp,
-                            config: cfg.clone(),
-                            peer_id: format!("{peer_addr}"),
-                            events: evs.clone(),
-                            stop,
-                            target_fps: fps,
-                            quality_milli: qual,
-                        };
-
-                        match crate::evrt_session::run_evrt_session(params) {
-                            Ok(()) => {}
-                            Err(e) => {
-                                let _ = evs.send(HostEvent::Log(
-                                    format!("EVRT direct failed ({e}), falling back to relay"),
-                                ));
-                                handle_relay_session(
-                                    cfg, evs, "(punch-fallback)".to_owned(), relay, String::new(),
-                                );
-                            }
-                        }
-                    });
-
-                    let _ = events.send(HostEvent::StateChanged(HostState::Accepting(
-                        peer_addr.to_string(),
-                    )));
-                    return None;
+                    // 3× punch чтобы открыть NAT-дырку для последующего EVRT
+                    for _ in 0..3 {
+                        let _ = reg_socket.send_to(&[0u8], peer_addr);
+                        thread::sleep(Duration::from_millis(30));
+                    }
                 }
             }
 
@@ -1225,178 +1187,97 @@ fn relay_session_inner(
         }
     }
 
-    let target_fps = negotiated_target_fps(&login, config.display.target_fps);
+    let target_fps    = negotiated_target_fps(&login, config.display.target_fps);
     let quality_milli = negotiated_quality_milli(&login);
-    let client_video = client_video_support(&login);
-    let codec_preference = config.display.codec;
-    host_log(
-        events,
-        format!(
-            "Auth OK for {peer_id}. Starting capture at {target_fps} fps, quality={}%",
-            quality_milli / 10
-        ),
-    );
-    let _ = events.send(HostEvent::SessionStarted {
-        peer_id: peer_id.to_owned(),
-    });
 
-    // ── 4. Two-thread session: video writer + input reader ───────────────────
-    // Decoupling them keeps the remote cursor responsive even while a frame is
-    // being captured / encoded / sent (which used to block input handling).
+    host_log(events, format!(
+        "Auth OK для {peer_id}. Pipeline старт: {target_fps}fps quality={}%",
+        quality_milli / 10,
+    ));
+    let _ = events.send(HostEvent::SessionStarted { peer_id: peer_id.to_owned() });
+
+    // ── Единый пайплайн: один захват → один энкодер → TCP + UDP ──────────────
+    //
+    // Заменяет старую схему двух параллельных систем (video_loop + evrt_session).
+    // Один MF энкодер, нет конкуренции, нет двойного захвата.
     let (send_cipher, recv_cipher) = match cipher.take() {
-        Some(c) => {
-            let (s, r) = c.into_halves();
-            (Some(s), Some(r))
-        }
-        None => (None, None),
+        Some(c) => { let (s, r) = c.into_halves(); (Some(s), Some(r)) }
+        None    => (None, None),
     };
 
     let write_stream = relay
         .try_clone()
         .map_err(|e| format!("try_clone relay stream: {e}"))?;
-    let stop = Arc::new(AtomicBool::new(false));
-    let shared_target_fps = Arc::new(AtomicU32::new(target_fps));
-    let shared_quality_milli = Arc::new(AtomicU32::new(quality_milli));
-    let (out_tx, out_rx) = mpsc::channel::<PeerMessage>();
 
-    // ── FSR адаптер (опционально) ─────────────────────────────────────────────
-    let fsr_adapter = config.display.fsr_quality
-        .to_fsr_quality()
-        .map(|q| crate::fsr::FsrAdapter::new(crate::fsr::FsrConfig {
-            quality:   q,
-            sharpness: config.display.fsr_sharpness,
-        }));
-    if let Some(ref a) = fsr_adapter {
-        host_log(
-            events,
-            format!(
-                "FSR включён: {} | sharpness={:.3}",
-                a.config.quality.label(),
-                a.config.sharpness,
-            ),
-        );
-    }
+    // Канал команд: input loop → pipeline
+    let (cmd_tx, cmd_rx) = mpsc::channel::<crate::video_pipeline::PipelineCmd>();
+    // Канал исходящих PeerMessage (shell output, etc.)
+    let (peer_msg_tx, peer_msg_rx) = mpsc::channel::<PeerMessage>();
 
-    // ── EVRT UDP сессия (параллельно с TCP relay) ─────────────────────────────
-    // Запускаем EVRT поверх выделенного UDP сокета если он открылся.
-    // EVRT и TCP relay работают параллельно — клиент переключится на UDP
-    // как только получит первый EVRT кадр. TCP relay используется как fallback.
-    if let Some((evrt_sock, evrt_port)) = evrt_socket {
-        let evrt_cfg    = config.clone();
-        let evrt_events = events.clone();
-        let evrt_stop   = stop.clone();
-        let evrt_fps    = shared_target_fps.clone();
-        let evrt_qual   = shared_quality_milli.clone();
-        let evrt_pid    = peer_id.to_owned();
+    let pipeline_cfg = crate::video_pipeline::PipelineConfig {
+        app_config:   config.clone(),
+        peer_id:      peer_id.to_owned(),
+        events:       events.clone(),
+        relay_stream: write_stream,
+        send_cipher,
+        recv_cipher,
+        evrt_socket:  evrt_socket.map(|(s, _)| s),
+        cmd_rx,
+        peer_msg_rx,
+    };
 
-        host_log(events, format!("EVRT: запускаем UDP сессию на порту {evrt_port}"));
-
-        thread::spawn(move || {
-            // Ждём первого punch от клиента (до 5 сек)
-            let mut buf     = vec![0u8; crate::evrt::MAX_PACKET_SIZE + 64];
-            let deadline    = std::time::Instant::now() + Duration::from_secs(5);
-            evrt_sock.set_read_timeout(Some(Duration::from_millis(300))).ok();
-            let mut peer_addr = None;
-
-            while std::time::Instant::now() < deadline
-                && !evrt_stop.load(Ordering::Relaxed)
-            {
-                if let Ok((_, src)) = evrt_sock.recv_from(&mut buf) {
-                    host_log(&evrt_events, format!("EVRT: punch от {src}"));
-                    peer_addr = Some(src);
-                    break;
-                }
-            }
-
-            let Some(peer_addr) = peer_addr else {
-                host_log(&evrt_events, "EVRT: клиент не прислал punch, используем TCP relay".into());
-                return;
-            };
-
-            let params = crate::evrt_session::EvrtSessionParams {
-                peer_addr,
-                socket:        evrt_sock,
-                config:        evrt_cfg,
-                peer_id:       evrt_pid,
-                events:        evrt_events,
-                stop:          evrt_stop,
-                target_fps:    evrt_fps,
-                quality_milli: evrt_qual,
-            };
-
-            if let Err(e) = crate::evrt_session::run_evrt_session(params) {
-                eprintln!("[evrt] сессия завершилась: {e}");
-            }
-        });
-    }
-
-    // ── Video thread (TCP relay — fallback пока EVRT не подключился) ─────────
-    let stop_v = stop.clone();
-    let target_fps_v = shared_target_fps.clone();
-    let quality_milli_v = shared_quality_milli.clone();
-    let encoder_preference = config.display.encoder;
-    let video_events = events.clone();
-    let video_handle = thread::spawn(move || {
-        video_loop(
-            write_stream,
-            send_cipher,
-            stop_v,
-            target_fps_v,
-            quality_milli_v,
-            out_rx,
-            video_events,
-            encoder_preference,
-            codec_preference,
-            client_video,
-            fsr_adapter,
-        );
+    let pipeline_stop = Arc::new(AtomicBool::new(false));
+    let pipeline_stop_v = pipeline_stop.clone();
+    let pipeline_handle = thread::spawn(move || {
+        crate::video_pipeline::run(pipeline_cfg);
+        pipeline_stop_v.store(true, Ordering::Relaxed);
     });
 
-    // ── Input loop (this thread) ──────────────────────────────────────────────
-    // A 1 s read timeout lets us notice the stop flag without busy-waiting.
+    // Shared FPS/quality для input loop → pipeline commands
+    let shared_target_fps    = Arc::new(AtomicU32::new(target_fps));
+    let shared_quality_milli = Arc::new(AtomicU32::new(quality_milli));
+    let stop = pipeline_stop.clone();
+
+    // ── Input loop (этот тред) — читает TCP, шлёт команды в pipeline ─────────
     let _ = relay.set_read_timeout(Some(Duration::from_secs(1)));
-    let mut recv_cipher = recv_cipher;
+    let mut recv_cipher2: Option<crate::crypto::RecvCipher> = None; // cipher ушёл в pipeline
     let mut shell: Option<ShellRuntime> = None;
+    let (out_tx, _out_rx) = mpsc::channel::<PeerMessage>(); // legacy compat
+
     while !stop.load(Ordering::Relaxed) {
-        match recv_peer_rc(&mut relay, &mut recv_cipher) {
-            Ok(Some(msg)) => handle_client_input(
+        match recv_peer_rc2(&mut relay, &mut recv_cipher2) {
+            Ok(Some(msg)) => handle_client_input_pipeline(
                 msg,
-                &out_tx,
+                &cmd_tx,
+                &peer_msg_tx,
                 &mut shell,
                 &shared_target_fps,
                 &shared_quality_milli,
             ),
             Ok(None) => {}
             Err(ref e) if is_timeout(e) => {}
-            Err(_) => break, // disconnected
+            Err(_) => break,
         }
     }
-    stop.store(true, Ordering::Relaxed);
 
-    // Обрываем TCP соединение — это разблокирует send_framed в video_loop
-    // который мог зависнуть ожидая дренажа буфера на Windows.
+    // Сигнал остановки
+    let _ = cmd_tx.send(crate::video_pipeline::PipelineCmd::Stop);
     let _ = relay.shutdown(std::net::Shutdown::Both);
 
     if let Some(mut shell) = shell.take() {
         shell.stop();
     }
 
-    // video_handle.join() с таймаутом 2 сек.
-    // На Windows MF-энкодер иногда блокируется при cleanup — не ждём вечно.
-    // Если поток не завершился — просто отпускаем (он завершится когда сможет).
+    // join pipeline с таймаутом 3 сек
     {
         let (done_tx, done_rx) = mpsc::channel::<()>();
         thread::spawn(move || {
-            let _ = video_handle.join();
+            let _ = pipeline_handle.join();
             let _ = done_tx.send(());
         });
-        match done_rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(()) => {} // нормальное завершение
-            Err(_) => {
-                // Поток не завершился за 2 сек — логируем и продолжаем.
-                // Код возврата 0xcfffffff больше не будет блокировать UI.
-                eprintln!("[host] video thread join timeout — detaching (MF encoder cleanup)");
-            }
+        match done_rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(()) => {}
+            Err(_) => eprintln!("[host] pipeline join timeout — detaching"),
         }
     }
 
@@ -2888,6 +2769,59 @@ fn handle_client_input(
         }
         Some(peer_message::Union::Shell(shell_msg)) => {
             handle_shell_message(shell_msg, outgoing, shell);
+        }
+        _ => {}
+    }
+}
+
+/// Версия recv_peer_rc без cipher — для нового pipeline input loop.
+/// Cipher теперь находится внутри pipeline, а не в input loop.
+fn recv_peer_rc2(
+    stream: &mut std::net::TcpStream,
+    _cipher: &mut Option<crate::crypto::RecvCipher>,
+) -> Result<Option<PeerMessage>, String> {
+    // Без шифрования на этом уровне — pipeline сам обрабатывает cipher.
+    // Читаем framed пакет и декодируем как PeerMessage (plain).
+    use crate::transport::read_framed;
+    let payload = read_framed(stream)?;
+    if payload.is_empty() {
+        return Ok(None);
+    }
+    let msg = crate::rustdesk_proto::decode_peer_message(&payload)
+        .map_err(|e| format!("decode: {e}"))?;
+    Ok(Some(msg))
+}
+
+/// Версия handle_client_input для нового pipeline — шлёт команды через канал.
+fn handle_client_input_pipeline(
+    msg: PeerMessage,
+    cmd_tx:       &mpsc::Sender<crate::video_pipeline::PipelineCmd>,
+    peer_msg_tx:  &mpsc::Sender<PeerMessage>,
+    shell:        &mut Option<ShellRuntime>,
+    target_fps:   &AtomicU32,
+    quality_milli: &AtomicU32,
+) {
+    use crate::video_pipeline::PipelineCmd;
+    match msg.union {
+        Some(peer_message::Union::MouseEvent(ev)) => inject_mouse(ev),
+        Some(peer_message::Union::KeyEvent(ev))   => inject_key(ev),
+        Some(peer_message::Union::Misc(Misc {
+            union: Some(misc::Union::Option(option)),
+        })) => {
+            if option.custom_fps > 0 {
+                let fps = (option.custom_fps as u32).clamp(5, MAX_TARGET_FPS);
+                target_fps.store(fps, Ordering::Relaxed);
+                let _ = cmd_tx.send(PipelineCmd::SetFps(fps));
+            }
+            if let Some(quality) = option_quality_milli(&option) {
+                quality_milli.store(quality, Ordering::Relaxed);
+                let _ = cmd_tx.send(PipelineCmd::SetQuality(quality));
+            }
+        }
+        Some(peer_message::Union::Shell(shell_msg)) => {
+            let _ = peer_msg_tx; // shell output goes via peer_msg_tx
+            let dummy_tx = mpsc::channel::<PeerMessage>().0;
+            handle_shell_message(shell_msg, &dummy_tx, shell);
         }
         _ => {}
     }

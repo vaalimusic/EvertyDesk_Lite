@@ -167,6 +167,62 @@ pub fn packetize_enhancement_frame(
     packetize(TYPE_ENHANCEMENT_FRAME, flags, frame_id, presentation_time_us, payload)
 }
 
+/// ROI (Region of Interest) — регион изменения экрана.
+/// Хост шлёт перед видео-фреймом чтобы клиент знал какая часть изменилась.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RoiRect {
+    pub frame_id: u32,
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+impl RoiRect {
+    pub fn to_json(self) -> Vec<u8> {
+        format!(
+            r#"{{"frameId":{},"x":{},"y":{},"w":{},"h":{}}}"#,
+            self.frame_id, self.x, self.y, self.w, self.h
+        ).into_bytes()
+    }
+
+    pub fn from_json(payload: &[u8]) -> Option<Self> {
+        let s = std::str::from_utf8(payload).ok()?;
+        Some(Self {
+            frame_id: json_u32_field(s, "frameId").unwrap_or(0),
+            x:        json_u32_field(s, "x").unwrap_or(0),
+            y:        json_u32_field(s, "y").unwrap_or(0),
+            w:        json_u32_field(s, "w").unwrap_or(0),
+            h:        json_u32_field(s, "h").unwrap_or(0),
+        })
+    }
+
+    /// Является ли ROI полным экраном (нет ограничений)?
+    pub fn is_full_screen(self) -> bool {
+        self.w == 0 && self.h == 0
+    }
+}
+
+/// Построить ROI-пакет для отправки перед видео-фреймом.
+pub fn build_roi_metadata(roi: RoiRect) -> Vec<u8> {
+    let json = roi.to_json();
+    if json.len() <= MAX_PAYLOAD_SIZE {
+        build_single(TYPE_ROI_METADATA, &json)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Пакетизировать аудио-фрейм (PCM данные).
+/// Аудио-фреймы маленькие и обычно умещаются в один пакет.
+pub fn packetize_audio_frame(
+    frame_id: u32,
+    presentation_time_us: u64,
+    payload: &[u8],
+) -> Vec<Vec<u8>> {
+    packetize(TYPE_AUDIO_FRAME, 0, frame_id, presentation_time_us, payload)
+}
+
 /// Построить одиночный пакет для конфигурации/управления.
 pub fn build_single(packet_type: u8, payload: &[u8]) -> Vec<u8> {
     assert!(
