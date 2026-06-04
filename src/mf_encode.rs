@@ -164,6 +164,16 @@ mod inner {
             ok
         }
 
+        /// Вернуть закешированные codec parameter sets (SPS/PPS или VPS/SPS/PPS).
+        /// Используется EVRT-сессией для отправки CodecConfig перед keyframe.
+        pub fn codec_config(&self) -> Option<Vec<u8>> {
+            if self.param_sets.is_empty() {
+                None
+            } else {
+                Some(self.param_sets.clone())
+            }
+        }
+
         pub fn current_bitrate(&self) -> u32 {
             self.bitrate
         }
@@ -867,6 +877,8 @@ mod fallback {
         pub fn current_bitrate(&self) -> u32 { 0 }
 
         pub fn update_bitrate(&mut self, _new_bitrate: u32) -> bool { false }
+
+        pub fn codec_config(&self) -> Option<Vec<u8>> { None }
 
         pub fn encode_bgra(
             &mut self,

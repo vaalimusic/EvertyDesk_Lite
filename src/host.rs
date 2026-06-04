@@ -712,7 +712,9 @@ fn handle_rendezvous_msg(
 
         // ── Standard incoming connection: server tells host a peer wants in ──
         // We always go through the relay (firewall-proof), regardless of the
-        // direct-punch hint, so it works on any network.
+        // direct-punch hint.
+        // Пробуем прямой UDP (EVRT) если force_relay=false и адрес декодируется.
+        // При неудаче — TCP relay как раньше.
         Some(rendezvous_message::Union::PunchHole(ph)) => {
             let dedupe_key = format!("punch-hole:{:?}", ph.socket_addr);
             if relay_event_seen_recently(dedupe_key, Duration::from_millis(500)) {
@@ -731,6 +733,76 @@ fn handle_rendezvous_msg(
                     ph.force_relay
                 ),
             );
+
+            // ── Попытка прямого EVRT UDP ──────────────────────────────────────
+            if !ph.force_relay {
+                if let Some(peer_addr) =
+                    crate::evrt_session::decode_punch_addr(&ph.socket_addr)
+                {
+                    host_log(events, format!("PunchHole: trying direct EVRT UDP → {peer_addr}"));
+                    let cfg   = config.clone();
+                    let evs   = events.clone();
+                    let stop  = Arc::new(AtomicBool::new(false));
+                    let fps   = Arc::new(AtomicU32::new(cfg.display.target_fps.clamp(5, 60)));
+                    let qual  = Arc::new(AtomicU32::new(1_000));
+                    let relay = relay_server.clone();
+
+                    // Передаём UDP-сокет регистрационного цикла через Arc
+                    // (сокет создаётся выше в registration_loop — здесь нет прямого доступа,
+                    // поэтому создаём новый временный на случайном порту для EVRT).
+                    thread::spawn(move || {
+                        let udp = match std::net::UdpSocket::bind("0.0.0.0:0") {
+                            Ok(s) => Arc::new(s),
+                            Err(e) => {
+                                let _ = evs.send(HostEvent::Log(
+                                    format!("EVRT: UDP bind failed: {e}, falling back to relay"),
+                                ));
+                                // Fallback: запустить TCP relay
+                                handle_relay_session(
+                                    cfg, evs, "(punch)".to_owned(), relay, String::new(),
+                                );
+                                return;
+                            }
+                        };
+
+                        // Punch: отправляем пустой UDP пакет чтобы открыть NAT-дырку
+                        let _ = udp.send_to(&[0u8], peer_addr);
+                        thread::sleep(Duration::from_millis(50));
+                        let _ = udp.send_to(&[0u8], peer_addr); // повтор
+
+                        let params = crate::evrt_session::EvrtSessionParams {
+                            peer_addr,
+                            socket: udp,
+                            config: cfg.clone(),
+                            peer_id: format!("{peer_addr}"),
+                            events: evs.clone(),
+                            stop,
+                            target_fps: fps,
+                            quality_milli: qual,
+                        };
+
+                        match crate::evrt_session::run_evrt_session(params) {
+                            Ok(()) => {}
+                            Err(e) => {
+                                let _ = evs.send(HostEvent::Log(
+                                    format!("EVRT direct failed ({e}), falling back to relay"),
+                                ));
+                                // Fallback: TCP relay
+                                handle_relay_session(
+                                    cfg, evs, "(punch-fallback)".to_owned(), relay, String::new(),
+                                );
+                            }
+                        }
+                    });
+
+                    let _ = events.send(HostEvent::StateChanged(HostState::Accepting(
+                        peer_addr.to_string(),
+                    )));
+                    return None;
+                }
+            }
+
+            // force_relay=true или адрес не декодируется → стандартный TCP relay
             create_relay(config, events, ph.socket_addr, relay_server);
             None
         }
@@ -2072,11 +2144,11 @@ struct VideoEncodeInterval {
 }
 
 #[derive(Clone, Copy)]
-struct ClientVideoSupport {
-    h264: bool,
-    h265: bool,
-    av1: bool,
-    prefer: PreferCodec,
+pub struct ClientVideoSupport {
+    pub h264: bool,
+    pub h265: bool,
+    pub av1: bool,
+    pub prefer: PreferCodec,
 }
 
 impl Default for ClientVideoSupport {
@@ -2090,11 +2162,11 @@ impl Default for ClientVideoSupport {
     }
 }
 
-struct EncodedPacket {
-    backend: VideoEncoderBackend,
-    codec: crate::nvenc::NvencCodec,
-    bytes: Vec<u8>,
-    key: bool,
+pub struct EncodedPacket {
+    pub backend: VideoEncoderBackend,
+    pub codec: crate::nvenc::NvencCodec,
+    pub bytes: Vec<u8>,
+    pub key: bool,
 }
 
 impl EncodedPacket {
@@ -4279,4 +4351,39 @@ fn hostname() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "EvertyDesk".to_owned())
+}
+
+// ─── Pub-обёртки для evrt_session ─────────────────────────────────────────────
+
+/// Публичная обёртка — нужна для `evrt_session.rs`.
+pub fn h264_target_bitrate_bps_pub(w: u32, h: u32, fps: u32, quality_milli: u32) -> u32 {
+    h264_target_bitrate_bps(w, h, fps, quality_milli)
+}
+
+/// Публичная обёртка choose_mf_encoder_codec — нужна для `evrt_session.rs`.
+pub fn choose_mf_encoder_codec_pub(
+    enc: crate::settings::EncoderPreference,
+    codec: crate::settings::CodecPreference,
+    client: ClientVideoSupport,
+) -> Option<crate::nvenc::NvencCodec> {
+    choose_mf_encoder_codec(enc, codec, client)
+}
+
+/// Публичная обёртка encode_mf_frame — нужна для `evrt_session.rs`.
+pub fn encode_mf_frame_pub(
+    encoder: &mut Option<crate::mf_encode::MfVideoEncoder>,
+    codec: crate::nvenc::NvencCodec,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate: u32,
+    bgra: &[u8],
+    force_key: bool,
+) -> Result<Option<EncodedPacket>, String> {
+    encode_mf_frame(encoder, codec, width, height, fps, bitrate, bgra, force_key)
+}
+
+/// Публичная обёртка release_stuck_input — нужна для `evrt_session.rs`.
+pub fn release_stuck_input_pub() {
+    release_stuck_input();
 }
