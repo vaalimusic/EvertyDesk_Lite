@@ -334,6 +334,45 @@ impl TransportClient {
             let _ = events.send(SessionEvent::Progress(pct, message));
         };
 
+        // ── Попытка прямого EVRT UDP (до TCP relay) ──────────────────────────
+        // Если hbbs вернул внешний UDP-адрес хоста (PunchHoleResponse.socket_addr),
+        // пробуем прямое соединение. При неудаче — обычный TCP relay.
+        {
+            let evrt_request = request.clone();
+            let evrt_events  = events.clone();
+            if let Ok(info) = establish_session_info(&evrt_request, &mut |_, _| {}) {
+                if let Some(ref addr_bytes) = info.peer_udp_addr {
+                    if let Some(host_addr) =
+                        crate::evrt_session::decode_punch_addr(addr_bytes)
+                    {
+                        let _ = evrt_events.send(SessionEvent::Progress(
+                            70,
+                            format!("Пробуем прямой EVRT → {host_addr}"),
+                        ));
+                        let stop_evrt = std::sync::Arc::new(
+                            std::sync::atomic::AtomicBool::new(false),
+                        );
+                        let udp = std::net::UdpSocket::bind("0.0.0.0:0").ok()
+                            .map(std::sync::Arc::new);
+                        if let Some(udp) = udp {
+                            let used = crate::evrt_client::try_evrt_before_relay(
+                                &udp,
+                                host_addr,
+                                &evrt_events,
+                                stop_evrt,
+                                display_config.target_fps >= 60,
+                            );
+                            if used {
+                                // EVRT сессия завершилась нормально — выходим
+                                return;
+                            }
+                            // Иначе продолжаем с TCP relay ниже
+                        }
+                    }
+                }
+            }
+        }
+
         let (mut relay, peer_stage, displays) = match establish_session(request, &mut emit_progress)
         {
             Ok(session) => session,
@@ -1010,6 +1049,36 @@ fn raise_adaptive_fps(current: i32, max_fps: i32) -> i32 {
         .copied()
         .find(|fps| *fps > current && *fps <= max_fps)
         .unwrap_or(current)
+}
+
+/// Лёгкий запрос к hbbs — только rendezvous-ответ без открытия relay.
+/// Используется EVRT-путём для получения `peer_udp_addr`.
+fn establish_session_info(
+    request: &ConnectionRequest,
+    _progress: &mut impl FnMut(u8, String),
+) -> Result<RendezvousInfo, String> {
+    let mut rendezvous = connect_tcp(&request.server.id_server, RENDEZVOUS_PORT)?;
+    let message = RendezvousMessage {
+        union: Some(rendezvous_message::Union::PunchHoleRequest(
+            PunchHoleRequest {
+                id: request.remote_id.clone(),
+                nat_type: NatType::UnknownNat as i32,
+                licence_key: request.server.public_key.clone(),
+                conn_type: ConnType::DefaultConn as i32,
+                token: String::new(),
+                version: "1.4.6".to_owned(),
+                udp_port: 0,
+                force_relay: false, // false = запросить punch-hole адрес
+                upnp_port: 0,
+                socket_addr_v6: Vec::new(),
+            },
+        )),
+    };
+    send_framed(&mut rendezvous, &encode_message(&message))?;
+    rendezvous.set_read_timeout(Some(Duration::from_secs(4))).ok();
+    let response = read_framed(&mut rendezvous)?;
+    let decoded = decode_message(&response).map_err(|e| format!("Decode: {e}"))?;
+    describe_rendezvous_response(&decoded)
 }
 
 fn establish_session(
@@ -3236,6 +3305,9 @@ struct RendezvousInfo {
     relay_server: Option<String>,
     relay_uuid: Option<String>,
     has_signed_pk: bool,
+    /// Внешний UDP-адрес хоста из `PunchHoleResponse.socket_addr` —
+    /// используется для попытки прямого EVRT-соединения.
+    peer_udp_addr: Option<Vec<u8>>,
 }
 
 fn describe_rendezvous_response(message: &RendezvousMessage) -> Result<RendezvousInfo, String> {
@@ -3255,6 +3327,8 @@ fn describe_rendezvous_response(message: &RendezvousMessage) -> Result<Rendezvou
                     .then(|| response.relay_server.clone()),
                 relay_uuid: None,
                 has_signed_pk: !response.pk.is_empty(),
+                peer_udp_addr: (!response.socket_addr.is_empty())
+                    .then(|| response.socket_addr.clone()),
             })
         }
         Some(rendezvous_message::Union::RelayResponse(response)) => {
@@ -3266,6 +3340,7 @@ fn describe_rendezvous_response(message: &RendezvousMessage) -> Result<Rendezvou
                         .then(|| response.relay_server.clone()),
                     relay_uuid: (!response.uuid.is_empty()).then(|| response.uuid.clone()),
                     has_signed_pk: false,
+                    peer_udp_addr: None,
                 })
             }
         }

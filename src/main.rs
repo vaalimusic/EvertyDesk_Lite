@@ -8,6 +8,7 @@ mod capture;
 mod colorconv;
 mod crypto;
 mod evrt;
+mod evrt_client;
 mod evrt_session;
 mod frame_queue;
 mod fsr;
