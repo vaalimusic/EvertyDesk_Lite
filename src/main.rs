@@ -89,6 +89,7 @@ fn main() -> eframe::Result<()> {
     if let Some(exit_code) = run_cli_connect() {
         std::process::exit(exit_code);
     }
+    start_hung_window_guardian();
 
     let renderer_mode = std::env::var("EVERTYDESK_RENDERER")
         .unwrap_or_else(|_| "auto".to_owned())
@@ -1626,12 +1627,82 @@ fn arm_shutdown_watchdog() {
     thread::Builder::new()
         .name("shutdown-watchdog".into())
         .spawn(|| {
-            thread::sleep(Duration::from_millis(3000));
-            // Called from a non-GPU thread: ExitProcess terminates the stuck
-            // GPU thread first, then DLL cleanup runs without contention.
-            std::process::exit(0);
+            thread::sleep(Duration::from_millis(2000));
+            // ExitProcess runs NVIDIA DLL destructors which deadlock with
+            // in-flight GPU work. TerminateProcess skips all cleanup and
+            // exits instantly — the OS reclaims all GPU resources.
+            force_terminate();
         })
         .ok();
+}
+
+fn force_terminate() -> ! {
+    #[cfg(windows)]
+    unsafe {
+        windows::Win32::System::Threading::TerminateProcess(
+            windows::Win32::System::Threading::GetCurrentProcess(),
+            0,
+        );
+        unreachable!()
+    }
+    #[cfg(not(windows))]
+    std::process::exit(0);
+}
+
+/// Background thread: if the main window becomes unresponsive (render thread
+/// stuck in GPU driver — common with OBS hooks or NVIDIA D3D deadlocks),
+/// IsHungAppWindow returns true and we terminate the process forcefully.
+/// This is the only reliable exit path when the Win32 message pump is blocked.
+fn start_hung_window_guardian() {
+    #[cfg(windows)]
+    thread::Builder::new()
+        .name("hung-guardian".into())
+        .spawn(|| {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                FindWindowA, SendMessageTimeoutA, ShowWindow, SMTO_ABORTIFHUNG, SW_HIDE, WM_NULL,
+            };
+            use windows::Win32::Foundation::{LPARAM, WPARAM};
+            use windows::core::s;
+
+            // Wait for the window to fully initialize.
+            thread::sleep(Duration::from_secs(5));
+
+            loop {
+                thread::sleep(Duration::from_millis(500));
+                unsafe {
+                    let hwnd = FindWindowA(None, s!("EvertyDesk Lite"));
+                    if hwnd.0 == 0 {
+                        continue;
+                    }
+                    // WM_NULL with 3 s timeout: normal render loop processes
+                    // messages every ~16 ms, so this only fires when genuinely stuck.
+                    let mut result = 0usize;
+                    let ok = SendMessageTimeoutA(
+                        hwnd,
+                        WM_NULL,
+                        WPARAM(0),
+                        LPARAM(0),
+                        SMTO_ABORTIFHUNG,
+                        3000,
+                        Some(&mut result),
+                    );
+                    if ok.0 == 0 {
+                        eprintln!("[guardian] Render thread stuck — hiding window");
+                        // Hide window immediately via win32k (kernel-level),
+                        // bypasses the stuck user-mode render thread.
+                        // User sees the window vanish instantly.
+                        ShowWindow(hwnd, SW_HIDE);
+                        thread::sleep(Duration::from_millis(200));
+                        eprintln!("[guardian] Terminating process");
+                        force_terminate();
+                    }
+                }
+            }
+        })
+        .ok();
+
+    #[cfg(not(windows))]
+    let _ = ();
 }
 
 

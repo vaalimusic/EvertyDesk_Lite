@@ -566,27 +566,17 @@ fn encode_loop(
 
     stop.store(true, Ordering::Relaxed);
 
-    // Move NVENC encoder to a background thread for deferred cleanup.
-    // everty_nvenc_destroy blocks until the GPU finishes the last encode job
-    // AND the capture thread stops using the GPU (Map/CopyResource).
-    // The capture thread exits within ~100 ms of seeing stop=true.
-    // Delaying NVENC destruction by 500 ms ensures both conditions are met
-    // without blocking encode_loop or the host thread.
-    // SAFETY: EncoderHandle wraps a raw pointer; everty_nvenc_destroy is
-    // thread-safe (NVENC API requirement for multi-process environments).
-    let deferred = crate::host::DeferredDrop::new(encoder);
-    std::thread::Builder::new()
-        .name("nvenc-cleanup".into())
-        .spawn(move || {
-            // Wait for capture thread to release GPU resources
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            drop(deferred); // NVENC destroyed here, safely
-            let _ = cap_handle; // capture handle kept alive until cleanup done
-        })
-        .ok();
+    // Do NOT call everty_nvenc_destroy here.
+    // Destroying a D3D11 device (used by NVENC) while WGPU renders via D3D12
+    // causes a deadlock inside nvwgf2umx.dll — both codepaths fight for the
+    // same NVIDIA internal critical section. The render thread freezes, the
+    // Win32 message pump stops, WM_CLOSE is never processed.
+    // Intentionally leaking the encoder avoids this entirely. The OS frees
+    // all VRAM when the process exits (normal or via TerminateProcess watchdog).
+    encoder.leak_gpu_resources();
+    let _ = cap_handle; // keep alive until capture notices stop (~100 ms)
 
     log(&events, "Encoder loop stopped".into());
-    // encode_loop returns immediately — no blocking on GPU teardown.
 }
 
 // ─── TCP Sender loop ──────────────────────────────────────────────────────────

@@ -4166,19 +4166,6 @@ pub struct EncodedOutput {
     pub codec: &'static str,
 }
 
-/// Wrapper that makes any T movable to another thread for deferred drop.
-/// SAFETY: caller guarantees T's destructor is thread-safe.
-pub struct DeferredDrop<T>(Option<T>);
-impl<T> DeferredDrop<T> {
-    pub fn new(v: T) -> Self { Self(Some(v)) }
-}
-impl<T> Drop for DeferredDrop<T> {
-    fn drop(&mut self) { drop(self.0.take()); }
-}
-// SAFETY: NvencEncoder/MultiEncoder destructors call everty_nvenc_destroy
-// which is documented as thread-safe in the NVENC API.
-unsafe impl<T> Send for DeferredDrop<T> {}
-
 /// Единый энкодер с каскадом аппаратных/программных бэкендов.
 pub struct MultiEncoder {
     // Выбранные кодеки для каждого бэкенда (None = бэкенд недоступен)
@@ -4253,6 +4240,23 @@ impl MultiEncoder {
     /// Причина отключения MF (если был выбран, но упал). Для диагностики.
     pub fn take_mf_error(&mut self) -> Option<String> {
         self.mf_error.take()
+    }
+
+    /// Intentionally leak GPU resources (NVENC D3D11 device) to avoid a
+    /// deadlock in nvwgf2umx.dll when WGPU's D3D12 renderer is still active.
+    /// The OS reclaims VRAM on process exit.  All CPU-side state is dropped
+    /// normally; only the GPU handle is forgotten.
+    pub fn leak_gpu_resources(&mut self) {
+        if let Some(nv) = self.nv.take() {
+            std::mem::forget(nv);
+        }
+        if let Some(mf) = self.mf.take() {
+            std::mem::forget(mf);
+        }
+        #[cfg(feature = "live-h264")]
+        if let Some(sw) = self.sw.take() {
+            std::mem::forget(sw);
+        }
     }
 
     /// Краткое описание активной цепочки бэкендов (для логов).
