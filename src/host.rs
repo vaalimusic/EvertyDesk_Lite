@@ -4166,6 +4166,19 @@ pub struct EncodedOutput {
     pub codec: &'static str,
 }
 
+/// Wrapper that makes any T movable to another thread for deferred drop.
+/// SAFETY: caller guarantees T's destructor is thread-safe.
+pub struct DeferredDrop<T>(Option<T>);
+impl<T> DeferredDrop<T> {
+    pub fn new(v: T) -> Self { Self(Some(v)) }
+}
+impl<T> Drop for DeferredDrop<T> {
+    fn drop(&mut self) { drop(self.0.take()); }
+}
+// SAFETY: NvencEncoder/MultiEncoder destructors call everty_nvenc_destroy
+// which is documented as thread-safe in the NVENC API.
+unsafe impl<T> Send for DeferredDrop<T> {}
+
 /// Единый энкодер с каскадом аппаратных/программных бэкендов.
 pub struct MultiEncoder {
     // Выбранные кодеки для каждого бэкенда (None = бэкенд недоступен)

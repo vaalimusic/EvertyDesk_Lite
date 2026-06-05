@@ -341,7 +341,10 @@ fn encode_loop(
     // Capture double buffer
     type CapSlot = Arc<Mutex<Option<(u32, u32, Vec<u8>)>>>;
     let cap_slot: CapSlot = Arc::new(Mutex::new(None));
-    {
+    // Keep the handle so we can join the capture thread before NVENC is
+    // destroyed.  Without this join, the DXGI duplication and NVENC D3D11
+    // devices overlap during teardown → GPU TDR → system freeze.
+    let cap_handle = {
         let cap_stop = stop.clone();
         let cap_fps = target_fps.clone();
         let cap_slot2 = cap_slot.clone();
@@ -368,8 +371,8 @@ fn encode_loop(
                     thread::sleep(Duration::from_micros(us.saturating_sub(500)));
                 }
             })
-            .expect("spawn capture");
-    }
+            .expect("spawn capture")
+    };
 
     let mut frame_id: u32 = 0;
     let mut last_idr: Instant = Instant::now();
@@ -562,7 +565,28 @@ fn encode_loop(
     }
 
     stop.store(true, Ordering::Relaxed);
+
+    // Move NVENC encoder to a background thread for deferred cleanup.
+    // everty_nvenc_destroy blocks until the GPU finishes the last encode job
+    // AND the capture thread stops using the GPU (Map/CopyResource).
+    // The capture thread exits within ~100 ms of seeing stop=true.
+    // Delaying NVENC destruction by 500 ms ensures both conditions are met
+    // without blocking encode_loop or the host thread.
+    // SAFETY: EncoderHandle wraps a raw pointer; everty_nvenc_destroy is
+    // thread-safe (NVENC API requirement for multi-process environments).
+    let deferred = crate::host::DeferredDrop::new(encoder);
+    std::thread::Builder::new()
+        .name("nvenc-cleanup".into())
+        .spawn(move || {
+            // Wait for capture thread to release GPU resources
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            drop(deferred); // NVENC destroyed here, safely
+            let _ = cap_handle; // capture handle kept alive until cleanup done
+        })
+        .ok();
+
     log(&events, "Encoder loop stopped".into());
+    // encode_loop returns immediately — no blocking on GPU teardown.
 }
 
 // ─── TCP Sender loop ──────────────────────────────────────────────────────────

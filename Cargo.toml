@@ -30,7 +30,6 @@ cc = "1"
 [dependencies]
 arboard = "3.6"
 base64 = "0.22"
-tray-icon = "0"
 eframe = { version = "0.34", default-features = false, features = [
     "wgpu",          # Vulkan/DX12/Metal + software fallback — no OpenGL 2.0 required
     "glow",          # OpenGL fallback for conservative Linux desktops
