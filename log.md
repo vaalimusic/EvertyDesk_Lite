@@ -66,3 +66,85 @@ Video: fps=60 bitrate=4503kbps bitrate_min=3800kbps bitrate_max=5000kbps roi_avg
 [19:42:34] Registered ✓ (key already on server)
 [19:42:34] Зарегистрировано на ID сервере ✓
 [19:42:37] Ожидание ответа от edesk.server1.everty.ru:21116 … (отправлено 4×, следующий heartbeat через 26s)
+
+
+1780688491  Frame received: h264-0 (H264)
+1780688493  Peer msg #4: VideoFrame display 0 H264 frames=1
+1780688493  Video telemetry: in=0.7 fps / 258 kbps, render=0.1 fps, codec=H264, packet=37 KB, queue=0 ms, decode=129 ms, drop=0, latency=n/a, health=низкий входящий поток: хост/сеть
+1780688493  Peer msg #5: VideoFrame display 0 H264 frames=1
+1780688495  Peer msg #6: VideoFrame display 0 H264 frames=1
+1780688495  Peer msg #7: VideoFrame display 0 H264 frames=1
+1780688495  Peer msg #8: VideoFrame display 0 H264 frames=1
+1780688496  Peer msg #9: VideoFrame display 0 H264 frames=1
+1780688496  Peer msg #10: VideoFrame display 0 H264 frames=1
+1780688496  Video telemetry: in=4.6 fps / 1207 kbps, render=0.9 fps, codec=H264, packet=5 KB, queue=0 ms, decode=11 ms, drop=0, latency=n/a, health=низкий входящий поток: хост/сеть
+1780688496  Peer msg #11: VideoFrame display 0 H264 frames=1
+1780688497  Peer msg #12: VideoFrame display 0 H264 frames=1
+1780688497  Peer msg #13: VideoFrame display 0 H264 frames=1
+1780688497  Peer msg #14: VideoFrame display 0 H264 frames=1
+1780688498  Peer msg #15: VideoFrame display 0 H264 frames=1
+1780688498  Peer msg #16: VideoFrame display 0 H264 frames=1
+1780688499  Peer msg #17: VideoFrame display 0 H264 frames=1
+1780688499  Peer msg #18: VideoFrame display 0 H264 frames=1
+1780688499  Video telemetry: in=2.7 fps / 491 kbps, render=2.3 fps, codec=H264, packet=18 KB, queue=0 ms, decode=9 ms, drop=0, latency=n/a, health=низкий входящий поток: хост/сеть
+1780688499  Video QoS feedback sent: 60 fps
+1780688499  Peer msg #19: VideoFrame display 0 H264 frames=1
+1780688500  Peer msg #20: VideoFrame display 0 H264 frames=1
+1780688500  Frame received: h264-316665 (H264)
+1780688503  Video telemetry: in=4.2 fps / 873 kbps, render=1.3 fps, codec=H264, packet=93 KB, queue=0 ms, decode=29 ms, drop=0, latency=n/a, health=низкий входящий поток: хост/сеть
+1780688503  Окно управления закрыто
+1780688503  Отключено
+1780688530  Session started for 454055949
+1780688530  Подключение к 454055949
+1780688530  5% - Validating input
+1780688530  15% - Validating server public key
+1780688530  30% - Connecting to ID server
+1780688530  45% - Connecting to Relay server
+1780688536  52% - UDP NAT probe unavailable; direct UDP disabled for this attempt (45.146.40.18:21116 attempt 12: recv failed: Resource temporarily unavailable (os error 35))
+1780688536  60% - Sending RustDesk PunchHoleRequest (EVRT probe)
+1780688536  80% - Waiting for rendezvous response
+1780688536  85% - Rendezvous protobuf response decoded
+1780688536  86% - Rendezvous selected relay; no direct candidate returned
+1780688536  88% - Using relay reservation from rendezvous response
+1780688536  92% - Opening relay stream
+1780688536  96% - Waiting for peer secure/login response
+1780688538  Connected: authorized; peer info: hostname=VAALIMUSIC, platform=windows, version=1.4.6; screenshot/control channel ready
+1780688538  Displays detected: 1
+1780688538  Display subscribed; waiting for first frame
+1780688538  Peer msg #1: Misc
+1780688538  Video QoS feedback sent: 60 fps
+1780688538  Peer msg #2: Misc
+1780688539  Peer msg #3: VideoFrame display 0 H264 frames=1
+1780688539  Live video stream active; using low-latency frame path
+1780688539  Frame received: h264-0 (H264)
+1780688541  Peer msg #4: VideoFrame display 0 H264 frames=1
+1780688541  Video telemetry: in=0.8 fps / 317 kbps, render=0.1 fps, codec=H264, packet=92 KB, queue=0 ms, decode=29 ms, drop=0, latency=n/a, health=низкий входящий поток: хост/сеть
+1780688541  Peer msg #5: VideoFrame display 0 H264 frames=1
+1780688542  Peer msg #6: VideoFrame display 0 H264 frames=1
+1780688542  Peer msg #7: VideoFrame display 0 H264 frames=1
+1780688542  Peer msg #8: VideoFrame display 0 H264 frames=1
+1780688542  Peer msg #9: VideoFrame display 0 H264 frames=1
+1780688543  Peer msg #10: VideoFrame display 0 H264 frames=1
+1780688543  Peer msg #11: VideoFrame display 0 H264 frames=1
+1780688543  Peer msg #12: VideoFrame display 0 H264 frames=1
+1780688544  Peer msg #13: VideoFrame display 0 H264 frames=1
+1780688544  Peer msg #14: VideoFrame display 0 H264 frames=1
+1780688544  Peer msg #15: VideoFrame display 0 H264 frames=1
+1780688544  Peer msg #16: VideoFrame display 0 H264 frames=1
+1780688544  Peer msg #17: VideoFrame display 0 H264 frames=1
+1780688544  Video telemetry: in=4.8 fps / 1205 kbps, render=2.3 fps, codec=H264, packet=24 KB, queue=0 ms, decode=10 ms, drop=0, latency=n/a, health=низкий входящий поток: хост/сеть
+1780688545  Peer msg #18: VideoFrame display 0 H264 frames=1
+1780688545  Peer msg #19: VideoFrame display 0 H264 frames=1
+1780688545  Peer msg #20: VideoFrame display 0 H264 frames=1
+1780688546  Frame received: h264-316665 (H264)
+1780688548  Video QoS feedback sent: 60 fps
+1780688548  Video telemetry: in=3.3 fps / 247 kbps, render=1.8 fps, codec=H264, packet=14 KB, queue=0 ms, decode=6 ms, drop=0, latency=n/a, health=низкий входящий поток: хост/сеть
+1780688551  Video telemetry: in=2.5 fps / 163 kbps, render=0.7 fps, codec=H264, packet=6 KB, queue=0 ms, decode=9 ms, drop=0, latency=n/a, health=низкий входящий поток: хост/сеть
+1780688554  Frame received: h264-649997 (H264)
+1780688554  Video telemetry: in=3.7 fps / 343 kbps, render=2.6 fps, codec=H264, packet=9 KB, queue=0 ms, decode=10 ms, drop=0, latency=n/a, health=низкий входящий поток: хост/сеть
+1780688558  Video telemetry: in=3.5 fps / 262 kbps, render=1.7 fps, codec=H264, packet=11 KB, queue=0 ms, decode=11 ms, drop=0, latency=n/a, health=низкий входящий поток: хост/сеть
+1780688558  Video QoS feedback sent: 60 fps
+1780688561  Video telemetry: in=1.4 fps / 488 kbps, render=2.5 fps, codec=H264, packet=9 KB, queue=0 ms, decode=8 ms, drop=0, latency=n/a, health=низкий входящий поток: хост/сеть
+1780688564  Frame received: h264-983329 (H264)
+1780688564  Окно управления закрыто
+1780688564  Отключено

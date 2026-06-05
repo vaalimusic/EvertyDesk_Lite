@@ -1919,11 +1919,14 @@ fn choose_mf_encoder_codec(
         CodecPreference::H265 => candidates.push(crate::nvenc::NvencCodec::H265),
         CodecPreference::H264 => candidates.push(crate::nvenc::NvencCodec::H264),
         CodecPreference::Auto => {
-            push_client_preferred_codec(&mut candidates, client.prefer);
-            candidates.extend([
-                crate::nvenc::NvencCodec::H265,
-                crate::nvenc::NvencCodec::H264,
-            ]);
+            // ★ H264 ПЕРВЫМ: аппаратный H264 MFT есть на всех GPU и быстрый.
+            //   H265 часто только софтверный MFT (190мс/кадр!) → откат на OpenH264.
+            //   RustDesk тоже использует H264 в Auto. H265 — только по явному запросу
+            //   и только если есть аппаратный энкодер.
+            candidates.push(crate::nvenc::NvencCodec::H264);
+            if crate::mf_encode::mf_encoder_status().has_hardware_h265() {
+                candidates.push(crate::nvenc::NvencCodec::H265);
+            }
         }
         CodecPreference::Av1 | CodecPreference::Vp9 => {
             candidates.push(crate::nvenc::NvencCodec::H264);
