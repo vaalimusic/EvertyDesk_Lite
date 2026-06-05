@@ -4101,6 +4101,12 @@ pub struct MultiEncoder {
     sw: Option<openh264::encoder::Encoder>,
     #[cfg(feature = "live-h264")]
     yuv: YuvFrame,
+
+    /// Какой бэкенд реально выдал последний кадр (для диагностики).
+    /// Меняется на первом успехе — видно MF это, OpenH264 или PNG.
+    active_backend: &'static str,
+    /// Логировать активный бэкенд один раз.
+    backend_logged: bool,
 }
 
 impl MultiEncoder {
@@ -4131,7 +4137,14 @@ impl MultiEncoder {
             sw,
             #[cfg(feature = "live-h264")]
             yuv: YuvFrame::default(),
+            active_backend: "none",
+            backend_logged: false,
         }
+    }
+
+    /// Реальный бэкенд который выдал последний кадр (MF/VideoToolbox/NVENC/OpenH264/PNG).
+    pub fn active_backend(&self) -> &'static str {
+        self.active_backend
     }
 
     /// Краткое описание активной цепочки бэкендов (для логов).
@@ -4183,6 +4196,7 @@ impl MultiEncoder {
                     } else {
                         None
                     };
+                    self.active_backend = "MediaFoundation";
                     return Some(EncodedOutput {
                         bytes: pkt.bytes,
                         key: pkt.key,
@@ -4208,6 +4222,7 @@ impl MultiEncoder {
                 force_key,
             ) {
                 Ok(Some(pkt)) => {
+                    self.active_backend = "VideoToolbox";
                     return Some(EncodedOutput {
                         bytes: pkt.bytes,
                         key: pkt.key,
@@ -4233,6 +4248,7 @@ impl MultiEncoder {
                 force_key,
             ) {
                 Ok(Some(pkt)) => {
+                    self.active_backend = "NVENC";
                     return Some(EncodedOutput {
                         bytes: pkt.bytes,
                         key: pkt.key,
@@ -4256,6 +4272,7 @@ impl MultiEncoder {
                 bgra,
                 force_key,
             ) {
+                self.active_backend = "OpenH264-SW";
                 return Some(EncodedOutput {
                     bytes: pkt.bytes,
                     key: pkt.key,
@@ -4267,6 +4284,7 @@ impl MultiEncoder {
 
         // 5. PNG fallback (только на keyframe чтобы не спамить большими кадрами)
         if force_key {
+            self.active_backend = "PNG";
             return Some(EncodedOutput {
                 bytes: encode_png_fallback(bgra, width, height),
                 key: true,

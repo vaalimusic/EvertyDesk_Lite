@@ -313,6 +313,7 @@ fn encode_loop(
     // ★ Телеметрия pipeline
     let mut tele = PipelineTelemetry::new(encoder.backend_label());
     let mut last_tele_at = Instant::now();
+    let mut backend_logged = false;
     const TELE_INTERVAL: Duration = Duration::from_secs(10);
 
     // Capture double buffer
@@ -444,7 +445,19 @@ fn encode_loop(
         let Some(out) = encoder.encode(enc_w, enc_h, fps, eff_bps, bgra, want_idr) else {
             continue;
         };
-        tele.mark_encode(encode_started.elapsed());
+        let encode_dur = encode_started.elapsed();
+        tele.mark_encode(encode_dur);
+
+        // ★ Один раз логируем РЕАЛЬНЫЙ бэкенд (MediaFoundation/OpenH264-SW/PNG).
+        //   Критично для диагностики: показывает, аппаратный энкодер или софт.
+        if !backend_logged {
+            backend_logged = true;
+            log(&events, format!(
+                "★ Реальный энкодер: {} ({}×{}@{}, первый кадр {}мс)",
+                encoder.active_backend(), enc_w, enc_h, fps,
+                encode_dur.as_millis(),
+            ));
+        }
 
         frame_id = frame_id.wrapping_add(1);
         let pts_us = sample_hns / 10;
