@@ -26,9 +26,12 @@ pub fn local_ipv4_addresses() -> Vec<Ipv4Addr> {
 }
 
 /// Сформировать строку кандидатов "ip1:port,ip2:port,..." для Misc.
+/// Исключаем link-local (169.254.x.x) — они почти всегда бесполезны и только
+/// заставляют клиента тратить время на заведомо мёртвые попытки.
 pub fn candidate_endpoints(port: u16) -> String {
     local_ipv4_addresses()
         .iter()
+        .filter(|ip| !ip.is_link_local())
         .map(|ip| format!("{ip}:{port}"))
         .collect::<Vec<_>>()
         .join(",")
