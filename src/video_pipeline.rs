@@ -57,6 +57,12 @@ pub struct EncodedFrame {
     pub codec:    &'static str,
 }
 
+/// Элемент TCP-канала: видеокадр или control-сообщение (shell output).
+enum TcpItem {
+    Video(EncodedFrame),
+    Peer(crate::rustdesk_proto::PeerMessage),
+}
+
 // ─── Pipeline commands ────────────────────────────────────────────────────────
 
 pub enum PipelineCmd {
@@ -89,7 +95,7 @@ pub fn run(cfg: PipelineConfig) {
     let PipelineConfig {
         app_config, peer_id, events,
         relay_stream, send_cipher,
-        evrt_socket, cmd_rx, peer_msg_rx: _,
+        evrt_socket, cmd_rx, peer_msg_rx,
     } = cfg;
 
     let stop       = Arc::new(AtomicBool::new(false));
@@ -101,14 +107,35 @@ pub fn run(cfg: PipelineConfig) {
     // IDR request channel: cmd_rx → encoder
     let (idr_tx, idr_rx) = mpsc::channel::<()>();
 
-    // ── Два канала кадров: encoder → tcp sender, encoder → evrt sender ────────
-    // SyncSender с буфером 2: если sender не успевает — encoder притормаживает,
-    // а не накапливает очередь (убивает latency).
-    let (tcp_tx, tcp_rx)   = mpsc::sync_channel::<EncodedFrame>(2);
+    // ── TCP канал несёт И видео, И control (shell output) ──────────────────────
+    // TcpItem::Video — видеокадры (с приоритетом latency, буфер 2)
+    // TcpItem::Peer  — shell output, control сообщения (всегда доставляются)
+    let (tcp_tx, tcp_rx)   = mpsc::sync_channel::<TcpItem>(8);
     let (evrt_tx, evrt_rx) = mpsc::sync_channel::<EncodedFrame>(2);
 
     // ── Флаг: EVRT активен? Устанавливается когда клиент прислал punch ────────
     let evrt_active: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+
+    // ── Forwarder: peer_msg_rx (shell output) → TCP канал ────────────────────
+    {
+        let tcp_fwd  = tcp_tx.clone();
+        let stop_fwd = stop.clone();
+        thread::Builder::new()
+            .name("pipeline-peermsg".into())
+            .spawn(move || {
+                while !stop_fwd.load(Ordering::Relaxed) {
+                    match peer_msg_rx.recv_timeout(Duration::from_millis(100)) {
+                        Ok(msg) => {
+                            // Shell output всегда идёт по TCP relay (не video path)
+                            if tcp_fwd.send(TcpItem::Peer(msg)).is_err() { break; }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(_) => break,
+                    }
+                }
+            })
+            .expect("spawn peermsg-forwarder");
+    }
 
     // ── Encoder + Capture thread ─────────────────────────────────────────────
     {
@@ -218,7 +245,7 @@ fn encode_loop(
     quality_ms:  Arc<AtomicU32>,
     config:      AppConfig,
     events:      Sender<HostEvent>,
-    tcp_tx:      SyncSender<EncodedFrame>,
+    tcp_tx:      SyncSender<TcpItem>,
     evrt_tx:     SyncSender<EncodedFrame>,
     evrt_active: Arc<Mutex<Option<SocketAddr>>>,
     idr_rx:      Receiver<()>,
@@ -248,6 +275,14 @@ fn encode_loop(
     // HNS PTS counter
     let mut sample_hns: u64 = 0;
     let hns_per_frame = |fps: u32| 10_000_000u64 / fps.max(1) as u64;
+
+    // ★ Детектор изменений — пропускает статичные кадры (экономия трафика)
+    let mut change_detector = crate::host::FrameChangeDetector::default();
+
+    // ★ Телеметрия pipeline
+    let mut tele = PipelineTelemetry::new(encoder.backend_label());
+    let mut last_tele_at = Instant::now();
+    const TELE_INTERVAL: Duration = Duration::from_secs(10);
 
     // Capture double buffer
     type CapSlot = Arc<Mutex<Option<(u32, u32, Vec<u8>)>>>;
@@ -302,37 +337,58 @@ fn encode_loop(
             next_frame_due = Instant::now() + frame_interval;
         }
 
-        // IDR
-        let want_idr = idr_rx.try_recv().is_ok() || last_idr.elapsed() > IDR_MIN;
+        // IDR по таймеру/запросу
+        let periodic_key = idr_rx.try_recv().is_ok() || last_idr.elapsed() > IDR_MIN;
 
         // Захват
+        let cap_started = Instant::now();
         let Some((cap_w, cap_h, bgra_raw)) =
             cap_slot.lock().ok().and_then(|mut s| s.take())
         else {
             thread::sleep(Duration::from_millis(1));
             continue;
         };
+        tele.mark_capture(cap_started.elapsed());
 
-        // FSR
-        let (enc_w, enc_h, bgra_owned);
-        let bgra: &[u8] = if let Some(ref mut a) = fsr {
-            let (nw, nh) = crate::capture::screen_size().unwrap_or((cap_w, cap_h));
-            bgra_owned = a.process_bgra(&bgra_raw, cap_w, cap_h, nw, nh).to_owned();
-            enc_w = nw; enc_h = nh;
-            &bgra_owned
+        // FSR: апскейл происходит in-place в буфере адаптера.
+        // Передаём срез напрямую в кодировщик — без лишнего .to_owned()
+        // (кодирование синхронно сразу после, буфер FSR жив весь кадр).
+        let (enc_w, enc_h) = if fsr.is_some() {
+            crate::capture::screen_size().unwrap_or((cap_w, cap_h))
         } else {
-            bgra_owned = Vec::new();
-            let _ = &bgra_owned;
-            enc_w = cap_w; enc_h = cap_h;
-            &bgra_raw
+            (cap_w, cap_h)
+        };
+        let bgra: &[u8] = match fsr {
+            Some(ref mut a) => a.process_bgra(&bgra_raw, cap_w, cap_h, enc_w, enc_h),
+            None            => &bgra_raw,
         };
 
+        // ── Детекция изменений: пропускаем статичные кадры ────────────────────
+        let change_started = Instant::now();
+        let decision = change_detector.decide(enc_w, enc_h, bgra, periodic_key);
+        tele.mark_change(change_started.elapsed());
+
+        if !decision.send {
+            // Кадр не изменился — не кодируем, не шлём. Экономия трафика и CPU.
+            tele.mark_skipped();
+            // Backoff при долгой статике — снижаем частоту опроса
+            if let Some(delay) = change_detector.static_backoff_delay(fps) {
+                thread::sleep(delay);
+            }
+            maybe_emit_telemetry(&events, &mut tele, &mut change_detector,
+                                 &mut last_tele_at, TELE_INTERVAL, fps);
+            continue;
+        }
+
+        let want_idr = decision.force_key || periodic_key;
         let quality  = quality_ms.load(Ordering::Relaxed);
         let eff_bps  = h264_target_bitrate_bps_pub(enc_w, enc_h, fps, quality);
 
         // ── Кодирование через единый каскад ───────────────────────────────────
+        let encode_started = Instant::now();
         let Some(out) = encoder.encode(enc_w, enc_h, fps, eff_bps, bgra, want_idr)
         else { continue };
+        tele.mark_encode(encode_started.elapsed());
 
         frame_id = frame_id.wrapping_add(1);
         let pts_us = sample_hns / 10;
@@ -340,6 +396,10 @@ fn encode_loop(
 
         let is_idr = out.key;
         if is_idr { last_idr = Instant::now(); }
+
+        // Отметить кадр как отправленный в детекторе
+        tele.mark_sent(out.bytes.len(), is_idr);
+        change_detector.mark_sent(enc_w, enc_h, bgra);
 
         let frame = EncodedFrame {
             bytes:    Arc::new(out.bytes),
@@ -352,30 +412,30 @@ fn encode_loop(
             codec:    out.codec,
         };
 
+        maybe_emit_telemetry(&events, &mut tele, &mut change_detector,
+                             &mut last_tele_at, TELE_INTERVAL, fps);
+
         // ── Dispatch ──────────────────────────────────────────────────────────
         // EVRT активен: все кадры → EVRT, только IDR → TCP (синхронизация)
         // EVRT не активен: все кадры → TCP
         let evrt_on = evrt_active.lock().map(|g| g.is_some()).unwrap_or(false);
 
         if evrt_on {
-            // EVRT primary: шлём все кадры в EVRT, IDR в TCP для sync
+            // EVRT primary: все кадры → EVRT, IDR → TCP для синхронизации
             match evrt_tx.try_send(frame.clone()) {
                 Ok(()) => {}
-                Err(mpsc::TrySendError::Full(_)) => {
-                    // EVRT буфер полон — клиент не успевает, пропускаем
-                }
+                Err(mpsc::TrySendError::Full(_)) => {} // клиент не успевает
                 Err(mpsc::TrySendError::Disconnected(_)) => break,
             }
             if is_idr {
-                // IDR в TCP для того чтобы клиент мог переключиться обратно
-                match tcp_tx.try_send(frame) {
+                match tcp_tx.try_send(TcpItem::Video(frame)) {
                     Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
                     Err(mpsc::TrySendError::Disconnected(_)) => break,
                 }
             }
         } else {
-            // TCP primary: все кадры в TCP
-            match tcp_tx.try_send(frame) {
+            // TCP primary: все кадры → TCP
+            match tcp_tx.try_send(TcpItem::Video(frame)) {
                 Ok(()) => {}
                 Err(mpsc::TrySendError::Full(_)) => {}
                 Err(mpsc::TrySendError::Disconnected(_)) => break,
@@ -391,10 +451,10 @@ fn encode_loop(
 
 fn tcp_send_loop(
     stop:        Arc<AtomicBool>,
-    frame_rx:    Receiver<EncodedFrame>,
+    item_rx:     Receiver<TcpItem>,
     stream:      &mut std::net::TcpStream,
     cipher:      &mut Option<crate::crypto::SendCipher>,
-    evrt_active: Arc<Mutex<Option<SocketAddr>>>,
+    _evrt_active: Arc<Mutex<Option<SocketAddr>>>,
     events:      Sender<HostEvent>,
 ) {
     // Write timeout чтобы не висеть при разрыве соединения
@@ -402,14 +462,19 @@ fn tcp_send_loop(
     log(&events, "TCP sender started".into());
 
     while !stop.load(Ordering::Relaxed) {
-        let frame = match frame_rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(f) => f,
+        let item = match item_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(i) => i,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(_) => break,
         };
 
-        let video_msg = make_tcp_video_frame(&frame);
-        let mut payload = crate::transport::encode_peer_message_raw(&video_msg);
+        // Видео → конвертируем в VideoFrame; control (shell) → как есть
+        let msg = match item {
+            TcpItem::Video(frame) => make_tcp_video_frame(&frame),
+            TcpItem::Peer(peer_msg) => peer_msg,
+        };
+
+        let mut payload = crate::transport::encode_peer_message_raw(&msg);
         if let Some(c) = cipher.as_mut() {
             payload = c.encrypt(&payload);
         }
@@ -502,6 +567,99 @@ fn evrt_send_loop(
         *g = None;
     }
     log(&events, "EVRT UDP sender stopped".into());
+}
+
+// ─── Телеметрия pipeline ──────────────────────────────────────────────────────
+
+/// Метрики кодирования за интервал. Эмитится в UI каждые 10 сек.
+struct PipelineTelemetry {
+    backend:        String,
+    sent_frames:    u64,
+    skipped_frames: u64,
+    sent_bytes:     u64,
+    keyframes:      u64,
+    capture_us_total: u64,
+    change_us_total:  u64,
+    encode_us_total:  u64,
+    samples:        u64,
+    capture_us_max: u64,
+    encode_us_max:  u64,
+}
+
+impl PipelineTelemetry {
+    fn new(backend: String) -> Self {
+        Self {
+            backend,
+            sent_frames: 0, skipped_frames: 0, sent_bytes: 0, keyframes: 0,
+            capture_us_total: 0, change_us_total: 0, encode_us_total: 0,
+            samples: 0, capture_us_max: 0, encode_us_max: 0,
+        }
+    }
+    fn mark_capture(&mut self, d: Duration) {
+        let us = d.as_micros() as u64;
+        self.capture_us_total += us;
+        self.capture_us_max = self.capture_us_max.max(us);
+        self.samples += 1;
+    }
+    fn mark_change(&mut self, d: Duration) {
+        self.change_us_total += d.as_micros() as u64;
+    }
+    fn mark_encode(&mut self, d: Duration) {
+        let us = d.as_micros() as u64;
+        self.encode_us_total += us;
+        self.encode_us_max = self.encode_us_max.max(us);
+    }
+    fn mark_sent(&mut self, bytes: usize, is_idr: bool) {
+        self.sent_frames += 1;
+        self.sent_bytes += bytes as u64;
+        if is_idr { self.keyframes += 1; }
+    }
+    fn mark_skipped(&mut self) {
+        self.skipped_frames += 1;
+    }
+    fn reset(&mut self) {
+        self.sent_frames = 0; self.skipped_frames = 0; self.sent_bytes = 0;
+        self.keyframes = 0; self.capture_us_total = 0; self.change_us_total = 0;
+        self.encode_us_total = 0; self.samples = 0;
+        self.capture_us_max = 0; self.encode_us_max = 0;
+    }
+}
+
+fn maybe_emit_telemetry(
+    events:          &Sender<HostEvent>,
+    tele:            &mut PipelineTelemetry,
+    _change:         &mut crate::host::FrameChangeDetector,
+    last_at:         &mut Instant,
+    interval:        Duration,
+    fps:             u32,
+) {
+    if last_at.elapsed() < interval { return; }
+
+    let s = tele.samples.max(1);
+    let sent = tele.sent_frames.max(1);
+    let avg_cap    = tele.capture_us_total / s / 1000; // ms
+    let avg_change = tele.change_us_total / s / 1000;
+    let avg_enc    = tele.encode_us_total / sent / 1000;
+    let avg_bytes  = tele.sent_bytes / sent;
+    let kbps = (tele.sent_bytes * 8) / 1000 / interval.as_secs().max(1);
+
+    let summary = format!(
+        "backend={} fps={} sent={} skipped_static={} keyframes={} \
+         avg_packet={}B {}kbps capture_avg={}ms capture_max={}ms \
+         change_avg={}ms encode_avg={}ms encode_max={}ms",
+        tele.backend, fps, tele.sent_frames, tele.skipped_frames, tele.keyframes,
+        avg_bytes, kbps, avg_cap, tele.capture_us_max / 1000,
+        avg_change, avg_enc, tele.encode_us_max / 1000,
+    );
+
+    eprintln!("[pipeline] telemetry: {summary}");
+    let _ = events.send(HostEvent::VideoTelemetry {
+        summary,
+        fallback_reason: None,
+    });
+
+    tele.reset();
+    *last_at = Instant::now();
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────

@@ -1375,9 +1375,10 @@ fn h264_target_bitrate_bps(width: u32, height: u32, fps: u32, quality_milli: u32
     ((pixels * fps * SCREEN_CONTENT_MILLI_BPP * quality) / 1_000_000).clamp(MIN_BPS, max_bps) as u32
 }
 
+/// Детектор изменений кадра — пропускает статичные кадры (экономия трафика).
+/// Используется единым video_pipeline.
 #[derive(Default)]
-#[allow(dead_code)] // orphaned: telemetry от старого video_loop
-struct FrameChangeDetector {
+pub struct FrameChangeDetector {
     width: u32,
     height: u32,
     /// FNV-1a hash of the last sent frame (computed by crate::colorconv::frame_signature).
@@ -1388,16 +1389,14 @@ struct FrameChangeDetector {
     skipped_static_since_log: u64,
 }
 
-#[allow(dead_code)] // orphaned: telemetry от старого video_loop
-struct FrameDecision {
-    send: bool,
-    force_key: bool,
+pub struct FrameDecision {
+    pub send: bool,
+    pub force_key: bool,
 }
 
-#[allow(dead_code)] // orphaned: telemetry от старого video_loop
-struct FrameSkipStats {
-    sent: u64,
-    skipped_static: u64,
+pub struct FrameSkipStats {
+    pub sent: u64,
+    pub skipped_static: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1618,7 +1617,7 @@ impl EncodedPacket {
 }
 
 impl FrameChangeDetector {
-    fn decide(
+    pub fn decide(
         &mut self,
         width: u32,
         height: u32,
@@ -1649,7 +1648,7 @@ impl FrameChangeDetector {
         }
     }
 
-    fn mark_sent(&mut self, width: u32, height: u32, bgra: &[u8]) {
+    pub fn mark_sent(&mut self, width: u32, height: u32, bgra: &[u8]) {
         self.width = width;
         self.height = height;
         self.last_hash = crate::colorconv::frame_signature(bgra, width as usize, height as usize);
@@ -1658,7 +1657,7 @@ impl FrameChangeDetector {
         self.sent_since_log = self.sent_since_log.saturating_add(1);
     }
 
-    fn take_stats(&mut self) -> FrameSkipStats {
+    pub fn take_stats(&mut self) -> FrameSkipStats {
         let stats = FrameSkipStats {
             sent: self.sent_since_log,
             skipped_static: self.skipped_static_since_log,
@@ -1676,7 +1675,7 @@ impl FrameChangeDetector {
         sig != self.last_hash
     }
 
-    fn static_backoff_delay(&self, fps: u32) -> Option<Duration> {
+    pub fn static_backoff_delay(&self, fps: u32) -> Option<Duration> {
         let fps = fps.clamp(5, MAX_TARGET_FPS);
         if self.consecutive_static_skips < fps {
             None
@@ -1686,7 +1685,6 @@ impl FrameChangeDetector {
             Some(Duration::from_millis(50))
         }
     }
-
 }
 
 fn client_video_support(login: &crate::rustdesk_proto::LoginRequest) -> ClientVideoSupport {
@@ -2222,9 +2220,8 @@ fn handle_client_input_pipeline(
             }
         }
         Some(peer_message::Union::Shell(shell_msg)) => {
-            let _ = peer_msg_tx; // shell output goes via peer_msg_tx
-            let dummy_tx = mpsc::channel::<PeerMessage>().0;
-            handle_shell_message(shell_msg, &dummy_tx, shell);
+            // Shell output идёт через peer_msg_tx → pipeline → TCP relay → клиент
+            handle_shell_message(shell_msg, peer_msg_tx, shell);
         }
         _ => {}
     }

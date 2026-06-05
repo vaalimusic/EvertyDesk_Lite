@@ -250,6 +250,44 @@ mod windows_nvenc {
                 _ => Err(error_from_buf(&err, "NVENC encode failed")),
             }
         }
+
+        /// Zero-copy кодирование из GPU shared-текстуры (HANDLE из DXGI capture).
+        /// Устраняет roundtrip GPU→CPU→GPU.
+        pub fn encode_texture(
+            &mut self,
+            codec: NvencCodec,
+            shared_handle: *mut c_void,
+            force_key: bool,
+        ) -> Result<Option<NvencPacket>, String> {
+            let mut data = ptr::null();
+            let mut len = 0_usize;
+            let mut key = 0_i32;
+            let mut err = vec![0_u8; ERR_BUF_LEN];
+            let status = unsafe {
+                everty_nvenc_encode_texture(
+                    self.raw,
+                    shared_handle,
+                    i32::from(force_key),
+                    &mut data,
+                    &mut len,
+                    &mut key,
+                    err.as_mut_ptr() as *mut c_char,
+                    err.len(),
+                )
+            };
+            match status {
+                STATUS_OK => {
+                    if len == 0 { return Ok(None); }
+                    if data.is_null() {
+                        return Err("NVENC returned null packet pointer".to_owned());
+                    }
+                    let bytes = unsafe { slice::from_raw_parts(data, len).to_vec() };
+                    Ok(Some(NvencPacket { codec, bytes, key: key != 0 || force_key }))
+                }
+                STATUS_NO_PACKET => Ok(None),
+                _ => Err(error_from_buf(&err, "NVENC texture encode failed")),
+            }
+        }
     }
 
     impl Drop for EncoderHandle {
@@ -339,6 +377,17 @@ mod windows_nvenc {
             ctx: *mut c_void,
             bgra: *const u8,
             bgra_len: usize,
+            force_key: i32,
+            data: *mut *const u8,
+            len: *mut usize,
+            key: *mut i32,
+            err: *mut c_char,
+            err_len: usize,
+        ) -> i32;
+        // Zero-copy: кодирование из GPU shared-текстуры (HANDLE).
+        fn everty_nvenc_encode_texture(
+            ctx: *mut c_void,
+            shared_handle: *mut c_void,
             force_key: i32,
             data: *mut *const u8,
             len: *mut usize,

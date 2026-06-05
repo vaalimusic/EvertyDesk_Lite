@@ -587,6 +587,84 @@ int encode_frame(NvencContext &ctx, const uint8_t *bgra, size_t bgra_len,
     return ok ? kOk : kErr;
 }
 
+// ─── Zero-copy: кодирование напрямую из GPU-текстуры ──────────────────────────
+//
+// Вместо UpdateSubresource (CPU→GPU загрузка) делаем CopyResource (GPU→GPU).
+// Текстура захвата передаётся через shared handle (IDXGIResource::GetSharedHandle
+// на устройстве захвата → OpenSharedResource на устройстве энкодера).
+// Это устраняет roundtrip GPU→CPU→GPU — главная оптимизация latency.
+int encode_frame_texture(NvencContext &ctx, void *shared_handle,
+                         bool force_key, const uint8_t **data, size_t *len,
+                         int *key, std::string &err) {
+    if (!shared_handle) {
+        err = "shared texture handle is null";
+        return kErr;
+    }
+
+    // Открываем shared-текстуру захвата на устройстве энкодера
+    ID3D11Texture2D *src_texture = nullptr;
+    HRESULT hr = ctx.dx.device->OpenSharedResource(
+        reinterpret_cast<HANDLE>(shared_handle),
+        __uuidof(ID3D11Texture2D),
+        reinterpret_cast<void **>(&src_texture));
+    if (FAILED(hr) || !src_texture) {
+        err = "OpenSharedResource failed (capture/encoder device mismatch?)";
+        return kErr;
+    }
+
+    Surface &surface = ctx.surfaces[ctx.frame_idx % ctx.surfaces.size()];
+
+    // GPU→GPU копия: текстура захвата → входная текстура энкодера.
+    // Никакого CPU-roundtrip.
+    ctx.dx.context->CopyResource(surface.texture, src_texture);
+    src_texture->Release();
+
+    NV_ENC_MAP_INPUT_RESOURCE mapped = {};
+    mapped.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
+    mapped.registeredResource = surface.registered;
+    NVENCSTATUS status =
+        ctx.api.fns.nvEncMapInputResource(ctx.encoder, &mapped);
+    if (status != NV_ENC_SUCCESS) {
+        err = status_message("nvEncMapInputResource", status);
+        return kErr;
+    }
+
+    NV_ENC_PIC_PARAMS pic = {};
+    pic.version = NV_ENC_PIC_PARAMS_VER;
+    pic.inputWidth = ctx.width;
+    pic.inputHeight = ctx.height;
+    pic.inputPitch = ctx.width;
+    pic.frameIdx = ctx.frame_idx;
+    pic.inputTimeStamp = ctx.frame_idx;
+    pic.inputDuration = 1;
+    pic.inputBuffer = mapped.mappedResource;
+    pic.outputBitstream = surface.bitstream;
+    pic.bufferFmt = mapped.mappedBufferFmt;
+    pic.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
+    if (force_key) {
+        pic.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR |
+                             NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
+    }
+
+    status = ctx.api.fns.nvEncEncodePicture(ctx.encoder, &pic);
+    if (status == NV_ENC_ERR_NEED_MORE_INPUT) {
+        ctx.api.fns.nvEncUnmapInputResource(ctx.encoder, mapped.mappedResource);
+        ++ctx.frame_idx;
+        return kNoPacket;
+    }
+    if (status != NV_ENC_SUCCESS) {
+        ctx.api.fns.nvEncUnmapInputResource(ctx.encoder, mapped.mappedResource);
+        err = status_message("nvEncEncodePicture", status);
+        return kErr;
+    }
+
+    const bool ok =
+        lock_packet(ctx, surface, force_key, data, len, key, err);
+    ctx.api.fns.nvEncUnmapInputResource(ctx.encoder, mapped.mappedResource);
+    ++ctx.frame_idx;
+    return ok ? kOk : kErr;
+}
+
 } // namespace
 
 extern "C" {
@@ -636,6 +714,29 @@ int everty_nvenc_encode(void *ctx_ptr, const uint8_t *bgra, size_t bgra_len,
     std::string error;
     int status = encode_frame(*static_cast<NvencContext *>(ctx_ptr), bgra,
                               bgra_len, force_key != 0, data, len, key, error);
+    if (status == kErr) {
+        set_error(err, err_len, error);
+    }
+    return status;
+}
+
+// Zero-copy кодирование из GPU shared-текстуры.
+// `shared_handle` — HANDLE из IDXGIResource::GetSharedHandle() на устройстве захвата.
+int everty_nvenc_encode_texture(void *ctx_ptr, void *shared_handle,
+                                int force_key, const uint8_t **data, size_t *len,
+                                int *key, char *err, size_t err_len) {
+    if (!ctx_ptr) {
+        set_error(err, err_len, "NVENC context is null");
+        return kErr;
+    }
+    if (data) *data = nullptr;
+    if (len)  *len = 0;
+    if (key)  *key = 0;
+
+    std::string error;
+    int status = encode_frame_texture(*static_cast<NvencContext *>(ctx_ptr),
+                                      shared_handle, force_key != 0,
+                                      data, len, key, error);
     if (status == kErr) {
         set_error(err, err_len, error);
     }
