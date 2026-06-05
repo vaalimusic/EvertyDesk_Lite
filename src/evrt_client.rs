@@ -666,6 +666,51 @@ pub fn try_evrt_before_relay(
     }
 }
 
+/// mini-ICE: пробуем список кандидатов хоста (LAN + VPN) по очереди.
+/// Первый ответивший — используем. Остальные пропускаем.
+/// Каждый кандидат пробуется со своим свежим UDP-сокетом.
+pub fn try_evrt_candidates(
+    candidates: Vec<SocketAddr>,
+    events: &Sender<SessionEvent>,
+    ultra_low_lat: bool,
+) -> bool {
+    for (i, addr) in candidates.iter().enumerate() {
+        evrt_log(
+            events,
+            format!("EVRT кандидат {}/{}: пробуем {addr}", i + 1, candidates.len()),
+        );
+        let Ok(udp) = UdpSocket::bind("0.0.0.0:0") else {
+            continue;
+        };
+        let udp = Arc::new(udp);
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Быстрая проба: короткий таймаут на каждый кандидат, чтобы не висеть.
+        // run_evrt_client сам делает CONNECT_TIMEOUT(4с); для перебора это ок,
+        // т.к. правильный кандидат (VPN/LAN) ответит почти мгновенно.
+        match run_evrt_client(EvrtClientParams {
+            socket: udp,
+            host_addr: *addr,
+            events: events.clone(),
+            stop,
+            ultra_low_latency: ultra_low_lat,
+        }) {
+            EvrtConnectResult::Ok => {
+                // Сессия завершилась нормально (была установлена)
+                return true;
+            }
+            EvrtConnectResult::NoResponse => {
+                evrt_log(events, format!("EVRT кандидат {addr}: нет ответа, дальше"));
+            }
+            EvrtConnectResult::Error(e) => {
+                evrt_log(events, format!("EVRT кандидат {addr}: ошибка ({e}), дальше"));
+            }
+        }
+    }
+    evrt_log(events, "EVRT: ни один кандидат не ответил — TCP relay".into());
+    false
+}
+
 // ─── тесты ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

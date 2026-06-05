@@ -715,6 +715,11 @@ pub mod misc {
         /// tag 100 — вне диапазона стандартных RustDesk полей.
         #[prost(uint32, tag = "100")]
         EvrtUdpPort(u32),
+        /// EVRT: список IP:порт кандидатов хоста (LAN + VPN + внешний).
+        /// Формат: "ip1:port,ip2:port,...". Клиент пробует каждый (mini-ICE).
+        /// Решает проблему мультихоминга (VPN: у хоста несколько IP).
+        #[prost(string, tag = "101")]
+        EvrtEndpoints(String),
     }
 }
 

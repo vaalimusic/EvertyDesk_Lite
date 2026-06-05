@@ -16,6 +16,7 @@ mod fsr;
 mod host;
 mod llm;
 mod mf_encode;
+mod netif;
 mod mf_video;
 mod nvenc;
 mod rustdesk_proto;

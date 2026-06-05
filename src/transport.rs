@@ -896,6 +896,7 @@ impl TransportClient {
                             )));
                         }
                         let mut evrt_port_seen: Option<u16> = None;
+                        let mut evrt_candidates: Vec<std::net::SocketAddr> = Vec::new();
                         let fs = handle_session_message(
                             message,
                             &mut relay,
@@ -906,31 +907,32 @@ impl TransportClient {
                             target_video_fps,
                             codec_preference,
                             &mut evrt_port_seen,
+                            &mut evrt_candidates,
                         );
-                        // ★ EVRT порт пришёл поздно (после LoginResponse) — запускаем
-                        //   прямое UDP-соединение, если ещё не запущено.
-                        if let Some(port) = evrt_port_seen {
-                            if !evrt_started {
-                                if let Some(mut base) = evrt_host_base {
-                                    base.set_port(port);
-                                    evrt_started = true;
-                                    let evrt_events = events.clone();
-                                    let evrt_stop = std::sync::Arc::new(
-                                        std::sync::atomic::AtomicBool::new(false),
-                                    );
-                                    let evrt_ull = initial_video_fps >= 60;
-                                    eprintln!("[evrt-client] late port → прямой UDP → {base}");
-                                    thread::spawn(move || {
-                                        if let Ok(udp) = std::net::UdpSocket::bind("0.0.0.0:0") {
-                                            let udp = std::sync::Arc::new(udp);
-                                            crate::evrt_client::try_evrt_before_relay(
-                                                &udp, base, &evrt_events, evrt_stop, evrt_ull,
-                                            );
-                                        }
-                                    });
-                                } else {
-                                    eprintln!("[evrt-client] EvrtUdpPort={port} но нет host IP — TCP relay");
+                        // ★ EVRT (после LoginResponse). Собираем кандидаты:
+                        //   1) список EvrtEndpoints (LAN+VPN) — основной путь
+                        //   2) host IP от hbbs punch-hole + EvrtUdpPort — запасной
+                        if !evrt_started {
+                            let mut candidates = evrt_candidates;
+                            if let (Some(port), Some(mut base)) = (evrt_port_seen, evrt_host_base) {
+                                base.set_port(port);
+                                if !candidates.contains(&base) {
+                                    candidates.push(base);
                                 }
+                            }
+                            if !candidates.is_empty() {
+                                evrt_started = true;
+                                let evrt_events = events.clone();
+                                let evrt_ull = initial_video_fps >= 60;
+                                eprintln!(
+                                    "[evrt-client] пробуем {} кандидат(ов): {:?}",
+                                    candidates.len(), candidates,
+                                );
+                                thread::spawn(move || {
+                                    crate::evrt_client::try_evrt_candidates(
+                                        candidates, &evrt_events, evrt_ull,
+                                    );
+                                });
                             }
                         }
                         fs
@@ -2009,6 +2011,7 @@ fn handle_session_message(
     target_video_fps: i32,
     codec_preference: CodecPreference,
     evrt_port_out: &mut Option<u16>,
+    evrt_candidates_out: &mut Vec<std::net::SocketAddr>,
 ) -> Option<FrameSource> {
     match message.union {
         Some(peer_message::Union::ScreenshotResponse(response)) => {
@@ -2283,12 +2286,20 @@ fn handle_session_message(
                     eprintln!("[session] Server requests RefreshVideo");
                 }
                 Some(misc::Union::EvrtUdpPort(port)) => {
-                    // ★ Хост сообщил EVRT UDP порт (приходит ПОСЛЕ LoginResponse,
-                    //   поэтому ловим его здесь, в session loop, а не в handshake).
+                    // Старый путь: только порт (нужен IP от hbbs punch-hole).
                     let p = (*port).min(65535) as u16;
                     if p > 0 {
-                        eprintln!("[session] ★ EvrtUdpPort={p} получен (session loop)");
+                        eprintln!("[session] EvrtUdpPort={p} получен (session loop)");
                         *evrt_port_out = Some(p);
+                    }
+                }
+                Some(misc::Union::EvrtEndpoints(list)) => {
+                    // ★ Новый путь: список IP:порт кандидатов (LAN+VPN). mini-ICE.
+                    eprintln!("[session] ★ EvrtEndpoints получены: [{list}]");
+                    for part in list.split(',') {
+                        if let Ok(addr) = part.trim().parse::<std::net::SocketAddr>() {
+                            evrt_candidates_out.push(addr);
+                        }
                     }
                 }
                 other => {

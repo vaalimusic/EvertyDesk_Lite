@@ -82,6 +82,9 @@ windows = { version = "0.48", features = [
     "Win32_Devices_Properties",
     "Win32_System_Threading",
     "Win32_System_SystemServices",
+    # EVRT: перечисление сетевых интерфейсов (LAN+VPN кандидаты)
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
     # Shared foundation types (HWND, HDC, HBITMAP …)
     "Win32_Foundation",
 ], optional = true }

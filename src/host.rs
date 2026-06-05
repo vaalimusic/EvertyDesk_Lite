@@ -1174,18 +1174,33 @@ fn relay_session_inner(
     let evrt_socket = try_open_evrt_socket(config, events);
 
     if let Some((ref _sock, evrt_port)) = evrt_socket {
-        let misc = PeerMessage {
+        // ★ Перечисляем ВСЕ локальные IP (LAN + VPN) как кандидаты — mini-ICE.
+        //   Это решает мультихоминг: через VPN клиент достучится по VPN-IP хоста.
+        let endpoints = crate::netif::candidate_endpoints(evrt_port);
+
+        if !endpoints.is_empty() {
+            let misc = PeerMessage {
+                union: Some(peer_message::Union::Misc(Misc {
+                    union: Some(misc::Union::EvrtEndpoints(endpoints.clone())),
+                })),
+            };
+            match send_peer_enc(&mut relay, &mut cipher, &misc) {
+                Ok(()) => host_log(
+                    events,
+                    format!("EVRT: Misc{{EvrtEndpoints=[{endpoints}]}} sent → клиент"),
+                ),
+                Err(e) => host_log(events, format!("EVRT: Misc endpoints send failed: {e}")),
+            }
+        }
+
+        // Дублируем старый EvrtUdpPort для обратной совместимости (если у клиента
+        // окажется punch-hole IP от hbbs).
+        let misc_port = PeerMessage {
             union: Some(peer_message::Union::Misc(Misc {
                 union: Some(misc::Union::EvrtUdpPort(evrt_port as u32)),
             })),
         };
-        match send_peer_enc(&mut relay, &mut cipher, &misc) {
-            Ok(()) => host_log(
-                events,
-                format!("EVRT: Misc{{EvrtUdpPort={evrt_port}}} sent → клиент"),
-            ),
-            Err(e) => host_log(events, format!("EVRT: Misc send failed: {e}")),
-        }
+        let _ = send_peer_enc(&mut relay, &mut cipher, &misc_port);
     }
 
     let target_fps = negotiated_target_fps(&login, config.display.target_fps);
