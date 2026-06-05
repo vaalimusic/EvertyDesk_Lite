@@ -926,11 +926,14 @@ impl TransportClient {
                                 let evrt_ull = initial_video_fps >= 60;
                                 eprintln!(
                                     "[evrt-client] пробуем {} кандидат(ов): {:?}",
-                                    candidates.len(), candidates,
+                                    candidates.len(),
+                                    candidates,
                                 );
                                 thread::spawn(move || {
                                     crate::evrt_client::try_evrt_candidates(
-                                        candidates, &evrt_events, evrt_ull,
+                                        candidates,
+                                        &evrt_events,
+                                        evrt_ull,
                                     );
                                 });
                             }
@@ -1332,9 +1335,18 @@ fn establish_session(
 
                 // Если порт уже пришёл в handshake — готовый адрес.
                 let evrt_host_addr = evrt_port_from_misc.and_then(|port| {
-                    host_udp_base.map(|mut addr| { addr.set_port(port); addr })
+                    host_udp_base.map(|mut addr| {
+                        addr.set_port(port);
+                        addr
+                    })
                 });
-                return Ok((relay_stream, peer_stage, displays, evrt_host_addr, host_udp_base));
+                return Ok((
+                    relay_stream,
+                    peer_stage,
+                    displays,
+                    evrt_host_addr,
+                    host_udp_base,
+                ));
             }
             Err(err) => last_err = err,
         }

@@ -677,7 +677,11 @@ pub fn try_evrt_candidates(
     for (i, addr) in candidates.iter().enumerate() {
         evrt_log(
             events,
-            format!("EVRT кандидат {}/{}: пробуем {addr}", i + 1, candidates.len()),
+            format!(
+                "EVRT кандидат {}/{}: пробуем {addr}",
+                i + 1,
+                candidates.len()
+            ),
         );
         let Ok(udp) = UdpSocket::bind("0.0.0.0:0") else {
             continue;
@@ -703,11 +707,17 @@ pub fn try_evrt_candidates(
                 evrt_log(events, format!("EVRT кандидат {addr}: нет ответа, дальше"));
             }
             EvrtConnectResult::Error(e) => {
-                evrt_log(events, format!("EVRT кандидат {addr}: ошибка ({e}), дальше"));
+                evrt_log(
+                    events,
+                    format!("EVRT кандидат {addr}: ошибка ({e}), дальше"),
+                );
             }
         }
     }
-    evrt_log(events, "EVRT: ни один кандидат не ответил — TCP relay".into());
+    evrt_log(
+        events,
+        "EVRT: ни один кандидат не ответил — TCP relay".into(),
+    );
     false
 }
 
