@@ -719,8 +719,6 @@ struct EvertyDeskApp {
     // ── System tray ───────────────────────────────────────────────────────────
     /// Tray icon handle; None if tray init failed (non-fatal).
     tray: Option<TrayHandle>,
-    /// Whether the main window is currently visible (false = hidden to tray).
-    window_visible: bool,
 }
 
 struct CursorCacheEntry {
@@ -960,7 +958,6 @@ impl EvertyDeskApp {
             },
             fsr_native_size: None,
             tray: build_tray_icon(),
-            window_visible: true,
         }
     }
 
@@ -1689,15 +1686,21 @@ impl EvertyDeskApp {
     fn update_egui(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.viewport().close_requested()) {
             if self.host_state.is_online() && self.tray.is_some() {
-                // Host is running — minimize to tray, don't quit
+                // Host is running — minimize to taskbar instead of closing.
+                // Do NOT use ViewportCommand::Visible(false): on Windows+WGPU
+                // it stalls the GPU swap chain and freezes the system.
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                self.window_visible = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                 self.update_tray_tooltip();
             } else {
+                // Signal stop to background threads, then let eframe tear down
+                // the GPU (WGPU/D3D12) cleanly before process exit.
+                // Calling process::exit() from within the GPU-render callback
+                // causes NVIDIA/D3D DLL destructors to deadlock.
                 self.tray = None;
                 self.shutdown();
-                std::process::exit(0);
+                // Don't call process::exit here.
+                // eframe will call on_exit() after GPU cleanup → watchdog exits.
             }
         }
 
@@ -1746,10 +1749,6 @@ impl EvertyDeskApp {
                 33 // ~30fps otherwise
             };
             ctx.request_repaint_after(Duration::from_millis(repaint_ms));
-        }
-        // Keep polling tray events even when the main window is hidden.
-        if !self.window_visible {
-            ctx.request_repaint_after(Duration::from_millis(500));
         }
 
         let software_backend = egui_software_backend_active();
@@ -3178,15 +3177,15 @@ impl EvertyDeskApp {
             } else if ev.id == quit_id {
                 self.tray = None;
                 self.shutdown();
-                std::process::exit(0);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                // process::exit called from watchdog after GPU cleanup in on_exit
             }
         }
     }
 
     fn show_window(&mut self, ctx: &egui::Context) {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        self.window_visible = true;
     }
 
     fn update_tray_tooltip(&mut self) {
