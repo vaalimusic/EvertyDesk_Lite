@@ -687,7 +687,7 @@ pub struct TestDelay {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct Misc {
-    #[prost(oneof = "misc::Union", tags = "5, 7, 10, 12, 31, 35")]
+    #[prost(oneof = "misc::Union", tags = "5, 7, 10, 12, 28, 31, 35")]
     pub union: Option<misc::Union>,
 }
 
@@ -706,6 +706,8 @@ pub mod misc {
         RefreshVideo(bool),
         #[prost(bool, tag = "12")]
         VideoReceived(bool),
+        #[prost(uint32, tag = "28")]
+        AutoAdjustFps(u32),
         #[prost(int32, tag = "31")]
         RefreshVideoDisplay(i32),
         #[prost(uint32, tag = "35")]

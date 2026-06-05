@@ -4,7 +4,7 @@ use std::{
     net::ToSocketAddrs,
     sync::mpsc::{self, Receiver, Sender},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -471,6 +471,8 @@ impl TransportClient {
         let mut skipped_video_last_log = 0_u64; // skipped_video_count at last log
                                                 // Tracks when we last sent a screenshot request — drives time-based refresh.
         let mut last_screenshot_sent: Option<Instant> = None;
+        let mut last_qos_feedback_sent: Option<Instant> = None;
+        let mut qos_feedback_sent = 0_u64;
         // Subscribe to display 0 (SwitchDisplay) then trigger video start.
         // SwitchDisplay must come first — it's the one-time subscription trigger.
         let _ = send_switch_display_subscribe(&mut relay, current_display);
@@ -1023,6 +1025,20 @@ impl TransportClient {
                     });
                 }
                 None => {}
+            }
+
+            let qos_feedback_due = last_qos_feedback_sent
+                .map(|instant| instant.elapsed() >= Duration::from_secs(1))
+                .unwrap_or(true);
+            if qos_feedback_due {
+                let _ = send_stream_qos_feedback(&mut relay, target_video_fps);
+                last_qos_feedback_sent = Some(Instant::now());
+                qos_feedback_sent = qos_feedback_sent.saturating_add(1);
+                if qos_feedback_sent == 1 || qos_feedback_sent % 10 == 0 {
+                    let _ = events.send(SessionEvent::Info(format!(
+                        "Video QoS feedback sent: {target_video_fps} fps"
+                    )));
+                }
             }
 
             // Time-based auto-refresh. Keep this to one display and avoid piling up PNG
@@ -1995,6 +2011,55 @@ fn test_delay_echo_message(delay: TestDelay) -> Option<PeerMessage> {
     })
 }
 
+fn send_stream_qos_feedback(relay: &mut TcpStream, fps: i32) -> Result<(), String> {
+    send_framed(relay, &encode_peer_message(&custom_fps_option_message(fps)))?;
+    send_framed(relay, &encode_peer_message(&auto_adjust_fps_message(fps)))?;
+    send_video_received(relay)?;
+    send_framed(
+        relay,
+        &encode_peer_message(&client_test_delay_message(current_time_millis())),
+    )
+}
+
+fn custom_fps_option_message(fps: i32) -> PeerMessage {
+    PeerMessage {
+        union: Some(peer_message::Union::Misc(Misc {
+            union: Some(misc::Union::Option(OptionMessage {
+                image_quality: ImageQuality::NotSet as i32,
+                custom_image_quality: 0,
+                supported_decoding: None,
+                custom_fps: fps.clamp(5, 60),
+            })),
+        })),
+    }
+}
+
+fn auto_adjust_fps_message(fps: i32) -> PeerMessage {
+    PeerMessage {
+        union: Some(peer_message::Union::Misc(Misc {
+            union: Some(misc::Union::AutoAdjustFps(fps.clamp(5, 60) as u32)),
+        })),
+    }
+}
+
+fn client_test_delay_message(now_ms: i64) -> PeerMessage {
+    PeerMessage {
+        union: Some(peer_message::Union::TestDelay(TestDelay {
+            time: now_ms,
+            from_client: true,
+            last_delay: 0,
+            target_bitrate: 0,
+        })),
+    }
+}
+
+fn current_time_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or_default()
+}
+
 fn send_video_received(relay: &mut TcpStream) -> Result<(), String> {
     let message = PeerMessage {
         union: Some(peer_message::Union::Misc(Misc {
@@ -2220,9 +2285,16 @@ fn handle_session_message(
             }
         }
         Some(peer_message::Union::TestDelay(delay)) => {
-            // last_delay is the RTT (ms) the server measured for the previous round-trip.
-            let rtt = delay.last_delay;
-            let _ = echo_test_delay(relay, delay);
+            let rtt = if delay.from_client && delay.time > 0 {
+                current_time_millis()
+                    .saturating_sub(delay.time)
+                    .clamp(0, u32::MAX as i64) as u32
+            } else {
+                // last_delay is the RTT (ms) the server measured for the previous round-trip.
+                let server_rtt = delay.last_delay;
+                let _ = echo_test_delay(relay, delay);
+                server_rtt
+            };
             if rtt > 0 {
                 let _ = events.send(SessionEvent::Latency(rtt));
             }
@@ -3677,6 +3749,44 @@ mod tests {
             target_bitrate: 2_000,
         })
         .is_none());
+    }
+
+    #[test]
+    fn custom_fps_feedback_does_not_reset_quality_or_codec() {
+        let message = custom_fps_option_message(120);
+        let Some(peer_message::Union::Misc(misc)) = message.union else {
+            panic!("expected Misc message");
+        };
+        let Some(misc::Union::Option(option)) = misc.union else {
+            panic!("expected Option message");
+        };
+        assert_eq!(option.custom_fps, 60);
+        assert_eq!(option.image_quality, ImageQuality::NotSet as i32);
+        assert_eq!(option.custom_image_quality, 0);
+        assert!(option.supported_decoding.is_none());
+    }
+
+    #[test]
+    fn auto_adjust_fps_feedback_uses_rustdesk_misc_field() {
+        let message = auto_adjust_fps_message(60);
+        let Some(peer_message::Union::Misc(misc)) = message.union else {
+            panic!("expected Misc message");
+        };
+        let Some(misc::Union::AutoAdjustFps(fps)) = misc.union else {
+            panic!("expected AutoAdjustFps message");
+        };
+        assert_eq!(fps, 60);
+    }
+
+    #[test]
+    fn client_test_delay_marks_probe_as_client_originated() {
+        let message = client_test_delay_message(12345);
+        let Some(peer_message::Union::TestDelay(delay)) = message.union else {
+            panic!("expected TestDelay message");
+        };
+        assert!(delay.from_client);
+        assert_eq!(delay.time, 12345);
+        assert_eq!(delay.last_delay, 0);
     }
 
     #[test]
