@@ -3554,7 +3554,7 @@ fn build_login_request(
             my_id: "evertydesk-lite".to_owned(),
             my_name: "EvertyDesk Lite".to_owned(),
             option: Some(video_option_message(fps, codec_preference)),
-            video_ack_required: false,
+            video_ack_required: true,
             version: "1.4.6".to_owned(),
             my_platform: std::env::consts::OS.to_owned(),
         })),
@@ -3710,6 +3710,7 @@ mod tests {
         assert_eq!(option.image_quality, ImageQuality::Balanced as i32);
         assert_eq!(option.custom_image_quality, 0);
         assert!(option.supported_decoding.is_some());
+        assert!(login.video_ack_required);
     }
 
     #[test]
