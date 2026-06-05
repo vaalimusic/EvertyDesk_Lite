@@ -24,4 +24,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "EvertyGame"
 include(":app")
+include(":android-client")
 include(":receiver")

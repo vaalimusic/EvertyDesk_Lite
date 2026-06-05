@@ -1,6 +1,6 @@
 # EvertyDesk Lite: technical plan
 
-Status date: 2026-06-03.
+Status date: 2026-06-06.
 
 This document tracks what is already implemented and what remains to turn
 EvertyDesk Lite from a compact RustDesk-compatible client into a fast,
@@ -44,6 +44,10 @@ The product direction is:
 - Clear connection progress and failure diagnostics.
 - Remote screen view in a separate window and inline mode.
 - Multi-display handling and display switching.
+- Shared compact remote-session toolbar for inline and detached viewers:
+  monitor selection, clipboard paste, fullscreen, fit-to-window, refresh,
+  PNG save, video profile switching, coordinate mode, Ctrl+Alt+Del, lock,
+  logs, and support report.
 - Mouse and keyboard input.
 - Coordinate modes for different monitor layouts.
 - Cursor data handling.
@@ -125,8 +129,26 @@ $env:EVERTYDESK_ENABLE_AV1_MF="1"
 - Build variants for Windows and Linux codec availability.
 - `cargo check`, `cargo test`, and `cargo check --no-default-features` pass.
 
+### Android Outgoing Client
+
+- First Android module added at `EvertyGame-main/android-client`.
+- The module is intentionally separate from the existing phone screen sender
+  POC and starts as an outgoing remote-control client.
+- Current Android scope: compact Compose shell, remote ID/password form,
+  EvertyDesk server settings, FPS/codec preference fields, quick-action layout,
+  and connection-controller scaffold.
+- The Android app currently does not perform the RustDesk handshake yet; the
+  next step is moving the shared framing/protobuf/crypto transport into a
+  reusable mobile-friendly layer.
+
 ## Recently Changed
 
+- Reworked the desktop remote-session toolbar so inline and detached viewers
+  share the same monitor, clipboard, fullscreen, refresh, quality, coordinate,
+  system-command, log, and report controls.
+- Added active-session video profile switching from the remote toolbar through
+  `SessionCommand::SetVideoProfile`, with persisted FPS/codec preferences.
+- Added the first Android outgoing-client module and documentation.
 - Removed the external encoder-process direction from the Windows acceleration
   path.
 - Added `src/mf_encode.rs` as the first direct native encoder backend.
@@ -303,7 +325,24 @@ Required architecture:
   - Interactive mode: higher FPS, lower buffering.
   - Game mode: lowest latency, hardware-only preference, aggressive frame drop.
 
-### 7. Host/Service Mode
+### 7. Android Outgoing Client
+
+Priority: high.
+
+- Extract or mirror the RustDesk-compatible message framing, protobuf models,
+  key exchange, login, and relay stream flow for Android.
+- Keep the first Android release outgoing-only: connect to desktop hosts,
+  render video, send input, switch displays, paste clipboard, and disconnect.
+- Add MediaCodec H.264 decode first, then H.265/AV1 only after desktop decoder
+  stability is proven.
+- Add a real viewer surface with low-latency frame replacement, no growing
+  queue, and touch/mouse/keyboard mapping.
+- Add monitor switching, clipboard send, fullscreen/orientation handling, and
+  session telemetry to match the desktop toolbar.
+- Decide whether the shared protocol core becomes Kotlin code, a Rust library
+  via JNI, or a small mixed layer.
+
+### 8. Host/Service Mode
 
 Priority: medium.
 
@@ -314,7 +353,7 @@ Priority: medium.
 - Linux X11/Wayland capture/input permissions.
 - Host logs with session IDs and approval decisions.
 
-### 8. Terminal and Automation
+### 9. Terminal and Automation
 
 Priority: medium.
 

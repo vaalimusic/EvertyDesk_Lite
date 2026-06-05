@@ -46,7 +46,8 @@ use host::{HostEvent, HostService, HostState};
 use rustdesk_proto::ControlKey;
 use settings as settings_mod;
 use settings_mod::{
-    generate_numeric_token, AppConfig, ConnectionHistoryEntry, ContactEntry, CoordinateMode,
+    generate_numeric_token, AppConfig, CodecPreference, ConnectionHistoryEntry, ContactEntry,
+    CoordinateMode,
 };
 use transport::{
     ConnectionRequest, ConnectionState, RemoteDisplay, SessionCommand, SessionEvent,
@@ -716,7 +717,6 @@ struct EvertyDeskApp {
     /// Нативное разрешение хоста (объявляется в PeerInfo / SessionEvent::Displays).
     /// FSR апскейлит каждый входящий кадр до этого разрешения.
     fsr_native_size: Option<(u32, u32)>,
-
     // ── System tray ───────────────────────────────────────────────────────────
 }
 
@@ -726,7 +726,6 @@ struct CursorCacheEntry {
     hotx: i32,
     hoty: i32,
 }
-
 
 enum WorkerEvent {
     Session(SessionEvent),
@@ -1658,11 +1657,11 @@ fn start_hung_window_guardian() {
     thread::Builder::new()
         .name("hung-guardian".into())
         .spawn(|| {
+            use windows::core::s;
+            use windows::Win32::Foundation::{LPARAM, WPARAM};
             use windows::Win32::UI::WindowsAndMessaging::{
                 FindWindowA, SendMessageTimeoutA, ShowWindow, SMTO_ABORTIFHUNG, SW_HIDE, WM_NULL,
             };
-            use windows::Win32::Foundation::{LPARAM, WPARAM};
-            use windows::core::s;
 
             // Wait for the window to fully initialize.
             thread::sleep(Duration::from_secs(5));
@@ -1704,7 +1703,6 @@ fn start_hung_window_guardian() {
     #[cfg(not(windows))]
     let _ = ();
 }
-
 
 impl EvertyDeskApp {
     #[allow(deprecated)]
@@ -3206,6 +3204,321 @@ impl EvertyDeskApp {
         self.worker = Some(rx);
     }
 
+    fn close_remote_viewer_panel(&mut self) {
+        self.remote_viewer_open = false;
+        self.remote_input_focused = false;
+        self.release_remote_modifiers();
+        self.last_mouse_pos = None;
+        self.wheel_accum = egui::Vec2::ZERO;
+        self.status = "Remote screen closed".to_owned();
+        self.send_command(SessionCommand::SetAutoRefresh {
+            enabled: false,
+            millis: self.refresh_millis,
+        });
+    }
+
+    fn switch_remote_display(&mut self, display: RemoteDisplay) {
+        let label = display_label(&display);
+        self.selected_display = display.index;
+        self.remote_texture = None;
+        self.remote_size = [0, 0];
+        self.last_mouse_pos = None;
+        self.cursor_pos = None;
+        self.screenshot_pending = false;
+        self.status = format!("Переключаем монитор: {label}");
+        self.log(self.status.clone());
+        self.send_command(SessionCommand::SetDisplay(display));
+    }
+
+    fn set_remote_fullscreen(&mut self, ctx: &egui::Context, fullscreen: bool) {
+        self.remote_fullscreen = fullscreen;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen));
+    }
+
+    fn set_remote_video_profile(&mut self, fps: i32, codec: CodecPreference) {
+        let fps = fps.clamp(5, 60);
+        self.video_fps = fps;
+        self.config.display.target_fps = fps as u32;
+        self.config.display.codec = codec;
+        self.config.save();
+        self.send_command(SessionCommand::SetVideoProfile { fps, codec });
+    }
+
+    fn remote_display_selector_ui(&mut self, ui: &mut egui::Ui, id: &'static str) {
+        if self.remote_displays.is_empty() {
+            ui.add_enabled(false, egui::Button::new("Монитор"))
+                .on_hover_text("Список мониторов появится после ответа хоста");
+            return;
+        }
+
+        let selected_text = self
+            .remote_displays
+            .iter()
+            .find(|display| display.index == self.selected_display)
+            .map(display_label)
+            .unwrap_or_else(|| format!("Дисплей {}", self.selected_display + 1));
+
+        egui::ComboBox::from_id_salt(id)
+            .selected_text(selected_text)
+            .show_ui(ui, |ui| {
+                let displays = self.remote_displays.clone();
+                for display in displays {
+                    let selected = display.index == self.selected_display;
+                    if ui
+                        .selectable_label(selected, display_label(&display))
+                        .clicked()
+                    {
+                        self.switch_remote_display(display);
+                        ui.close();
+                    }
+                }
+            });
+    }
+
+    fn remote_video_profile_menu_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label("Частота кадров");
+        ui.horizontal_wrapped(|ui| {
+            for fps in [15, 20, 30, 60] {
+                if ui
+                    .selectable_label(self.video_fps == fps, format!("{fps}"))
+                    .clicked()
+                {
+                    self.set_remote_video_profile(fps, self.config.display.codec);
+                    ui.close();
+                }
+            }
+        });
+
+        ui.separator();
+        ui.label("Кодек");
+        for codec in [
+            CodecPreference::Auto,
+            CodecPreference::H264,
+            CodecPreference::H265,
+            CodecPreference::Av1,
+            CodecPreference::Vp9,
+        ] {
+            let label = match codec {
+                CodecPreference::Av1 if !crate::video::av1_available() => "AV1 (эксп.)",
+                CodecPreference::H265 if !crate::video::h265_available() => "H265 (если доступен)",
+                _ => codec.label(),
+            };
+            if ui
+                .selectable_label(self.config.display.codec == codec, label)
+                .clicked()
+            {
+                self.set_remote_video_profile(self.video_fps, codec);
+                ui.close();
+            }
+        }
+    }
+
+    fn remote_more_menu_ui(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .checkbox(&mut self.auto_refresh, "Авто-обновление PNG")
+            .changed()
+        {
+            self.save_ui_config();
+            self.send_command(SessionCommand::SetAutoRefresh {
+                enabled: self.auto_refresh,
+                millis: self.refresh_millis,
+            });
+        }
+        let mut refresh_ms = self.refresh_millis as f32;
+        if ui
+            .add(
+                egui::Slider::new(&mut refresh_ms, 50.0..=2000.0)
+                    .text("мс / кадр")
+                    .clamping(egui::SliderClamping::Always),
+            )
+            .changed()
+        {
+            self.refresh_millis = refresh_ms.round() as u64;
+            self.save_ui_config();
+            self.send_command(SessionCommand::SetAutoRefresh {
+                enabled: self.auto_refresh,
+                millis: self.refresh_millis,
+            });
+        }
+
+        ui.separator();
+        egui::ComboBox::from_id_salt("coordinate-mode")
+            .selected_text(coordinate_mode_label(self.coordinate_mode))
+            .show_ui(ui, |ui| {
+                for mode in [
+                    CoordinateMode::Auto,
+                    CoordinateMode::Absolute,
+                    CoordinateMode::Local,
+                ] {
+                    if ui
+                        .selectable_value(
+                            &mut self.coordinate_mode,
+                            mode,
+                            coordinate_mode_label(mode),
+                        )
+                        .clicked()
+                    {
+                        self.save_ui_config();
+                        self.last_mouse_pos = None;
+                    }
+                }
+            });
+
+        ui.separator();
+        if ui.button("Ctrl+Alt+Del").clicked() {
+            self.send_command(SessionCommand::KeyControl(ControlKey::CtrlAltDel));
+            self.request_visual_refresh_after_input();
+            ui.close();
+        }
+        if ui.button("Заблокировать экран").clicked() {
+            self.send_command(SessionCommand::KeyControl(ControlKey::LockScreen));
+            self.request_visual_refresh_after_input();
+            ui.close();
+        }
+
+        ui.separator();
+        if ui.button("Сохранить лог").clicked() {
+            self.save_session_log_file();
+            ui.close();
+        }
+        if ui.button("Собрать отчёт").clicked() {
+            self.save_support_report();
+            ui.close();
+        }
+
+        ui.separator();
+        if let Some((x, y)) = self.last_mouse_pos {
+            ui.label(format!("Мышь: {x}, {y}"));
+        }
+        if let Some(age) = self.last_screenshot_age_ms() {
+            ui.label(format!("Возраст кадра: {age} мс"));
+        }
+        ui.label(format!("Событий ввода: {}", self.input_events_sent));
+    }
+
+    fn remote_session_toolbar_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        detached_window: bool,
+    ) {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.horizontal_wrapped(|ui| {
+            if !detached_window
+                && ui
+                    .button("Назад")
+                    .on_hover_text("Закрыть экран без отключения сеанса")
+                    .clicked()
+            {
+                self.close_remote_viewer_panel();
+                return;
+            }
+
+            if ui
+                .button("Отключить")
+                .on_hover_text("Завершить удаленный сеанс")
+                .clicked()
+            {
+                self.remote_viewer_open = false;
+                self.remote_input_focused = false;
+                self.release_remote_modifiers();
+                self.last_mouse_pos = None;
+                self.wheel_accum = egui::Vec2::ZERO;
+                self.disconnect_session("Отключено");
+                if detached_window {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                return;
+            }
+
+            ui.separator();
+            self.remote_display_selector_ui(
+                ui,
+                if detached_window {
+                    "remote-display"
+                } else {
+                    "software-remote-display"
+                },
+            );
+
+            ui.separator();
+            ui.add(
+                egui::TextEdit::singleline(&mut self.text_to_send)
+                    .hint_text("Текст")
+                    .desired_width(if detached_window { 170.0 } else { 190.0 }),
+            );
+            let send_text = ui
+                .add_enabled(
+                    !self.text_to_send.is_empty(),
+                    egui::Button::new("Отправить"),
+                )
+                .on_hover_text("Отправить текст в удаленный ввод");
+            if send_text.clicked()
+                || (ui.ctx().input(|i| i.key_pressed(egui::Key::Enter))
+                    && !self.remote_input_focused
+                    && !self.text_to_send.is_empty())
+            {
+                let text = std::mem::take(&mut self.text_to_send);
+                self.send_command(SessionCommand::KeyText(text));
+                self.request_visual_refresh_after_input();
+            }
+            if ui
+                .button("Буфер")
+                .on_hover_text("Вставить локальный буфер в удаленную машину")
+                .clicked()
+            {
+                self.paste_local_clipboard_to_remote();
+            }
+
+            ui.separator();
+            if ui
+                .button("Обновить")
+                .on_hover_text("Перезапросить live-video и контрольный PNG-кадр")
+                .clicked()
+            {
+                self.send_command(SessionCommand::RefreshVideo);
+                self.send_command(SessionCommand::Screenshot);
+            }
+            if ui
+                .button("PNG")
+                .on_hover_text("Сохранить текущий кадр")
+                .clicked()
+            {
+                self.save_current_frame_png();
+            }
+            if ui
+                .selectable_label(self.fit_to_window, "Вписать")
+                .on_hover_text("Масштабировать экран под окно")
+                .clicked()
+            {
+                self.fit_to_window = !self.fit_to_window;
+                self.save_ui_config();
+            }
+            if ui
+                .button(if self.remote_fullscreen {
+                    "Окно"
+                } else {
+                    "Fullscreen"
+                })
+                .on_hover_text("Полный экран (F11)")
+                .clicked()
+            {
+                self.set_remote_fullscreen(ctx, !self.remote_fullscreen);
+            }
+
+            ui.separator();
+            ui.menu_button(
+                format!(
+                    "{} / {} fps",
+                    self.config.display.codec.label(),
+                    self.video_fps
+                ),
+                |ui| self.remote_video_profile_menu_ui(ui),
+            );
+            ui.menu_button("Ещё", |ui| self.remote_more_menu_ui(ui));
+        });
+    }
+
     #[allow(deprecated)]
     fn remote_viewer_inline(&mut self, ctx: &egui::Context) {
         if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
@@ -3216,154 +3529,7 @@ impl EvertyDeskApp {
         }
 
         egui::Panel::top("software-remote-toolbar").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .button("Back")
-                    .on_hover_text("Close remote screen")
-                    .clicked()
-                {
-                    self.remote_viewer_open = false;
-                    self.remote_input_focused = false;
-                    self.release_remote_modifiers();
-                    self.last_mouse_pos = None;
-                    self.wheel_accum = egui::Vec2::ZERO;
-                    self.status = "Remote screen closed".to_owned();
-                    self.send_command(SessionCommand::SetAutoRefresh {
-                        enabled: false,
-                        millis: self.refresh_millis,
-                    });
-                }
-
-                if ui.button("Disconnect").clicked() {
-                    self.disconnect_session("Disconnected");
-                }
-
-                if !self.remote_displays.is_empty() {
-                    ui.separator();
-                    let selected_text = self
-                        .remote_displays
-                        .iter()
-                        .find(|d| d.index == self.selected_display)
-                        .map(display_label)
-                        .unwrap_or_else(|| format!("Display {}", self.selected_display + 1));
-                    egui::ComboBox::from_id_salt("software-remote-display")
-                        .selected_text(selected_text)
-                        .show_ui(ui, |ui| {
-                            let displays = self.remote_displays.clone();
-                            for display in displays {
-                                let label = display_label(&display);
-                                if ui
-                                    .selectable_value(
-                                        &mut self.selected_display,
-                                        display.index,
-                                        label,
-                                    )
-                                    .clicked()
-                                {
-                                    self.remote_texture = None;
-                                    self.remote_size = [0, 0];
-                                    self.send_command(SessionCommand::SetDisplay(display));
-                                }
-                            }
-                        });
-                }
-
-                ui.separator();
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.text_to_send)
-                        .hint_text("Text -> Enter")
-                        .desired_width(180.0),
-                );
-                if ui
-                    .add_enabled(!self.text_to_send.is_empty(), egui::Button::new("Send"))
-                    .clicked()
-                    || (ui.ctx().input(|i| i.key_pressed(egui::Key::Enter))
-                        && !self.remote_input_focused
-                        && !self.text_to_send.is_empty())
-                {
-                    let text = std::mem::take(&mut self.text_to_send);
-                    self.send_command(SessionCommand::KeyText(text));
-                    self.request_visual_refresh_after_input();
-                }
-
-                if ui.button("Paste").clicked() {
-                    self.paste_local_clipboard_to_remote();
-                }
-                if ui
-                    .button("PNG")
-                    .on_hover_text("Save current frame")
-                    .clicked()
-                {
-                    self.save_current_frame_png();
-                }
-                if ui.button("Refresh").clicked() {
-                    self.send_command(SessionCommand::RefreshVideo);
-                    self.send_command(SessionCommand::Screenshot);
-                }
-                if ui.checkbox(&mut self.fit_to_window, "Fit").changed() {
-                    self.save_ui_config();
-                }
-
-                ui.menu_button("More", |ui| {
-                    if ui
-                        .checkbox(&mut self.auto_refresh, "Auto refresh")
-                        .changed()
-                    {
-                        self.save_ui_config();
-                        self.send_command(SessionCommand::SetAutoRefresh {
-                            enabled: self.auto_refresh,
-                            millis: self.refresh_millis,
-                        });
-                    }
-                    let mut refresh_ms = self.refresh_millis as f32;
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut refresh_ms, 50.0..=2000.0)
-                                .text("ms/frame")
-                                .clamping(egui::SliderClamping::Always),
-                        )
-                        .changed()
-                    {
-                        self.refresh_millis = refresh_ms.round() as u64;
-                        self.save_ui_config();
-                        self.send_command(SessionCommand::SetAutoRefresh {
-                            enabled: self.auto_refresh,
-                            millis: self.refresh_millis,
-                        });
-                    }
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label("Video fps");
-                        for fps in [15, 20, 30, 60] {
-                            if ui
-                                .selectable_label(self.video_fps == fps, fps.to_string())
-                                .clicked()
-                            {
-                                self.video_fps = fps;
-                                self.send_command(SessionCommand::SetVideoFps { fps });
-                            }
-                        }
-                    });
-                    if ui.button("Ctrl+Alt+Del").clicked() {
-                        self.send_command(SessionCommand::KeyControl(ControlKey::CtrlAltDel));
-                        self.request_visual_refresh_after_input();
-                        ui.close();
-                    }
-                    if ui.button("Lock screen").clicked() {
-                        self.send_command(SessionCommand::KeyControl(ControlKey::LockScreen));
-                        self.request_visual_refresh_after_input();
-                        ui.close();
-                    }
-                    if ui.button("Save log").clicked() {
-                        self.save_session_log_file();
-                        ui.close();
-                    }
-                    if ui.button("Support report").clicked() {
-                        self.save_support_report();
-                        ui.close();
-                    }
-                });
-            });
+            self.remote_session_toolbar_ui(ui, ctx, false);
         });
 
         egui::Panel::bottom("software-remote-statusbar").show(ctx, |ui| {
@@ -3581,184 +3747,8 @@ impl EvertyDeskApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.remote_fullscreen));
             }
 
-            // ── Toolbar ────────────────────────────────────────────────────────────
             egui::Panel::top("remote-toolbar").show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    // Display selector
-                    if !self.remote_displays.is_empty() {
-                        let selected_text = self
-                            .remote_displays
-                            .iter()
-                            .find(|d| d.index == self.selected_display)
-                            .map(display_label)
-                            .unwrap_or_else(|| format!("Дисплей {}", self.selected_display + 1));
-                        egui::ComboBox::from_id_salt("remote-display")
-                            .selected_text(selected_text)
-                            .show_ui(ui, |ui| {
-                                let displays = self.remote_displays.clone();
-                                for display in displays {
-                                    let label = display_label(&display);
-                                    if ui
-                                        .selectable_value(
-                                            &mut self.selected_display,
-                                            display.index,
-                                            label,
-                                        )
-                                        .clicked()
-                                    {
-                                        self.remote_texture = None;
-                                        self.remote_size = [0, 0];
-                                        self.send_command(SessionCommand::SetDisplay(display));
-                                    }
-                                }
-                            });
-                    }
-
-                    ui.separator();
-
-                    // Quick text send
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.text_to_send)
-                            .hint_text("Текст → Enter")
-                            .desired_width(160.0),
-                    );
-                    let send_text =
-                        ui.add_enabled(!self.text_to_send.is_empty(), egui::Button::new("⏎"));
-                    if send_text.clicked()
-                        || (ui.ctx().input(|i| i.key_pressed(egui::Key::Enter))
-                            && !self.remote_input_focused
-                            && !self.text_to_send.is_empty())
-                    {
-                        let text = std::mem::take(&mut self.text_to_send);
-                        self.send_command(SessionCommand::KeyText(text));
-                        self.request_visual_refresh_after_input();
-                    }
-                    if ui.button("⧉").on_hover_text("Вставить из буфера").clicked()
-                    {
-                        self.paste_local_clipboard_to_remote();
-                    }
-                    if ui.button("▣").on_hover_text("Сохранить кадр PNG").clicked() {
-                        self.save_current_frame_png();
-                    }
-
-                    ui.separator();
-
-                    if ui.button("🗗").on_hover_text("Полный экран (F11)").clicked() {
-                        self.remote_fullscreen = !self.remote_fullscreen;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(
-                            self.remote_fullscreen,
-                        ));
-                    }
-                    if ui.checkbox(&mut self.fit_to_window, "Вписать").changed() {
-                        self.save_ui_config();
-                    }
-
-                    ui.separator();
-
-                    // "More" menu — advanced / rarely used settings
-                    ui.menu_button("⋯", |ui| {
-                        if ui
-                            .checkbox(&mut self.auto_refresh, "Авто-обновление")
-                            .changed()
-                        {
-                            self.save_ui_config();
-                            self.send_command(SessionCommand::SetAutoRefresh {
-                                enabled: self.auto_refresh,
-                                millis: self.refresh_millis,
-                            });
-                        }
-                        let mut refresh_ms = self.refresh_millis as f32;
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut refresh_ms, 50.0..=2000.0)
-                                    .text("мс / кадр")
-                                    .clamping(egui::SliderClamping::Always),
-                            )
-                            .changed()
-                        {
-                            self.refresh_millis = refresh_ms.round() as u64;
-                            self.save_ui_config();
-                            self.send_command(SessionCommand::SetAutoRefresh {
-                                enabled: self.auto_refresh,
-                                millis: self.refresh_millis,
-                            });
-                        }
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.label("Video fps");
-                            for fps in [15, 20, 30, 60] {
-                                if ui
-                                    .selectable_label(self.video_fps == fps, fps.to_string())
-                                    .clicked()
-                                {
-                                    self.video_fps = fps;
-                                    self.send_command(SessionCommand::SetVideoFps { fps });
-                                }
-                            }
-                        });
-                        if ui.button("↺ Обновить поток").clicked() {
-                            self.send_command(SessionCommand::RefreshVideo);
-                            ui.close();
-                        }
-                        if ui.button("Вставить буфер").clicked() {
-                            self.paste_local_clipboard_to_remote();
-                            ui.close();
-                        }
-                        if ui.button("Сохранить кадр PNG").clicked() {
-                            self.save_current_frame_png();
-                            ui.close();
-                        }
-                        if ui.button("Сохранить лог").clicked() {
-                            self.save_session_log_file();
-                            ui.close();
-                        }
-                        if ui.button("Собрать отчёт").clicked() {
-                            self.save_support_report();
-                            ui.close();
-                        }
-                        ui.separator();
-                        egui::ComboBox::from_id_salt("coordinate-mode")
-                            .selected_text(coordinate_mode_label(self.coordinate_mode))
-                            .show_ui(ui, |ui| {
-                                for mode in [
-                                    CoordinateMode::Auto,
-                                    CoordinateMode::Absolute,
-                                    CoordinateMode::Local,
-                                ] {
-                                    if ui
-                                        .selectable_value(
-                                            &mut self.coordinate_mode,
-                                            mode,
-                                            coordinate_mode_label(mode),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.save_ui_config();
-                                        self.last_mouse_pos = None;
-                                    }
-                                }
-                            });
-                        ui.separator();
-                        if ui.button("Ctrl+Alt+Del").clicked() {
-                            self.send_command(SessionCommand::KeyControl(ControlKey::CtrlAltDel));
-                            self.request_visual_refresh_after_input();
-                            ui.close();
-                        }
-                        if ui.button("🔒 Заблокировать экран").clicked() {
-                            self.send_command(SessionCommand::KeyControl(ControlKey::LockScreen));
-                            self.request_visual_refresh_after_input();
-                            ui.close();
-                        }
-                        ui.separator();
-                        if let Some((x, y)) = self.last_mouse_pos {
-                            ui.label(format!("Мышь: {x}, {y}"));
-                        }
-                        if let Some(age) = self.last_screenshot_age_ms() {
-                            ui.label(format!("Возраст кадра: {age} мс"));
-                        }
-                        ui.label(format!("Отправлено событий: {}", self.input_events_sent));
-                    });
-                });
+                self.remote_session_toolbar_ui(ui, ctx, true);
             });
 
             // ── Status bar (bottom) ─────────────────────────────────────────────────
