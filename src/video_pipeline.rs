@@ -112,7 +112,9 @@ pub fn run(cfg: PipelineConfig) {
     // ── TCP канал несёт И видео, И control (shell output) ──────────────────────
     // TcpItem::Video — видеокадры (с приоритетом latency, буфер 2)
     // TcpItem::Peer  — shell output, control сообщения (всегда доставляются)
-    let (tcp_tx, tcp_rx) = mpsc::sync_channel::<TcpItem>(8);
+    // Буфер 4: при блокирующем send даёт backpressure без большой задержки
+    // (≤4 кадра в полёте ≈ 130мс на 30fps). EVRT-канал меньше — UDP latency-critical.
+    let (tcp_tx, tcp_rx) = mpsc::sync_channel::<TcpItem>(4);
     let (evrt_tx, evrt_rx) = mpsc::sync_channel::<EncodedFrame>(2);
 
     // ── Флаг: EVRT активен? Устанавливается когда клиент прислал punch ────────
@@ -494,11 +496,19 @@ fn encode_loop(
                 }
             }
         } else {
-            // TCP primary: все кадры → TCP
-            match tcp_tx.try_send(TcpItem::Video(frame)) {
+            // TCP primary: БЛОКИРУЮЩИЙ send — backpressure.
+            //
+            // Раньше был try_send: при медленном relay буфер переполнялся и
+            // 90% кадров дропалось → клиент видел 3-8 fps вместо 30.
+            //
+            // Блокирующий send заставляет энкодер ждать места в канале, т.е.
+            // подстраивает темп под пропускную способность сети. Промежуточные
+            // кадры дропаются на захвате (capture double-buffer держит только
+            // свежий), поэтому задержка НЕ накапливается — отдаём свежие кадры
+            // в темпе сети.
+            match tcp_tx.send(TcpItem::Video(frame)) {
                 Ok(()) => {}
-                Err(mpsc::TrySendError::Full(_)) => {}
-                Err(mpsc::TrySendError::Disconnected(_)) => break,
+                Err(_) => break, // канал закрыт — сессия завершена
             }
         }
     }
