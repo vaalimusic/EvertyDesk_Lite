@@ -349,7 +349,7 @@ fn run_gui(renderer: eframe::Renderer) -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         APP_NAME,
         options,
         Box::new(|cc| {
@@ -361,7 +361,11 @@ fn run_gui(renderer: eframe::Renderer) -> eframe::Result<()> {
             );
             Ok(Box::new(EvertyDeskApp::new()))
         }),
-    )
+    );
+    if result.is_ok() {
+        std::process::exit(0);
+    }
+    result
 }
 
 /// Headless host loop — same as `--host` CLI mode, used as auto-fallback
@@ -1611,12 +1615,28 @@ impl eframe::App for EvertyDeskApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.shutdown();
+        arm_shutdown_watchdog();
     }
+}
+
+fn arm_shutdown_watchdog() {
+    thread::Builder::new()
+        .name("shutdown-watchdog".into())
+        .spawn(|| {
+            thread::sleep(Duration::from_millis(1500));
+            std::process::exit(0);
+        })
+        .ok();
 }
 
 impl EvertyDeskApp {
     #[allow(deprecated)]
     fn update_egui(&mut self, ctx: &egui::Context) {
+        if ctx.input(|input| input.viewport().close_requested()) {
+            self.shutdown();
+            std::process::exit(0);
+        }
+
         self.poll_worker();
         self.poll_terminal_ai();
         self.maybe_request_terminal_auto_ai();

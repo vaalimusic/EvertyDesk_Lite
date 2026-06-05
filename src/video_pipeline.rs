@@ -273,9 +273,20 @@ pub fn run(cfg: PipelineConfig) {
     }
 
     stop.store(true, Ordering::Relaxed);
-    for handle in worker_handles {
-        let _ = handle.join();
-    }
+    let join_events = events.clone();
+    let join_peer = peer_id.clone();
+    thread::Builder::new()
+        .name("pipeline-joiner".into())
+        .spawn(move || {
+            for handle in worker_handles {
+                let _ = handle.join();
+            }
+            log(
+                &join_events,
+                format!("Pipeline workers joined for {join_peer}"),
+            );
+        })
+        .ok();
 
     log(&events, format!("Pipeline для {peer_id} завершён"));
 }
@@ -647,8 +658,7 @@ fn evrt_send_loop(
                 &events,
                 "EVRT: punch timeout — UDP сессия не запущена".into(),
             );
-            // Дренируем evrt_rx чтобы encoder не блокировался
-            while frame_rx.recv_timeout(Duration::from_millis(10)).is_ok() {}
+            log(&events, "EVRT UDP sender stopped".into());
             return;
         }
         if let Ok((_, src)) = socket.recv_from(&mut buf) {
