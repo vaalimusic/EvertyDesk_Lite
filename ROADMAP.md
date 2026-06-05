@@ -6,6 +6,12 @@ This document tracks what is already implemented and what remains to turn
 EvertyDesk Lite from a compact RustDesk-compatible client into a fast,
 portable support workstation.
 
+> **Связанные документы:**
+> - [`EVRT_ROADMAP.md`](EVRT_ROADMAP.md) — игровой стриминговый стек EVRT
+>   (прямой UDP, низкая задержка, адаптация). Разработка Артура Валиева.
+> - [`WINDOWS_DEV_GUIDE.md`](WINDOWS_DEV_GUIDE.md) — сборка и тестирование EVRT
+>   под Windows, чек-листы валидации на железе.
+
 ## Current Goal
 
 EvertyDesk Lite should stay small, native, and usable on imperfect machines:
