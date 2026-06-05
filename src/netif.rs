@@ -42,7 +42,8 @@ fn priority(ip: &Ipv4Addr) -> u8 {
     } else if o[0] == 10
         || (o[0] == 172 && (16..=31).contains(&o[1]))
         || (o[0] == 192 && o[1] == 168)
-        || o[0] == 100 // CGNAT / Tailscale 100.64.0.0/10
+        || o[0] == 100
+    // CGNAT / Tailscale 100.64.0.0/10
     {
         0 // приватные LAN/VPN — наивысший приоритет
     } else {
@@ -55,11 +56,11 @@ fn priority(ip: &Ipv4Addr) -> u8 {
 #[cfg(all(windows, feature = "live-vp9-mf"))]
 fn platform_ipv4() -> Vec<Ipv4Addr> {
     use std::ptr;
-    use windows::Win32::Networking::WinSock::{AF_INET, AF_UNSPEC, SOCKADDR_IN};
     use windows::Win32::NetworkManagement::IpHelper::{
         GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
         GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH,
     };
+    use windows::Win32::Networking::WinSock::{AF_INET, AF_UNSPEC, SOCKADDR_IN};
 
     let mut out = Vec::new();
     unsafe {
@@ -203,8 +204,8 @@ mod tests {
     #[test]
     fn private_addresses_sorted_first() {
         let priv_ip = Ipv4Addr::new(192, 168, 1, 5);
-        let pub_ip  = Ipv4Addr::new(8, 8, 8, 8);
-        let ll_ip   = Ipv4Addr::new(169, 254, 1, 1);
+        let pub_ip = Ipv4Addr::new(8, 8, 8, 8);
+        let ll_ip = Ipv4Addr::new(169, 254, 1, 1);
         assert!(priority(&priv_ip) < priority(&pub_ip));
         assert!(priority(&pub_ip) < priority(&ll_ip));
     }

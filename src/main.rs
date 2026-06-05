@@ -16,8 +16,8 @@ mod fsr;
 mod host;
 mod llm;
 mod mf_encode;
-mod netif;
 mod mf_video;
+mod netif;
 mod nvenc;
 mod rustdesk_proto;
 mod settings;
@@ -654,6 +654,7 @@ struct EvertyDeskApp {
     frame_decode_ms: u64,
     frame_dropped: usize,
     last_stream_tune_at: Option<Instant>,
+    last_video_metric_log_at: Option<Instant>,
     png_fallback_started_at: Option<Instant>,
     /// When the last live (VP9/H264) frame was received.
     /// Used to suppress PNG screenshot frames while live video is active.
@@ -905,6 +906,7 @@ impl EvertyDeskApp {
             frame_decode_ms: 0,
             frame_dropped: 0,
             last_stream_tune_at: None,
+            last_video_metric_log_at: None,
             png_fallback_started_at: None,
             last_live_frame_at: None,
             stream_health: "ожидание кадра".to_owned(),
@@ -996,6 +998,7 @@ impl EvertyDeskApp {
         self.frame_decode_ms = 0;
         self.frame_dropped = 0;
         self.last_stream_tune_at = None;
+        self.last_video_metric_log_at = None;
         self.png_fallback_started_at = None;
         self.last_live_frame_at = None;
         self.stream_health = "ожидание кадра".to_owned();
@@ -1246,6 +1249,23 @@ impl EvertyDeskApp {
                         self.stream_health = "декодер/отрисовка отстаёт".to_owned();
                     }
                 }
+                if self
+                    .last_video_metric_log_at
+                    .map(|instant| instant.elapsed() >= Duration::from_secs(3))
+                    .unwrap_or(true)
+                {
+                    self.last_video_metric_log_at = Some(Instant::now());
+                    self.log(format!(
+                        "Video telemetry: in={input_fps:.1} fps / {input_kbps} kbps, render={:.1} fps, codec={}, packet={} KB, queue={} ms, decode={} ms, drop={}, health={}",
+                        self.display_fps,
+                        self.last_frame_codec,
+                        self.frame_bytes / 1024,
+                        self.frame_queue_ms,
+                        self.frame_decode_ms,
+                        self.frame_dropped,
+                        self.stream_health
+                    ));
+                }
             }
             SessionEvent::Displays(displays) => {
                 // Запоминаем нативное разрешение хоста для FSR апскейла.
@@ -1434,6 +1454,7 @@ impl EvertyDeskApp {
         self.stream_input_fps = 0.0;
         self.stream_input_kbps = 0;
         self.last_stream_tune_at = None;
+        self.last_video_metric_log_at = None;
         self.png_fallback_started_at = None;
         self.last_live_frame_at = None;
         self.stream_health = "отключено".to_owned();
