@@ -995,6 +995,7 @@ impl TransportClient {
                     screenshot_pending = false;
                     last_frame_received = Instant::now();
                     if let FrameSource::Video { bytes } = source {
+                        let _ = send_video_received(&mut relay);
                         video_metric_packets = video_metric_packets.saturating_add(1);
                         video_metric_bytes = video_metric_bytes.saturating_add(bytes as u64);
                         let metric_elapsed = last_video_packet_metrics.elapsed();
