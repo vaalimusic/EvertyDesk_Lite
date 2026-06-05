@@ -36,7 +36,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{host::HostEvent, settings::AppConfig};
+use crate::{
+    host::{ClientVideoSupport, HostEvent},
+    settings::AppConfig,
+};
 
 // ─── Encoded frame ────────────────────────────────────────────────────────────
 
@@ -78,6 +81,7 @@ pub struct PipelineConfig {
     pub app_config: AppConfig,
     pub peer_id: String,
     pub events: Sender<HostEvent>,
+    pub client_video: ClientVideoSupport,
     pub relay_stream: std::net::TcpStream,
     /// Шифрование исходящего TCP потока (видео).
     /// RecvCipher остаётся в relay_session_inner для расшифровки управляющих сообщений.
@@ -94,6 +98,7 @@ pub fn run(cfg: PipelineConfig) {
         app_config,
         peer_id,
         events,
+        client_video,
         relay_stream,
         send_cipher,
         evrt_socket,
@@ -150,6 +155,7 @@ pub fn run(cfg: PipelineConfig) {
         let qual_e = quality_ms.clone();
         let bitrate_scale_e = bitrate_scale_milli.clone();
         let cfg_e = app_config.clone();
+        let client_video_e = client_video;
         let ev_e = events.clone();
         let tcp_e = tcp_tx;
         let evrt_e = evrt_tx;
@@ -164,6 +170,7 @@ pub fn run(cfg: PipelineConfig) {
                     qual_e,
                     bitrate_scale_e,
                     cfg_e,
+                    client_video_e,
                     ev_e,
                     tcp_e,
                     evrt_e,
@@ -270,23 +277,16 @@ fn encode_loop(
     quality_ms: Arc<AtomicU32>,
     bitrate_scale_milli: Arc<AtomicU32>,
     config: AppConfig,
+    client_video: ClientVideoSupport,
     events: Sender<HostEvent>,
     tcp_tx: SyncSender<TcpItem>,
     evrt_tx: SyncSender<EncodedFrame>,
     evrt_active: Arc<Mutex<Option<SocketAddr>>>,
     idr_rx: Receiver<()>,
 ) {
-    use crate::host::{h264_target_bitrate_bps_pub, ClientVideoSupport, MultiEncoder};
-    use crate::rustdesk_proto::PreferCodec;
+    use crate::host::{h264_target_bitrate_bps_pub, MultiEncoder};
 
     log(&events, "Encoder loop started".into());
-
-    let client_video = ClientVideoSupport {
-        h264: true,
-        h265: true,
-        av1: false,
-        prefer: PreferCodec::Auto,
-    };
 
     // ★ Единый каскад энкодеров: MF → VideoToolbox → NVENC → OpenH264 → PNG
     let mut encoder = MultiEncoder::new(config.display.encoder, config.display.codec, client_video);
@@ -428,7 +428,8 @@ fn encode_loop(
         let relief_milli = bitrate_scale_milli
             .load(Ordering::Relaxed)
             .clamp(MIN_BITRATE_SCALE_MILLI, 1_000);
-        let mut eff_bps = adapt_bitrate(base_bps, decision.roi, enc_w, enc_h, want_idr, relief_milli);
+        let mut eff_bps =
+            adapt_bitrate(base_bps, decision.roi, enc_w, enc_h, want_idr, relief_milli);
 
         // ★ Cap битрейта под транспорт.
         //   EVRT активен (прямой UDP по LAN) → полный битрейт, сеть быстрая.
@@ -452,11 +453,17 @@ fn encode_loop(
         //   Критично для диагностики: показывает, аппаратный энкодер или софт.
         if !backend_logged {
             backend_logged = true;
-            log(&events, format!(
-                "★ Реальный энкодер: {} ({}×{}@{}, первый кадр {}мс)",
-                encoder.active_backend(), enc_w, enc_h, fps,
-                encode_dur.as_millis(),
-            ));
+            log(
+                &events,
+                format!(
+                    "★ Реальный энкодер: {} ({}×{}@{}, первый кадр {}мс)",
+                    encoder.active_backend(),
+                    enc_w,
+                    enc_h,
+                    fps,
+                    encode_dur.as_millis(),
+                ),
+            );
             // Если MF упал и мы на софте — печатаем ПОЧЕМУ MF не сработал.
             if let Some(err) = encoder.take_mf_error() {
                 log(&events, format!("★ MF отключён, причина: {err}"));

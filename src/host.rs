@@ -1205,6 +1205,7 @@ fn relay_session_inner(
 
     let target_fps = negotiated_target_fps(&login, config.display.target_fps);
     let quality_milli = negotiated_quality_milli(&login);
+    let client_video = client_video_support(&login);
 
     host_log(
         events,
@@ -1244,6 +1245,7 @@ fn relay_session_inner(
         app_config: config.clone(),
         peer_id: peer_id.to_owned(),
         events: events.clone(),
+        client_video,
         relay_stream: write_stream,
         send_cipher,
         evrt_socket: evrt_socket.map(|(s, _)| s),
@@ -4327,8 +4329,8 @@ fn codec_label(codec: crate::nvenc::NvencCodec) -> &'static str {
 #[cfg(feature = "live-h264")]
 fn build_openh264_encoder() -> Option<openh264::encoder::Encoder> {
     use openh264::encoder::{
-        BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod,
-        RateControlMode, SpsPpsStrategy, UsageType,
+        BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode,
+        SpsPpsStrategy, UsageType,
     };
     // ★ Многопоточность — главный рычаг скорости софтверного H264.
     //   На слабом/VM железе без аппаратного MF это разница между 3 и 25 fps.
