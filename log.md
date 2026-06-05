@@ -63,3 +63,85 @@ Video: fps=60 bitrate=4756kbps bitrate_min=4700kbps bitrate_max=5000kbps roi_avg
 [20:26:37] RegisterPeerResponse  request_pk=false
 [20:26:37] Registered ✓ (key already on server)
 [20:26:37] Зарегистрировано на ID сервере ✓
+
+
+1780691208  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691208  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691208  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691208  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691208  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691208  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691208  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691208  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691208  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691208  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691208  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691208  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691208  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691208  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691208  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691208  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691208  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691209  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691209  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691209  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691209  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691209  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691209  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691209  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691209  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691209  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691209  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691209  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691209  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691209  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691209  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691209  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691209  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691209  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691209  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691209  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691209  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691209  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691209  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691209  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691209  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691209  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691210  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691210  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691210  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691210  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691210  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691210  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691210  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691210  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691210  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691210  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691210  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691210  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691210  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691210  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691210  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691210  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691210  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691210  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691210  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691210  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691210  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691210  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691210  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691210  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691210  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691211  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691211  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691211  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691211  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691211  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691211  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691211  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691211  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691211  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691211  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691211  Окно управления закрыто
+1780691211  Server sent H265, but hardware H265 decode is unavailable; requesting fallback
+1780691211  Отключено
