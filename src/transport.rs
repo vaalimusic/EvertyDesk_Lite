@@ -457,9 +457,9 @@ impl TransportClient {
         let mut last_decoder_recovery: Option<Instant> = None;
         let mut last_adaptive_raise = Instant::now();
         let mut stable_decoded_frames = 0_u32;
-        // Quality starts at Balanced for fast encoder warm-up, raised to Best
-        // after the stream has been stable for a few seconds.
-        let mut _current_quality = ImageQuality::Balanced;
+        // 60 fps sessions are interactive first: start with RustDesk's speed
+        // quality, then raise only after the incoming stream proves it is fast.
+        let mut _current_quality = initial_stream_quality(initial_video_fps);
         let mut quality_raise_sent = false;
         let mut h264_decode_failures = 0_u32;
         let mut vp9_decode_failures = 0_u32;
@@ -1825,10 +1825,7 @@ fn send_codec_sync_options(
 }
 
 fn video_option_message(fps: i32, codec_preference: CodecPreference) -> OptionMessage {
-    // Start at Balanced quality so the host encoder can warm up quickly.
-    // A large IDR at Best quality delays the first frame significantly, especially
-    // over relay.  We raise to Best after the stream stabilises.
-    video_option_message_quality(fps, codec_preference, ImageQuality::Balanced)
+    video_option_message_quality(fps, codec_preference, initial_stream_quality(fps))
 }
 
 fn video_option_message_quality(
@@ -1841,6 +1838,14 @@ fn video_option_message_quality(
         custom_image_quality: 0,
         supported_decoding: Some(supported_decoding(codec_preference)),
         custom_fps: fps.clamp(5, 60),
+    }
+}
+
+fn initial_stream_quality(fps: i32) -> ImageQuality {
+    if fps >= 45 {
+        ImageQuality::Low
+    } else {
+        ImageQuality::Balanced
     }
 }
 
@@ -3568,7 +3573,7 @@ fn build_login_request(
             my_id: "evertydesk-lite".to_owned(),
             my_name: "EvertyDesk Lite".to_owned(),
             option: Some(video_option_message(fps, codec_preference)),
-            video_ack_required: true,
+            video_ack_required: false,
             version: "1.4.6".to_owned(),
             my_platform: std::env::consts::OS.to_owned(),
         })),
@@ -3721,10 +3726,10 @@ mod tests {
         assert_eq!(login.username, "123");
         let option = login.option.unwrap();
         assert_eq!(option.custom_fps, 60);
-        assert_eq!(option.image_quality, ImageQuality::Balanced as i32);
+        assert_eq!(option.image_quality, ImageQuality::Low as i32);
         assert_eq!(option.custom_image_quality, 0);
         assert!(option.supported_decoding.is_some());
-        assert!(login.video_ack_required);
+        assert!(!login.video_ack_required);
     }
 
     #[test]
@@ -3803,6 +3808,13 @@ mod tests {
         assert!(delay.from_client);
         assert_eq!(delay.time, 12345);
         assert_eq!(delay.last_delay, 0);
+    }
+
+    #[test]
+    fn initial_quality_prefers_speed_for_high_fps() {
+        assert_eq!(initial_stream_quality(60), ImageQuality::Low);
+        assert_eq!(initial_stream_quality(45), ImageQuality::Low);
+        assert_eq!(initial_stream_quality(30), ImageQuality::Balanced);
     }
 
     #[test]
