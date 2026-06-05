@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["live-h264", "live-vp9-mf"]
+default = ["live-h264", "live-vp9-mf", "live-nvenc-sdk"]
 live-h264  = ["dep:openh264"]
 # FSR: параллельная обработка строк через rayon (быстрее на многоядерных CPU)
 # Подключи rayon в [dependencies] и включи фичу: cargo build --features fsr-parallel

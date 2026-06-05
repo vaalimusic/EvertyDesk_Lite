@@ -1,6 +1,7 @@
 #ifdef _WIN32
 
 #define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
 #include <windows.h>
 
 #include <algorithm>
@@ -21,7 +22,6 @@ constexpr int kErr = -1;
 constexpr uint32_t kCodecMaskH264 = 1u << 0;
 constexpr uint32_t kCodecMaskH265 = 1u << 1;
 constexpr uint32_t kBufferCount = 3;
-constexpr uint32_t kInfiniteGop = 0xffff'ffffu;
 
 using NvEncodeApiCreateInstance =
     NVENCSTATUS(NVENCAPI *)(NV_ENCODE_API_FUNCTION_LIST *);
@@ -349,23 +349,31 @@ bool init_encoder(NvencContext &ctx, int codec, uint32_t width, uint32_t height,
     NV_ENC_CONFIG config = preset.presetCfg;
     config.version = NV_ENC_CONFIG_VER;
     config.profileGUID = NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID;
-    config.gopLength = kInfiniteGop;
+    config.gopLength = std::max<uint32_t>(fps, 1);
     config.frameIntervalP = 1;
     config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
     config.rcParams.multiPass = NV_ENC_MULTI_PASS_DISABLED;
     config.rcParams.averageBitRate = bitrate;
     config.rcParams.maxBitRate = bitrate;
-    config.rcParams.vbvBufferSize = std::max<uint32_t>(bitrate / fps, 64 * 1024);
+    config.rcParams.vbvBufferSize =
+        std::max<uint32_t>((bitrate / std::max<uint32_t>(fps, 1)) * 2, 64 * 1024);
     config.rcParams.vbvInitialDelay = config.rcParams.vbvBufferSize;
+    config.rcParams.enableLookahead = 0;
+    config.rcParams.lookaheadDepth = 0;
+    config.rcParams.zeroReorderDelay = 1;
+    config.rcParams.enableNonRefP = 1;
+    config.rcParams.strictGOPTarget = 1;
 
     if (codec == 1) {
         config.encodeCodecConfig.h264Config.outputAUD = 1;
         config.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
-        config.encodeCodecConfig.h264Config.idrPeriod = kInfiniteGop;
+        config.encodeCodecConfig.h264Config.disableSPSPPS = 0;
+        config.encodeCodecConfig.h264Config.idrPeriod = config.gopLength;
     } else if (codec == 2) {
         config.encodeCodecConfig.hevcConfig.outputAUD = 1;
         config.encodeCodecConfig.hevcConfig.repeatSPSPPS = 1;
-        config.encodeCodecConfig.hevcConfig.idrPeriod = kInfiniteGop;
+        config.encodeCodecConfig.hevcConfig.disableSPSPPS = 0;
+        config.encodeCodecConfig.hevcConfig.idrPeriod = config.gopLength;
     }
 
     NV_ENC_INITIALIZE_PARAMS init = {};

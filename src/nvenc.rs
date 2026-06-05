@@ -113,26 +113,30 @@ impl NvencEncoder {
 pub fn nvenc_encoder_codecs() -> Vec<NvencCodec> {
     #[cfg(all(nvenc_api_ffi, windows))]
     {
-        return windows_nvenc::support()
+        windows_nvenc::support()
             .map(|support| support.codecs.clone())
-            .unwrap_or_default();
+            .unwrap_or_default()
     }
-
-    Vec::new()
+    #[cfg(not(all(nvenc_api_ffi, windows)))]
+    {
+        Vec::new()
+    }
 }
 
 pub fn nvenc_encoder_names() -> Option<Vec<String>> {
     #[cfg(all(nvenc_api_ffi, windows))]
     {
-        return Some(
+        Some(
             windows_nvenc::support()
                 .filter(|support| !support.codecs.is_empty())
                 .map(|support| vec![support.label()])
                 .unwrap_or_default(),
-        );
+        )
     }
-
-    Some(Vec::new())
+    #[cfg(not(all(nvenc_api_ffi, windows)))]
+    {
+        Some(Vec::new())
+    }
 }
 
 pub fn nvenc_supported_platform() -> bool {

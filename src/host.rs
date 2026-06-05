@@ -4116,9 +4116,9 @@ impl MultiEncoder {
         codec_pref: CodecPreference,
         client: ClientVideoSupport,
     ) -> Self {
+        let desired_nv = choose_nvenc_codec(encoder_pref, codec_pref, client);
         let desired_mf = choose_mf_encoder_codec(encoder_pref, codec_pref, client);
         let desired_vt = choose_videotoolbox_codec(encoder_pref, codec_pref, client);
-        let desired_nv = choose_nvenc_codec(encoder_pref, codec_pref, client);
 
         #[cfg(feature = "live-h264")]
         let sw = build_openh264_encoder();
@@ -4150,14 +4150,14 @@ impl MultiEncoder {
     /// Краткое описание активной цепочки бэкендов (для логов).
     pub fn backend_label(&self) -> String {
         let mut parts = Vec::new();
+        if let Some(c) = self.desired_nv {
+            parts.push(format!("NVENC/{}", c.label()));
+        }
         if let Some(c) = self.desired_mf {
             parts.push(format!("MF/{}", c.label()));
         }
         if let Some(c) = self.desired_vt {
             parts.push(format!("VT/{}", c.label()));
-        }
-        if let Some(c) = self.desired_nv {
-            parts.push(format!("NVENC/{}", c.label()));
         }
         #[cfg(feature = "live-h264")]
         if self.sw.is_some() {
@@ -4178,7 +4178,37 @@ impl MultiEncoder {
         bgra: &[u8],
         force_key: bool,
     ) -> Option<EncodedOutput> {
-        // 1. Media Foundation (Windows)
+        // 1. Direct NVENC (Windows, NVIDIA). This is the EvertyGame-grade path:
+        // D3D11 + NVENC ultra-low-latency settings, with MF only as fallback.
+        if let Some(codec) = self.desired_nv.filter(|_| !self.nv_disabled) {
+            match encode_nvenc_frame(
+                &mut self.nv,
+                codec,
+                width,
+                height,
+                fps,
+                bitrate,
+                bgra,
+                force_key,
+            ) {
+                Ok(Some(pkt)) => {
+                    self.active_backend = "NVENC";
+                    return Some(EncodedOutput {
+                        bytes: pkt.bytes,
+                        key: pkt.key,
+                        sps_pps: None,
+                        codec: codec_label(codec),
+                    });
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    eprintln!("[host-video] NVENC disabled after error: {err}");
+                    self.nv_disabled = true;
+                }
+            }
+        }
+
+        // 2. Media Foundation (Windows)
         if let Some(codec) = self.desired_mf.filter(|_| !self.mf_disabled) {
             match encode_mf_frame(
                 &mut self.mf,
@@ -4205,11 +4235,14 @@ impl MultiEncoder {
                     });
                 }
                 Ok(None) => {}
-                Err(_) => self.mf_disabled = true,
+                Err(err) => {
+                    eprintln!("[host-video] MediaFoundation disabled after error: {err}");
+                    self.mf_disabled = true;
+                }
             }
         }
 
-        // 2. VideoToolbox (macOS)
+        // 3. VideoToolbox (macOS)
         if let Some(codec) = self.desired_vt.filter(|_| !self.vt_disabled) {
             match encode_videotoolbox_frame(
                 &mut self.vt,
@@ -4231,33 +4264,10 @@ impl MultiEncoder {
                     });
                 }
                 Ok(None) => {}
-                Err(_) => self.vt_disabled = true,
-            }
-        }
-
-        // 3. NVENC
-        if let Some(codec) = self.desired_nv.filter(|_| !self.nv_disabled) {
-            match encode_nvenc_frame(
-                &mut self.nv,
-                codec,
-                width,
-                height,
-                fps,
-                bitrate,
-                bgra,
-                force_key,
-            ) {
-                Ok(Some(pkt)) => {
-                    self.active_backend = "NVENC";
-                    return Some(EncodedOutput {
-                        bytes: pkt.bytes,
-                        key: pkt.key,
-                        sps_pps: None,
-                        codec: codec_label(codec),
-                    });
+                Err(err) => {
+                    eprintln!("[host-video] VideoToolbox disabled after error: {err}");
+                    self.vt_disabled = true;
                 }
-                Ok(None) => {}
-                Err(_) => self.nv_disabled = true,
             }
         }
 
