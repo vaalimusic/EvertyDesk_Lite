@@ -86,3 +86,85 @@
 [20:31:57] Сессия с (relay) завершена 
 [20:31:57] TCP sender stopped
 [20:32:00] Ожидание ответа от edesk.server1.everty.ru:21116 … (отправлено 6×, следующий heartbeat через 8s)
+
+
+1780691473  Peer msg #7: VideoFrame display 0 H264 frames=1
+1780691473  Peer msg #8: VideoFrame display 0 H264 frames=1
+1780691473  Peer msg #9: VideoFrame display 0 H264 frames=1
+1780691473  Video telemetry: in=8.8 fps / 561 kbps, render=0.0 fps, codec=H264, packet=6 KB, queue=0 ms, decode=8 ms, drop=0, latency=n/a, health=декодер/отрисовка отстаёт
+1780691473  Peer msg #10: VideoFrame display 0 H264 frames=1
+1780691473  Peer msg #11: VideoFrame display 0 H264 frames=1
+1780691473  Peer msg #12: VideoFrame display 0 H264 frames=1
+1780691473  Peer msg #13: VideoFrame display 0 H264 frames=1
+1780691473  Peer msg #14: VideoFrame display 0 H264 frames=1
+1780691473  Peer msg #15: VideoFrame display 0 H264 frames=1
+1780691473  Peer msg #16: VideoFrame display 0 H264 frames=1
+1780691474  Peer msg #17: VideoFrame display 0 H264 frames=1
+1780691474  Peer msg #18: VideoFrame display 0 H264 frames=1
+1780691474  Peer msg #19: VideoFrame display 0 H264 frames=1
+1780691474  Peer msg #20: VideoFrame display 0 H264 frames=1
+1780691474  Frame received: h264-316665 (H264)
+1780691475  Frame received: h264-649997 (H264)
+1780691475  Frame received: h264-983329 (H264)
+1780691476  Video telemetry: in=39.9 fps / 3717 kbps, render=38.7 fps, codec=H264, packet=1 KB, queue=0 ms, decode=5 ms, drop=0, latency=n/a, health=live поток стабилен
+1780691476  Frame received: h264-1316661 (H264)
+1780691477  Frame received: h264-1983325 (H264)
+1780691477  Frame received: h264-2316657 (H264)
+1780691478  Stream stable at 34.4 fps — raised quality to Best
+1780691478  Frame received: h264-2649989 (H264)
+1780691479  Frame received: h264-2983321 (H264)
+1780691479  Video telemetry: in=41.6 fps / 3225 kbps, render=40.4 fps, codec=H264, packet=15 KB, queue=0 ms, decode=5 ms, drop=0, latency=n/a, health=live поток стабилен
+1780691479  Frame received: h264-3316653 (H264)
+1780691480  Frame received: h264-3649985 (H264)
+1780691480  Frame received: h264-3983317 (H264)
+1780691481  Frame received: h264-4316649 (H264)
+1780691481  Frame received: h264-4649981 (H264)
+1780691481  Video QoS feedback sent: 60 fps
+1780691482  Frame received: h264-4983313 (H264)
+1780691482  Video telemetry: in=37.6 fps / 3226 kbps, render=38.7 fps, codec=H264, packet=19 KB, queue=0 ms, decode=4 ms, drop=0, latency=n/a, health=live поток стабилен
+1780691482  Frame received: h264-5316645 (H264)
+1780691483  Frame received: h264-5649977 (H264)
+1780691484  Frame received: h264-6316641 (H264)
+1780691485  Frame received: h264-6983305 (H264)
+1780691485  Video telemetry: in=35.9 fps / 3004 kbps, render=35.2 fps, codec=H264, packet=11 KB, queue=0 ms, decode=5 ms, drop=0, latency=n/a, health=live поток стабилен
+1780691485  Frame received: h264-7316637 (H264)
+1780691486  Frame received: h264-7649969 (H264)
+1780691488  Video telemetry: in=5.2 fps / 329 kbps, render=8.6 fps, codec=H264, packet=1 KB, queue=0 ms, decode=7 ms, drop=0, latency=n/a, health=низкий входящий поток: хост/сеть
+1780691488  Frame received: h264-7983301 (H264)
+1780691489  Frame received: h264-8316633 (H264)
+1780691491  Frame received: h264-8649965 (H264)
+1780691491  Video QoS feedback sent: 60 fps
+1780691491  Video telemetry: in=17.0 fps / 842 kbps, render=5.3 fps, codec=H264, packet=7 KB, queue=0 ms, decode=4 ms, drop=0, latency=n/a, health=декодер/отрисовка отстаёт
+1780691492  Frame received: h264-8983297 (H264)
+1780691493  Frame received: h264-9316629 (H264)
+1780691494  Frame received: h264-9633294 (H264)
+1780691494  Frame received: h264-9649961 (H264)
+1780691495  Video telemetry: in=38.4 fps / 2484 kbps, render=8.2 fps, codec=H264, packet=14 KB, queue=0 ms, decode=5 ms, drop=0, latency=n/a, health=декодер/отрисовка отстаёт
+1780691495  Frame received: h264-9983293 (H264)
+1780691495  Frame received: h264-10316625 (H264)
+1780691496  Frame received: h264-10649957 (H264)
+1780691498  Video telemetry: in=10.2 fps / 686 kbps, render=10.0 fps, codec=H264, packet=1 KB, queue=0 ms, decode=9 ms, drop=0, latency=n/a, health=live поток стабилен
+1780691498  Frame received: h264-10983289 (H264)
+1780691500  Frame received: h264-11316621 (H264)
+1780691501  Video telemetry: in=10.2 fps / 642 kbps, render=10.4 fps, codec=H264, packet=10 KB, queue=0 ms, decode=10 ms, drop=0, latency=n/a, health=live поток стабилен
+1780691501  Video QoS feedback sent: 60 fps
+1780691502  Frame received: h264-11649953 (H264)
+1780691503  Frame received: h264-11983285 (H264)
+1780691503  Frame received: h264-12316617 (H264)
+1780691504  Frame received: h264-12649949 (H264)
+1780691504  Video telemetry: in=26.4 fps / 2065 kbps, render=28.0 fps, codec=H264, packet=9 KB, queue=0 ms, decode=6 ms, drop=0, latency=n/a, health=live поток стабилен
+1780691505  Frame received: h264-12983281 (H264)
+1780691506  Frame received: h264-13316613 (H264)
+1780691507  Frame received: h264-13649945 (H264)
+1780691507  Video telemetry: in=10.0 fps / 1173 kbps, render=10.0 fps, codec=H264, packet=15 KB, queue=0 ms, decode=9 ms, drop=0, latency=n/a, health=live поток стабилен
+1780691509  Frame received: h264-13983277 (H264)
+1780691510  Video telemetry: in=10.8 fps / 565 kbps, render=10.8 fps, codec=H264, packet=6 KB, queue=0 ms, decode=4 ms, drop=0, latency=n/a, health=live поток стабилен
+1780691511  Frame received: h264-14316609 (H264)
+1780691511  Video QoS feedback sent: 60 fps
+1780691513  Frame received: h264-14649941 (H264)
+1780691514  Video telemetry: in=10.2 fps / 787 kbps, render=10.2 fps, codec=H264, packet=7 KB, queue=0 ms, decode=8 ms, drop=0, latency=n/a, health=live поток стабилен
+1780691515  Frame received: h264-14983273 (H264)
+1780691517  Frame received: h264-15316605 (H264)
+1780691517  Video telemetry: in=10.7 fps / 884 kbps, render=10.7 fps, codec=H264, packet=9 KB, queue=0 ms, decode=11 ms, drop=0, latency=n/a, health=live поток стабилен
+1780691517  Окно управления закрыто
+1780691517  Отключено
