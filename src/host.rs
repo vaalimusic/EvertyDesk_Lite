@@ -1172,18 +1172,16 @@ fn relay_session_inner(
     // Клиент получает порт → punch-hole → EVRT сессия.
     // Если UDP не поднялся за 2 сек — клиент остаётся на TCP relay.
     let evrt_socket = try_open_evrt_socket(config, events);
+    let mut evrt_announce: Option<(String, u16)> = None;
 
     if let Some((ref _sock, evrt_port)) = evrt_socket {
         // ★ Перечисляем ВСЕ локальные IP (LAN + VPN) как кандидаты — mini-ICE.
         //   Это решает мультихоминг: через VPN клиент достучится по VPN-IP хоста.
         let endpoints = crate::netif::candidate_endpoints(evrt_port);
+        evrt_announce = Some((endpoints.clone(), evrt_port));
 
         if !endpoints.is_empty() {
-            let misc = PeerMessage {
-                union: Some(peer_message::Union::Misc(Misc {
-                    union: Some(misc::Union::EvrtEndpoints(endpoints.clone())),
-                })),
-            };
+            let misc = evrt_endpoints_message(&endpoints);
             match send_peer_enc(&mut relay, &mut cipher, &misc) {
                 Ok(()) => host_log(
                     events,
@@ -1195,11 +1193,7 @@ fn relay_session_inner(
 
         // Дублируем старый EvrtUdpPort для обратной совместимости (если у клиента
         // окажется punch-hole IP от hbbs).
-        let misc_port = PeerMessage {
-            union: Some(peer_message::Union::Misc(Misc {
-                union: Some(misc::Union::EvrtUdpPort(evrt_port as u32)),
-            })),
-        };
+        let misc_port = evrt_port_message(evrt_port);
         let _ = send_peer_enc(&mut relay, &mut cipher, &misc_port);
     }
 
@@ -1259,6 +1253,10 @@ fn relay_session_inner(
         crate::video_pipeline::run(pipeline_cfg);
         pipeline_stop_v.store(true, Ordering::Relaxed);
     });
+
+    if let Some((endpoints, evrt_port)) = evrt_announce {
+        repeat_evrt_announcement(peer_msg_tx.clone(), events.clone(), endpoints, evrt_port);
+    }
 
     // Shared FPS/quality для input loop → pipeline commands
     let shared_target_fps = Arc::new(AtomicU32::new(target_fps));
@@ -3931,6 +3929,47 @@ fn tcp_probe(host: &str, port: u16, local_id: &str, events: &Sender<HostEvent>) 
     }
 
     host_log(events, "=== TCP probe done ===".to_owned());
+}
+
+/// Send a PeerMessage over the relay, encrypting it if the secure channel is up.
+fn evrt_endpoints_message(endpoints: &str) -> PeerMessage {
+    PeerMessage {
+        union: Some(peer_message::Union::Misc(Misc {
+            union: Some(misc::Union::EvrtEndpoints(endpoints.to_owned())),
+        })),
+    }
+}
+
+fn evrt_port_message(port: u16) -> PeerMessage {
+    PeerMessage {
+        union: Some(peer_message::Union::Misc(Misc {
+            union: Some(misc::Union::EvrtUdpPort(port as u32)),
+        })),
+    }
+}
+
+fn repeat_evrt_announcement(
+    peer_msg_tx: mpsc::Sender<PeerMessage>,
+    events: Sender<HostEvent>,
+    endpoints: String,
+    evrt_port: u16,
+) {
+    thread::Builder::new()
+        .name("evrt-announce".into())
+        .spawn(move || {
+            for attempt in 1..=6 {
+                thread::sleep(Duration::from_millis(350));
+                if !endpoints.is_empty() {
+                    let _ = peer_msg_tx.send(evrt_endpoints_message(&endpoints));
+                }
+                let _ = peer_msg_tx.send(evrt_port_message(evrt_port));
+                host_log(
+                    &events,
+                    format!("EVRT: announcement repeat #{attempt} port={evrt_port}"),
+                );
+            }
+        })
+        .ok();
 }
 
 /// Send a PeerMessage over the relay, encrypting it if the secure channel is up.
