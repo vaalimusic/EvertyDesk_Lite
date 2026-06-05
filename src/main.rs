@@ -715,6 +715,12 @@ struct EvertyDeskApp {
     /// Нативное разрешение хоста (объявляется в PeerInfo / SessionEvent::Displays).
     /// FSR апскейлит каждый входящий кадр до этого разрешения.
     fsr_native_size: Option<(u32, u32)>,
+
+    // ── System tray ───────────────────────────────────────────────────────────
+    /// Tray icon handle; None if tray init failed (non-fatal).
+    tray: Option<TrayHandle>,
+    /// Whether the main window is currently visible (false = hidden to tray).
+    window_visible: bool,
 }
 
 struct CursorCacheEntry {
@@ -722,6 +728,14 @@ struct CursorCacheEntry {
     texture: Option<egui::TextureHandle>,
     hotx: i32,
     hoty: i32,
+}
+
+/// System-tray state. Dropped just before process exit to remove the icon.
+struct TrayHandle {
+    _icon: tray_icon::TrayIcon,
+    open_id: tray_icon::menu::MenuId,
+    quit_id: tray_icon::menu::MenuId,
+    last_tooltip: String,
 }
 
 enum WorkerEvent {
@@ -945,6 +959,8 @@ impl EvertyDeskApp {
                 })
             },
             fsr_native_size: None,
+            tray: build_tray_icon(),
+            window_visible: true,
         }
     }
 
@@ -1614,6 +1630,7 @@ impl eframe::App for EvertyDeskApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.tray = None; // remove tray icon before GPU teardown
         self.shutdown();
         arm_shutdown_watchdog();
     }
@@ -1623,20 +1640,68 @@ fn arm_shutdown_watchdog() {
     thread::Builder::new()
         .name("shutdown-watchdog".into())
         .spawn(|| {
-            thread::sleep(Duration::from_millis(1500));
+            thread::sleep(Duration::from_millis(2500));
             std::process::exit(0);
         })
         .ok();
 }
 
+/// Build a system-tray icon with Open / Quit menu.
+/// Returns None silently if the platform doesn't support tray (non-fatal).
+fn build_tray_icon() -> Option<TrayHandle> {
+    use tray_icon::{
+        menu::{Menu, MenuId, MenuItem, PredefinedMenuItem},
+        TrayIconBuilder,
+    };
+
+    let bytes = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/edesk_lite_logo.png"));
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    let icon = tray_icon::Icon::from_rgba(img.into_raw(), w, h).ok()?;
+
+    let open_item = MenuItem::new("Открыть EvertyDesk Lite", true, None);
+    let quit_item = MenuItem::new("Выйти", true, None);
+    let open_id: MenuId = open_item.id().clone();
+    let quit_id: MenuId = quit_item.id().clone();
+
+    let menu = Menu::new();
+    let _ = menu.append(&open_item);
+    let _ = menu.append(&PredefinedMenuItem::separator());
+    let _ = menu.append(&quit_item);
+
+    let _icon = TrayIconBuilder::new()
+        .with_icon(icon)
+        .with_menu(Box::new(menu))
+        .with_tooltip("EvertyDesk Lite")
+        .build()
+        .ok()?;
+
+    Some(TrayHandle {
+        _icon,
+        open_id,
+        quit_id,
+        last_tooltip: String::new(),
+    })
+}
+
 impl EvertyDeskApp {
     #[allow(deprecated)]
     fn update_egui(&mut self, ctx: &egui::Context) {
-        if ctx.input(|input| input.viewport().close_requested()) {
-            self.shutdown();
-            std::process::exit(0);
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if self.host_state.is_online() && self.tray.is_some() {
+                // Host is running — minimize to tray, don't quit
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.window_visible = false;
+                self.update_tray_tooltip();
+            } else {
+                self.tray = None;
+                self.shutdown();
+                std::process::exit(0);
+            }
         }
 
+        self.poll_tray_events(ctx);
         self.poll_worker();
         self.poll_terminal_ai();
         self.maybe_request_terminal_auto_ai();
@@ -1681,6 +1746,10 @@ impl EvertyDeskApp {
                 33 // ~30fps otherwise
             };
             ctx.request_repaint_after(Duration::from_millis(repaint_ms));
+        }
+        // Keep polling tray events even when the main window is hidden.
+        if !self.window_visible {
+            ctx.request_repaint_after(Duration::from_millis(500));
         }
 
         let software_backend = egui_software_backend_active();
@@ -3020,6 +3089,7 @@ impl EvertyDeskApp {
         match ev {
             HostEvent::StateChanged(state) => {
                 self.host_state = state;
+                self.update_tray_tooltip();
             }
             HostEvent::Registered { .. } => {
                 self.host_log.push(format!(
@@ -3071,6 +3141,60 @@ impl EvertyDeskApp {
                     self.host_log.drain(0..50);
                 }
             }
+        }
+    }
+
+    // ── Tray ─────────────────────────────────────────────────────────────────
+
+    fn poll_tray_events(&mut self, ctx: &egui::Context) {
+        use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
+        use tray_icon::menu::MenuEvent;
+
+        // Left-click or double-click → show window
+        while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+            let show = matches!(
+                ev,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } | TrayIconEvent::DoubleClick {
+                    button: MouseButton::Left,
+                    ..
+                }
+            );
+            if show {
+                self.show_window(ctx);
+            }
+        }
+
+        // Menu: Open / Quit
+        let Some(ref tray) = self.tray else { return };
+        let open_id = tray.open_id.clone();
+        let quit_id = tray.quit_id.clone();
+        while let Ok(ev) = MenuEvent::receiver().try_recv() {
+            if ev.id == open_id {
+                self.show_window(ctx);
+            } else if ev.id == quit_id {
+                self.tray = None;
+                self.shutdown();
+                std::process::exit(0);
+            }
+        }
+    }
+
+    fn show_window(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        self.window_visible = true;
+    }
+
+    fn update_tray_tooltip(&mut self) {
+        let Some(ref mut tray) = self.tray else { return };
+        let tip = format!("EvertyDesk Lite — {}", self.host_state.label());
+        if tip != tray.last_tooltip {
+            let _ = tray._icon.set_tooltip(Some(tip.as_str()));
+            tray.last_tooltip = tip;
         }
     }
 
