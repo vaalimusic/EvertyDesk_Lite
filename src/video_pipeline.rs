@@ -529,19 +529,12 @@ fn encode_loop(
                 }
             }
         } else {
-            // TCP primary: БЛОКИРУЮЩИЙ send — backpressure.
-            //
-            // Раньше был try_send: при медленном relay буфер переполнялся и
-            // 90% кадров дропалось → клиент видел 3-8 fps вместо 30.
-            //
-            // Блокирующий send заставляет энкодер ждать места в канале, т.е.
-            // подстраивает темп под пропускную способность сети. Промежуточные
-            // кадры дропаются на захвате (capture double-buffer держит только
-            // свежий), поэтому задержка НЕ накапливается — отдаём свежие кадры
-            // в темпе сети.
-            match tcp_tx.send(TcpItem::Video(frame)) {
-                Ok(()) => {}
-                Err(_) => break, // канал закрыт — сессия завершена
+            // TCP relay is bounded and latency-sensitive. Drop video when the
+            // sender is backed up so control messages and shutdown can still
+            // make progress; the next captured frame will be fresher anyway.
+            match tcp_tx.try_send(TcpItem::Video(frame)) {
+                Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                Err(mpsc::TrySendError::Disconnected(_)) => break,
             }
         }
     }
