@@ -1734,7 +1734,7 @@ impl EvertyDeskApp {
     }
 
     fn shutdown(&mut self) {
-        if let Some(svc) = &self.host_service {
+        if let Some(svc) = self.host_service.take() {
             svc.stop();
         }
         if self.connected || self.busy {

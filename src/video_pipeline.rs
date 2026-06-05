@@ -136,8 +136,9 @@ pub fn run(cfg: PipelineConfig) {
                     match peer_msg_rx.recv_timeout(Duration::from_millis(100)) {
                         Ok(msg) => {
                             // Shell output всегда идёт по TCP relay (не video path)
-                            if tcp_fwd.send(TcpItem::Peer(msg)).is_err() {
-                                break;
+                            match tcp_fwd.try_send(TcpItem::Peer(msg)) {
+                                Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                                Err(mpsc::TrySendError::Disconnected(_)) => break,
                             }
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}

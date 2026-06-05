@@ -166,20 +166,25 @@ pub enum HostCommand {
 pub struct HostService {
     pub event_rx: Receiver<HostEvent>,
     command_tx: Sender<HostCommand>,
+    stop: Arc<AtomicBool>,
 }
 
 impl HostService {
     pub fn start(config: AppConfig) -> Self {
         let (event_tx, event_rx) = mpsc::channel::<HostEvent>();
         let (command_tx, command_rx) = mpsc::channel::<HostCommand>();
-        thread::spawn(move || run_host_loop(config, event_tx, command_rx));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        thread::spawn(move || run_host_loop(config, event_tx, command_rx, stop_thread));
         Self {
             event_rx,
             command_tx,
+            stop,
         }
     }
 
     pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
         let _ = self.command_tx.send(HostCommand::Stop);
     }
 
@@ -320,6 +325,7 @@ fn run_host_loop(
     mut config: AppConfig,
     events: Sender<HostEvent>,
     commands: Receiver<HostCommand>,
+    stop: Arc<AtomicBool>,
 ) {
     // On Windows, ensure an inbound UDP firewall rule exists for this binary.
     // This is needed because Windows Firewall blocks unsolicited inbound UDP
@@ -328,13 +334,17 @@ fn run_host_loop(
     setup_udp_firewall(&events);
 
     loop {
+        if stop.load(Ordering::Relaxed) {
+            let _ = events.send(HostEvent::StateChanged(HostState::Idle));
+            return;
+        }
         let _ = events.send(HostEvent::StateChanged(HostState::Connecting));
         host_log(
             &events,
             format!("Connecting to ID server {}…", config.server.id_server),
         );
 
-        match registration_loop(&config, &events, &commands) {
+        match registration_loop(&config, &events, &commands, &stop) {
             LoopResult::Stop => {
                 let _ = events.send(HostEvent::StateChanged(HostState::Idle));
                 return;
@@ -349,6 +359,10 @@ fn run_host_loop(
                 let deadline = Instant::now() + Duration::from_secs(10);
                 loop {
                     thread::sleep(Duration::from_millis(250));
+                    if stop.load(Ordering::Relaxed) {
+                        let _ = events.send(HostEvent::StateChanged(HostState::Idle));
+                        return;
+                    }
                     if let Ok(cmd) = commands.try_recv() {
                         match cmd {
                             HostCommand::Stop => {
@@ -380,6 +394,7 @@ fn registration_loop(
     config: &AppConfig,
     events: &Sender<HostEvent>,
     commands: &Receiver<HostCommand>,
+    stop: &Arc<AtomicBool>,
 ) -> LoopResult {
     // ── Self-test: UDP loopback (proves recv_from works on this machine) ─────
     udp_loopback_test(events);
@@ -547,6 +562,9 @@ fn registration_loop(
     let mut buf = vec![0u8; 8192];
 
     loop {
+        if stop.load(Ordering::Relaxed) {
+            return LoopResult::Stop;
+        }
         // ── Periodic diagnostic tick ──────────────────────────────────────────
         if last_tick.elapsed() >= Duration::from_secs(5) {
             host_log(events, format!(
@@ -632,7 +650,9 @@ fn registration_loop(
                         }
                         other => {
                             let msg2 = RendezvousMessage { union: other };
-                            if let Some(r) = handle_rendezvous_msg(msg2, config, events, &socket) {
+                            if let Some(r) =
+                                handle_rendezvous_msg(msg2, config, events, &socket, stop)
+                            {
                                 return r;
                             }
                         }
@@ -653,6 +673,7 @@ fn handle_rendezvous_msg(
     config: &AppConfig,
     events: &Sender<HostEvent>,
     reg_socket: &Arc<UdpSocket>,
+    stop: &Arc<AtomicBool>,
 ) -> Option<LoopResult> {
     match msg.union {
         Some(rendezvous_message::Union::RegisterPeerResponse(r)) => {
@@ -707,8 +728,9 @@ fn handle_rendezvous_msg(
             let evs = events.clone();
             let peer_id = req.id.clone();
             let uuid = req.uuid.clone();
+            let stop_session = stop.clone();
             thread::spawn(move || {
-                handle_relay_session(cfg, evs, peer_id, relay, uuid);
+                handle_relay_session(cfg, evs, peer_id, relay, uuid, stop_session);
             });
             None
         }
@@ -757,7 +779,7 @@ fn handle_rendezvous_msg(
             }
 
             // force_relay=true или адрес не декодируется → стандартный TCP relay
-            create_relay(config, events, ph.socket_addr, relay_server);
+            create_relay(config, events, ph.socket_addr, relay_server, stop.clone());
             None
         }
 
@@ -777,7 +799,7 @@ fn handle_rendezvous_msg(
                 events,
                 format!("FetchLocalAddr incoming  relay={relay_server}"),
             );
-            create_relay(config, events, fla.socket_addr, relay_server);
+            create_relay(config, events, fla.socket_addr, relay_server, stop.clone());
             None
         }
 
@@ -840,6 +862,7 @@ fn create_relay(
     events: &Sender<HostEvent>,
     peer_socket_addr: Vec<u8>,
     relay_server: String,
+    stop: Arc<AtomicBool>,
 ) {
     let uuid = uuid::Uuid::new_v4().to_string();
 
@@ -881,7 +904,7 @@ fn create_relay(
     let evs = events.clone();
     let peer_id = "(relay)".to_owned();
     thread::spawn(move || {
-        handle_relay_session(cfg, evs, peer_id, relay_server, uuid);
+        handle_relay_session(cfg, evs, peer_id, relay_server, uuid, stop);
     });
 }
 
@@ -895,8 +918,9 @@ fn handle_relay_session(
     peer_id: String,
     relay_server: String,
     uuid: String,
+    stop: Arc<AtomicBool>,
 ) {
-    match relay_session_inner(&config, &events, &peer_id, &relay_server, &uuid) {
+    match relay_session_inner(&config, &events, &peer_id, &relay_server, &uuid, &stop) {
         Ok(()) => {
             host_log(&events, format!("Session with {peer_id} ended normally."));
         }
@@ -917,7 +941,11 @@ fn relay_session_inner(
     peer_id: &str,
     relay_server: &str,
     uuid: &str,
+    host_stop: &Arc<AtomicBool>,
 ) -> Result<(), String> {
+    if host_stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     // ── 1. Connect to relay ───────────────────────────────────────────────────
     host_log(events, format!("Connecting to relay {relay_server}…"));
     let mut relay =
@@ -1270,7 +1298,7 @@ fn relay_session_inner(
     let mut shell: Option<ShellRuntime> = None;
     let (_peer_out_tx, _peer_out_rx) = mpsc::channel::<PeerMessage>();
 
-    while !stop.load(Ordering::Relaxed) {
+    while !stop.load(Ordering::Relaxed) && !host_stop.load(Ordering::Relaxed) {
         match recv_peer_rc(&mut relay, &mut recv_cipher) {
             Ok(Some(msg)) => handle_client_input_pipeline(
                 msg,
