@@ -452,6 +452,7 @@ impl TransportClient {
         let mut video_metric_packets = 0_u64;
         let mut video_metric_bytes = 0_u64;
         let mut last_video_packet_metrics = Instant::now();
+        let mut latest_input_fps = 0.0_f32;
         let mut target_video_fps = initial_video_fps;
         let mut last_decoder_recovery: Option<Instant> = None;
         let mut last_adaptive_raise = Instant::now();
@@ -640,7 +641,8 @@ impl TransportClient {
                             && live_video_seen
                             && queue_ms <= 200
                             && decode_ms <= 60
-                            && last_live_bootstrap.elapsed() >= Duration::from_secs(3)
+                            && latest_input_fps >= best_quality_min_input_fps(target_video_fps)
+                            && last_live_bootstrap.elapsed() >= Duration::from_secs(6)
                         {
                             quality_raise_sent = true;
                             _current_quality = ImageQuality::Best;
@@ -654,9 +656,9 @@ impl TransportClient {
                                 })),
                             };
                             let _ = send_framed(&mut relay, &encode_peer_message(&msg));
-                            let _ = events.send(SessionEvent::Info(
-                                "Stream stable — raised quality to Best".to_owned(),
-                            ));
+                            let _ = events.send(SessionEvent::Info(format!(
+                                "Stream stable at {latest_input_fps:.1} fps — raised quality to Best"
+                            )));
                         }
 
                         if adaptive_quality
@@ -1004,6 +1006,7 @@ impl TransportClient {
                             let input_fps = video_metric_packets as f32 / secs;
                             let input_kbps =
                                 ((video_metric_bytes as f32 * 8.0) / secs / 1000.0).round() as u64;
+                            latest_input_fps = input_fps;
                             let _ = events.send(SessionEvent::VideoPacketMetrics {
                                 input_fps,
                                 input_kbps,
@@ -1141,6 +1144,17 @@ fn raise_adaptive_fps(current: i32, max_fps: i32) -> i32 {
         .copied()
         .find(|fps| *fps > current && *fps <= max_fps)
         .unwrap_or(current)
+}
+
+fn best_quality_min_input_fps(target_fps: i32) -> f32 {
+    let target = target_fps.clamp(5, 60);
+    if target >= 45 {
+        24.0
+    } else if target >= 30 {
+        18.0
+    } else {
+        12.0
+    }
 }
 
 /// Лёгкий запрос к hbbs — только rendezvous-ответ без открытия relay.
@@ -3859,6 +3873,14 @@ mod tests {
             lower_adaptive_fps(30, backlog_recovery_min_fps(30, 10), false),
             20
         );
+    }
+
+    #[test]
+    fn best_quality_requires_real_incoming_fps() {
+        assert_eq!(best_quality_min_input_fps(60), 24.0);
+        assert_eq!(best_quality_min_input_fps(45), 24.0);
+        assert_eq!(best_quality_min_input_fps(30), 18.0);
+        assert_eq!(best_quality_min_input_fps(20), 12.0);
     }
 
     #[test]
