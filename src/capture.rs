@@ -898,14 +898,12 @@ mod linux_x11_shm {
             let byte_len = (width as usize)
                 .checked_mul(height as usize)?
                 .checked_mul(4)?;
-            let shm_id = unsafe {
-                libc::shmget(libc::IPC_PRIVATE, byte_len, libc::IPC_CREAT | 0o600)
-            };
+            let shm_id =
+                unsafe { libc::shmget(libc::IPC_PRIVATE, byte_len, libc::IPC_CREAT | 0o600) };
             if shm_id < 0 {
                 return None;
             }
-            let shm_ptr =
-                unsafe { libc::shmat(shm_id, std::ptr::null(), 0) };
+            let shm_ptr = unsafe { libc::shmat(shm_id, std::ptr::null(), 0) };
             if shm_ptr as isize == -1 {
                 unsafe { libc::shmctl(shm_id, libc::IPC_RMID, std::ptr::null_mut()) };
                 return None;
@@ -915,7 +913,10 @@ mod linux_x11_shm {
 
             // Register with the X server.
             let seg = conn.generate_id().ok()?;
-            conn.shm_attach(seg, shm_id as u32, false).ok()?.check().ok()?;
+            conn.shm_attach(seg, shm_id as u32, false)
+                .ok()?
+                .check()
+                .ok()?;
 
             Some(Self {
                 conn,
@@ -938,13 +939,14 @@ mod linux_x11_shm {
             self.conn
                 .shm_get_image(
                     self.root,
-                    0, 0,
+                    0,
+                    0,
                     self.width,
                     self.height,
-                    !0u32,                          // plane_mask = all planes
-                    2u8, // XCB_IMAGE_FORMAT_Z_PIXMAP
+                    !0u32, // plane_mask = all planes
+                    2u8,   // XCB_IMAGE_FORMAT_Z_PIXMAP
                     self.seg,
-                    0,                              // offset in segment
+                    0, // offset in segment
                 )
                 .ok()?
                 .reply()
@@ -1008,10 +1010,7 @@ mod linux_x11_shm {
                 *cell.borrow_mut() = ShmCapture::connect();
             }
 
-            let result = cell
-                .borrow()
-                .as_ref()
-                .and_then(|cap| cap.capture_into(out));
+            let result = cell.borrow().as_ref().and_then(|cap| cap.capture_into(out));
 
             if result.is_none() {
                 // Invalidate on any failure so the next call retries.
@@ -1023,9 +1022,9 @@ mod linux_x11_shm {
 
     fn current_screen_size() -> Option<(u32, u32)> {
         SHM.with(|cell| {
-            cell.borrow().as_ref().map(|cap| {
-                (cap.width as u32, cap.height as u32)
-            })
+            cell.borrow()
+                .as_ref()
+                .map(|cap| (cap.width as u32, cap.height as u32))
         })
     }
 }

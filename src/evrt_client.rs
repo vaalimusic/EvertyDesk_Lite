@@ -41,25 +41,25 @@ use crate::{
 
 // ─── константы ────────────────────────────────────────────────────────────────
 
-const CONNECT_TIMEOUT:    Duration = Duration::from_secs(4);
-const IDLE_TIMEOUT:       Duration = Duration::from_secs(6);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(6);
 const FEEDBACK_INTERVAL_ULL: Duration = Duration::from_millis(70);
 const FEEDBACK_INTERVAL_NORM: Duration = Duration::from_millis(150);
-const PUNCH_REPEATS: usize  = 3;
-const PUNCH_GAP:  Duration  = Duration::from_millis(30);
+const PUNCH_REPEATS: usize = 3;
+const PUNCH_GAP: Duration = Duration::from_millis(30);
 
 // ─── публичный интерфейс ──────────────────────────────────────────────────────
 
 /// Параметры EVRT-клиента.
 pub struct EvrtClientParams {
     /// UDP-сокет клиента (уже забиндированный на локальном порту).
-    pub socket:    Arc<UdpSocket>,
+    pub socket: Arc<UdpSocket>,
     /// Внешний адрес хоста из rendezvous ответа.
     pub host_addr: SocketAddr,
     /// Канал событий → UI.
-    pub events:    Sender<SessionEvent>,
+    pub events: Sender<SessionEvent>,
     /// Сигнал остановки.
-    pub stop:      Arc<AtomicBool>,
+    pub stop: Arc<AtomicBool>,
     /// Ultra-low-latency режим (feedback каждые 70мс вместо 150мс).
     pub ultra_low_latency: bool,
 }
@@ -76,7 +76,13 @@ pub enum EvrtConnectResult {
 
 /// Запустить прямую EVRT-сессию клиента. Блокирует до завершения.
 pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
-    let EvrtClientParams { socket, host_addr, events, stop, ultra_low_latency } = params;
+    let EvrtClientParams {
+        socket,
+        host_addr,
+        events,
+        stop,
+        ultra_low_latency,
+    } = params;
 
     evrt_log(&events, format!("EVRT client: punching to {host_addr}"));
 
@@ -91,7 +97,9 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
     let _ = socket.send_to(&kf_pkt, host_addr);
 
     // ── Ожидаем SessionConfig от хоста ───────────────────────────────────────
-    socket.set_read_timeout(Some(Duration::from_millis(300))).ok();
+    socket
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .ok();
     let mut buf = vec![0u8; evrt::MAX_PACKET_SIZE + 64];
     let deadline = Instant::now() + CONNECT_TIMEOUT;
     let mut session_cfg: Option<SessionConfig> = None;
@@ -102,11 +110,17 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
                 if let Some(pkt) = evrt::parse(&buf, len) {
                     if pkt.packet_type == evrt::TYPE_SESSION_CONFIG {
                         if let Some(cfg) = SessionConfig::from_json(&pkt.payload) {
-                            evrt_log(&events, format!(
-                                "EVRT: SessionConfig received — {}x{}@{} {} {:.1}Mbps",
-                                cfg.width, cfg.height, cfg.fps, cfg.codec,
-                                cfg.bitrate as f64 / 1_000_000.0,
-                            ));
+                            evrt_log(
+                                &events,
+                                format!(
+                                    "EVRT: SessionConfig received — {}x{}@{} {} {:.1}Mbps",
+                                    cfg.width,
+                                    cfg.height,
+                                    cfg.fps,
+                                    cfg.codec,
+                                    cfg.bitrate as f64 / 1_000_000.0,
+                                ),
+                            );
                             session_cfg = Some(cfg);
                             break;
                         }
@@ -129,24 +143,26 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
 
     let _ = events.send(SessionEvent::Info(format!(
         "EVRT прямое подключение: {}×{}@{} fps {} {:.1} Mбит/с",
-        session_cfg.width, session_cfg.height, session_cfg.fps,
+        session_cfg.width,
+        session_cfg.height,
+        session_cfg.fps,
         session_cfg.codec,
         session_cfg.bitrate as f64 / 1_000_000.0,
     )));
     // ★ Уведомляем UI — EVRT активен
     let _ = events.send(SessionEvent::EvrtStatus {
-        active:    true,
+        active: true,
         host_addr: host_addr.ip().to_string(),
-        port:      host_addr.port(),
+        port: host_addr.port(),
     });
 
     // ── Внутреннее состояние для метрик ──────────────────────────────────────
-    let last_arrival_us  = Arc::new(AtomicU64::new(0));
+    let last_arrival_us = Arc::new(AtomicU64::new(0));
     let arrival_delta_ms = Arc::new(AtomicI32::new(-1));
-    let decode_delta_ms  = Arc::new(AtomicI32::new(-1));
-    let queued_units     = Arc::new(AtomicI32::new(0));
-    let dropped_units    = Arc::new(AtomicU64::new(0));
-    let decode_fps_atom  = Arc::new(AtomicI32::new(0));
+    let decode_delta_ms = Arc::new(AtomicI32::new(-1));
+    let queued_units = Arc::new(AtomicI32::new(0));
+    let dropped_units = Arc::new(AtomicU64::new(0));
+    let decode_fps_atom = Arc::new(AtomicI32::new(0));
 
     // ── Очередь кадров ────────────────────────────────────────────────────────
     let queue_cfg = if session_cfg.is_cinema_smooth() {
@@ -157,16 +173,16 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
     let queue = Arc::new(FrameQueue::new(queue_cfg));
 
     // ── Декодер: поток берёт из queue и шлёт SessionEvent::Frame ─────────────
-    let decode_queue   = queue.clone();
-    let decode_events  = events.clone();
-    let decode_stop    = stop.clone();
+    let decode_queue = queue.clone();
+    let decode_events = events.clone();
+    let decode_stop = stop.clone();
     let decode_delta_c = decode_delta_ms.clone();
-    let decode_fps_c   = decode_fps_atom.clone();
-    let queued_c       = queued_units.clone();
-    let dropped_c      = dropped_units.clone();
-    let cfg_codec      = session_cfg.codec.clone();
-    let cfg_w          = session_cfg.width;
-    let cfg_h          = session_cfg.height;
+    let decode_fps_c = decode_fps_atom.clone();
+    let queued_c = queued_units.clone();
+    let dropped_c = dropped_units.clone();
+    let cfg_codec = session_cfg.codec.clone();
+    let cfg_w = session_cfg.width;
+    let cfg_h = session_cfg.height;
 
     let decode_handle = thread::spawn(move || {
         evrt_decode_loop(
@@ -184,28 +200,31 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
     });
 
     // ── Поток приёма UDP → reassembler → queue ────────────────────────────────
-    let recv_socket     = socket.clone();
-    let recv_stop       = stop.clone();
-    let recv_queue      = queue.handle();
-    let recv_events     = events.clone();
-    let recv_arrival    = last_arrival_us.clone();
-    let recv_delta      = arrival_delta_ms.clone();
+    let recv_socket = socket.clone();
+    let recv_stop = stop.clone();
+    let recv_queue = queue.handle();
+    let recv_events = events.clone();
+    let recv_arrival = last_arrival_us.clone();
+    let recv_delta = arrival_delta_ms.clone();
 
     // WASAPI playback lives inside the receive thread: COM objects stay
     // on the same thread where they are created and used.
     let recv_handle = thread::spawn(move || {
-        let mut reassembler       = ChannelReassembler::new();
-        let mut audio_re          = crate::evrt_audio::AudioReassembler::new();
-        let mut audio_player      = crate::evrt_audio::AudioPlayer::new();
-        let mut buf               = vec![0u8; evrt::MAX_PACKET_SIZE + 64];
-        let mut last_pkt_at       = Instant::now();
-        recv_socket.set_read_timeout(Some(Duration::from_millis(500))).ok();
+        let mut reassembler = ChannelReassembler::new();
+        let mut audio_re = crate::evrt_audio::AudioReassembler::new();
+        let mut audio_player = crate::evrt_audio::AudioPlayer::new();
+        let mut buf = vec![0u8; evrt::MAX_PACKET_SIZE + 64];
+        let mut last_pkt_at = Instant::now();
+        recv_socket
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .ok();
 
         while !recv_stop.load(Ordering::Relaxed) {
+            audio_player.tick();
             match recv_socket.recv_from(&mut buf) {
                 Ok((len, src)) if src == host_addr => {
                     let now_us = evrt::now_us();
-                    let prev   = recv_arrival.swap(now_us, Ordering::Relaxed);
+                    let prev = recv_arrival.swap(now_us, Ordering::Relaxed);
                     if prev > 0 {
                         let delta = ((now_us.saturating_sub(prev)) / 1000) as i32;
                         recv_delta.store(delta, Ordering::Relaxed);
@@ -226,11 +245,14 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
                             }
                             evrt::TYPE_SESSION_CONFIG => {
                                 if let Some(cfg) = SessionConfig::from_json(&pkt.payload) {
-                                    evrt_log(&recv_events, format!(
-                                        "EVRT: SessionConfig update {:.1}Mbps @{}fps",
-                                        cfg.bitrate as f64 / 1_000_000.0,
-                                        cfg.fps,
-                                    ));
+                                    evrt_log(
+                                        &recv_events,
+                                        format!(
+                                            "EVRT: SessionConfig update {:.1}Mbps @{}fps",
+                                            cfg.bitrate as f64 / 1_000_000.0,
+                                            cfg.fps,
+                                        ),
+                                    );
                                 }
                             }
                             // ── Аудио ────────────────────────────────────────
@@ -238,12 +260,15 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
                                 if let Some(audio_cfg) =
                                     crate::evrt_audio::AudioConfig::from_json(&pkt.payload)
                                 {
-                                    evrt_log(&recv_events, format!(
-                                        "EVRT Audio: {}Hz {}ch {}bit",
-                                        audio_cfg.sample_rate,
-                                        audio_cfg.channels,
-                                        audio_cfg.bits_per_sample,
-                                    ));
+                                    evrt_log(
+                                        &recv_events,
+                                        format!(
+                                            "EVRT Audio: {}Hz {}ch {}bit",
+                                            audio_cfg.sample_rate,
+                                            audio_cfg.channels,
+                                            audio_cfg.bits_per_sample,
+                                        ),
+                                    );
                                     audio_player.init(&audio_cfg);
                                 }
                             }
@@ -265,6 +290,7 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
                 }
                 Ok(_) => {} // чужой пакет
                 Err(ref e) if is_timeout(e) => {
+                    audio_player.tick();
                     if last_pkt_at.elapsed() > IDLE_TIMEOUT {
                         evrt_log(&recv_events, "EVRT: idle timeout".into());
                         recv_stop.store(true, Ordering::Relaxed);
@@ -289,12 +315,14 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
         FEEDBACK_INTERVAL_NORM
     };
 
-    let mut jitter       = AdaptiveJitter::new();
-    let mut last_fb_at   = Instant::now();
+    let mut jitter = AdaptiveJitter::new();
+    let mut last_fb_at = Instant::now();
     let mut queue_drops_seen = 0u64;
     let cinema = session_cfg.is_cinema_smooth();
 
-    socket.set_read_timeout(Some(Duration::from_millis(50))).ok();
+    socket
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .ok();
 
     while !stop.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_millis(20));
@@ -305,11 +333,11 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
         last_fb_at = Instant::now();
 
         // Собираем метрики
-        let arr_delta   = arrival_delta_ms.load(Ordering::Relaxed);
-        let dec_delta   = decode_delta_ms.load(Ordering::Relaxed);
-        let queued      = queued_units.load(Ordering::Relaxed).max(0) as u32;
-        let drops       = dropped_units.load(Ordering::Relaxed);
-        let new_drops   = drops.saturating_sub(queue_drops_seen);
+        let arr_delta = arrival_delta_ms.load(Ordering::Relaxed);
+        let dec_delta = decode_delta_ms.load(Ordering::Relaxed);
+        let queued = queued_units.load(Ordering::Relaxed).max(0) as u32;
+        let drops = dropped_units.load(Ordering::Relaxed);
+        let new_drops = drops.saturating_sub(queue_drops_seen);
         queue_drops_seen = drops;
         let fps_decoded = decode_fps_atom.load(Ordering::Relaxed).max(0) as u32;
 
@@ -322,13 +350,13 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
 
         let fb = ReceiverFeedback {
             pressure,
-            backlog_frames:    queued,
-            queue_drops:       drops,
-            decode_fps:        fps_decoded,
+            backlog_frames: queued,
+            queue_drops: drops,
+            decode_fps: fps_decoded,
             assembly_delay_ms: 0,
-            arrival_delta_ms:  arr_delta,
-            decode_delta_ms:   dec_delta,
-            present_delta_ms:  -1,
+            arrival_delta_ms: arr_delta,
+            decode_delta_ms: dec_delta,
+            present_delta_ms: -1,
             pulse_estimate_ms: -1,
             input_estimate_ms: -1,
         };
@@ -338,12 +366,12 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
 
         // ★ Метрики → UI (каждый тик feedback loop)
         let _ = events.send(SessionEvent::EvrtMetrics {
-            pressure:         pressure.as_str().to_owned(),
+            pressure: pressure.as_str().to_owned(),
             arrival_delta_ms: arr_delta,
-            decode_delta_ms:  dec_delta,
+            decode_delta_ms: dec_delta,
             jitter_ms,
-            bitrate_mbps:     0.0, // хост сообщает в SessionConfig keepalive
-            fps:              fps_decoded,
+            bitrate_mbps: 0.0, // хост сообщает в SessionConfig keepalive
+            fps: fps_decoded,
         });
 
         // Если critical + задержка растёт → запрос keyframe
@@ -360,9 +388,9 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
 
     // ★ Уведомляем UI — EVRT завершён
     let _ = events.send(SessionEvent::EvrtStatus {
-        active:    false,
+        active: false,
         host_addr: host_addr.ip().to_string(),
-        port:      host_addr.port(),
+        port: host_addr.port(),
     });
 
     evrt_log(&events, "EVRT client session ended".into());
@@ -372,16 +400,16 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
 // ─── декодер-петля ─────────────────────────────────────────────────────────────
 
 fn evrt_decode_loop(
-    queue:      Arc<FrameQueue>,
-    events:     Sender<SessionEvent>,
-    stop:       Arc<AtomicBool>,
-    codec:      String,
-    width:      u32,
-    height:     u32,
-    delta_ms:   Arc<AtomicI32>,
-    fps_atom:   Arc<AtomicI32>,
-    queued:     Arc<AtomicI32>,
-    dropped:    Arc<AtomicU64>,
+    queue: Arc<FrameQueue>,
+    events: Sender<SessionEvent>,
+    stop: Arc<AtomicBool>,
+    codec: String,
+    width: u32,
+    height: u32,
+    delta_ms: Arc<AtomicI32>,
+    fps_atom: Arc<AtomicI32>,
+    queued: Arc<AtomicI32>,
+    dropped: Arc<AtomicU64>,
 ) {
     // ── Инициализация декодеров (те же что в decode_frame_loop) ──────────────
     #[cfg(feature = "live-h264")]
@@ -427,15 +455,23 @@ fn evrt_decode_loop(
         // Декодировать в зависимости от кодека
         let maybe_event = match codec.to_ascii_uppercase().as_str() {
             "H264" => decode_h264_frame(
-                &bytes, width, height,
-                &mut h264_vt, &mut h264_sw, &mut vt_fail_streak,
+                &bytes,
+                width,
+                height,
+                &mut h264_vt,
+                &mut h264_sw,
+                &mut vt_fail_streak,
             ),
-            "H265" | "HEVC" => decode_h265_frame(
-                &bytes, width, height, &mut h265_mf, mf_status.h265,
-            ),
+            "H265" | "HEVC" => {
+                decode_h265_frame(&bytes, width, height, &mut h265_mf, mf_status.h265)
+            }
             _ => decode_h264_frame(
-                &bytes, width, height,
-                &mut h264_vt, &mut h264_sw, &mut vt_fail_streak,
+                &bytes,
+                width,
+                height,
+                &mut h264_vt,
+                &mut h264_sw,
+                &mut vt_fail_streak,
             ),
         };
 
@@ -462,7 +498,7 @@ fn evrt_decode_loop(
             let _ = events.send(SessionEvent::Frame {
                 sid,
                 codec: codec.clone(),
-                width:  w,
+                width: w,
                 height: h,
                 rgba,
             });
@@ -475,15 +511,13 @@ fn evrt_decode_loop(
 // ─── декодирование H264 ────────────────────────────────────────────────────────
 
 fn decode_h264_frame(
-    bytes:        &[u8],
-    _width:       u32,
-    _height:      u32,
-    vt:           &mut Option<crate::videotoolbox::VideoToolboxH264Decoder>,
-    #[cfg(feature = "live-h264")]
-    sw:           &mut Option<openh264::decoder::Decoder>,
-    #[cfg(not(feature = "live-h264"))]
-    _sw:          &mut Option<()>,
-    vt_failures:  &mut u32,
+    bytes: &[u8],
+    _width: u32,
+    _height: u32,
+    vt: &mut Option<crate::videotoolbox::VideoToolboxH264Decoder>,
+    #[cfg(feature = "live-h264")] sw: &mut Option<openh264::decoder::Decoder>,
+    #[cfg(not(feature = "live-h264"))] _sw: &mut Option<()>,
+    vt_failures: &mut u32,
 ) -> Option<(Vec<u8>, usize, usize)> {
     const VT_FAIL_LIMIT: u32 = 5;
 
@@ -495,8 +529,12 @@ fn decode_h264_frame(
                     *vt_failures = 0;
                     return Some((rgba, w, h));
                 }
-                Ok(None) => { *vt_failures += 1; }
-                Err(_)   => { *vt_failures += 1; }
+                Ok(None) => {
+                    *vt_failures += 1;
+                }
+                Err(_) => {
+                    *vt_failures += 1;
+                }
             }
         }
     }
@@ -521,15 +559,17 @@ fn decode_h264_frame(
 // ─── декодирование H265 ────────────────────────────────────────────────────────
 
 fn decode_h265_frame(
-    bytes:    &[u8],
-    width:    u32,
-    height:   u32,
-    mf_dec:   &mut Option<crate::mf_video::MfVideoDecoder>,
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    mf_dec: &mut Option<crate::mf_video::MfVideoDecoder>,
     mf_avail: bool,
 ) -> Option<(Vec<u8>, usize, usize)> {
     use crate::mf_video::MfVideoCodec;
 
-    if !mf_avail { return None; }
+    if !mf_avail {
+        return None;
+    }
 
     let dec = mf_dec.get_or_insert_with(|| {
         crate::mf_video::MfVideoDecoder::new(MfVideoCodec::H265, width, height)
@@ -546,10 +586,10 @@ fn decode_h265_frame(
 
 fn compute_pressure(
     arrival_delta_ms: i32,
-    decode_delta_ms:  i32,
-    backlog:          u32,
-    new_drops:        u64,
-    cinema:           bool,
+    decode_delta_ms: i32,
+    backlog: u32,
+    new_drops: u64,
+    cinema: bool,
 ) -> Pressure {
     let (high_ms, crit_ms, backlog_crit, backlog_high) = if cinema {
         (30, 44, 3, 2)
@@ -568,16 +608,19 @@ fn compute_pressure(
         || backlog >= backlog_high
         || new_drops >= 1;
 
-    if crit  { Pressure::Critical }
-    else if high { Pressure::High }
-    else    { Pressure::Normal }
+    if crit {
+        Pressure::Critical
+    } else if high {
+        Pressure::High
+    } else {
+        Pressure::Normal
+    }
 }
 
 // ─── вспомогательные ──────────────────────────────────────────────────────────
 
 fn is_timeout(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::WouldBlock
-        || e.kind() == std::io::ErrorKind::TimedOut
+    e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut
 }
 
 fn evrt_log(events: &Sender<SessionEvent>, msg: String) {
@@ -590,16 +633,16 @@ fn evrt_log(events: &Sender<SessionEvent>, msg: String) {
 /// Попробовать установить прямое EVRT-соединение.
 /// Если хост не отвечает за `CONNECT_TIMEOUT` — вернуть `None` (нужен relay).
 pub fn try_evrt_before_relay(
-    local_udp:     &Arc<UdpSocket>,
-    host_addr:     SocketAddr,
-    events:        &Sender<SessionEvent>,
-    stop:          Arc<AtomicBool>,
+    local_udp: &Arc<UdpSocket>,
+    host_addr: SocketAddr,
+    events: &Sender<SessionEvent>,
+    stop: Arc<AtomicBool>,
     ultra_low_lat: bool,
 ) -> bool {
     let params = EvrtClientParams {
-        socket:           local_udp.clone(),
+        socket: local_udp.clone(),
         host_addr,
-        events:           events.clone(),
+        events: events.clone(),
         stop,
         ultra_low_latency: ultra_low_lat,
     };
@@ -607,11 +650,17 @@ pub fn try_evrt_before_relay(
     match run_evrt_client(params) {
         EvrtConnectResult::Ok => true,
         EvrtConnectResult::NoResponse => {
-            evrt_log(events, "EVRT: no response — falling back to TCP relay".into());
+            evrt_log(
+                events,
+                "EVRT: no response — falling back to TCP relay".into(),
+            );
             false
         }
         EvrtConnectResult::Error(e) => {
-            evrt_log(events, format!("EVRT error ({e}) — falling back to TCP relay"));
+            evrt_log(
+                events,
+                format!("EVRT error ({e}) — falling back to TCP relay"),
+            );
             false
         }
     }

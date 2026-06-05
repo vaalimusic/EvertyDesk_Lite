@@ -13,7 +13,7 @@
 
 ## TL;DR текущего состояния
 
-Весь EVRT-стек **написан и компилируется**, 61 unit-тест зелёный, полный билд
+Весь EVRT-стек **написан и компилируется**, 78 unit-тестов зелёные, полный билд
 проходит. **Но end-to-end на Windows ни разу не запускался** — это главный риск
 и следующий обязательный шаг.
 
@@ -76,9 +76,11 @@ EVRT стек (прямой UDP, low-latency, адаптация)┘
 | FSR 1.0 EASU+RCAS | ✅🔬 | — |
 | FSR zero-copy (убран per-frame .to_owned) | ✅ | — |
 | Аудио WASAPI (capture хост + playback клиент) | ✅🔬 | высокий |
-| Аудио jitter-буфер (убрать щелчки) | ❌ | высокий |
-| ROI метаданные | 🟡 | средний |
-| ROI детекция грязных регионов | ❌ | средний |
+| Аудио jitter-буфер (убрать щелчки) | ✅🔬 | высокий |
+| ROI метаданные | ✅🔬 | средний |
+| ROI детекция грязных регионов | ✅🔬 | средний |
+| ROI-driven adaptive bitrate | ✅🔬 | средний |
+| EVRT feedback-driven bitrate relief | ✅🔬 | высокий |
 | Enhancement stream (base+quality layer) | ❌ | низкий |
 
 ---
@@ -120,9 +122,9 @@ EVRT стек (прямой UDP, low-latency, адаптация)┘
 2. 🔬 Подтвердить EVRT UDP реально поднимается  ← без этого стек только в теории
 3. 🔬 Измерить latency TCP relay vs EVRT
 4. 🔬 Проверить аудио end-to-end
-5. ❌ Аудио jitter-буфер
+5. ✅🔬 Аудио jitter-буфер написан, нужна проверка на Windows/UDP loss
 6. ❌ NVENC zero-copy end-to-end (нужен NVIDIA-бокс)
-7. ❌ ROI детекция грязных регионов
+7. ✅🔬 ROI tile dirty-region detection + EVRT feedback bitrate scaling написаны, нужна проверка metadata/bitrate на живой сессии
 8. ⏸ Свой relay-node
 ```
 
@@ -132,11 +134,12 @@ EVRT стек (прямой UDP, low-latency, адаптация)┘
 
 | # | Что | Серьёзность |
 |---|-----|-------------|
-| 1 | 29 warnings (orphaned telemetry от video_loop) | низкая |
+| 1 | 17 warnings (dead-code/orphaned telemetry от video_loop) | низкая |
 | 2 | `login_request_uses_32_byte_password_hash` падал ДО нас | низкая (не регрессия) |
-| 3 | Аудио без jitter-буфера → щелчки | средняя |
+| 3 | Аудио jitter-буфер написан, нужна проверка на Windows/UDP loss | средняя |
 | 4 | NVENC zero-copy примитив не подключён | средняя |
-| 5 | Нет сетевых интеграционных тестов (только unit) | средняя |
+| 5 | ROI + EVRT feedback используются как bitrate policy, но не как region encode | средняя |
+| 6 | Нет сетевых интеграционных тестов (только unit) | средняя |
 
 ---
 
@@ -158,4 +161,4 @@ AdaptiveJitter · AdaptiveRelief · FeedbackLoop · Windows perf hints ·
 FSR 1.0 (+zero-copy срез) · Misc{EvrtUdpPort} · выделенный сокет ·
 единый pipeline · MultiEncoder · dispatcher · FrameChangeDetector ·
 PipelineTelemetry · фиксы (cipher/shell/зависание/двойной hbbs/IP) ·
-NVENC zero-copy примитив · атрибуция авторства.
+NVENC zero-copy примитив · аудио jitter-buffer · ROI dirty-region detection · ROI-driven bitrate · EVRT feedback bitrate relief · атрибуция авторства.

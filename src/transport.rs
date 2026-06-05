@@ -105,18 +105,18 @@ pub enum SessionEvent {
     ShellError(String),
     /// EVRT прямое UDP соединение установлено / разорвано.
     EvrtStatus {
-        active:    bool,
+        active: bool,
         host_addr: String,
-        port:      u16,
+        port: u16,
     },
     /// EVRT метрики в реальном времени.
     EvrtMetrics {
-        pressure:         String,  // "normal" / "high" / "critical"
+        pressure: String, // "normal" / "high" / "critical"
         arrival_delta_ms: i32,
-        decode_delta_ms:  i32,
-        jitter_ms:        u32,
-        bitrate_mbps:     f32,
-        fps:              u32,
+        decode_delta_ms: i32,
+        jitter_ms: u32,
+        bitrate_mbps: f32,
+        fps: u32,
     },
 }
 
@@ -354,20 +354,18 @@ impl TransportClient {
         // пробуем прямое соединение. При неудаче — обычный TCP relay.
         {
             let evrt_request = request.clone();
-            let evrt_events  = events.clone();
+            let evrt_events = events.clone();
             if let Ok(info) = establish_session_info(&evrt_request, &mut |_, _| {}) {
                 if let Some(ref addr_bytes) = info.peer_udp_addr {
-                    if let Some(host_addr) =
-                        crate::evrt_session::decode_punch_addr(addr_bytes)
-                    {
+                    if let Some(host_addr) = crate::evrt_session::decode_punch_addr(addr_bytes) {
                         let _ = evrt_events.send(SessionEvent::Progress(
                             70,
                             format!("Пробуем прямой EVRT → {host_addr}"),
                         ));
-                        let stop_evrt = std::sync::Arc::new(
-                            std::sync::atomic::AtomicBool::new(false),
-                        );
-                        let udp = std::net::UdpSocket::bind("0.0.0.0:0").ok()
+                        let stop_evrt =
+                            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let udp = std::net::UdpSocket::bind("0.0.0.0:0")
+                            .ok()
                             .map(std::sync::Arc::new);
                         if let Some(udp) = udp {
                             let used = crate::evrt_client::try_evrt_before_relay(
@@ -389,14 +387,13 @@ impl TransportClient {
         }
 
         let (mut relay, peer_stage, displays, evrt_host_addr) =
-            match establish_session(request.clone(), &mut emit_progress)
-        {
-            Ok(session) => session,
-            Err(err) => {
-                let _ = events.send(SessionEvent::Failed(err));
-                return;
-            }
-        };
+            match establish_session(request.clone(), &mut emit_progress) {
+                Ok(session) => session,
+                Err(err) => {
+                    let _ = events.send(SessionEvent::Failed(err));
+                    return;
+                }
+            };
 
         eprintln!("[session] Connected: {peer_stage}");
         eprintln!("[session] Displays: {}", displays.len());
@@ -413,9 +410,7 @@ impl TransportClient {
         // IP из PunchHoleResponse.socket_addr, порт из Misc{EvrtUdpPort}.
         if let Some(host_addr) = evrt_host_addr {
             let evrt_events = events.clone();
-            let evrt_stop   = std::sync::Arc::new(
-                std::sync::atomic::AtomicBool::new(false),
-            );
+            let evrt_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let evrt_ull = display_config.target_fps >= 60;
 
             eprintln!("[evrt-client] прямой UDP → {host_addr}");
@@ -645,13 +640,11 @@ impl TransportClient {
                             _current_quality = ImageQuality::Best;
                             let msg = PeerMessage {
                                 union: Some(peer_message::Union::Misc(Misc {
-                                    union: Some(misc::Union::Option(
-                                        video_option_message_quality(
-                                            target_video_fps,
-                                            codec_preference,
-                                            ImageQuality::Best,
-                                        ),
-                                    )),
+                                    union: Some(misc::Union::Option(video_option_message_quality(
+                                        target_video_fps,
+                                        codec_preference,
+                                        ImageQuality::Best,
+                                    ))),
                                 })),
                             };
                             let _ = send_framed(&mut relay, &encode_peer_message(&msg));
@@ -1119,7 +1112,9 @@ fn establish_session_info(
         )),
     };
     send_framed(&mut rendezvous, &encode_message(&message))?;
-    rendezvous.set_read_timeout(Some(Duration::from_secs(4))).ok();
+    rendezvous
+        .set_read_timeout(Some(Duration::from_secs(4)))
+        .ok();
     let response = read_framed(&mut rendezvous)?;
     let decoded = decode_message(&response).map_err(|e| format!("Decode: {e}"))?;
     describe_rendezvous_response(&decoded)
@@ -1128,7 +1123,15 @@ fn establish_session_info(
 fn establish_session(
     request: ConnectionRequest,
     progress: &mut impl FnMut(u8, String),
-) -> Result<(TcpStream, String, Vec<RemoteDisplay>, Option<std::net::SocketAddr>), String> {
+) -> Result<
+    (
+        TcpStream,
+        String,
+        Vec<RemoteDisplay>,
+        Option<std::net::SocketAddr>,
+    ),
+    String,
+> {
     progress(5, "Validating input".to_owned());
     if request.remote_id.is_empty() {
         return Err("Enter remote ID".to_owned());
@@ -1151,7 +1154,10 @@ fn establish_session(
     //   • peer_udp_addr — внешний UDP-адрес хоста (для EVRT punch-hole)
     //   • relay_server / relay_uuid — для TCP relay fallback
     // Один RTT к hbbs вместо двух.
-    progress(60, "Sending RustDesk PunchHoleRequest (EVRT probe)".to_owned());
+    progress(
+        60,
+        "Sending RustDesk PunchHoleRequest (EVRT probe)".to_owned(),
+    );
     let message = RendezvousMessage {
         union: Some(rendezvous_message::Union::PunchHoleRequest(
             PunchHoleRequest {
@@ -1182,7 +1188,10 @@ fn establish_session(
     let rendezvous = match rendezvous_info {
         Ok(info) => info,
         Err(_) => {
-            progress(82, "EVRT probe failed, retrying with force_relay=true".to_owned());
+            progress(
+                82,
+                "EVRT probe failed, retrying with force_relay=true".to_owned(),
+            );
             let mut rendezvous2 = connect_tcp(&request.server.id_server, RENDEZVOUS_PORT)?;
             let msg2 = RendezvousMessage {
                 union: Some(rendezvous_message::Union::PunchHoleRequest(
@@ -1201,7 +1210,9 @@ fn establish_session(
                 )),
             };
             send_framed(&mut rendezvous2, &encode_message(&msg2))?;
-            rendezvous2.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            rendezvous2
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .ok();
             let resp2 = read_framed(&mut rendezvous2)?;
             let dec2 = decode_message(&resp2).map_err(|e| format!("Decode failed: {e}"))?;
             describe_rendezvous_response(&dec2)?
@@ -1279,9 +1290,14 @@ fn establish_session(
                 // Если хост прислал EVRT порт в Misc — используем его.
                 // IP берём из peer_udp_addr который hbbs вернул нам за ОДИН запрос.
                 let evrt_host_addr = evrt_port_from_misc.and_then(|port| {
-                    rendezvous.peer_udp_addr.as_ref()
+                    rendezvous
+                        .peer_udp_addr
+                        .as_ref()
                         .and_then(|b| crate::evrt_session::decode_punch_addr(b))
-                        .map(|mut addr| { addr.set_port(port); addr })
+                        .map(|mut addr| {
+                            addr.set_port(port);
+                            addr
+                        })
                 });
                 return Ok((relay_stream, peer_stage, displays, evrt_host_addr));
             }
@@ -3750,9 +3766,6 @@ pub fn encode_peer_message_raw(msg: &crate::rustdesk_proto::PeerMessage) -> Vec<
 }
 
 /// Публичный алиас send_framed для video_pipeline.
-pub fn send_framed_raw(
-    stream: &mut std::net::TcpStream,
-    payload: &[u8],
-) -> Result<(), String> {
+pub fn send_framed_raw(stream: &mut std::net::TcpStream, payload: &[u8]) -> Result<(), String> {
     send_framed(stream, payload)
 }

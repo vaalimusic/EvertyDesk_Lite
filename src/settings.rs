@@ -117,24 +117,24 @@ pub enum FsrQualitySetting {
 impl FsrQualitySetting {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Off          => "Выключен",
-            Self::Native       => "Native (только RCAS)",
+            Self::Off => "Выключен",
+            Self::Native => "Native (только RCAS)",
             Self::UltraQuality => "Ultra Quality (1.3×)",
-            Self::Quality      => "Quality (1.5×)",
-            Self::Balanced     => "Balanced (1.7×)",
-            Self::Performance  => "Performance (2×)",
+            Self::Quality => "Quality (1.5×)",
+            Self::Balanced => "Balanced (1.7×)",
+            Self::Performance => "Performance (2×)",
         }
     }
 
     /// Конвертация в enum из крейта fsr.
     pub fn to_fsr_quality(self) -> Option<crate::fsr::FsrQuality> {
         match self {
-            Self::Off          => None,
-            Self::Native       => Some(crate::fsr::FsrQuality::Native),
+            Self::Off => None,
+            Self::Native => Some(crate::fsr::FsrQuality::Native),
             Self::UltraQuality => Some(crate::fsr::FsrQuality::UltraQuality),
-            Self::Quality      => Some(crate::fsr::FsrQuality::Quality),
-            Self::Balanced     => Some(crate::fsr::FsrQuality::Balanced),
-            Self::Performance  => Some(crate::fsr::FsrQuality::Performance),
+            Self::Quality => Some(crate::fsr::FsrQuality::Quality),
+            Self::Balanced => Some(crate::fsr::FsrQuality::Balanced),
+            Self::Performance => Some(crate::fsr::FsrQuality::Performance),
         }
     }
 
@@ -143,7 +143,9 @@ impl FsrQualitySetting {
     }
 }
 
-fn default_fsr_sharpness() -> f32 { 0.875 }
+fn default_fsr_sharpness() -> f32 {
+    0.875
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DisplayConfig {

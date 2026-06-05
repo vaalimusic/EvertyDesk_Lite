@@ -166,6 +166,17 @@ $env:EVERTYDESK_ENABLE_AV1_MF="1"
   low-delay VBR, bitrate, GOP size, quality/speed, and force-keyframe.
 - Added codec preference tests for conservative H.264/H.265/AV1/VP9 fallback
   ordering.
+- Added an EVRT audio jitter buffer on the client playback path:
+  40 ms prebuffer, bounded 180 ms queue, partial WASAPI writes preserved
+  instead of dropping the unwritten tail.
+- Added tile-based ROI dirty-region detection without keeping a previous full
+  frame copy; EVRT now sends dirty ROI metadata before video frames.
+- Added ROI-driven bitrate adaptation in the unified encoder pipeline:
+  small dirty regions lower the target bitrate, while fullscreen and IDR frames
+  stay at full quality.
+- Connected EVRT `ReceiverFeedback` / `AdaptiveRelief` to the live encoder
+  bitrate path through a shared integer scale, so client pressure now lowers
+  target bitrate instead of only producing logs.
 
 ## Remaining Work
 
@@ -250,7 +261,8 @@ Priority: high.
 - Promote the Windows Desktop Duplication path from prototype to production and
   use Windows Graphics Capture where Desktop Duplication is not enough.
 - Add dirty-rectangle capture/encode where the host backend supports it.
-- Add adaptive bitrate from frame change density and measured relay throughput.
+- Extend adaptive bitrate with measured relay throughput; frame-change density
+  and EVRT receiver pressure already drive target bitrate.
 - Add adaptive FPS floor/ceiling for static vs active screens.
 - Avoid copying decoded RGBA more than necessary before egui texture upload.
 - Measure CPU cost separately for capture, conversion, encode, network, decode,

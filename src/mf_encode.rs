@@ -23,12 +23,12 @@ mod inner {
                 MFVideoFormat_H264_ES, MFVideoFormat_H265, MFVideoFormat_HEVC,
                 MFVideoFormat_HEVC_ES, MFVideoFormat_NV12, MFSTARTUP_NOSOCKET,
                 MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE,
-                MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
+                MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_COMMAND_FLUSH,
                 MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
-                MFT_MESSAGE_COMMAND_FLUSH, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO,
-                MFT_REGISTER_TYPE_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE,
-                MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO,
-                MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
+                MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO, MFT_REGISTER_TYPE_INFO,
+                MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
+                MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
+                MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
             },
             System::Com::{
                 CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED, VARIANT, VARIANT_0,
@@ -361,10 +361,7 @@ mod inner {
                 None
             } else {
                 // Size: at least 1 second of bitrate, at least 128 KiB.
-                let sz = self
-                    .output_buf_size
-                    .max(self.bitrate / 8)
-                    .max(128 * 1024);
+                let sz = self.output_buf_size.max(self.bitrate / 8).max(128 * 1024);
                 let buf = MFCreateMemoryBuffer(sz)?;
                 let sample = MFCreateSample()?;
                 sample.AddBuffer(&buf)?;
@@ -404,9 +401,7 @@ mod inner {
                     self.provides_samples = info.provides_samples;
                     self.output_buf_size = info.output_buf_size;
                     // Re-apply output type to accept the new format.
-                    let _ = self.transform.ProcessMessage(
-                        MFT_MESSAGE_COMMAND_FLUSH, 0,
-                    );
+                    let _ = self.transform.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
                     self.first_packet = true; // re-learn param sets after flush
                     self.param_sets.clear();
                     Ok(None)
@@ -874,11 +869,17 @@ mod fallback {
             false
         }
 
-        pub fn current_bitrate(&self) -> u32 { 0 }
+        pub fn current_bitrate(&self) -> u32 {
+            0
+        }
 
-        pub fn update_bitrate(&mut self, _new_bitrate: u32) -> bool { false }
+        pub fn update_bitrate(&mut self, _new_bitrate: u32) -> bool {
+            false
+        }
 
-        pub fn codec_config(&self) -> Option<Vec<u8>> { None }
+        pub fn codec_config(&self) -> Option<Vec<u8>> {
+            None
+        }
 
         pub fn encode_bgra(
             &mut self,

@@ -24,6 +24,7 @@
 #![allow(dead_code)]
 
 use std::{
+    collections::VecDeque,
     net::{SocketAddr, UdpSocket},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -35,21 +36,24 @@ use std::{
 
 use crate::evrt;
 
+const AUDIO_PREBUFFER_MS: u32 = 40;
+const AUDIO_MAX_BUFFER_MS: u32 = 180;
+
 // ─── AudioConfig ─────────────────────────────────────────────────────────────
 
 /// Конфигурация аудио-потока.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioConfig {
-    pub sample_rate:  u32,
-    pub channels:     u16,
+    pub sample_rate: u32,
+    pub channels: u16,
     pub bits_per_sample: u16,
 }
 
 impl Default for AudioConfig {
     fn default() -> Self {
         Self {
-            sample_rate:      48000,
-            channels:         2,
+            sample_rate: 48000,
+            channels: 2,
             bits_per_sample: 16,
         }
     }
@@ -71,7 +75,11 @@ impl AudioConfig {
         let sr = json_u32(s, "sampleRate").unwrap_or(48000);
         let ch = json_u32(s, "channels").unwrap_or(2) as u16;
         let bps = json_u32(s, "bitsPerSample").unwrap_or(16) as u16;
-        Some(Self { sample_rate: sr, channels: ch, bits_per_sample: bps })
+        Some(Self {
+            sample_rate: sr,
+            channels: ch,
+            bits_per_sample: bps,
+        })
     }
 
     /// Байт на сэмпл (для одного канала).
@@ -91,11 +99,7 @@ impl AudioConfig {
 ///
 /// Блокирует до установки `stop=true`.
 /// На не-Windows платформах — no-op.
-pub fn run_audio_capture(
-    socket:    Arc<UdpSocket>,
-    peer_addr: SocketAddr,
-    stop:      Arc<AtomicBool>,
-) {
+pub fn run_audio_capture(socket: Arc<UdpSocket>, peer_addr: SocketAddr, stop: Arc<AtomicBool>) {
     #[cfg(target_os = "windows")]
     {
         if let Err(e) = run_audio_capture_windows(socket, peer_addr, stop) {
@@ -113,16 +117,14 @@ pub fn run_audio_capture(
 
 #[cfg(target_os = "windows")]
 fn run_audio_capture_windows(
-    socket:    Arc<UdpSocket>,
+    socket: Arc<UdpSocket>,
     peer_addr: SocketAddr,
-    stop:      Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
 ) -> Result<(), String> {
     use windows::Win32::{
         Media::Audio::{
-            eRender, eConsole,
-            IAudioCaptureClient, IAudioClient,
-            IMMDeviceEnumerator, MMDeviceEnumerator,
-            AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
+            eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator,
+            MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
             WAVEFORMATEX, WAVE_FORMAT_PCM,
         },
         System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED},
@@ -148,13 +150,13 @@ fn run_audio_capture_windows(
         let cfg = AudioConfig::default();
         let block_align = (cfg.channels * cfg.bits_per_sample / 8) as u16;
         let fmt = WAVEFORMATEX {
-            wFormatTag:      WAVE_FORMAT_PCM as u16,
-            nChannels:       cfg.channels,
-            nSamplesPerSec:  cfg.sample_rate,
+            wFormatTag: WAVE_FORMAT_PCM as u16,
+            nChannels: cfg.channels,
+            nSamplesPerSec: cfg.sample_rate,
             nAvgBytesPerSec: cfg.sample_rate * block_align as u32,
-            nBlockAlign:     block_align,
-            wBitsPerSample:  cfg.bits_per_sample,
-            cbSize:          0,
+            nBlockAlign: block_align,
+            wBitsPerSample: cfg.bits_per_sample,
+            cbSize: 0,
         };
 
         // Период буфера: 10 мс в единицах 100-нс
@@ -179,10 +181,14 @@ fn run_audio_capture_windows(
             .GetService()
             .map_err(|e| format!("GetService IAudioCaptureClient: {e}"))?;
 
-        client.Start().map_err(|e| format!("IAudioClient::Start: {e}"))?;
+        client
+            .Start()
+            .map_err(|e| format!("IAudioClient::Start: {e}"))?;
 
-        eprintln!("[evrt-audio] WASAPI loopback старт: {}Hz {}ch {}bit",
-            cfg.sample_rate, cfg.channels, cfg.bits_per_sample);
+        eprintln!(
+            "[evrt-audio] WASAPI loopback старт: {}Hz {}ch {}bit",
+            cfg.sample_rate, cfg.channels, cfg.bits_per_sample
+        );
 
         let bytes_per_frame = cfg.bytes_per_frame();
         let mut frame_id: u32 = 0;
@@ -217,9 +223,7 @@ fn run_audio_capture_windows(
                 let _ = socket.send_to(pkt, peer_addr);
             }
 
-            capture_client
-                .ReleaseBuffer(num_frames_available)
-                .ok();
+            capture_client.ReleaseBuffer(num_frames_available).ok();
         }
 
         client.Stop().ok();
@@ -233,6 +237,10 @@ fn run_audio_capture_windows(
 /// Принять аудио-фрейм от хоста и поставить в очередь воспроизведения.
 /// Создаёт WASAPI playback при первом вызове.
 pub struct AudioPlayer {
+    cfg: Option<AudioConfig>,
+    queue: VecDeque<Vec<u8>>,
+    front_offset: usize,
+    buffering: bool,
     #[cfg(target_os = "windows")]
     inner: Option<WasapiPlayer>,
     #[cfg(not(target_os = "windows"))]
@@ -242,6 +250,10 @@ pub struct AudioPlayer {
 impl AudioPlayer {
     pub fn new() -> Self {
         Self {
+            cfg: None,
+            queue: VecDeque::new(),
+            front_offset: 0,
+            buffering: true,
             #[cfg(target_os = "windows")]
             inner: None,
             #[cfg(not(target_os = "windows"))]
@@ -253,10 +265,19 @@ impl AudioPlayer {
     pub fn init(&mut self, cfg: &AudioConfig) {
         #[cfg(target_os = "windows")]
         {
+            if self.cfg.as_ref() == Some(cfg) && self.inner.is_some() {
+                return;
+            }
             match WasapiPlayer::new(cfg) {
                 Ok(p) => {
-                    eprintln!("[evrt-audio] WASAPI playback инициализирован: {}Hz {}ch",
-                        cfg.sample_rate, cfg.channels);
+                    eprintln!(
+                        "[evrt-audio] WASAPI playback инициализирован: {}Hz {}ch",
+                        cfg.sample_rate, cfg.channels
+                    );
+                    self.cfg = Some(cfg.clone());
+                    self.queue.clear();
+                    self.front_offset = 0;
+                    self.buffering = true;
                     self.inner = Some(p);
                 }
                 Err(e) => eprintln!("[evrt-audio] WASAPI playback init failed: {e}"),
@@ -272,21 +293,113 @@ impl AudioPlayer {
     /// Воспроизвести PCM-фрейм.
     pub fn play(&mut self, pcm: &[u8]) {
         #[cfg(target_os = "windows")]
-        if let Some(ref mut p) = self.inner {
-            if let Err(e) = p.write(pcm) {
-                eprintln!("[evrt-audio] play error: {e}");
+        {
+            if pcm.is_empty() {
+                return;
             }
+            if self.cfg.is_none() || self.inner.is_none() {
+                self.init(&AudioConfig::default());
+            }
+            self.enqueue_pcm(pcm);
+            self.pump();
         }
         #[cfg(not(target_os = "windows"))]
         let _ = pcm;
     }
+
+    pub fn tick(&mut self) {
+        #[cfg(target_os = "windows")]
+        self.pump();
+    }
+
+    #[cfg(target_os = "windows")]
+    fn enqueue_pcm(&mut self, pcm: &[u8]) {
+        self.queue.push_back(pcm.to_vec());
+        while self.queued_ms() > AUDIO_MAX_BUFFER_MS && self.queue.len() > 1 {
+            self.queue.pop_front();
+            self.front_offset = 0;
+            self.buffering = false;
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn pump(&mut self) {
+        if self.buffering && self.queued_ms() < AUDIO_PREBUFFER_MS {
+            return;
+        }
+        self.buffering = false;
+
+        let Some(inner) = self.inner.as_mut() else {
+            return;
+        };
+
+        let mut writes = 0;
+        while writes < 8 {
+            let Some(front_len) = self.queue.front().map(Vec::len) else {
+                self.buffering = true;
+                self.front_offset = 0;
+                break;
+            };
+
+            if self.front_offset >= front_len {
+                self.queue.pop_front();
+                self.front_offset = 0;
+                continue;
+            }
+
+            let consumed = {
+                let front = self.queue.front().expect("front checked above");
+                match inner.write_some(&front[self.front_offset..]) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        eprintln!("[evrt-audio] play error: {e}");
+                        break;
+                    }
+                }
+            };
+
+            if consumed == 0 {
+                break;
+            }
+
+            self.front_offset += consumed;
+            writes += 1;
+        }
+    }
+
+    fn queued_ms(&self) -> u32 {
+        let Some(cfg) = &self.cfg else {
+            return 0;
+        };
+        pcm_duration_ms(cfg, self.queued_bytes())
+    }
+
+    fn queued_bytes(&self) -> usize {
+        self.queue
+            .iter()
+            .enumerate()
+            .map(|(idx, chunk)| {
+                if idx == 0 {
+                    chunk.len().saturating_sub(self.front_offset)
+                } else {
+                    chunk.len()
+                }
+            })
+            .sum()
+    }
+}
+
+fn pcm_duration_ms(cfg: &AudioConfig, bytes: usize) -> u32 {
+    let bytes_per_frame = cfg.bytes_per_frame().max(1);
+    let frames = bytes / bytes_per_frame;
+    ((frames as u64).saturating_mul(1000) / u64::from(cfg.sample_rate.max(1))) as u32
 }
 
 #[cfg(target_os = "windows")]
 struct WasapiPlayer {
-    client:        windows::Win32::Media::Audio::IAudioClient,
+    client: windows::Win32::Media::Audio::IAudioClient,
     render_client: windows::Win32::Media::Audio::IAudioRenderClient,
-    block_align:   usize,
+    block_align: usize,
     buffer_frames: u32,
 }
 
@@ -295,11 +408,8 @@ impl WasapiPlayer {
     fn new(cfg: &AudioConfig) -> Result<Self, String> {
         use windows::Win32::{
             Media::Audio::{
-                eRender, eConsole,
-                IAudioClient, IAudioRenderClient,
-                IMMDeviceEnumerator, MMDeviceEnumerator,
-                AUDCLNT_SHAREMODE_SHARED,
-                WAVEFORMATEX, WAVE_FORMAT_PCM,
+                eConsole, eRender, IAudioClient, IAudioRenderClient, IMMDeviceEnumerator,
+                MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, WAVEFORMATEX, WAVE_FORMAT_PCM,
             },
             System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED},
         };
@@ -321,19 +431,19 @@ impl WasapiPlayer {
 
             let block_align = (cfg.channels * cfg.bits_per_sample / 8) as u16;
             let fmt = WAVEFORMATEX {
-                wFormatTag:      WAVE_FORMAT_PCM as u16,
-                nChannels:       cfg.channels,
-                nSamplesPerSec:  cfg.sample_rate,
+                wFormatTag: WAVE_FORMAT_PCM as u16,
+                nChannels: cfg.channels,
+                nSamplesPerSec: cfg.sample_rate,
                 nAvgBytesPerSec: cfg.sample_rate * block_align as u32,
-                nBlockAlign:     block_align,
-                wBitsPerSample:  cfg.bits_per_sample,
-                cbSize:          0,
+                nBlockAlign: block_align,
+                wBitsPerSample: cfg.bits_per_sample,
+                cbSize: 0,
             };
 
             client
                 .Initialize(
                     AUDCLNT_SHAREMODE_SHARED,
-                    0, // no flags for playback
+                    0,       // no flags for playback
                     200_000, // 20ms буфер
                     0,
                     &fmt as *const _,
@@ -360,11 +470,14 @@ impl WasapiPlayer {
         }
     }
 
-    fn write(&mut self, pcm: &[u8]) -> Result<(), String> {
-        if pcm.is_empty() { return Ok(()); }
+    fn write_some(&mut self, pcm: &[u8]) -> Result<usize, String> {
+        if pcm.is_empty() {
+            return Ok(0);
+        }
 
         unsafe {
-            let padding = self.client
+            let padding = self
+                .client
                 .GetCurrentPadding()
                 .map_err(|e| format!("GetCurrentPadding: {e}"))?;
 
@@ -373,25 +486,22 @@ impl WasapiPlayer {
             let frames_to_write = frames_in_data.min(available);
 
             if frames_to_write == 0 {
-                return Ok(());
+                return Ok(0);
             }
 
-            let buf_ptr = self.render_client
+            let buf_ptr = self
+                .render_client
                 .GetBuffer(frames_to_write)
                 .map_err(|e| format!("GetBuffer: {e}"))?;
 
             let write_bytes = frames_to_write as usize * self.block_align;
-            std::ptr::copy_nonoverlapping(
-                pcm.as_ptr(),
-                buf_ptr,
-                write_bytes.min(pcm.len()),
-            );
+            std::ptr::copy_nonoverlapping(pcm.as_ptr(), buf_ptr, write_bytes.min(pcm.len()));
 
             self.render_client
                 .ReleaseBuffer(frames_to_write, 0)
                 .map_err(|e| format!("ReleaseBuffer: {e}"))?;
 
-            Ok(())
+            Ok(write_bytes)
         }
     }
 }
@@ -399,7 +509,9 @@ impl WasapiPlayer {
 #[cfg(target_os = "windows")]
 impl Drop for WasapiPlayer {
     fn drop(&mut self) {
-        unsafe { let _ = self.client.Stop(); }
+        unsafe {
+            let _ = self.client.Stop();
+        }
     }
 }
 
@@ -452,26 +564,39 @@ impl AudioReassembler {
                 return None;
             }
         }
-        if self.latest_id_seen.map(|s| pkt.frame_id > s).unwrap_or(true) {
+        if self
+            .latest_id_seen
+            .map(|s| pkt.frame_id > s)
+            .unwrap_or(true)
+        {
             // Очищаем фреймы старше текущего на 8
             let cutoff = pkt.frame_id.saturating_sub(8);
             self.frames.retain(|&id, _| id >= cutoff);
             self.latest_id_seen = Some(pkt.frame_id);
         }
 
-        let entry = self.frames.entry(pkt.frame_id).or_insert_with(|| AudioAssembly {
-            parts:    vec![None; pkt.packet_count as usize],
-            received: 0,
-            count:    pkt.packet_count,
-        });
+        let entry = self
+            .frames
+            .entry(pkt.frame_id)
+            .or_insert_with(|| AudioAssembly {
+                parts: vec![None; pkt.packet_count as usize],
+                received: 0,
+                count: pkt.packet_count,
+            });
 
-        if entry.count != pkt.packet_count { return None; }
+        if entry.count != pkt.packet_count {
+            return None;
+        }
         let idx = pkt.packet_index as usize;
-        if idx >= entry.parts.len() || entry.parts[idx].is_some() { return None; }
+        if idx >= entry.parts.len() || entry.parts[idx].is_some() {
+            return None;
+        }
         entry.parts[idx] = Some(pkt.payload.clone());
         entry.received += 1;
 
-        if entry.received < entry.count { return None; }
+        if entry.received < entry.count {
+            return None;
+        }
 
         // Фрейм собран
         let assembly = self.frames.remove(&pkt.frame_id)?;
@@ -484,7 +609,9 @@ impl AudioReassembler {
 }
 
 impl Default for AudioReassembler {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ─── Хелперы ─────────────────────────────────────────────────────────────────
@@ -493,7 +620,9 @@ fn json_u32(s: &str, key: &str) -> Option<u32> {
     let needle = format!("\"{}\"", key);
     let pos = s.find(&needle)?;
     let rest = s[pos + needle.len()..].trim_start_matches([' ', ':', '\t']);
-    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
     rest[..end].parse().ok()
 }
 
@@ -522,10 +651,32 @@ mod tests {
         let frame_480 = 480 * cfg.bytes_per_frame();
         assert_eq!(frame_480, 1920);
         let pkts = evrt::packetize_audio_frame(1, 0, &vec![0u8; frame_480]);
-        assert!(pkts.len() <= 2, "аудио фрейм 10мс должен занимать ≤2 UDP пакета");
+        assert!(
+            pkts.len() <= 2,
+            "аудио фрейм 10мс должен занимать ≤2 UDP пакета"
+        );
         for pkt in &pkts {
             assert!(pkt.len() <= evrt::MAX_PACKET_SIZE);
         }
+    }
+
+    #[test]
+    fn audio_duration_uses_pcm_frame_size() {
+        let cfg = AudioConfig::default();
+        assert_eq!(pcm_duration_ms(&cfg, 480 * cfg.bytes_per_frame()), 10);
+        assert_eq!(pcm_duration_ms(&cfg, 1_920 * cfg.bytes_per_frame()), 40);
+    }
+
+    #[test]
+    fn audio_player_queue_accounts_for_partial_front_chunk() {
+        let cfg = AudioConfig::default();
+        let frame_10ms = 480 * cfg.bytes_per_frame();
+        let mut player = AudioPlayer::new();
+        player.cfg = Some(cfg);
+        player.queue.push_back(vec![0u8; frame_10ms * 3]);
+        assert_eq!(player.queued_ms(), 30);
+        player.front_offset = frame_10ms;
+        assert_eq!(player.queued_ms(), 20);
     }
 
     #[test]

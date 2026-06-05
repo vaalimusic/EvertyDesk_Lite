@@ -277,12 +277,18 @@ mod windows_nvenc {
             };
             match status {
                 STATUS_OK => {
-                    if len == 0 { return Ok(None); }
+                    if len == 0 {
+                        return Ok(None);
+                    }
                     if data.is_null() {
                         return Err("NVENC returned null packet pointer".to_owned());
                     }
                     let bytes = unsafe { slice::from_raw_parts(data, len).to_vec() };
-                    Ok(Some(NvencPacket { codec, bytes, key: key != 0 || force_key }))
+                    Ok(Some(NvencPacket {
+                        codec,
+                        bytes,
+                        key: key != 0 || force_key,
+                    }))
                 }
                 STATUS_NO_PACKET => Ok(None),
                 _ => Err(error_from_buf(&err, "NVENC texture encode failed")),

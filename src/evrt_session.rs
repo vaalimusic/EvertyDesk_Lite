@@ -39,10 +39,10 @@ use crate::{
 
 // ─── константы ────────────────────────────────────────────────────────────────
 
-const IDLE_TIMEOUT:      Duration = Duration::from_secs(8);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(8);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
-const IDR_MIN_INTERVAL:  Duration = Duration::from_secs(2);
-const SPIN_THRESHOLD:    Duration = Duration::from_micros(1_500);
+const IDR_MIN_INTERVAL: Duration = Duration::from_secs(2);
+const SPIN_THRESHOLD: Duration = Duration::from_micros(1_500);
 
 // ─── публичный интерфейс ──────────────────────────────────────────────────────
 
@@ -52,53 +52,71 @@ const SPIN_THRESHOLD:    Duration = Duration::from_micros(1_500);
 /// Здесь только UDP-доставка + feedback.
 pub struct EvrtSessionParams {
     /// Адрес клиента (после punch-hole).
-    pub peer_addr:     SocketAddr,
+    pub peer_addr: SocketAddr,
     /// UDP сокет (тот же что зарегистрирован на hbbs).
-    pub socket:        Arc<UdpSocket>,
+    pub socket: Arc<UdpSocket>,
     /// Конфиг приложения (для SessionConfig).
-    pub config:        AppConfig,
+    pub config: AppConfig,
     /// ID пира для логов.
-    pub peer_id:       String,
+    pub peer_id: String,
     /// События → UI.
-    pub events:        Sender<HostEvent>,
+    pub events: Sender<HostEvent>,
     /// Сигнал остановки (shared с pipeline).
-    pub stop:          Arc<AtomicBool>,
+    pub stop: Arc<AtomicBool>,
     /// ★ Готовые кадры из video_pipeline — основная инновация.
     ///   Нет дублирующего захвата/кодирования.
-    pub frame_rx:      Receiver<EncodedFrame>,
+    pub frame_rx: Receiver<EncodedFrame>,
     /// Актуальный FPS (для отчёта в SessionConfig keepalive).
-    pub target_fps:    Arc<AtomicU32>,
+    pub target_fps: Arc<AtomicU32>,
     /// Актуальный quality milli.
     pub quality_milli: Arc<AtomicU32>,
+    /// Масштаб bitrate от EVRT feedback: 1000 = полный bitrate, ниже = relief.
+    pub bitrate_scale_milli: Arc<AtomicU32>,
 }
 
 /// Запустить EVRT сессию. Блокирует до завершения.
 pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
     let EvrtSessionParams {
-        peer_addr, socket, config, peer_id, events, stop,
-        frame_rx, target_fps, quality_milli,
+        peer_addr,
+        socket,
+        config,
+        peer_id,
+        events,
+        stop,
+        frame_rx,
+        target_fps,
+        quality_milli,
+        bitrate_scale_milli,
     } = params;
 
     // ── Windows performance hints ─────────────────────────────────────────────
     let _perf = WindowsPerfHints::enable(&events);
 
     evrt_log(&events, format!("EVRT session → {peer_addr}"));
+    bitrate_scale_milli.store(1_000, Ordering::Relaxed);
 
     // ── SessionConfig ─────────────────────────────────────────────────────────
     let (screen_w, screen_h) = crate::capture::screen_size().unwrap_or((1920, 1080));
-    let fps     = target_fps.load(Ordering::Relaxed).clamp(5, 60);
+    let fps = target_fps.load(Ordering::Relaxed).clamp(5, 60);
     let bitrate = crate::host::h264_target_bitrate_bps_pub(
-        screen_w, screen_h, fps, quality_milli.load(Ordering::Relaxed),
+        screen_w,
+        screen_h,
+        fps,
+        quality_milli.load(Ordering::Relaxed),
     );
 
     let session_cfg = SessionConfig {
-        codec:           choose_codec(&config),
-        preset:          if config.display.fsr_quality.is_enabled() { "GAME".into() } else { "MEDIA".into() },
-        width:           screen_w,
-        height:          screen_h,
+        codec: choose_codec(&config),
+        preset: if config.display.fsr_quality.is_enabled() {
+            "GAME".into()
+        } else {
+            "MEDIA".into()
+        },
+        width: screen_w,
+        height: screen_h,
         fps,
         bitrate,
-        stream_mode:     "single".into(),
+        stream_mode: "single".into(),
         adaptation_mode: "GAME".into(),
     };
 
@@ -108,15 +126,22 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
     thread::sleep(Duration::from_millis(5));
     send_udp(&socket, &cfg_pkt, peer_addr)?;
 
-    evrt_log(&events, format!(
-        "EVRT SessionConfig: {}×{}@{} {:.1}Mbps {}",
-        screen_w, screen_h, fps,
-        bitrate as f64 / 1_000_000.0,
-        session_cfg.codec,
-    ));
+    evrt_log(
+        &events,
+        format!(
+            "EVRT SessionConfig: {}×{}@{} {:.1}Mbps {}",
+            screen_w,
+            screen_h,
+            fps,
+            bitrate as f64 / 1_000_000.0,
+            session_cfg.codec,
+        ),
+    );
 
     // ── Ожидаем RequestKeyFrame от клиента ────────────────────────────────────
-    socket.set_read_timeout(Some(Duration::from_millis(200))).ok();
+    socket
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .ok();
     let mut buf = vec![0u8; evrt::MAX_PACKET_SIZE + 64];
     let deadline = Instant::now() + Duration::from_secs(5);
 
@@ -139,19 +164,21 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
     }
 
     // ── Feedback + keyframe request channels ──────────────────────────────────
-    let (fb_tx,  fb_rx)  = std::sync::mpsc::channel::<ReceiverFeedback>();
-    let (kf_tx,  kf_rx)  = std::sync::mpsc::channel::<()>();
+    let (fb_tx, fb_rx) = std::sync::mpsc::channel::<ReceiverFeedback>();
+    let (kf_tx, kf_rx) = std::sync::mpsc::channel::<()>();
 
     // ── Receive loop: feedback/control от клиента ─────────────────────────────
     {
-        let recv_sock   = socket.clone();
-        let recv_stop   = stop.clone();
+        let recv_sock = socket.clone();
+        let recv_stop = stop.clone();
         let recv_events = events.clone();
 
         thread::spawn(move || {
-            let mut buf       = vec![0u8; evrt::MAX_PACKET_SIZE + 64];
-            let mut last_pkt  = Instant::now();
-            recv_sock.set_read_timeout(Some(Duration::from_millis(500))).ok();
+            let mut buf = vec![0u8; evrt::MAX_PACKET_SIZE + 64];
+            let mut last_pkt = Instant::now();
+            recv_sock
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .ok();
 
             while !recv_stop.load(Ordering::Relaxed) {
                 match recv_sock.recv_from(&mut buf) {
@@ -187,16 +214,16 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
 
     // ── Аудио (WASAPI loopback) ───────────────────────────────────────────────
     {
-        let audio_sock  = socket.clone();
-        let audio_stop  = stop.clone();
+        let audio_sock = socket.clone();
+        let audio_stop = stop.clone();
         thread::spawn(move || {
             crate::evrt_audio::run_audio_capture(audio_sock, peer_addr, audio_stop);
         });
     }
 
     // ── Главный цикл: берём кадры из pipeline → пакетизируем → UDP ───────────
-    let mut relief         = AdaptiveRelief::new(true);
-    let mut last_idr       = Instant::now();
+    let mut relief = AdaptiveRelief::new(true);
+    let mut last_idr = Instant::now();
     let mut last_keepalive = Instant::now();
 
     // HNS PTS (как в EvertyGame _sampleTimeHns)
@@ -206,16 +233,23 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
     evrt_log(&events, "EVRT: main loop started".into());
 
     while !stop.load(Ordering::Relaxed) {
-
         // ── Feedback от клиента ───────────────────────────────────────────────
         while let Ok(fb) = fb_rx.try_recv() {
             let cur_fps = target_fps.load(Ordering::Relaxed);
             if let Some(step) = relief.on_feedback(&fb, cur_fps) {
-                let scale = AdaptiveRelief::bitrate_scale(step);
-                evrt_log(&events, format!(
-                    "EVRT adaptive relief step={step} scale={scale:.2} pressure={}",
-                    fb.pressure.as_str(),
-                ));
+                let scale_milli = relief
+                    .apply_pending_milli()
+                    .unwrap_or_else(|| AdaptiveRelief::bitrate_scale_milli(step));
+                bitrate_scale_milli.store(scale_milli, Ordering::Relaxed);
+                evrt_log(
+                    &events,
+                    format!(
+                        "EVRT adaptive relief step={} scale={}pct pressure={}",
+                        relief.current_step(),
+                        scale_milli / 10,
+                        fb.pressure.as_str(),
+                    ),
+                );
             }
         }
 
@@ -226,10 +260,22 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
         if last_keepalive.elapsed() > KEEPALIVE_INTERVAL {
             let cur_fps = target_fps.load(Ordering::Relaxed).clamp(5, 60);
             let cur_bps = crate::host::h264_target_bitrate_bps_pub(
-                screen_w, screen_h, cur_fps, quality_milli.load(Ordering::Relaxed),
+                screen_w,
+                screen_h,
+                cur_fps,
+                quality_milli.load(Ordering::Relaxed),
             );
-            let upd = SessionConfig { fps: cur_fps, bitrate: cur_bps, ..session_cfg.clone() };
-            let _ = send_udp(&socket, &evrt::build_session_config(&upd.to_json()), peer_addr);
+            let cur_bps = scale_bitrate_bps(cur_bps, bitrate_scale_milli.load(Ordering::Relaxed));
+            let upd = SessionConfig {
+                fps: cur_fps,
+                bitrate: cur_bps,
+                ..session_cfg.clone()
+            };
+            let _ = send_udp(
+                &socket,
+                &evrt::build_session_config(&upd.to_json()),
+                peer_addr,
+            );
             last_keepalive = Instant::now();
         }
 
@@ -262,7 +308,7 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
         // ── ROI перед кадром ─────────────────────────────────────────────────
         let roi = evrt::RoiRect {
             frame_id: frame.frame_id,
-            x: 0, y: 0, w: 0, h: 0, // full-screen
+            ..frame.roi
         };
         let roi_pkt = evrt::build_roi_metadata(roi);
         if !roi_pkt.is_empty() {
@@ -271,13 +317,11 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
 
         // ── PTS ───────────────────────────────────────────────────────────────
         let cur_fps = target_fps.load(Ordering::Relaxed).clamp(5, 60);
-        let pts_us  = sample_hns / 10;
-        sample_hns  = sample_hns.wrapping_add(hns_per_frame(cur_fps));
+        let pts_us = sample_hns / 10;
+        sample_hns = sample_hns.wrapping_add(hns_per_frame(cur_fps));
 
         // ── Пакетизация и отправка ────────────────────────────────────────────
-        let pkts = evrt::packetize_video_frame(
-            frame.frame_id, pts_us, frame.is_idr, &frame.bytes,
-        );
+        let pkts = evrt::packetize_video_frame(frame.frame_id, pts_us, frame.is_idr, &frame.bytes);
         for pkt in &pkts {
             if send_udp(&socket, pkt, peer_addr).is_err() {
                 stop.store(true, Ordering::Relaxed);
@@ -288,11 +332,12 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
 
     let _ = events.send(HostEvent::SessionEnded {
         peer_id: peer_id.clone(),
-        reason:  "EVRT".into(),
+        reason: "EVRT".into(),
     });
     let _ = events.send(HostEvent::StateChanged(crate::host::HostState::Ready));
 
     evrt_log(&events, format!("EVRT: сессия с {peer_id} завершена"));
+    bitrate_scale_milli.store(1_000, Ordering::Relaxed);
     crate::host::release_stuck_input_pub();
     Ok(())
 }
@@ -301,7 +346,7 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
 
 struct WindowsPerfHints {
     #[cfg(target_os = "windows")]
-    timer_raised:      bool,
+    timer_raised: bool,
     #[cfg(target_os = "windows")]
     original_priority: Option<u32>,
 }
@@ -312,7 +357,9 @@ impl WindowsPerfHints {
         {
             use std::os::raw::c_uint;
             #[link(name = "winmm")]
-            extern "system" { fn timeBeginPeriod(uPeriod: c_uint) -> c_uint; }
+            extern "system" {
+                fn timeBeginPeriod(uPeriod: c_uint) -> c_uint;
+            }
             let timer_raised = unsafe { timeBeginPeriod(1) } == 0;
             if timer_raised {
                 evrt_log(events, "EVRT perf: timer → 1 ms ✓".into());
@@ -325,14 +372,20 @@ impl WindowsPerfHints {
             }
             let proc = unsafe { GetCurrentProcess() };
             let orig = unsafe { GetPriorityClass(proc) };
-            let ok   = unsafe { SetPriorityClass(proc, 0x80) }; // HIGH
+            let ok = unsafe { SetPriorityClass(proc, 0x80) }; // HIGH
             if ok != 0 {
                 evrt_log(events, "EVRT perf: priority → High ✓".into());
             }
-            Self { timer_raised, original_priority: Some(orig) }
+            Self {
+                timer_raised,
+                original_priority: Some(orig),
+            }
         }
         #[cfg(not(target_os = "windows"))]
-        { let _ = events; Self {} }
+        {
+            let _ = events;
+            Self {}
+        }
     }
 }
 
@@ -343,8 +396,12 @@ impl Drop for WindowsPerfHints {
             use std::os::raw::c_uint;
             if self.timer_raised {
                 #[link(name = "winmm")]
-                extern "system" { fn timeEndPeriod(uPeriod: c_uint) -> c_uint; }
-                unsafe { timeEndPeriod(1); }
+                extern "system" {
+                    fn timeEndPeriod(uPeriod: c_uint) -> c_uint;
+                }
+                unsafe {
+                    timeEndPeriod(1);
+                }
             }
             if let Some(orig) = self.original_priority {
                 #[link(name = "kernel32")]
@@ -352,7 +409,9 @@ impl Drop for WindowsPerfHints {
                     fn GetCurrentProcess() -> *mut std::ffi::c_void;
                     fn SetPriorityClass(h: *mut std::ffi::c_void, c: c_uint) -> i32;
                 }
-                unsafe { SetPriorityClass(GetCurrentProcess(), orig); }
+                unsafe {
+                    SetPriorityClass(GetCurrentProcess(), orig);
+                }
             }
         }
     }
@@ -361,7 +420,9 @@ impl Drop for WindowsPerfHints {
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 fn send_udp(socket: &UdpSocket, data: &[u8], addr: SocketAddr) -> Result<(), String> {
-    socket.send_to(data, addr).map_err(|e| format!("UDP send: {e}"))?;
+    socket
+        .send_to(data, addr)
+        .map_err(|e| format!("UDP send: {e}"))?;
     Ok(())
 }
 
@@ -373,7 +434,13 @@ fn choose_codec(config: &AppConfig) -> String {
     match config.display.codec {
         crate::settings::CodecPreference::H265 => "H265",
         _ => "H264",
-    }.to_owned()
+    }
+    .to_owned()
+}
+
+fn scale_bitrate_bps(base_bps: u32, scale_milli: u32) -> u32 {
+    let scale_milli = scale_milli.clamp(1, 1_000);
+    ((u64::from(base_bps) * u64::from(scale_milli)) / 1_000) as u32
 }
 
 fn evrt_log(events: &Sender<HostEvent>, msg: String) {
@@ -385,8 +452,8 @@ fn evrt_log(events: &Sender<HostEvent>, msg: String) {
 pub fn decode_punch_addr(bytes: &[u8]) -> Option<SocketAddr> {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     match bytes.len() {
-        6  => {
-            let ip   = Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]);
+        6 => {
+            let ip = Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]);
             let port = u16::from_be_bytes([bytes[4], bytes[5]]);
             Some(SocketAddr::new(IpAddr::V4(ip), port))
         }
@@ -406,7 +473,7 @@ mod tests {
     #[test]
     fn decode_v4() {
         let bytes = [10u8, 0, 0, 1, 0x1F, 0x90];
-        let addr  = decode_punch_addr(&bytes).unwrap();
+        let addr = decode_punch_addr(&bytes).unwrap();
         assert_eq!(addr.port(), 8080);
         assert_eq!(addr.ip().to_string(), "10.0.0.1");
     }

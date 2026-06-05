@@ -12,7 +12,6 @@ mod evrt_audio;
 mod evrt_client;
 mod evrt_session;
 mod frame_queue;
-mod video_pipeline;
 mod fsr;
 mod host;
 mod llm;
@@ -26,6 +25,7 @@ mod software_ui;
 mod transport;
 mod ui;
 mod video;
+mod video_pipeline;
 mod videotoolbox;
 mod vp9_mf;
 #[cfg(feature = "live-vpx-system")]
@@ -932,7 +932,7 @@ impl EvertyDeskApp {
                 let cfg = AppConfig::load_or_create();
                 cfg.display.fsr_quality.to_fsr_quality().map(|q| {
                     crate::fsr::FsrAdapter::new(crate::fsr::FsrConfig {
-                        quality:   q,
+                        quality: q,
                         sharpness: cfg.display.fsr_sharpness,
                     })
                 })
@@ -1177,9 +1177,9 @@ impl EvertyDeskApp {
                     // Конвертируем RGBA → BGRA для FSR (FSR работает с BGRA)
                     let mut bgra = vec![0u8; rgba.len()];
                     for i in (0..rgba.len()).step_by(4) {
-                        bgra[i]     = rgba[i + 2]; // B
+                        bgra[i] = rgba[i + 2]; // B
                         bgra[i + 1] = rgba[i + 1]; // G
-                        bgra[i + 2] = rgba[i];     // R
+                        bgra[i + 2] = rgba[i]; // R
                         bgra[i + 3] = rgba[i + 3]; // A
                     }
 
@@ -1190,9 +1190,9 @@ impl EvertyDeskApp {
                     // BGRA → RGBA обратно
                     let mut out_rgba = vec![0u8; upscaled_bgra.len()];
                     for i in (0..upscaled_bgra.len()).step_by(4) {
-                        out_rgba[i]     = upscaled_bgra[i + 2]; // R
+                        out_rgba[i] = upscaled_bgra[i + 2]; // R
                         out_rgba[i + 1] = upscaled_bgra[i + 1]; // G
-                        out_rgba[i + 2] = upscaled_bgra[i];     // B
+                        out_rgba[i + 2] = upscaled_bgra[i]; // B
                         out_rgba[i + 3] = 255;
                     }
 
@@ -1202,10 +1202,8 @@ impl EvertyDeskApp {
                 };
 
                 self.last_frame_rgba = final_rgba;
-                let image = ColorImage::from_rgba_unmultiplied(
-                    [final_w, final_h],
-                    &self.last_frame_rgba,
-                );
+                let image =
+                    ColorImage::from_rgba_unmultiplied([final_w, final_h], &self.last_frame_rgba);
                 self.remote_size = image.size;
                 self.pending_image = Some(image);
                 self.last_screenshot_sid = sid;
@@ -1253,8 +1251,7 @@ impl EvertyDeskApp {
                 // Используем первый (primary) дисплей.
                 if let Some(primary) = displays.first() {
                     if primary.width > 0 && primary.height > 0 {
-                        self.fsr_native_size =
-                            Some((primary.width as u32, primary.height as u32));
+                        self.fsr_native_size = Some((primary.width as u32, primary.height as u32));
                     }
                 }
                 self.remote_displays = displays;
@@ -1334,7 +1331,11 @@ impl EvertyDeskApp {
                     .push_str(&format!("\r\n[console error] {err}\r\n"));
             }
             SessionEvent::Info(message) => self.log(message),
-            SessionEvent::EvrtStatus { active, host_addr, port } => {
+            SessionEvent::EvrtStatus {
+                active,
+                host_addr,
+                port,
+            } => {
                 self.evrt_active = active;
                 self.evrt_host_addr = if active {
                     format!("{host_addr}:{port}")
@@ -1349,13 +1350,18 @@ impl EvertyDeskApp {
                 }
             }
             SessionEvent::EvrtMetrics {
-                pressure, arrival_delta_ms, decode_delta_ms, jitter_ms, fps, ..
+                pressure,
+                arrival_delta_ms,
+                decode_delta_ms,
+                jitter_ms,
+                fps,
+                ..
             } => {
-                self.evrt_pressure         = pressure;
+                self.evrt_pressure = pressure;
                 self.evrt_arrival_delta_ms = arrival_delta_ms;
-                self.evrt_decode_delta_ms  = decode_delta_ms;
-                self.evrt_jitter_ms        = jitter_ms;
-                self.evrt_fps              = fps;
+                self.evrt_decode_delta_ms = decode_delta_ms;
+                self.evrt_jitter_ms = jitter_ms;
+                self.evrt_fps = fps;
             }
             SessionEvent::Failed(err) => {
                 self.busy = false;
@@ -1617,16 +1623,17 @@ impl EvertyDeskApp {
             || self.host_state.is_online()
         {
             // Poll faster when live video is streaming to reduce decode→render lag.
-        let repaint_ms = if self.connected
-            && self.last_live_frame_at
-                .map(|t| t.elapsed() < Duration::from_secs(3))
-                .unwrap_or(false)
-        {
-            16 // ~60fps poll when stream is active
-        } else {
-            33 // ~30fps otherwise
-        };
-        ctx.request_repaint_after(Duration::from_millis(repaint_ms));
+            let repaint_ms = if self.connected
+                && self
+                    .last_live_frame_at
+                    .map(|t| t.elapsed() < Duration::from_secs(3))
+                    .unwrap_or(false)
+            {
+                16 // ~60fps poll when stream is active
+            } else {
+                33 // ~30fps otherwise
+            };
+            ctx.request_repaint_after(Duration::from_millis(repaint_ms));
         }
 
         let software_backend = egui_software_backend_active();
@@ -3340,8 +3347,8 @@ impl EvertyDeskApp {
                     ui.separator();
                     let pressure_color = match self.evrt_pressure.as_str() {
                         "critical" => egui::Color32::from_rgb(220, 70, 70),
-                        "high"     => egui::Color32::from_rgb(220, 170, 50),
-                        _          => egui::Color32::from_rgb(50, 200, 120),
+                        "high" => egui::Color32::from_rgb(220, 170, 50),
+                        _ => egui::Color32::from_rgb(50, 200, 120),
                     };
                     ui.label(
                         egui::RichText::new("⚡ EVRT")
@@ -4588,6 +4595,12 @@ fn compact_host_video_status(summary: &str) -> String {
         "size",
         "fps",
         "bitrate",
+        "bitrate_min",
+        "bitrate_max",
+        "roi_avg",
+        "roi_max",
+        "relief",
+        "relief_min",
         "packets",
         "avg_packet",
         "capture_avg",

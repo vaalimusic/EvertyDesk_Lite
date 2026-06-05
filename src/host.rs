@@ -741,12 +741,13 @@ fn handle_rendezvous_msg(
             // EVRT активируется из video_pipeline через evrt_send_loop —
             // там ждут punch уже на выделенном EVRT сокете (другой порт).
             if !ph.force_relay {
-                if let Some(peer_addr) =
-                    crate::evrt_session::decode_punch_addr(&ph.socket_addr)
-                {
-                    host_log(events, format!(
+                if let Some(peer_addr) = crate::evrt_session::decode_punch_addr(&ph.socket_addr) {
+                    host_log(
+                        events,
+                        format!(
                         "PunchHole: peer={peer_addr} (EVRT будет активирован через video_pipeline)",
-                    ));
+                    ),
+                    );
                     // 3× punch чтобы открыть NAT-дырку для последующего EVRT
                     for _ in 0..3 {
                         let _ = reg_socket.send_to(&[0u8], peer_addr);
@@ -1187,22 +1188,30 @@ fn relay_session_inner(
         }
     }
 
-    let target_fps    = negotiated_target_fps(&login, config.display.target_fps);
+    let target_fps = negotiated_target_fps(&login, config.display.target_fps);
     let quality_milli = negotiated_quality_milli(&login);
 
-    host_log(events, format!(
-        "Auth OK для {peer_id}. Pipeline старт: {target_fps}fps quality={}%",
-        quality_milli / 10,
-    ));
-    let _ = events.send(HostEvent::SessionStarted { peer_id: peer_id.to_owned() });
+    host_log(
+        events,
+        format!(
+            "Auth OK для {peer_id}. Pipeline старт: {target_fps}fps quality={}%",
+            quality_milli / 10,
+        ),
+    );
+    let _ = events.send(HostEvent::SessionStarted {
+        peer_id: peer_id.to_owned(),
+    });
 
     // ── Единый пайплайн: один захват → один энкодер → TCP + UDP ──────────────
     //
     // Заменяет старую схему двух параллельных систем (video_loop + evrt_session).
     // Один MF энкодер, нет конкуренции, нет двойного захвата.
     let (send_cipher, mut recv_cipher) = match cipher.take() {
-        Some(c) => { let (s, r) = c.into_halves(); (Some(s), Some(r)) }
-        None    => (None, None),
+        Some(c) => {
+            let (s, r) = c.into_halves();
+            (Some(s), Some(r))
+        }
+        None => (None, None),
     };
 
     let write_stream = relay
@@ -1217,12 +1226,12 @@ fn relay_session_inner(
     // recv_cipher НЕ идёт в pipeline — остаётся в input loop этого треда
     // для расшифровки MouseEvent/KeyEvent от клиента.
     let pipeline_cfg = crate::video_pipeline::PipelineConfig {
-        app_config:   config.clone(),
-        peer_id:      peer_id.to_owned(),
-        events:       events.clone(),
+        app_config: config.clone(),
+        peer_id: peer_id.to_owned(),
+        events: events.clone(),
         relay_stream: write_stream,
         send_cipher,
-        evrt_socket:  evrt_socket.map(|(s, _)| s),
+        evrt_socket: evrt_socket.map(|(s, _)| s),
         cmd_rx,
         peer_msg_rx,
     };
@@ -1235,7 +1244,7 @@ fn relay_session_inner(
     });
 
     // Shared FPS/quality для input loop → pipeline commands
-    let shared_target_fps    = Arc::new(AtomicU32::new(target_fps));
+    let shared_target_fps = Arc::new(AtomicU32::new(target_fps));
     let shared_quality_milli = Arc::new(AtomicU32::new(quality_milli));
     let stop = pipeline_stop.clone();
 
@@ -1289,7 +1298,6 @@ fn relay_session_inner(
 
     Ok(())
 }
-
 
 fn negotiated_target_fps(login: &crate::rustdesk_proto::LoginRequest, configured_fps: u32) -> u32 {
     let host_limit = configured_fps.clamp(5, MAX_TARGET_FPS);
@@ -1383,6 +1391,10 @@ pub struct FrameChangeDetector {
     height: u32,
     /// FNV-1a hash of the last sent frame (computed by crate::colorconv::frame_signature).
     last_hash: u64,
+    last_tile_cols: u32,
+    last_tile_rows: u32,
+    last_tile_hashes: Vec<u64>,
+    pending_fingerprint: Option<FrameFingerprint>,
     last_sent_at: Option<Instant>,
     consecutive_static_skips: u32,
     sent_since_log: u64,
@@ -1392,6 +1404,16 @@ pub struct FrameChangeDetector {
 pub struct FrameDecision {
     pub send: bool,
     pub force_key: bool,
+    pub roi: crate::evrt::RoiRect,
+}
+
+struct FrameFingerprint {
+    width: u32,
+    height: u32,
+    hash: u64,
+    tile_cols: u32,
+    tile_rows: u32,
+    tile_hashes: Vec<u64>,
 }
 
 pub struct FrameSkipStats {
@@ -1627,16 +1649,26 @@ impl FrameChangeDetector {
         const STATIC_REFRESH: Duration = Duration::from_secs(2);
 
         let size_changed = self.width != width || self.height != height;
+        let current = FrameFingerprint::build(width, height, bgra);
         let idle_refresh = self
             .last_sent_at
             .map(|instant| instant.elapsed() >= STATIC_REFRESH)
             .unwrap_or(true);
-        let changed = size_changed || self.frame_changed(width, height, bgra);
+        let changed = size_changed || self.frame_changed(&current);
         let send = changed || periodic_key || idle_refresh;
+        let roi = if size_changed || self.last_hash == 0 || periodic_key || idle_refresh {
+            full_screen_roi()
+        } else if changed {
+            self.dirty_roi(&current).unwrap_or_else(full_screen_roi)
+        } else {
+            full_screen_roi()
+        };
+        self.pending_fingerprint = Some(current);
         if send {
             FrameDecision {
                 send: true,
                 force_key: size_changed || periodic_key || idle_refresh,
+                roi,
             }
         } else {
             self.consecutive_static_skips = self.consecutive_static_skips.saturating_add(1);
@@ -1644,6 +1676,7 @@ impl FrameChangeDetector {
             FrameDecision {
                 send: false,
                 force_key: false,
+                roi,
             }
         }
     }
@@ -1651,7 +1684,15 @@ impl FrameChangeDetector {
     pub fn mark_sent(&mut self, width: u32, height: u32, bgra: &[u8]) {
         self.width = width;
         self.height = height;
-        self.last_hash = crate::colorconv::frame_signature(bgra, width as usize, height as usize);
+        let fingerprint = self
+            .pending_fingerprint
+            .take()
+            .filter(|fp| fp.width == width && fp.height == height)
+            .unwrap_or_else(|| FrameFingerprint::build(width, height, bgra));
+        self.last_hash = fingerprint.hash;
+        self.last_tile_cols = fingerprint.tile_cols;
+        self.last_tile_rows = fingerprint.tile_rows;
+        self.last_tile_hashes = fingerprint.tile_hashes;
         self.last_sent_at = Some(Instant::now());
         self.consecutive_static_skips = 0;
         self.sent_since_log = self.sent_since_log.saturating_add(1);
@@ -1667,12 +1708,60 @@ impl FrameChangeDetector {
         stats
     }
 
-    fn frame_changed(&self, width: u32, height: u32, bgra: &[u8]) -> bool {
+    fn frame_changed(&self, current: &FrameFingerprint) -> bool {
         if self.last_hash == 0 {
             return true;
         }
-        let sig = crate::colorconv::frame_signature(bgra, width as usize, height as usize);
-        sig != self.last_hash
+        current.hash != self.last_hash
+            || current.tile_cols != self.last_tile_cols
+            || current.tile_rows != self.last_tile_rows
+            || current.tile_hashes != self.last_tile_hashes
+    }
+
+    fn dirty_roi(&self, current: &FrameFingerprint) -> Option<crate::evrt::RoiRect> {
+        if current.width != self.width
+            || current.height != self.height
+            || current.tile_cols != self.last_tile_cols
+            || current.tile_rows != self.last_tile_rows
+            || current.tile_hashes.len() != self.last_tile_hashes.len()
+        {
+            return Some(full_screen_roi());
+        }
+
+        let mut min_col = current.tile_cols;
+        let mut min_row = current.tile_rows;
+        let mut max_col = 0_u32;
+        let mut max_row = 0_u32;
+        let mut any = false;
+
+        for row in 0..current.tile_rows {
+            for col in 0..current.tile_cols {
+                let idx = (row * current.tile_cols + col) as usize;
+                if current.tile_hashes[idx] != self.last_tile_hashes[idx] {
+                    any = true;
+                    min_col = min_col.min(col);
+                    min_row = min_row.min(row);
+                    max_col = max_col.max(col);
+                    max_row = max_row.max(row);
+                }
+            }
+        }
+
+        if !any {
+            return None;
+        }
+
+        let x = min_col * DIRTY_TILE_SIZE;
+        let y = min_row * DIRTY_TILE_SIZE;
+        let right = ((max_col + 1) * DIRTY_TILE_SIZE).min(current.width);
+        let bottom = ((max_row + 1) * DIRTY_TILE_SIZE).min(current.height);
+        Some(crate::evrt::RoiRect {
+            frame_id: 0,
+            x,
+            y,
+            w: right.saturating_sub(x),
+            h: bottom.saturating_sub(y),
+        })
     }
 
     pub fn static_backoff_delay(&self, fps: u32) -> Option<Duration> {
@@ -1684,6 +1773,93 @@ impl FrameChangeDetector {
         } else {
             Some(Duration::from_millis(50))
         }
+    }
+}
+
+const DIRTY_TILE_SIZE: u32 = 32;
+const TILE_HASH_TARGET_SAMPLES: usize = 16;
+const FNV_OFFSET: u64 = 14695981039346656037;
+const FNV_PRIME: u64 = 1099511628211;
+
+impl FrameFingerprint {
+    fn build(width: u32, height: u32, bgra: &[u8]) -> Self {
+        let hash = crate::colorconv::frame_signature(bgra, width as usize, height as usize);
+        if width == 0 || height == 0 || bgra.len() < width as usize * height as usize * 4 {
+            return Self {
+                width,
+                height,
+                hash,
+                tile_cols: 0,
+                tile_rows: 0,
+                tile_hashes: Vec::new(),
+            };
+        }
+
+        let tile_cols = div_ceil_u32(width, DIRTY_TILE_SIZE);
+        let tile_rows = div_ceil_u32(height, DIRTY_TILE_SIZE);
+        let mut tile_hashes = Vec::with_capacity(tile_cols as usize * tile_rows as usize);
+        for row in 0..tile_rows {
+            for col in 0..tile_cols {
+                let x0 = col * DIRTY_TILE_SIZE;
+                let y0 = row * DIRTY_TILE_SIZE;
+                let x1 = ((col + 1) * DIRTY_TILE_SIZE).min(width);
+                let y1 = ((row + 1) * DIRTY_TILE_SIZE).min(height);
+                tile_hashes.push(tile_hash(width, bgra, x0, y0, x1, y1));
+            }
+        }
+
+        Self {
+            width,
+            height,
+            hash,
+            tile_cols,
+            tile_rows,
+            tile_hashes,
+        }
+    }
+}
+
+fn tile_hash(width: u32, bgra: &[u8], x0: u32, y0: u32, x1: u32, y1: u32) -> u64 {
+    let tile_w = x1.saturating_sub(x0).max(1);
+    let tile_h = y1.saturating_sub(y0).max(1);
+    let pixels = tile_w as usize * tile_h as usize;
+    let step = (pixels / TILE_HASH_TARGET_SAMPLES).max(1);
+
+    let mut hash = FNV_OFFSET;
+    let mut local = 0usize;
+    while local < pixels {
+        let px = local as u32;
+        let x = x0 + px % tile_w;
+        let y = y0 + px / tile_w;
+        let base = (y as usize * width as usize + x as usize) * 4;
+        if base + 2 < bgra.len() {
+            let b = bgra[base] as u64;
+            let g = bgra[base + 1] as u64;
+            let r = bgra[base + 2] as u64;
+            hash = hash.wrapping_mul(FNV_PRIME) ^ r;
+            hash = hash.wrapping_mul(FNV_PRIME) ^ g;
+            hash = hash.wrapping_mul(FNV_PRIME) ^ b;
+        }
+        local += step;
+    }
+    hash
+}
+
+fn div_ceil_u32(value: u32, divisor: u32) -> u32 {
+    if value == 0 {
+        0
+    } else {
+        1 + (value - 1) / divisor.max(1)
+    }
+}
+
+fn full_screen_roi() -> crate::evrt::RoiRect {
+    crate::evrt::RoiRect {
+        frame_id: 0,
+        x: 0,
+        y: 0,
+        w: 0,
+        h: 0,
     }
 }
 
@@ -1857,7 +2033,11 @@ fn encode_mf_frame(
         )?);
         eprintln!(
             "[host-video] MF {} encoder started at {}x{}@{} bitrate={}",
-            codec.label(), width, height, fps, bitrate
+            codec.label(),
+            width,
+            height,
+            fps,
+            bitrate
         );
     } else if let Some(enc) = encoder.as_mut() {
         // Update bitrate at runtime — avoids tearing down and restarting the
@@ -1910,7 +2090,11 @@ fn encode_videotoolbox_frame(
         )?);
         eprintln!(
             "[host-video] VideoToolbox {} encoder started at {}x{}@{} bitrate={}",
-            codec.label(), width, height, fps, bitrate
+            codec.label(),
+            width,
+            height,
+            fps,
+            bitrate
         );
     } else if let Some(enc) = encoder.as_mut() {
         if enc.current_bitrate() != bitrate {
@@ -1958,7 +2142,11 @@ fn encode_nvenc_frame(
         )?);
         eprintln!(
             "[host-video] NVENC {} encoder started at {}x{}@{} bitrate={}",
-            codec.label(), width, height, fps, bitrate
+            codec.label(),
+            width,
+            height,
+            fps,
+            bitrate
         );
     } else if let Some(enc) = encoder.as_mut() {
         if enc.current_bitrate() != bitrate {
@@ -2086,9 +2274,15 @@ impl openh264::formats::YUVSource for YuvFrame {
     fn strides(&self) -> (usize, usize, usize) {
         (self.width, self.width / 2, self.width / 2)
     }
-    fn y(&self) -> &[u8] { &self.y }
-    fn u(&self) -> &[u8] { &self.u }
-    fn v(&self) -> &[u8] { &self.v }
+    fn y(&self) -> &[u8] {
+        &self.y
+    }
+    fn u(&self) -> &[u8] {
+        &self.u
+    }
+    fn v(&self) -> &[u8] {
+        &self.v
+    }
 }
 
 /// BGRA → planar I420.  Delegates to `crate::colorconv` for the fast path.
@@ -2100,10 +2294,7 @@ fn bgra_to_yuv420_into(out: &mut YuvFrame, w: usize, h: usize, bgra: &[u8]) {
     out.resize(w, h);
     let dst_w = out.width;
     let dst_h = out.height;
-    crate::colorconv::bgra_to_i420(
-        &mut out.y, &mut out.u, &mut out.v,
-        w, h, dst_w, dst_h, bgra,
-    );
+    crate::colorconv::bgra_to_i420(&mut out.y, &mut out.u, &mut out.v, w, h, dst_w, dst_h, bgra);
 }
 
 #[cfg(test)]
@@ -2131,6 +2322,46 @@ mod video_quality_tests {
 
         let changed = vec![255_u8; 64 * 64 * 4];
         assert!(detector.decide(64, 64, &changed, false).send);
+    }
+
+    #[test]
+    fn frame_change_detector_first_frame_uses_fullscreen_roi() {
+        let mut detector = FrameChangeDetector::default();
+        let frame = vec![0_u8; 64 * 64 * 4];
+        let decision = detector.decide(64, 64, &frame, false);
+        assert!(decision.send);
+        assert!(decision.roi.is_full_screen());
+    }
+
+    #[test]
+    fn frame_change_detector_reports_tile_dirty_roi() {
+        let mut detector = FrameChangeDetector::default();
+        let frame = vec![0_u8; 128 * 128 * 4];
+        detector.mark_sent(128, 128, &frame);
+
+        let mut changed = frame.clone();
+        for y in 64..96 {
+            for x in 64..96 {
+                let base = (y * 128 + x) * 4;
+                changed[base] = 255;
+                changed[base + 1] = 255;
+                changed[base + 2] = 255;
+                changed[base + 3] = 255;
+            }
+        }
+
+        let decision = detector.decide(128, 128, &changed, false);
+        assert!(decision.send);
+        assert_eq!(
+            decision.roi,
+            crate::evrt::RoiRect {
+                frame_id: 0,
+                x: 64,
+                y: 64,
+                w: 32,
+                h: 32,
+            }
+        );
     }
 
     #[test]
@@ -2196,16 +2427,16 @@ mod video_quality_tests {
 /// Версия handle_client_input для нового pipeline — шлёт команды через канал.
 fn handle_client_input_pipeline(
     msg: PeerMessage,
-    cmd_tx:       &mpsc::Sender<crate::video_pipeline::PipelineCmd>,
-    peer_msg_tx:  &mpsc::Sender<PeerMessage>,
-    shell:        &mut Option<ShellRuntime>,
-    target_fps:   &AtomicU32,
+    cmd_tx: &mpsc::Sender<crate::video_pipeline::PipelineCmd>,
+    peer_msg_tx: &mpsc::Sender<PeerMessage>,
+    shell: &mut Option<ShellRuntime>,
+    target_fps: &AtomicU32,
     quality_milli: &AtomicU32,
 ) {
     use crate::video_pipeline::PipelineCmd;
     match msg.union {
         Some(peer_message::Union::MouseEvent(ev)) => inject_mouse(ev),
-        Some(peer_message::Union::KeyEvent(ev))   => inject_key(ev),
+        Some(peer_message::Union::KeyEvent(ev)) => inject_key(ev),
         Some(peer_message::Union::Misc(Misc {
             union: Some(misc::Union::Option(option)),
         })) => {
@@ -3824,23 +4055,23 @@ pub fn release_stuck_input_pub() {
 
 /// Результат кодирования: байты + флаг IDR + опциональные SPS/PPS + кодек.
 pub struct EncodedOutput {
-    pub bytes:   Vec<u8>,
-    pub key:     bool,
+    pub bytes: Vec<u8>,
+    pub key: bool,
     pub sps_pps: Option<Vec<u8>>,
-    pub codec:   &'static str,
+    pub codec: &'static str,
 }
 
 /// Единый энкодер с каскадом аппаратных/программных бэкендов.
 pub struct MultiEncoder {
     // Выбранные кодеки для каждого бэкенда (None = бэкенд недоступен)
-    desired_mf:  Option<crate::nvenc::NvencCodec>,
-    desired_vt:  Option<crate::nvenc::NvencCodec>,
-    desired_nv:  Option<crate::nvenc::NvencCodec>,
+    desired_mf: Option<crate::nvenc::NvencCodec>,
+    desired_vt: Option<crate::nvenc::NvencCodec>,
+    desired_nv: Option<crate::nvenc::NvencCodec>,
 
     // Состояния энкодеров (lazy-init)
-    mf:  Option<crate::mf_encode::MfVideoEncoder>,
-    vt:  Option<crate::videotoolbox::VideoToolboxEncoder>,
-    nv:  Option<crate::nvenc::NvencEncoder>,
+    mf: Option<crate::mf_encode::MfVideoEncoder>,
+    vt: Option<crate::videotoolbox::VideoToolboxEncoder>,
+    nv: Option<crate::nvenc::NvencEncoder>,
 
     // Disabled-флаги: после ошибки бэкенд выключается
     mf_disabled: bool,
@@ -3849,7 +4080,7 @@ pub struct MultiEncoder {
 
     // OpenH264 software fallback
     #[cfg(feature = "live-h264")]
-    sw:  Option<openh264::encoder::Encoder>,
+    sw: Option<openh264::encoder::Encoder>,
     #[cfg(feature = "live-h264")]
     yuv: YuvFrame,
 }
@@ -3858,8 +4089,8 @@ impl MultiEncoder {
     /// Создать энкодер, выбрав доступные бэкенды по preference и возможностям клиента.
     pub fn new(
         encoder_pref: EncoderPreference,
-        codec_pref:   CodecPreference,
-        client:       ClientVideoSupport,
+        codec_pref: CodecPreference,
+        client: ClientVideoSupport,
     ) -> Self {
         let desired_mf = choose_mf_encoder_codec(encoder_pref, codec_pref, client);
         let desired_vt = choose_videotoolbox_codec(encoder_pref, codec_pref, client);
@@ -3869,9 +4100,15 @@ impl MultiEncoder {
         let sw = build_openh264_encoder();
 
         Self {
-            desired_mf, desired_vt, desired_nv,
-            mf: None, vt: None, nv: None,
-            mf_disabled: false, vt_disabled: false, nv_disabled: false,
+            desired_mf,
+            desired_vt,
+            desired_nv,
+            mf: None,
+            vt: None,
+            nv: None,
+            mf_disabled: false,
+            vt_disabled: false,
+            nv_disabled: false,
             #[cfg(feature = "live-h264")]
             sw,
             #[cfg(feature = "live-h264")]
@@ -3882,11 +4119,19 @@ impl MultiEncoder {
     /// Краткое описание активной цепочки бэкендов (для логов).
     pub fn backend_label(&self) -> String {
         let mut parts = Vec::new();
-        if let Some(c) = self.desired_mf { parts.push(format!("MF/{}", c.label())); }
-        if let Some(c) = self.desired_vt { parts.push(format!("VT/{}", c.label())); }
-        if let Some(c) = self.desired_nv { parts.push(format!("NVENC/{}", c.label())); }
+        if let Some(c) = self.desired_mf {
+            parts.push(format!("MF/{}", c.label()));
+        }
+        if let Some(c) = self.desired_vt {
+            parts.push(format!("VT/{}", c.label()));
+        }
+        if let Some(c) = self.desired_nv {
+            parts.push(format!("NVENC/{}", c.label()));
+        }
         #[cfg(feature = "live-h264")]
-        if self.sw.is_some() { parts.push("OpenH264".to_owned()); }
+        if self.sw.is_some() {
+            parts.push("OpenH264".to_owned());
+        }
         parts.push("PNG".to_owned());
         parts.join(" → ")
     }
@@ -3904,13 +4149,26 @@ impl MultiEncoder {
     ) -> Option<EncodedOutput> {
         // 1. Media Foundation (Windows)
         if let Some(codec) = self.desired_mf.filter(|_| !self.mf_disabled) {
-            match encode_mf_frame(&mut self.mf, codec, width, height, fps, bitrate, bgra, force_key) {
+            match encode_mf_frame(
+                &mut self.mf,
+                codec,
+                width,
+                height,
+                fps,
+                bitrate,
+                bgra,
+                force_key,
+            ) {
                 Ok(Some(pkt)) => {
                     let sps = if pkt.key {
                         self.mf.as_ref().and_then(|e| e.codec_config())
-                    } else { None };
+                    } else {
+                        None
+                    };
                     return Some(EncodedOutput {
-                        bytes: pkt.bytes, key: pkt.key, sps_pps: sps,
+                        bytes: pkt.bytes,
+                        key: pkt.key,
+                        sps_pps: sps,
                         codec: codec_label(codec),
                     });
                 }
@@ -3921,10 +4179,21 @@ impl MultiEncoder {
 
         // 2. VideoToolbox (macOS)
         if let Some(codec) = self.desired_vt.filter(|_| !self.vt_disabled) {
-            match encode_videotoolbox_frame(&mut self.vt, codec, width, height, fps, bitrate, bgra, force_key) {
+            match encode_videotoolbox_frame(
+                &mut self.vt,
+                codec,
+                width,
+                height,
+                fps,
+                bitrate,
+                bgra,
+                force_key,
+            ) {
                 Ok(Some(pkt)) => {
                     return Some(EncodedOutput {
-                        bytes: pkt.bytes, key: pkt.key, sps_pps: None,
+                        bytes: pkt.bytes,
+                        key: pkt.key,
+                        sps_pps: None,
                         codec: codec_label(codec),
                     });
                 }
@@ -3935,10 +4204,21 @@ impl MultiEncoder {
 
         // 3. NVENC
         if let Some(codec) = self.desired_nv.filter(|_| !self.nv_disabled) {
-            match encode_nvenc_frame(&mut self.nv, codec, width, height, fps, bitrate, bgra, force_key) {
+            match encode_nvenc_frame(
+                &mut self.nv,
+                codec,
+                width,
+                height,
+                fps,
+                bitrate,
+                bgra,
+                force_key,
+            ) {
                 Ok(Some(pkt)) => {
                     return Some(EncodedOutput {
-                        bytes: pkt.bytes, key: pkt.key, sps_pps: None,
+                        bytes: pkt.bytes,
+                        key: pkt.key,
+                        sps_pps: None,
                         codec: codec_label(codec),
                     });
                 }
@@ -3951,10 +4231,18 @@ impl MultiEncoder {
         #[cfg(feature = "live-h264")]
         {
             if let Some(pkt) = encode_h264_frame(
-                self.sw.as_mut(), &mut self.yuv, width, height, bgra, force_key,
+                self.sw.as_mut(),
+                &mut self.yuv,
+                width,
+                height,
+                bgra,
+                force_key,
             ) {
                 return Some(EncodedOutput {
-                    bytes: pkt.bytes, key: pkt.key, sps_pps: None, codec: "H264",
+                    bytes: pkt.bytes,
+                    key: pkt.key,
+                    sps_pps: None,
+                    codec: "H264",
                 });
             }
         }
@@ -3963,7 +4251,9 @@ impl MultiEncoder {
         if force_key {
             return Some(EncodedOutput {
                 bytes: encode_png_fallback(bgra, width, height),
-                key: true, sps_pps: None, codec: "PNG",
+                key: true,
+                sps_pps: None,
+                codec: "PNG",
             });
         }
 
@@ -3974,7 +4264,7 @@ impl MultiEncoder {
 fn codec_label(codec: crate::nvenc::NvencCodec) -> &'static str {
     match codec {
         crate::nvenc::NvencCodec::H265 => "H265",
-        crate::nvenc::NvencCodec::Av1  => "AV1",
+        crate::nvenc::NvencCodec::Av1 => "AV1",
         crate::nvenc::NvencCodec::H264 => "H264",
     }
 }
@@ -3982,8 +4272,8 @@ fn codec_label(codec: crate::nvenc::NvencCodec) -> &'static str {
 #[cfg(feature = "live-h264")]
 fn build_openh264_encoder() -> Option<openh264::encoder::Encoder> {
     use openh264::encoder::{
-        BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod,
-        RateControlMode, SpsPpsStrategy, UsageType,
+        BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode,
+        SpsPpsStrategy, UsageType,
     };
     let cfg = EncoderConfig::new()
         .usage_type(UsageType::ScreenContentRealTime)
@@ -4001,10 +4291,10 @@ fn build_openh264_encoder() -> Option<openh264::encoder::Encoder> {
 pub fn encode_png_fallback(bgra: &[u8], w: u32, h: u32) -> Vec<u8> {
     use image::{ImageBuffer, Rgba};
     let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
-        ImageBuffer::from_raw(w, h, bgra.to_vec())
-            .unwrap_or_else(|| ImageBuffer::new(w, h));
+        ImageBuffer::from_raw(w, h, bgra.to_vec()).unwrap_or_else(|| ImageBuffer::new(w, h));
     let mut out = Vec::new();
-    img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).ok();
+    img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .ok();
     out
 }
 

@@ -42,23 +42,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 // ─── константы ────────────────────────────────────────────────────────────────
 
-pub const MAGIC: u32           = 0x4556_5254; // "EVRT"
-pub const VERSION: u8          = 3;
-pub const HEADER_SIZE: usize   = 24;
+pub const MAGIC: u32 = 0x4556_5254; // "EVRT"
+pub const VERSION: u8 = 3;
+pub const HEADER_SIZE: usize = 24;
 pub const MAX_PACKET_SIZE: usize = 1200;
 pub const MAX_PAYLOAD_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE;
 
 // ─── типы пакетов ─────────────────────────────────────────────────────────────
 
-pub const TYPE_SESSION_CONFIG:     u8 = 1;
-pub const TYPE_CODEC_CONFIG:       u8 = 2;
-pub const TYPE_VIDEO_FRAME:        u8 = 3;
-pub const TYPE_CONTROL:            u8 = 4;
-pub const TYPE_AUDIO_CONFIG:       u8 = 5;
-pub const TYPE_AUDIO_FRAME:        u8 = 6;
+pub const TYPE_SESSION_CONFIG: u8 = 1;
+pub const TYPE_CODEC_CONFIG: u8 = 2;
+pub const TYPE_VIDEO_FRAME: u8 = 3;
+pub const TYPE_CONTROL: u8 = 4;
+pub const TYPE_AUDIO_CONFIG: u8 = 5;
+pub const TYPE_AUDIO_FRAME: u8 = 6;
 pub const TYPE_ENHANCEMENT_CONFIG: u8 = 7;
-pub const TYPE_ENHANCEMENT_FRAME:  u8 = 8;
-pub const TYPE_ROI_METADATA:       u8 = 9;
+pub const TYPE_ENHANCEMENT_FRAME: u8 = 8;
+pub const TYPE_ROI_METADATA: u8 = 9;
 
 // ─── флаги ────────────────────────────────────────────────────────────────────
 
@@ -69,13 +69,13 @@ pub const FLAG_KEY_FRAME: u16 = 0x0001;
 /// Распарсенный EVRT-пакет.
 #[derive(Debug, Clone)]
 pub struct EvrtPacket {
-    pub packet_type:         u8,
-    pub flags:               u16,
-    pub frame_id:            u32,
-    pub packet_index:        u16,
-    pub packet_count:        u16,
+    pub packet_type: u8,
+    pub flags: u16,
+    pub frame_id: u32,
+    pub packet_index: u16,
+    pub packet_count: u16,
     pub presentation_time_us: u64,
-    pub payload:             Vec<u8>,
+    pub payload: Vec<u8>,
 }
 
 impl EvrtPacket {
@@ -103,13 +103,13 @@ pub fn parse(buf: &[u8], len: usize) -> Option<EvrtPacket> {
         return None;
     }
 
-    let packet_type          = b[5];
-    let flags                = u16::from_be_bytes([b[6], b[7]]);
-    let frame_id             = u32::from_be_bytes([b[8], b[9], b[10], b[11]]);
-    let packet_index         = u16::from_be_bytes([b[12], b[13]]);
-    let packet_count         = u16::from_be_bytes([b[14], b[15]]);
-    let presentation_time_us = u64::from_be_bytes([b[16], b[17], b[18], b[19],
-                                                    b[20], b[21], b[22], b[23]]);
+    let packet_type = b[5];
+    let flags = u16::from_be_bytes([b[6], b[7]]);
+    let frame_id = u32::from_be_bytes([b[8], b[9], b[10], b[11]]);
+    let packet_index = u16::from_be_bytes([b[12], b[13]]);
+    let packet_count = u16::from_be_bytes([b[14], b[15]]);
+    let presentation_time_us =
+        u64::from_be_bytes([b[16], b[17], b[18], b[19], b[20], b[21], b[22], b[23]]);
     let payload = b[HEADER_SIZE..].to_vec();
 
     Some(EvrtPacket {
@@ -157,7 +157,13 @@ pub fn packetize_video_frame(
     payload: &[u8],
 ) -> Vec<Vec<u8>> {
     let flags = if is_key_frame { FLAG_KEY_FRAME } else { 0 };
-    packetize(TYPE_VIDEO_FRAME, flags, frame_id, presentation_time_us, payload)
+    packetize(
+        TYPE_VIDEO_FRAME,
+        flags,
+        frame_id,
+        presentation_time_us,
+        payload,
+    )
 }
 
 /// Пакетизировать enhancement-кадр.
@@ -168,12 +174,18 @@ pub fn packetize_enhancement_frame(
     payload: &[u8],
 ) -> Vec<Vec<u8>> {
     let flags = if is_key_frame { FLAG_KEY_FRAME } else { 0 };
-    packetize(TYPE_ENHANCEMENT_FRAME, flags, frame_id, presentation_time_us, payload)
+    packetize(
+        TYPE_ENHANCEMENT_FRAME,
+        flags,
+        frame_id,
+        presentation_time_us,
+        payload,
+    )
 }
 
 /// ROI (Region of Interest) — регион изменения экрана.
 /// Хост шлёт перед видео-фреймом чтобы клиент знал какая часть изменилась.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RoiRect {
     pub frame_id: u32,
     pub x: u32,
@@ -187,23 +199,44 @@ impl RoiRect {
         format!(
             r#"{{"frameId":{},"x":{},"y":{},"w":{},"h":{}}}"#,
             self.frame_id, self.x, self.y, self.w, self.h
-        ).into_bytes()
+        )
+        .into_bytes()
     }
 
     pub fn from_json(payload: &[u8]) -> Option<Self> {
         let s = std::str::from_utf8(payload).ok()?;
         Some(Self {
             frame_id: json_u32_field(s, "frameId").unwrap_or(0),
-            x:        json_u32_field(s, "x").unwrap_or(0),
-            y:        json_u32_field(s, "y").unwrap_or(0),
-            w:        json_u32_field(s, "w").unwrap_or(0),
-            h:        json_u32_field(s, "h").unwrap_or(0),
+            x: json_u32_field(s, "x").unwrap_or(0),
+            y: json_u32_field(s, "y").unwrap_or(0),
+            w: json_u32_field(s, "w").unwrap_or(0),
+            h: json_u32_field(s, "h").unwrap_or(0),
         })
     }
 
     /// Является ли ROI полным экраном (нет ограничений)?
     pub fn is_full_screen(self) -> bool {
         self.w == 0 && self.h == 0
+    }
+
+    pub fn dirty_area_milli(self, frame_width: u32, frame_height: u32) -> u32 {
+        if self.is_full_screen() {
+            return 1_000;
+        }
+        let frame_area = u64::from(frame_width) * u64::from(frame_height);
+        if frame_area == 0 {
+            return 1_000;
+        }
+
+        let x0 = self.x.min(frame_width);
+        let y0 = self.y.min(frame_height);
+        let x1 = self.x.saturating_add(self.w).min(frame_width);
+        let y1 = self.y.saturating_add(self.h).min(frame_height);
+        let dirty_w = x1.saturating_sub(x0);
+        let dirty_h = y1.saturating_sub(y0);
+        let dirty_area = u64::from(dirty_w) * u64::from(dirty_h);
+
+        ((dirty_area * 1_000 + frame_area - 1) / frame_area).min(1_000) as u32
     }
 }
 
@@ -298,14 +331,14 @@ pub fn build_request_key_frame() -> Vec<u8> {
 /// Feedback от получателя к отправителю.
 #[derive(Debug, Clone, Default)]
 pub struct ReceiverFeedback {
-    pub pressure:         Pressure,
-    pub backlog_frames:   u32,
-    pub queue_drops:      u64,
-    pub decode_fps:       u32,
+    pub pressure: Pressure,
+    pub backlog_frames: u32,
+    pub queue_drops: u64,
+    pub decode_fps: u32,
     pub assembly_delay_ms: i32,
-    pub arrival_delta_ms:  i32,
-    pub decode_delta_ms:   i32,
-    pub present_delta_ms:  i32,
+    pub arrival_delta_ms: i32,
+    pub decode_delta_ms: i32,
+    pub present_delta_ms: i32,
     pub pulse_estimate_ms: i32,
     pub input_estimate_ms: i32,
 }
@@ -321,8 +354,8 @@ pub enum Pressure {
 impl Pressure {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Normal   => "normal",
-            Self::High     => "high",
+            Self::Normal => "normal",
+            Self::High => "high",
             Self::Critical => "critical",
         }
     }
@@ -330,8 +363,8 @@ impl Pressure {
     pub fn from_str(s: &str) -> Self {
         match s {
             "critical" => Self::Critical,
-            "high"     => Self::High,
-            _          => Self::Normal,
+            "high" => Self::High,
+            _ => Self::Normal,
         }
     }
 }
@@ -362,8 +395,8 @@ pub fn parse_control(payload: &[u8]) -> Option<ControlMessage> {
     let s = std::str::from_utf8(payload).ok()?;
     let kind = json_str_field(s, "kind")?;
     match kind.as_str() {
-        "request_key_frame"  => Some(ControlMessage::RequestKeyFrame),
-        "receiver_feedback"  => parse_feedback(s).map(ControlMessage::ReceiverFeedback),
+        "request_key_frame" => Some(ControlMessage::RequestKeyFrame),
+        "receiver_feedback" => parse_feedback(s).map(ControlMessage::ReceiverFeedback),
         _ => None,
     }
 }
@@ -379,12 +412,12 @@ pub enum ControlMessage {
 /// Конфигурация сессии, совместимая с EvertyGame SessionConfig.
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
-    pub codec:    String,
-    pub preset:   String,
-    pub width:    u32,
-    pub height:   u32,
-    pub fps:      u32,
-    pub bitrate:  u32,
+    pub codec: String,
+    pub preset: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub bitrate: u32,
     pub stream_mode: String,
     pub adaptation_mode: String,
 }
@@ -410,13 +443,13 @@ impl SessionConfig {
     pub fn from_json(payload: &[u8]) -> Option<Self> {
         let s = std::str::from_utf8(payload).ok()?;
         Some(Self {
-            codec:           json_str_field(s, "codec").unwrap_or_default(),
-            preset:          json_str_field(s, "preset").unwrap_or_default(),
-            width:           json_u32_field(s, "width").unwrap_or(1920),
-            height:          json_u32_field(s, "height").unwrap_or(1080),
-            fps:             json_u32_field(s, "fps").unwrap_or(60),
-            bitrate:         json_u32_field(s, "bitrate").unwrap_or(8_000_000),
-            stream_mode:     json_str_field(s, "streamMode").unwrap_or_else(|| "single".into()),
+            codec: json_str_field(s, "codec").unwrap_or_default(),
+            preset: json_str_field(s, "preset").unwrap_or_default(),
+            width: json_u32_field(s, "width").unwrap_or(1920),
+            height: json_u32_field(s, "height").unwrap_or(1080),
+            fps: json_u32_field(s, "fps").unwrap_or(60),
+            bitrate: json_u32_field(s, "bitrate").unwrap_or(8_000_000),
+            stream_mode: json_str_field(s, "streamMode").unwrap_or_else(|| "single".into()),
             adaptation_mode: json_str_field(s, "adaptationMode").unwrap_or_else(|| "GAME".into()),
         })
     }
@@ -447,7 +480,9 @@ fn json_u32_field(s: &str, key: &str) -> Option<u32> {
     let pos = s.find(needle.as_str())?;
     let rest = &s[pos + needle.len()..];
     let rest = rest.trim_start_matches([' ', ':', '\t']);
-    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
     rest[..end].parse().ok()
 }
 
@@ -467,22 +502,22 @@ fn json_u64_field(s: &str, key: &str) -> Option<u64> {
     let pos = s.find(needle.as_str())?;
     let rest = &s[pos + needle.len()..];
     let rest = rest.trim_start_matches([' ', ':', '\t']);
-    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
     rest[..end].parse().ok()
 }
 
 fn parse_feedback(s: &str) -> Option<ReceiverFeedback> {
     Some(ReceiverFeedback {
-        pressure:          Pressure::from_str(
-            &json_str_field(s, "pressure").unwrap_or_default(),
-        ),
-        backlog_frames:    json_u32_field(s, "backlogFrames").unwrap_or(0),
-        queue_drops:       json_u64_field(s, "queueDrops").unwrap_or(0),
-        decode_fps:        json_u32_field(s, "decodeFps").unwrap_or(0),
+        pressure: Pressure::from_str(&json_str_field(s, "pressure").unwrap_or_default()),
+        backlog_frames: json_u32_field(s, "backlogFrames").unwrap_or(0),
+        queue_drops: json_u64_field(s, "queueDrops").unwrap_or(0),
+        decode_fps: json_u32_field(s, "decodeFps").unwrap_or(0),
         assembly_delay_ms: json_i32_field(s, "assemblyDelayMs").unwrap_or(-1),
-        arrival_delta_ms:  json_i32_field(s, "arrivalDeltaMs").unwrap_or(-1),
-        decode_delta_ms:   json_i32_field(s, "decodeDeltaMs").unwrap_or(-1),
-        present_delta_ms:  json_i32_field(s, "presentDeltaMs").unwrap_or(-1),
+        arrival_delta_ms: json_i32_field(s, "arrivalDeltaMs").unwrap_or(-1),
+        decode_delta_ms: json_i32_field(s, "decodeDeltaMs").unwrap_or(-1),
+        present_delta_ms: json_i32_field(s, "presentDeltaMs").unwrap_or(-1),
         pulse_estimate_ms: json_i32_field(s, "pulseEstimateMs").unwrap_or(-1),
         input_estimate_ms: json_i32_field(s, "inputEstimateMs").unwrap_or(-1),
     })
@@ -529,21 +564,21 @@ mod tests {
 
     #[test]
     fn parse_invalid() {
-        assert!(parse(&[0u8; 10], 10).is_none());           // too short
+        assert!(parse(&[0u8; 10], 10).is_none()); // too short
         assert!(parse(&[0u8; HEADER_SIZE], HEADER_SIZE).is_none()); // wrong magic
     }
 
     #[test]
     fn feedback_roundtrip() {
         let fb = ReceiverFeedback {
-            pressure:          Pressure::Critical,
-            backlog_frames:    3,
-            queue_drops:       17,
-            decode_fps:        45,
+            pressure: Pressure::Critical,
+            backlog_frames: 3,
+            queue_drops: 17,
+            decode_fps: 45,
             assembly_delay_ms: 12,
-            arrival_delta_ms:  8,
-            decode_delta_ms:   5,
-            present_delta_ms:  3,
+            arrival_delta_ms: 8,
+            decode_delta_ms: 5,
+            present_delta_ms: 3,
             pulse_estimate_ms: 22,
             input_estimate_ms: 30,
         };
@@ -571,15 +606,39 @@ mod tests {
     }
 
     #[test]
+    fn roi_dirty_area_fullscreen_is_full_frame() {
+        let roi = RoiRect {
+            frame_id: 7,
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        };
+        assert_eq!(roi.dirty_area_milli(1920, 1080), 1_000);
+    }
+
+    #[test]
+    fn roi_dirty_area_clips_to_frame() {
+        let roi = RoiRect {
+            frame_id: 7,
+            x: 90,
+            y: 90,
+            w: 50,
+            h: 50,
+        };
+        assert_eq!(roi.dirty_area_milli(100, 100), 10);
+    }
+
+    #[test]
     fn session_config_roundtrip() {
         let cfg = SessionConfig {
-            codec:           "H264".into(),
-            preset:          "GAME".into(),
-            width:           1280,
-            height:          720,
-            fps:             60,
-            bitrate:         8_500_000,
-            stream_mode:     "single".into(),
+            codec: "H264".into(),
+            preset: "GAME".into(),
+            width: 1280,
+            height: 720,
+            fps: 60,
+            bitrate: 8_500_000,
+            stream_mode: "single".into(),
             adaptation_mode: "GAME".into(),
         };
         let json = cfg.to_json();

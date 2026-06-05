@@ -904,9 +904,7 @@ mod macos {
         }
 
         let result = match fmt {
-            K_CV_PIXEL_FORMAT_TYPE_32_BGRA => {
-                rgba_from_bgra_locked(pixel_buffer, width, height)
-            }
+            K_CV_PIXEL_FORMAT_TYPE_32_BGRA => rgba_from_bgra_locked(pixel_buffer, width, height),
             K_CV_PIXEL_FORMAT_420V | K_CV_PIXEL_FORMAT_420F => {
                 rgba_from_nv12_locked(pixel_buffer, width, height)
             }
@@ -974,7 +972,9 @@ mod macos {
         let uv_plane = slice::from_raw_parts(uv_ptr, uv_len);
 
         let mut rgba = Vec::with_capacity(width * height * 4);
-        crate::colorconv::nv12_to_rgba(&mut rgba, width, height, y_plane, uv_plane, y_stride, uv_stride);
+        crate::colorconv::nv12_to_rgba(
+            &mut rgba, width, height, y_plane, uv_plane, y_stride, uv_stride,
+        );
         Some((width, height, rgba))
     }
 
@@ -1294,9 +1294,13 @@ mod fallback {
             false
         }
 
-        pub fn current_bitrate(&self) -> u32 { 0 }
+        pub fn current_bitrate(&self) -> u32 {
+            0
+        }
 
-        pub fn update_bitrate(&mut self, _new_bitrate: u32) -> bool { false }
+        pub fn update_bitrate(&mut self, _new_bitrate: u32) -> bool {
+            false
+        }
 
         pub fn encode_bgra(
             &mut self,

@@ -73,20 +73,20 @@ impl FsrQuality {
     pub fn scale_factor(self) -> f32 {
         match self {
             Self::UltraQuality => 1.3,
-            Self::Quality      => 1.5,
-            Self::Balanced     => 1.7,
-            Self::Performance  => 2.0,
-            Self::Native       => 1.0,
+            Self::Quality => 1.5,
+            Self::Balanced => 1.7,
+            Self::Performance => 2.0,
+            Self::Native => 1.0,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Self::UltraQuality => "Ultra Quality (1.3×)",
-            Self::Quality      => "Quality (1.5×)",
-            Self::Balanced     => "Balanced (1.7×)",
-            Self::Performance  => "Performance (2×)",
-            Self::Native       => "Native (RCAS only)",
+            Self::Quality => "Quality (1.5×)",
+            Self::Balanced => "Balanced (1.7×)",
+            Self::Performance => "Performance (2×)",
+            Self::Native => "Native (RCAS only)",
         }
     }
 }
@@ -164,7 +164,13 @@ impl FsrAdapter {
 
             // RCAS: обострение после апскейла
             self.rcas_buf.resize(out_len, 0);
-            rcas_bgra(&self.easu_buf, dst_w, dst_h, &mut self.rcas_buf, self.config.sharpness);
+            rcas_bgra(
+                &self.easu_buf,
+                dst_w,
+                dst_h,
+                &mut self.rcas_buf,
+                self.config.sharpness,
+            );
         }
 
         &self.rcas_buf
@@ -227,14 +233,7 @@ pub fn input_resolution(quality: FsrQuality, out_w: u32, out_h: u32) -> (u32, u3
 //  5. Смешиваем.
 
 /// Апскейл BGRA-изображения с помощью FSR EASU (однопоточно).
-pub fn easu_bgra(
-    src: &[u8],
-    src_w: u32,
-    src_h: u32,
-    dst: &mut [u8],
-    dst_w: u32,
-    dst_h: u32,
-) {
+pub fn easu_bgra(src: &[u8], src_w: u32, src_h: u32, dst: &mut [u8], dst_w: u32, dst_h: u32) {
     let sw = src_w as f32;
     let sh = src_h as f32;
     let dw = dst_w as f32;
@@ -248,10 +247,10 @@ pub fn easu_bgra(
         for dx in 0..dst_w {
             let pixel = easu_pixel(src, src_w, src_h, dx, dy, scale_x, scale_y, sw, sh);
             let idx = ((dy * dst_w + dx) * 4) as usize;
-            dst[idx]     = pixel[0]; // B
+            dst[idx] = pixel[0]; // B
             dst[idx + 1] = pixel[1]; // G
             dst[idx + 2] = pixel[2]; // R
-            dst[idx + 3] = 255;      // A
+            dst[idx + 3] = 255; // A
         }
     }
 }
@@ -278,13 +277,9 @@ pub fn easu_bgra_parallel(
         .enumerate()
         .for_each(|(dy, row)| {
             for dx in 0..dst_w {
-                let pixel = easu_pixel(
-                    src, src_w, src_h,
-                    dx, dy as u32,
-                    scale_x, scale_y, sw, sh,
-                );
+                let pixel = easu_pixel(src, src_w, src_h, dx, dy as u32, scale_x, scale_y, sw, sh);
                 let idx = (dx * 4) as usize;
-                row[idx]     = pixel[0];
+                row[idx] = pixel[0];
                 row[idx + 1] = pixel[1];
                 row[idx + 2] = pixel[2];
                 row[idx + 3] = 255;
@@ -315,7 +310,7 @@ fn easu_pixel(
     // Целая и дробная часть
     let ix = src_x.floor() as i32;
     let iy = src_y.floor() as i32;
-    let fx = src_x - ix as f32;   // [0, 1)
+    let fx = src_x - ix as f32; // [0, 1)
     let fy = src_y - iy as f32;
 
     // ── 3×3 сэмплы для анализа градиента ──────────────────────────────────────
@@ -323,13 +318,13 @@ fn easu_pixel(
     //  p01 p11 p21
     //  p02 p12 p22
     let p00 = sample_luma(src, src_w, src_h, ix - 1, iy - 1);
-    let p10 = sample_luma(src, src_w, src_h, ix,     iy - 1);
+    let p10 = sample_luma(src, src_w, src_h, ix, iy - 1);
     let p20 = sample_luma(src, src_w, src_h, ix + 1, iy - 1);
     let p01 = sample_luma(src, src_w, src_h, ix - 1, iy);
-    let _p11 = sample_luma(src, src_w, src_h, ix,    iy);      // центр — для Sobel не нужен
+    let _p11 = sample_luma(src, src_w, src_h, ix, iy); // центр — для Sobel не нужен
     let p21 = sample_luma(src, src_w, src_h, ix + 1, iy);
     let p02 = sample_luma(src, src_w, src_h, ix - 1, iy + 1);
-    let p12 = sample_luma(src, src_w, src_h, ix,     iy + 1);
+    let p12 = sample_luma(src, src_w, src_h, ix, iy + 1);
     let p22 = sample_luma(src, src_w, src_h, ix + 1, iy + 1);
 
     // ── Оценка направления края (Sobel) ───────────────────────────────────────
@@ -414,13 +409,7 @@ fn catmull_rom_weights(t: f32) -> [f32; 4] {
 //  4. Unsharp-mask с адаптивным весом.
 
 /// Проход RCAS по BGRA-изображению (однопоточно).
-pub fn rcas_bgra(
-    src: &[u8],
-    w: u32,
-    h: u32,
-    dst: &mut [u8],
-    sharpness: f32,
-) {
+pub fn rcas_bgra(src: &[u8], w: u32, h: u32, dst: &mut [u8], sharpness: f32) {
     // sharpness: 0.0 = максимум, 1.0 = выключено
     // con = -sharpness / (1 - sharpness)... упрощаем до линейного коэффициента
     let sharpness = sharpness.clamp(0.0, 1.0);
@@ -429,7 +418,7 @@ pub fn rcas_bgra(
         for x in 0..w {
             let pixel = rcas_pixel(src, w, h, x, y, sharpness);
             let idx = ((y * w + x) * 4) as usize;
-            dst[idx]     = pixel[0]; // B
+            dst[idx] = pixel[0]; // B
             dst[idx + 1] = pixel[1]; // G
             dst[idx + 2] = pixel[2]; // R
             dst[idx + 3] = 255;
@@ -438,13 +427,7 @@ pub fn rcas_bgra(
 }
 
 #[cfg(feature = "fsr-parallel")]
-pub fn rcas_bgra_parallel(
-    src: &[u8],
-    w: u32,
-    h: u32,
-    dst: &mut [u8],
-    sharpness: f32,
-) {
+pub fn rcas_bgra_parallel(src: &[u8], w: u32, h: u32, dst: &mut [u8], sharpness: f32) {
     use rayon::prelude::*;
     let sharpness = sharpness.clamp(0.0, 1.0);
 
@@ -454,7 +437,7 @@ pub fn rcas_bgra_parallel(
             for x in 0..w {
                 let pixel = rcas_pixel(src, w, h, x, y as u32, sharpness);
                 let idx = (x * 4) as usize;
-                row[idx]     = pixel[0];
+                row[idx] = pixel[0];
                 row[idx + 1] = pixel[1];
                 row[idx + 2] = pixel[2];
                 row[idx + 3] = 255;
@@ -471,11 +454,11 @@ fn rcas_pixel(src: &[u8], w: u32, h: u32, x: u32, y: u32, sharpness: f32) -> [u8
     let iy = y as i32;
 
     // 5-тапный крест
-    let [bc, gc, rc] = sample_bgr(src, w, h, ix,     iy);
+    let [bc, gc, rc] = sample_bgr(src, w, h, ix, iy);
     let [bl, gl, rl] = sample_bgr(src, w, h, ix - 1, iy);
     let [br, gr, rr] = sample_bgr(src, w, h, ix + 1, iy);
-    let [bu, gu, ru] = sample_bgr(src, w, h, ix,     iy - 1);
-    let [bd, gd, rd] = sample_bgr(src, w, h, ix,     iy + 1);
+    let [bu, gu, ru] = sample_bgr(src, w, h, ix, iy - 1);
+    let [bd, gd, rd] = sample_bgr(src, w, h, ix, iy + 1);
 
     // ── Яркость каждого тапа (Rec.709) ────────────────────────────────────────
     let lc = luma(rc, gc, bc);
@@ -520,11 +503,7 @@ fn sample_bgr(src: &[u8], w: u32, h: u32, x: i32, y: i32) -> [f32; 3] {
     let cx = x.clamp(0, (w as i32) - 1) as u32;
     let cy = y.clamp(0, (h as i32) - 1) as u32;
     let idx = ((cy * w + cx) * 4) as usize;
-    [
-        src[idx]     as f32,
-        src[idx + 1] as f32,
-        src[idx + 2] as f32,
-    ]
+    [src[idx] as f32, src[idx + 1] as f32, src[idx + 2] as f32]
 }
 
 /// Яркость пикселя BGRA (Rec.709).
@@ -585,15 +564,15 @@ pub fn process_frame_with_telemetry(
 ) -> Vec<u8> {
     use std::time::Instant;
 
-    telemetry.enabled   = true;
-    telemetry.quality   = adapter.config.quality.label().to_owned();
-    telemetry.input_w   = src_w;
-    telemetry.input_h   = src_h;
-    telemetry.output_w  = dst_w;
-    telemetry.output_h  = dst_h;
+    telemetry.enabled = true;
+    telemetry.quality = adapter.config.quality.label().to_owned();
+    telemetry.input_w = src_w;
+    telemetry.input_h = src_h;
+    telemetry.output_w = dst_w;
+    telemetry.output_h = dst_h;
 
-    let is_native = adapter.config.quality == FsrQuality::Native
-        || (src_w == dst_w && src_h == dst_h);
+    let is_native =
+        adapter.config.quality == FsrQuality::Native || (src_w == dst_w && src_h == dst_h);
 
     let out_len = (dst_w * dst_h * 4) as usize;
 
@@ -610,7 +589,13 @@ pub fn process_frame_with_telemetry(
     // RCAS
     let mut rcas_buf = vec![0u8; out_len];
     let t1 = Instant::now();
-    rcas_bgra(&easu_buf, dst_w, dst_h, &mut rcas_buf, adapter.config.sharpness);
+    rcas_bgra(
+        &easu_buf,
+        dst_w,
+        dst_h,
+        &mut rcas_buf,
+        adapter.config.sharpness,
+    );
     telemetry.rcas_ms = t1.elapsed().as_millis() as u64;
 
     rcas_buf
@@ -640,9 +625,9 @@ pub mod gpu {
                     ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D,
                     ID3D11UnorderedAccessView, D3D11_BIND_SHADER_RESOURCE,
                     D3D11_BIND_UNORDERED_ACCESS, D3D11_BUFFER_DESC, D3D11_CPU_ACCESS_READ,
-                    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SUBRESOURCE_DATA,
-                    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
-                    D3D11_CREATE_DEVICE_FLAG,
+                    D3D11_CREATE_DEVICE_FLAG, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
+                    D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+                    D3D11_USAGE_STAGING,
                 },
                 Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC},
             },
@@ -785,13 +770,13 @@ void RcasCS(uint3 tid : SV_DispatchThreadID) {
 
     /// D3D11-контекст FSR.
     pub struct FsrGpu {
-        device:       ID3D11Device,
-        ctx:          ID3D11DeviceContext,
-        easu_shader:  ID3D11ComputeShader,
-        rcas_shader:  ID3D11ComputeShader,
-        param_buf:    ID3D11Buffer,
-        easu_tex:     Option<(ID3D11Texture2D, ID3D11UnorderedAccessView, u32, u32)>,
-        staging_tex:  Option<(ID3D11Texture2D, u32, u32)>,
+        device: ID3D11Device,
+        ctx: ID3D11DeviceContext,
+        easu_shader: ID3D11ComputeShader,
+        rcas_shader: ID3D11ComputeShader,
+        param_buf: ID3D11Buffer,
+        easu_tex: Option<(ID3D11Texture2D, ID3D11UnorderedAccessView, u32, u32)>,
+        staging_tex: Option<(ID3D11Texture2D, u32, u32)>,
     }
 
     impl FsrGpu {
@@ -800,8 +785,8 @@ void RcasCS(uint3 tid : SV_DispatchThreadID) {
             use windows::Win32::Graphics::Direct3D11::D3D11_SDK_VERSION;
 
             let mut device = None;
-            let mut ctx    = None;
-            let mut level  = D3D_FEATURE_LEVEL_11_0;
+            let mut ctx = None;
+            let mut level = D3D_FEATURE_LEVEL_11_0;
 
             unsafe {
                 D3D11CreateDevice(
@@ -818,17 +803,19 @@ void RcasCS(uint3 tid : SV_DispatchThreadID) {
             }
 
             let device: ID3D11Device = device.unwrap();
-            let ctx:    ID3D11DeviceContext = ctx.unwrap();
+            let ctx: ID3D11DeviceContext = ctx.unwrap();
 
             let easu_shader = compile_cs(&device, EASU_HLSL, "EasuCS")?;
             let rcas_shader = compile_cs(&device, RCAS_HLSL, "RcasCS")?;
-            let param_buf   = create_const_buf(&device, 32)?;
+            let param_buf = create_const_buf(&device, 32)?;
 
             Ok(Self {
-                device, ctx,
-                easu_shader, rcas_shader,
+                device,
+                ctx,
+                easu_shader,
+                rcas_shader,
                 param_buf,
-                easu_tex:    None,
+                easu_tex: None,
                 staging_tex: None,
             })
         }
@@ -838,59 +825,65 @@ void RcasCS(uint3 tid : SV_DispatchThreadID) {
         pub fn process(
             &mut self,
             src_bgra: &[u8],
-            src_w: u32, src_h: u32,
-            dst_w: u32, dst_h: u32,
+            src_w: u32,
+            src_h: u32,
+            dst_w: u32,
+            dst_h: u32,
             sharpness: f32,
         ) -> WResult<Vec<u8>> {
             unsafe {
                 // Обновить параметры
                 let params: [f32; 8] = [
-                    src_w as f32, src_h as f32,
-                    dst_w as f32, dst_h as f32,
+                    src_w as f32,
+                    src_h as f32,
+                    dst_w as f32,
+                    dst_h as f32,
                     src_w as f32 / dst_w as f32,
                     src_h as f32 / dst_h as f32,
-                    sharpness, 0.0,
+                    sharpness,
+                    0.0,
                 ];
                 update_const_buf(&self.ctx, &self.param_buf, &params);
 
                 // Входная текстура SRV
-                let src_tex = create_texture_srv(
-                    &self.device, src_bgra, src_w, src_h,
-                )?;
+                let src_tex = create_texture_srv(&self.device, src_bgra, src_w, src_h)?;
 
                 // EASU output UAV (dst_w × dst_h)
-                let easu_out = ensure_uav(
-                    &mut self.easu_tex,
-                    &self.device, dst_w, dst_h,
-                )?;
+                let easu_out = ensure_uav(&mut self.easu_tex, &self.device, dst_w, dst_h)?;
 
                 // ── EASU dispatch ──────────────────────────────────────────
                 self.ctx.CSSetShader(&self.easu_shader, None);
-                self.ctx.CSSetConstantBuffers(0, Some(&[Some(self.param_buf.clone())]));
-                self.ctx.CSSetShaderResources(0, Some(&[Some(src_tex.1.clone())]));
-                self.ctx.CSSetUnorderedAccessViews(0, Some(&[Some(easu_out.clone())]), None);
-                self.ctx.Dispatch(
-                    (dst_w + 7) / 8,
-                    (dst_h + 7) / 8,
-                    1,
-                );
+                self.ctx
+                    .CSSetConstantBuffers(0, Some(&[Some(self.param_buf.clone())]));
+                self.ctx
+                    .CSSetShaderResources(0, Some(&[Some(src_tex.1.clone())]));
+                self.ctx
+                    .CSSetUnorderedAccessViews(0, Some(&[Some(easu_out.clone())]), None);
+                self.ctx.Dispatch((dst_w + 7) / 8, (dst_h + 7) / 8, 1);
                 self.ctx.CSSetUnorderedAccessViews(0, Some(&[None]), None);
                 self.ctx.CSSetShaderResources(0, Some(&[None]));
 
                 // Промежуточный: EASU-output как SRV для RCAS
-                let easu_srv = create_srv_for_uav_tex(&self.device, &self.easu_tex.as_ref().unwrap().0)?;
+                let easu_srv =
+                    create_srv_for_uav_tex(&self.device, &self.easu_tex.as_ref().unwrap().0)?;
 
                 // RCAS — пишем обратно в staging
                 let staging = ensure_staging(&mut self.staging_tex, &self.device, dst_w, dst_h)?;
 
                 // Для RCAS нам нужен отдельный UAV (переиспользуем easu_tex, тут не совпадает —
                 // используем временную текстуру)
-                let mut tmp_uav_holder: Option<(ID3D11Texture2D, ID3D11UnorderedAccessView, u32, u32)> = None;
+                let mut tmp_uav_holder: Option<(
+                    ID3D11Texture2D,
+                    ID3D11UnorderedAccessView,
+                    u32,
+                    u32,
+                )> = None;
                 let rcas_uav = ensure_uav(&mut tmp_uav_holder, &self.device, dst_w, dst_h)?;
 
                 self.ctx.CSSetShader(&self.rcas_shader, None);
                 self.ctx.CSSetShaderResources(0, Some(&[Some(easu_srv)]));
-                self.ctx.CSSetUnorderedAccessViews(0, Some(&[Some(rcas_uav)]), None);
+                self.ctx
+                    .CSSetUnorderedAccessViews(0, Some(&[Some(rcas_uav)]), None);
                 self.ctx.Dispatch((dst_w + 7) / 8, (dst_h + 7) / 8, 1);
                 self.ctx.CSSetUnorderedAccessViews(0, Some(&[None]), None);
                 self.ctx.CSSetShaderResources(0, Some(&[None]));
@@ -900,15 +893,17 @@ void RcasCS(uint3 tid : SV_DispatchThreadID) {
                 self.ctx.CopyResource(staging, rcas_tex);
 
                 let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                self.ctx.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+                self.ctx
+                    .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
 
-                let row_pitch  = mapped.RowPitch as usize;
+                let row_pitch = mapped.RowPitch as usize;
                 let pixel_size = (dst_w * 4) as usize;
-                let mut out    = vec![0u8; (dst_w * dst_h * 4) as usize];
+                let mut out = vec![0u8; (dst_w * dst_h * 4) as usize];
 
                 let src_ptr = mapped.pData as *const u8;
                 for row in 0..dst_h as usize {
-                    let src_row = std::slice::from_raw_parts(src_ptr.add(row * row_pitch), pixel_size);
+                    let src_row =
+                        std::slice::from_raw_parts(src_ptr.add(row * row_pitch), pixel_size);
                     let dst_row = &mut out[row * pixel_size..(row + 1) * pixel_size];
                     dst_row.copy_from_slice(src_row);
                 }
@@ -922,15 +917,11 @@ void RcasCS(uint3 tid : SV_DispatchThreadID) {
 
     // ── D3D11 helpers ──────────────────────────────────────────────────────────
 
-    fn compile_cs(
-        device: &ID3D11Device,
-        hlsl: &str,
-        entry: &str,
-    ) -> WResult<ID3D11ComputeShader> {
-        use windows::Win32::Graphics::Direct3D::Fxc::{D3DCompile, D3DCOMPILE_OPTIMIZATION_LEVEL3};
+    fn compile_cs(device: &ID3D11Device, hlsl: &str, entry: &str) -> WResult<ID3D11ComputeShader> {
         use windows::core::PCSTR;
+        use windows::Win32::Graphics::Direct3D::Fxc::{D3DCompile, D3DCOMPILE_OPTIMIZATION_LEVEL3};
 
-        let mut blob   = None;
+        let mut blob = None;
         let mut errors = None;
 
         let src_bytes = hlsl.as_bytes();
@@ -962,9 +953,9 @@ void RcasCS(uint3 tid : SV_DispatchThreadID) {
 
     fn create_const_buf(device: &ID3D11Device, bytes: u32) -> WResult<ID3D11Buffer> {
         let desc = D3D11_BUFFER_DESC {
-            ByteWidth:      (bytes + 15) & !15, // 16-байт выравнивание
-            Usage:          windows::Win32::Graphics::Direct3D11::D3D11_USAGE_DYNAMIC,
-            BindFlags:      windows::Win32::Graphics::Direct3D11::D3D11_BIND_CONSTANT_BUFFER.0,
+            ByteWidth: (bytes + 15) & !15, // 16-байт выравнивание
+            Usage: windows::Win32::Graphics::Direct3D11::D3D11_USAGE_DYNAMIC,
+            BindFlags: windows::Win32::Graphics::Direct3D11::D3D11_BIND_CONSTANT_BUFFER.0,
             CPUAccessFlags: windows::Win32::Graphics::Direct3D11::D3D11_CPU_ACCESS_WRITE.0,
             ..Default::default()
         };
@@ -974,9 +965,10 @@ void RcasCS(uint3 tid : SV_DispatchThreadID) {
     }
 
     unsafe fn update_const_buf(ctx: &ID3D11DeviceContext, buf: &ID3D11Buffer, data: &[f32]) {
-        use windows::Win32::Graphics::Direct3D11::{D3D11_MAP_WRITE_DISCARD};
+        use windows::Win32::Graphics::Direct3D11::D3D11_MAP_WRITE_DISCARD;
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        ctx.Map(buf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped)).ok();
+        ctx.Map(buf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))
+            .ok();
         let dst = std::slice::from_raw_parts_mut(mapped.pData as *mut f32, data.len());
         dst.copy_from_slice(data);
         ctx.Unmap(buf, 0);
@@ -985,13 +977,19 @@ void RcasCS(uint3 tid : SV_DispatchThreadID) {
     fn create_texture_srv(
         device: &ID3D11Device,
         data: &[u8],
-        w: u32, h: u32,
+        w: u32,
+        h: u32,
     ) -> WResult<(ID3D11Texture2D, ID3D11ShaderResourceView)> {
         let desc = D3D11_TEXTURE2D_DESC {
-            Width: w, Height: h,
-            MipLevels: 1, ArraySize: 1,
+            Width: w,
+            Height: h,
+            MipLevels: 1,
+            ArraySize: 1,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: D3D11_BIND_SHADER_RESOURCE.0,
             ..Default::default()
@@ -1012,14 +1010,24 @@ void RcasCS(uint3 tid : SV_DispatchThreadID) {
     fn ensure_uav<'a>(
         holder: &'a mut Option<(ID3D11Texture2D, ID3D11UnorderedAccessView, u32, u32)>,
         device: &ID3D11Device,
-        w: u32, h: u32,
+        w: u32,
+        h: u32,
     ) -> WResult<&'a ID3D11UnorderedAccessView> {
-        if holder.as_ref().map(|h| h.2 != w || h.3 != h.3).unwrap_or(true) {
+        if holder
+            .as_ref()
+            .map(|h| h.2 != w || h.3 != h.3)
+            .unwrap_or(true)
+        {
             let desc = D3D11_TEXTURE2D_DESC {
-                Width: w, Height: h,
-                MipLevels: 1, ArraySize: 1,
+                Width: w,
+                Height: h,
+                MipLevels: 1,
+                ArraySize: 1,
                 Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Usage: D3D11_USAGE_DEFAULT,
                 BindFlags: D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_UNORDERED_ACCESS.0,
                 ..Default::default()
@@ -1046,14 +1054,24 @@ void RcasCS(uint3 tid : SV_DispatchThreadID) {
     fn ensure_staging<'a>(
         holder: &'a mut Option<(ID3D11Texture2D, u32, u32)>,
         device: &ID3D11Device,
-        w: u32, h: u32,
+        w: u32,
+        h: u32,
     ) -> WResult<&'a ID3D11Texture2D> {
-        if holder.as_ref().map(|h| h.1 != w || h.2 != h).unwrap_or(true) {
+        if holder
+            .as_ref()
+            .map(|h| h.1 != w || h.2 != h)
+            .unwrap_or(true)
+        {
             let desc = D3D11_TEXTURE2D_DESC {
-                Width: w, Height: h,
-                MipLevels: 1, ArraySize: 1,
+                Width: w,
+                Height: h,
+                MipLevels: 1,
+                ArraySize: 1,
                 Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Usage: D3D11_USAGE_STAGING,
                 CPUAccessFlags: D3D11_CPU_ACCESS_READ.0,
                 ..Default::default()
@@ -1075,8 +1093,9 @@ mod tests {
     /// Дымовой тест: API не паникует на минимальных данных.
     #[test]
     fn test_easu_smoke() {
-        let src = vec![100u8, 150, 200, 255, 80, 120, 160, 255,
-                       90,  130, 170, 255, 60, 100, 140, 255];
+        let src = vec![
+            100u8, 150, 200, 255, 80, 120, 160, 255, 90, 130, 170, 255, 60, 100, 140, 255,
+        ];
         let mut dst = vec![0u8; 4 * 4 * 4]; // 4×4
         easu_bgra(&src, 2, 2, &mut dst, 4, 4);
         assert_eq!(dst.len(), 64);
@@ -1092,9 +1111,17 @@ mod tests {
         let mut dst = vec![0u8; src.len()];
         rcas_bgra(&src, 4, 4, &mut dst, 0.875);
         for i in (0..dst.len()).step_by(4) {
-            assert!((dst[i]   as i32 - 128).abs() <= 2, "B[{i}] = {}", dst[i]);
-            assert!((dst[i+1] as i32 - 128).abs() <= 2, "G[{i}] = {}", dst[i+1]);
-            assert!((dst[i+2] as i32 - 128).abs() <= 2, "R[{i}] = {}", dst[i+2]);
+            assert!((dst[i] as i32 - 128).abs() <= 2, "B[{i}] = {}", dst[i]);
+            assert!(
+                (dst[i + 1] as i32 - 128).abs() <= 2,
+                "G[{i}] = {}",
+                dst[i + 1]
+            );
+            assert!(
+                (dst[i + 2] as i32 - 128).abs() <= 2,
+                "R[{i}] = {}",
+                dst[i + 2]
+            );
         }
     }
 
@@ -1141,9 +1168,7 @@ mod tests {
         let (iw, ih) = adapter.input_size(1280, 720);
         let src = vec![200u8; (iw * ih * 4) as usize];
         let mut tele = FsrTelemetry::default();
-        let out = process_frame_with_telemetry(
-            &mut adapter, &src, iw, ih, 1280, 720, &mut tele,
-        );
+        let out = process_frame_with_telemetry(&mut adapter, &src, iw, ih, 1280, 720, &mut tele);
         assert!(tele.enabled);
         assert_eq!(out.len(), 1280 * 720 * 4);
         println!("{}", tele.summary());

@@ -72,9 +72,9 @@ fn bgra_to_i420_fast(
     // Process two rows per outer iteration so chroma only needs one pass.
     for row_pair in 0..(h / 2) {
         let by = row_pair * 2;
-        let src0 = by * w * 4;         // start of even row in bgra
-        let src1 = (by + 1) * w * 4;  // start of odd row
-        let y0 = by * w;               // start of even row in y_plane
+        let src0 = by * w * 4; // start of even row in bgra
+        let src1 = (by + 1) * w * 4; // start of odd row
+        let y0 = by * w; // start of even row in y_plane
         let y1 = (by + 1) * w;
         let uv_row = row_pair * (w / 2);
 
@@ -91,9 +91,9 @@ fn bgra_to_i420_fast(
             let (b10, g10, r10) = unsafe { px(bgra, s10) };
             let (b11, g11, r11) = unsafe { px(bgra, s11) };
 
-            y_plane[y0 + bx]     = y_bt601(r00, g00, b00);
+            y_plane[y0 + bx] = y_bt601(r00, g00, b00);
             y_plane[y0 + bx + 1] = y_bt601(r01, g01, b01);
-            y_plane[y1 + bx]     = y_bt601(r10, g10, b10);
+            y_plane[y1 + bx] = y_bt601(r10, g10, b10);
             y_plane[y1 + bx + 1] = y_bt601(r11, g11, b11);
 
             // Average 2×2 block for chroma.
@@ -140,8 +140,10 @@ fn bgra_to_i420_padded(
                     b_sum += b;
                 }
             }
-            u_plane[uv_row + col_pair] = u_bt601((r_sum + 2) >> 2, (g_sum + 2) >> 2, (b_sum + 2) >> 2);
-            v_plane[uv_row + col_pair] = v_bt601((r_sum + 2) >> 2, (g_sum + 2) >> 2, (b_sum + 2) >> 2);
+            u_plane[uv_row + col_pair] =
+                u_bt601((r_sum + 2) >> 2, (g_sum + 2) >> 2, (b_sum + 2) >> 2);
+            v_plane[uv_row + col_pair] =
+                v_bt601((r_sum + 2) >> 2, (g_sum + 2) >> 2, (b_sum + 2) >> 2);
         }
     }
 }
@@ -176,13 +178,7 @@ pub fn bgra_to_nv12(
 }
 
 #[inline]
-fn bgra_to_nv12_fast(
-    y_plane: &mut [u8],
-    uv_plane: &mut [u8],
-    w: usize,
-    h: usize,
-    bgra: &[u8],
-) {
+fn bgra_to_nv12_fast(y_plane: &mut [u8], uv_plane: &mut [u8], w: usize, h: usize, bgra: &[u8]) {
     for row_pair in 0..(h / 2) {
         let by = row_pair * 2;
         let src0 = by * w * 4;
@@ -203,16 +199,16 @@ fn bgra_to_nv12_fast(
             let (b10, g10, r10) = unsafe { px(bgra, s10) };
             let (b11, g11, r11) = unsafe { px(bgra, s11) };
 
-            y_plane[y0 + bx]     = y_bt601(r00, g00, b00);
+            y_plane[y0 + bx] = y_bt601(r00, g00, b00);
             y_plane[y0 + bx + 1] = y_bt601(r01, g01, b01);
-            y_plane[y1 + bx]     = y_bt601(r10, g10, b10);
+            y_plane[y1 + bx] = y_bt601(r10, g10, b10);
             y_plane[y1 + bx + 1] = y_bt601(r11, g11, b11);
 
             let r = (r00 + r01 + r10 + r11 + 2) >> 2;
             let g = (g00 + g01 + g10 + g11 + 2) >> 2;
             let b = (b00 + b01 + b10 + b11 + 2) >> 2;
             let uv = uv_off + bx;
-            uv_plane[uv]     = u_bt601(r, g, b); // Cb
+            uv_plane[uv] = u_bt601(r, g, b); // Cb
             uv_plane[uv + 1] = v_bt601(r, g, b); // Cr
         }
     }
@@ -252,7 +248,7 @@ fn bgra_to_nv12_padded(
                 }
             }
             let uv = uv_off + bx;
-            out[uv]     = u_bt601((r_sum + 2) >> 2, (g_sum + 2) >> 2, (b_sum + 2) >> 2);
+            out[uv] = u_bt601((r_sum + 2) >> 2, (g_sum + 2) >> 2, (b_sum + 2) >> 2);
             out[uv + 1] = v_bt601((r_sum + 2) >> 2, (g_sum + 2) >> 2, (b_sum + 2) >> 2);
         }
     }
@@ -318,7 +314,7 @@ pub fn nv12_to_rgba(
             let b = (y + (1815 * cb >> 10)).clamp(0, 255) as u8;
 
             let px = out_row + col * 4;
-            rgba[px]     = r;
+            rgba[px] = r;
             rgba[px + 1] = g;
             rgba[px + 2] = b;
             rgba[px + 3] = 255;

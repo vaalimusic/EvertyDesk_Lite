@@ -110,7 +110,7 @@ netsh advfirewall firewall add rule name="EvertyDesk-EVRT-UDP" `
 - [ ] На хосте играет звук → в логах `EVRT: WASAPI loopback старт`
 - [ ] На клиенте `EVRT Audio: 48000Hz 2ch 16bit` + `WASAPI playback инициализирован`
 - [ ] Звук слышен на клиенте, синхронен с видео
-- [ ] При потере пакетов — нет фатальных крэшей (щелчки допустимы, jitter-буфер аудио ещё не сделан)
+- [ ] При потере пакетов — нет фатальных крэшей, jitter-буфер сглаживает мелкий UDP jitter
 
 ### 4.5. Статичные кадры (экономия трафика)
 - [ ] Оставить статичный экран → в телеметрии pipeline `skipped_static` растёт
@@ -184,10 +184,10 @@ netsh advfirewall firewall add rule name="EvertyDesk-EVRT-UDP" `
 | # | Проблема | Влияние | Где |
 |---|----------|---------|-----|
 | 1 | NVENC zero-copy не подключён end-to-end | latency не оптимальна на NVIDIA | shim+capture |
-| 2 | Аудио без jitter-буфера | щелчки при потере пакетов | `evrt_audio.rs` |
-| 3 | ROI всегда full-screen (w=0,h=0) | нет оптимизации грязных регионов | `evrt_session.rs` |
+| 2 | Аудио jitter-буфер требует живой проверки | возможны щелчки при сильной потере пакетов | `evrt_audio.rs` |
+| 3 | ROI/EVRT feedback bitrate требует живой проверки | используется как telemetry/metadata + bitrate policy, не region encode | `host.rs`, `video_pipeline.rs`, `evrt_session.rs`, `frame_queue.rs` |
 | 4 | Enhancement stream не реализован | только base layer | `evrt.rs` (есть константы) |
-| 5 | 29 warnings (dead-code telemetry от старого video_loop) | косметика | `host.rs` |
+| 5 | 17 warnings (dead-code/orphaned telemetry от старого video_loop) | косметика | `host.rs`, `video_pipeline.rs` |
 | 6 | `transport::login_request_uses_32_byte_password_hash` тест падал ДО нас | не наша регрессия | `transport.rs` |
 | 7 | Ничего не тестировано на Windows | **главный риск** | весь EVRT-стек |
 
@@ -198,7 +198,7 @@ netsh advfirewall firewall add rule name="EvertyDesk-EVRT-UDP" `
 ```powershell
 cargo build --release                          # базовая сборка
 cargo build --release --features live-nvenc-sdk # с NVENC
-cargo test                                      # 61 тест (1 предсуществующий падёж)
+cargo test                                      # 78 тестов
 cargo test evrt                                 # только EVRT-тесты
 cargo check 2>&1 | Select-String "warning"      # посмотреть warnings
 ```
