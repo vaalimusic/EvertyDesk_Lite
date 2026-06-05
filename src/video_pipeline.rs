@@ -427,7 +427,17 @@ fn encode_loop(
         let relief_milli = bitrate_scale_milli
             .load(Ordering::Relaxed)
             .clamp(MIN_BITRATE_SCALE_MILLI, 1_000);
-        let eff_bps = adapt_bitrate(base_bps, decision.roi, enc_w, enc_h, want_idr, relief_milli);
+        let mut eff_bps = adapt_bitrate(base_bps, decision.roi, enc_w, enc_h, want_idr, relief_milli);
+
+        // ★ Cap битрейта под транспорт.
+        //   EVRT активен (прямой UDP по LAN) → полный битрейт, сеть быстрая.
+        //   EVRT НЕ активен (TCP relay) → relay тянет ~5-8 Мбит/с, выше — захлёб.
+        //   RustDesk целится в 3-6 Мбит/с на relay; делаем так же.
+        let evrt_on = evrt_active.lock().map(|g| g.is_some()).unwrap_or(false);
+        if !evrt_on {
+            const RELAY_MAX_BPS: u32 = 5_000_000; // безопасно для hbbr relay
+            eff_bps = eff_bps.min(RELAY_MAX_BPS);
+        }
 
         // ── Кодирование через единый каскад ───────────────────────────────────
         let encode_started = Instant::now();
@@ -480,8 +490,7 @@ fn encode_loop(
         // ── Dispatch ──────────────────────────────────────────────────────────
         // EVRT активен: все кадры → EVRT, только IDR → TCP (синхронизация)
         // EVRT не активен: все кадры → TCP
-        let evrt_on = evrt_active.lock().map(|g| g.is_some()).unwrap_or(false);
-
+        // (evrt_on уже вычислен выше для cap битрейта)
         if evrt_on {
             // EVRT primary: все кадры → EVRT, IDR → TCP для синхронизации
             match evrt_tx.try_send(frame.clone()) {
