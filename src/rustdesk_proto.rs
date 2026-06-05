@@ -36,8 +36,14 @@ pub struct PunchHoleResponse {
     pub relay_server: String,
     #[prost(string, tag = "7")]
     pub other_failure: String,
-    #[prost(int32, tag = "9")]
+    #[prost(int32, tag = "8")]
     pub feedback: i32,
+    #[prost(bool, tag = "9")]
+    pub is_udp: bool,
+    #[prost(int32, tag = "10")]
+    pub upnp_port: i32,
+    #[prost(bytes, tag = "11")]
+    pub socket_addr_v6: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -58,6 +64,32 @@ pub struct RelayResponse {
     pub version: String,
     #[prost(int32, tag = "9")]
     pub feedback: i32,
+    #[prost(bytes, tag = "10")]
+    pub socket_addr_v6: Vec<u8>,
+    #[prost(int32, tag = "11")]
+    pub upnp_port: i32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ConfigUpdate {
+    #[prost(int32, tag = "1")]
+    pub serial: i32,
+    #[prost(string, repeated, tag = "2")]
+    pub rendezvous_servers: Vec<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct TestNatRequest {
+    #[prost(int32, tag = "1")]
+    pub serial: i32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct TestNatResponse {
+    #[prost(int32, tag = "1")]
+    pub port: i32,
+    #[prost(message, optional, tag = "2")]
+    pub cu: Option<ConfigUpdate>,
 }
 
 /// Server → Host: a peer wants to connect. Host decides direct-punch vs relay.
@@ -176,7 +208,7 @@ pub struct KeyExchange {
 pub struct RendezvousMessage {
     #[prost(
         oneof = "rendezvous_message::Union",
-        tags = "6, 7, 15, 16, 8, 9, 11, 12, 18, 19, 23, 24, 25"
+        tags = "6, 7, 15, 16, 8, 9, 11, 12, 18, 19, 23, 24, 25, 20, 21"
     )]
     pub union: Option<rendezvous_message::Union>,
 }
@@ -187,7 +219,7 @@ pub mod rendezvous_message {
     use super::{
         FetchLocalAddr, KeyExchange, OnlineRequest, OnlineResponse, PunchHole, PunchHoleRequest,
         PunchHoleResponse, RegisterPeer, RegisterPeerResponse, RegisterPk, RegisterPkResponse,
-        RelayResponse, RequestRelay,
+        RelayResponse, RequestRelay, TestNatRequest, TestNatResponse,
     };
 
     #[derive(Clone, PartialEq, Oneof)]
@@ -225,6 +257,10 @@ pub mod rendezvous_message {
         /// Secure handshake key exchange. (real tag 25)
         #[prost(message, tag = "25")]
         KeyExchange(KeyExchange),
+        #[prost(message, tag = "20")]
+        TestNatRequest(TestNatRequest),
+        #[prost(message, tag = "21")]
+        TestNatResponse(TestNatResponse),
     }
 }
 
@@ -863,5 +899,62 @@ mod tests {
             decoded.union,
             Some(rendezvous_message::Union::RequestRelay(_))
         ));
+    }
+
+    #[test]
+    fn test_nat_round_trips() {
+        let message = RendezvousMessage {
+            union: Some(rendezvous_message::Union::TestNatResponse(
+                TestNatResponse {
+                    port: 32123,
+                    cu: Some(ConfigUpdate {
+                        serial: 7,
+                        rendezvous_servers: vec!["hbbs.example.test".to_owned()],
+                    }),
+                },
+            )),
+        };
+
+        let encoded = encode_message(&message);
+        let decoded = decode_message(&encoded).unwrap();
+        match decoded.union {
+            Some(rendezvous_message::Union::TestNatResponse(response)) => {
+                assert_eq!(response.port, 32123);
+                assert_eq!(response.cu.unwrap().serial, 7);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn punch_hole_response_uses_current_feedback_and_udp_tags() {
+        let message = RendezvousMessage {
+            union: Some(rendezvous_message::Union::PunchHoleResponse(
+                PunchHoleResponse {
+                    socket_addr: vec![127, 0, 0, 1, 0x52, 0x7c],
+                    pk: Vec::new(),
+                    failure: 0,
+                    relay_server: String::new(),
+                    other_failure: String::new(),
+                    feedback: 42,
+                    is_udp: true,
+                    upnp_port: 0,
+                    socket_addr_v6: Vec::new(),
+                },
+            )),
+        };
+
+        let encoded = encode_message(&message);
+        assert!(encoded.windows(2).any(|pair| pair == [0x40, 42]));
+        assert!(encoded.windows(2).any(|pair| pair == [0x48, 1]));
+
+        let decoded = decode_message(&encoded).unwrap();
+        match decoded.union {
+            Some(rendezvous_message::Union::PunchHoleResponse(response)) => {
+                assert_eq!(response.feedback, 42);
+                assert!(response.is_udp);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
     }
 }
