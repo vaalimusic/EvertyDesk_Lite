@@ -617,6 +617,7 @@ struct EvertyDeskApp {
     remote_check_busy: bool,
     connected: bool,
     remote_viewer_open: bool,
+    remote_viewer_window_spawned: bool,
     remote_fullscreen: bool,
     progress: u8,
     events: Vec<String>,
@@ -870,6 +871,7 @@ impl EvertyDeskApp {
             remote_check_busy: false,
             connected: false,
             remote_viewer_open: false,
+            remote_viewer_window_spawned: false,
             remote_fullscreen: false,
             progress: 0,
             events: vec!["App started".to_owned()],
@@ -977,6 +979,7 @@ impl EvertyDeskApp {
         self.busy = true;
         self.connected = false;
         self.remote_viewer_open = false;
+        self.remote_viewer_window_spawned = false;
         self.shell_window_open = false;
         self.remote_fullscreen = false;
         self.remote_id = normalized_remote_id;
@@ -1129,6 +1132,7 @@ impl EvertyDeskApp {
                 self.busy = false;
                 self.connected = true;
                 self.remote_viewer_open = self.connect_kind == ConnectKind::Screen;
+                self.remote_viewer_window_spawned = false;
                 self.shell_window_open = self.connect_kind == ConnectKind::Shell;
                 self.progress = 100;
                 self.connection_state = ConnectionState::RelayReady {
@@ -1309,7 +1313,21 @@ impl EvertyDeskApp {
                         self.send_command(SessionCommand::SetDisplay(display));
                     }
                 }
-                self.log(format!("Displays detected: {}", self.remote_displays.len()));
+                let display_list = self
+                    .remote_displays
+                    .iter()
+                    .map(display_label)
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                self.log(format!(
+                    "Displays detected: {}{}",
+                    self.remote_displays.len(),
+                    if display_list.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{display_list}]")
+                    }
+                ));
             }
             SessionEvent::CursorData {
                 id,
@@ -1400,6 +1418,7 @@ impl EvertyDeskApp {
                 self.busy = false;
                 self.connected = false;
                 self.remote_viewer_open = false;
+                self.remote_viewer_window_spawned = false;
                 self.remote_fullscreen = false;
                 self.session_tx = None;
                 self.connection_state = ConnectionState::Failed(err.clone());
@@ -1412,6 +1431,7 @@ impl EvertyDeskApp {
                 self.busy = false;
                 self.connected = false;
                 self.remote_viewer_open = false;
+                self.remote_viewer_window_spawned = false;
                 self.remote_fullscreen = false;
                 self.session_tx = None;
                 self.remote_input_focused = false;
@@ -1442,6 +1462,7 @@ impl EvertyDeskApp {
         self.busy = false;
         self.connected = false;
         self.remote_viewer_open = false;
+        self.remote_viewer_window_spawned = false;
         self.remote_fullscreen = false;
         self.remote_texture = None;
         self.pending_image = None;
@@ -1943,6 +1964,7 @@ impl EvertyDeskApp {
                 .clicked()
             {
                 self.remote_viewer_open = true;
+                self.remote_viewer_window_spawned = false;
                 self.status = "Экран открыт".to_owned();
                 self.send_command(SessionCommand::SetAutoRefresh {
                     enabled: self.auto_refresh,
@@ -3206,6 +3228,7 @@ impl EvertyDeskApp {
 
     fn close_remote_viewer_panel(&mut self) {
         self.remote_viewer_open = false;
+        self.remote_viewer_window_spawned = false;
         self.remote_input_focused = false;
         self.release_remote_modifiers();
         self.last_mouse_pos = None;
@@ -3245,34 +3268,50 @@ impl EvertyDeskApp {
     }
 
     fn remote_display_selector_ui(&mut self, ui: &mut egui::Ui, id: &'static str) {
-        if self.remote_displays.is_empty() {
-            ui.add_enabled(false, egui::Button::new("Монитор"))
-                .on_hover_text("Список мониторов появится после ответа хоста");
-            return;
-        }
-
-        let selected_text = self
+        let display_count = self.remote_displays.len();
+        let selected_pos = self
             .remote_displays
             .iter()
-            .find(|display| display.index == self.selected_display)
-            .map(display_label)
-            .unwrap_or_else(|| format!("Дисплей {}", self.selected_display + 1));
+            .position(|display| display.index == self.selected_display)
+            .map(|pos| pos + 1)
+            .unwrap_or(0);
+        let button_text = if display_count == 0 {
+            "▣ 0".to_owned()
+        } else {
+            format!("▣ {selected_pos}/{display_count}")
+        };
 
-        egui::ComboBox::from_id_salt(id)
-            .selected_text(selected_text)
-            .show_ui(ui, |ui| {
-                let displays = self.remote_displays.clone();
-                for display in displays {
-                    let selected = display.index == self.selected_display;
-                    if ui
-                        .selectable_label(selected, display_label(&display))
-                        .clicked()
-                    {
-                        self.switch_remote_display(display);
-                        ui.close();
+        ui.push_id(id, |ui| {
+            ui.menu_button(button_text, |ui| {
+                ui.label("Мониторы хоста");
+                ui.separator();
+
+                if self.remote_displays.is_empty() {
+                    ui.label("Хост пока не прислал список экранов.");
+                } else {
+                    let displays = self.remote_displays.clone();
+                    for display in displays {
+                        let selected = display.index == self.selected_display;
+                        if ui
+                            .selectable_label(selected, display_label(&display))
+                            .clicked()
+                        {
+                            self.switch_remote_display(display);
+                            ui.close();
+                        }
                     }
                 }
-            });
+
+                ui.separator();
+                if ui.button("Перезапросить экран").clicked() {
+                    self.refresh_remote_screen();
+                    ui.close();
+                }
+                ui.label(format!("Получено от хоста: {display_count}"));
+            })
+            .response
+            .on_hover_text("Выбор монитора удаленной машины");
+        });
     }
 
     fn remote_video_profile_menu_ui(&mut self, ui: &mut egui::Ui) {
@@ -3396,28 +3435,40 @@ impl EvertyDeskApp {
         ui.label(format!("Событий ввода: {}", self.input_events_sent));
     }
 
+    fn refresh_remote_screen(&mut self) {
+        if let Some(display) = self
+            .remote_displays
+            .iter()
+            .find(|display| display.index == self.selected_display)
+            .cloned()
+        {
+            self.send_command(SessionCommand::SetDisplay(display));
+        } else {
+            self.send_command(SessionCommand::RefreshVideo);
+            self.send_command(SessionCommand::Screenshot);
+        }
+        self.log(format!(
+            "Remote screen refresh requested; host displays known: {}",
+            self.remote_displays.len()
+        ));
+    }
+
     fn remote_session_toolbar_ui(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         detached_window: bool,
     ) {
-        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.spacing_mut().item_spacing.x = 4.0;
         ui.horizontal_wrapped(|ui| {
             if !detached_window
-                && ui
-                    .button("Назад")
-                    .on_hover_text("Закрыть экран без отключения сеанса")
-                    .clicked()
+                && remote_icon_button(ui, "←", "Закрыть экран без отключения сеанса").clicked()
             {
                 self.close_remote_viewer_panel();
                 return;
             }
 
-            if ui
-                .button("Отключить")
-                .on_hover_text("Завершить удаленный сеанс")
-                .clicked()
+            if remote_icon_button(ui, "⏻", "Завершить удаленный сеанс").clicked()
             {
                 self.remote_viewer_open = false;
                 self.remote_input_focused = false;
@@ -3431,7 +3482,6 @@ impl EvertyDeskApp {
                 return;
             }
 
-            ui.separator();
             self.remote_display_selector_ui(
                 ui,
                 if detached_window {
@@ -3441,18 +3491,17 @@ impl EvertyDeskApp {
                 },
             );
 
-            ui.separator();
             ui.add(
                 egui::TextEdit::singleline(&mut self.text_to_send)
                     .hint_text("Текст")
-                    .desired_width(if detached_window { 170.0 } else { 190.0 }),
+                    .desired_width(if detached_window { 140.0 } else { 160.0 }),
             );
-            let send_text = ui
-                .add_enabled(
-                    !self.text_to_send.is_empty(),
-                    egui::Button::new("Отправить"),
-                )
-                .on_hover_text("Отправить текст в удаленный ввод");
+            let send_text = remote_icon_button_enabled(
+                ui,
+                !self.text_to_send.is_empty(),
+                "↵",
+                "Отправить текст",
+            );
             if send_text.clicked()
                 || (ui.ctx().input(|i| i.key_pressed(egui::Key::Enter))
                     && !self.remote_input_focused
@@ -3462,60 +3511,45 @@ impl EvertyDeskApp {
                 self.send_command(SessionCommand::KeyText(text));
                 self.request_visual_refresh_after_input();
             }
-            if ui
-                .button("Буфер")
-                .on_hover_text("Вставить локальный буфер в удаленную машину")
-                .clicked()
+            if remote_icon_button(ui, "⧉", "Вставить локальный буфер").clicked()
             {
                 self.paste_local_clipboard_to_remote();
             }
 
-            ui.separator();
-            if ui
-                .button("Обновить")
-                .on_hover_text("Перезапросить live-video и контрольный PNG-кадр")
+            if remote_icon_button(ui, "↻", "Перезапросить live-video и контрольный PNG-кадр")
                 .clicked()
             {
-                self.send_command(SessionCommand::RefreshVideo);
-                self.send_command(SessionCommand::Screenshot);
+                self.refresh_remote_screen();
             }
-            if ui
-                .button("PNG")
-                .on_hover_text("Сохранить текущий кадр")
-                .clicked()
+            if remote_icon_button(ui, "PNG", "Сохранить текущий кадр").clicked()
             {
                 self.save_current_frame_png();
             }
-            if ui
-                .selectable_label(self.fit_to_window, "Вписать")
-                .on_hover_text("Масштабировать экран под окно")
+            if remote_icon_toggle(ui, "⇱", self.fit_to_window, "Масштабировать экран под окно")
                 .clicked()
             {
                 self.fit_to_window = !self.fit_to_window;
                 self.save_ui_config();
             }
-            if ui
-                .button(if self.remote_fullscreen {
-                    "Окно"
-                } else {
-                    "Fullscreen"
-                })
-                .on_hover_text("Полный экран (F11)")
-                .clicked()
+            if remote_icon_button(
+                ui,
+                if self.remote_fullscreen { "□" } else { "⛶" },
+                "Полный экран (F11)",
+            )
+            .clicked()
             {
                 self.set_remote_fullscreen(ctx, !self.remote_fullscreen);
             }
 
-            ui.separator();
             ui.menu_button(
                 format!(
-                    "{} / {} fps",
+                    "AV {} {}",
                     self.config.display.codec.label(),
                     self.video_fps
                 ),
                 |ui| self.remote_video_profile_menu_ui(ui),
             );
-            ui.menu_button("Ещё", |ui| self.remote_more_menu_ui(ui));
+            ui.menu_button("⋯", |ui| self.remote_more_menu_ui(ui));
         });
     }
 
@@ -3725,15 +3759,19 @@ impl EvertyDeskApp {
             format!("EvertyDesk — {id}{fps_part}{lat_part}")
         };
         let viewport_id = egui::ViewportId::from_hash_of("evertydesk-lite-remote-viewer");
-        let builder = egui::ViewportBuilder::default()
+        let mut builder = egui::ViewportBuilder::default()
             .with_title(title)
             .with_resizable(true)
-            .with_inner_size([1100.0, 760.0])
             .with_min_inner_size([720.0, 480.0]);
+        if !self.remote_viewer_window_spawned {
+            builder = builder.with_inner_size(remote_viewer_initial_size(self.remote_size));
+            self.remote_viewer_window_spawned = true;
+        }
 
         ctx.show_viewport_immediate(viewport_id, builder, |ctx, _class| {
             if ctx.input(|input| input.viewport().close_requested()) {
                 self.remote_viewer_open = false;
+                self.remote_viewer_window_spawned = false;
                 self.remote_input_focused = false;
                 self.release_remote_modifiers();
                 self.last_mouse_pos = None;
@@ -4494,6 +4532,54 @@ fn display_label(display: &RemoteDisplay) -> String {
         display.x,
         display.y
     )
+}
+
+fn remote_viewer_initial_size(remote_size: [usize; 2]) -> [f32; 2] {
+    let [width, height] = remote_size;
+    if width == 0 || height == 0 {
+        return [1100.0, 760.0];
+    }
+
+    let toolbar_and_status = 104.0;
+    let max_content = egui::vec2(1280.0, 820.0 - toolbar_and_status);
+    let scale = (max_content.x / width as f32)
+        .min(max_content.y / height as f32)
+        .clamp(0.25, 1.0);
+    [
+        (width as f32 * scale).clamp(900.0, 1280.0),
+        (height as f32 * scale + toolbar_and_status).clamp(620.0, 860.0),
+    ]
+}
+
+fn remote_icon_button(ui: &mut egui::Ui, icon: &str, tooltip: &str) -> egui::Response {
+    remote_icon_button_enabled(ui, true, icon, tooltip)
+}
+
+fn remote_icon_button_enabled(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    icon: &str,
+    tooltip: &str,
+) -> egui::Response {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(egui::RichText::new(icon).size(14.0)).min_size(egui::vec2(34.0, 30.0)),
+    )
+    .on_hover_text(tooltip)
+}
+
+fn remote_icon_toggle(
+    ui: &mut egui::Ui,
+    icon: &str,
+    selected: bool,
+    tooltip: &str,
+) -> egui::Response {
+    ui.add(
+        egui::Button::new(egui::RichText::new(icon).size(14.0))
+            .selected(selected)
+            .min_size(egui::vec2(34.0, 30.0)),
+    )
+    .on_hover_text(tooltip)
 }
 
 fn coordinate_mode_label(mode: CoordinateMode) -> &'static str {
