@@ -1255,14 +1255,19 @@ impl EvertyDeskApp {
                     .unwrap_or(true)
                 {
                     self.last_video_metric_log_at = Some(Instant::now());
+                    let latency = self
+                        .latency_ms
+                        .map(|ms| format!("{ms} ms"))
+                        .unwrap_or_else(|| "n/a".to_owned());
                     self.log(format!(
-                        "Video telemetry: in={input_fps:.1} fps / {input_kbps} kbps, render={:.1} fps, codec={}, packet={} KB, queue={} ms, decode={} ms, drop={}, health={}",
+                        "Video telemetry: in={input_fps:.1} fps / {input_kbps} kbps, render={:.1} fps, codec={}, packet={} KB, queue={} ms, decode={} ms, drop={}, latency={}, health={}",
                         self.display_fps,
                         self.last_frame_codec,
                         self.frame_bytes / 1024,
                         self.frame_queue_ms,
                         self.frame_decode_ms,
                         self.frame_dropped,
+                        latency,
                         self.stream_health
                     ));
                 }

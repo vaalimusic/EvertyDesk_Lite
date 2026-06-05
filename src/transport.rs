@@ -21,7 +21,7 @@ use crate::{
         CursorData, EncodedVideoFrames, ImageQuality, KeyEvent, KeyboardMode, LoginRequest, Misc,
         MouseEvent, NatType, OnlineRequest, OptionMessage, PeerMessage, PreferCodec, PublicKey,
         PunchHoleFailure, PunchHoleRequest, RendezvousMessage, RequestRelay, ScreenshotRequest,
-        ShellMessage, ShellMessageKind, SupportedDecoding, SwitchDisplay,
+        ShellMessage, ShellMessageKind, SupportedDecoding, SwitchDisplay, TestDelay,
     },
     settings::{CodecPreference, DisplayConfig, ServerConfig},
 };
@@ -1978,16 +1978,21 @@ fn wait_for_video_probe(relay: &mut TcpStream) -> Result<String, String> {
 
 fn echo_test_delay(
     relay: &mut TcpStream,
-    mut delay: crate::rustdesk_proto::TestDelay,
+    delay: crate::rustdesk_proto::TestDelay,
 ) -> Result<(), String> {
-    if delay.from_client {
+    let Some(message) = test_delay_echo_message(delay) else {
         return Ok(());
-    }
-    delay.from_client = true;
-    let message = PeerMessage {
-        union: Some(peer_message::Union::TestDelay(delay)),
     };
     send_framed(relay, &encode_peer_message(&message))
+}
+
+fn test_delay_echo_message(delay: TestDelay) -> Option<PeerMessage> {
+    if delay.from_client {
+        return None;
+    }
+    Some(PeerMessage {
+        union: Some(peer_message::Union::TestDelay(delay)),
+    })
 }
 
 fn send_video_received(relay: &mut TcpStream) -> Result<(), String> {
@@ -3643,6 +3648,35 @@ mod tests {
         };
         assert!(login.password.is_empty());
         assert_eq!(login.username, "123");
+    }
+
+    #[test]
+    fn test_delay_echo_preserves_server_probe_flag() {
+        let message = test_delay_echo_message(TestDelay {
+            time: 42,
+            from_client: false,
+            last_delay: 17,
+            target_bitrate: 2_000,
+        })
+        .expect("server TestDelay probes must be echoed");
+
+        let Some(peer_message::Union::TestDelay(delay)) = message.union else {
+            panic!("expected TestDelay echo");
+        };
+        assert!(!delay.from_client);
+        assert_eq!(delay.last_delay, 17);
+        assert_eq!(delay.target_bitrate, 2_000);
+    }
+
+    #[test]
+    fn test_delay_echo_ignores_client_originated_probe() {
+        assert!(test_delay_echo_message(TestDelay {
+            time: 42,
+            from_client: true,
+            last_delay: 17,
+            target_bitrate: 2_000,
+        })
+        .is_none());
     }
 
     #[test]
