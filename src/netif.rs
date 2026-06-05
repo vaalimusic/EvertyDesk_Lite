@@ -54,7 +54,6 @@ fn priority(ip: &Ipv4Addr) -> u8 {
 
 #[cfg(all(windows, feature = "live-vp9-mf"))]
 fn platform_ipv4() -> Vec<Ipv4Addr> {
-    use std::ptr;
     use windows::Win32::Networking::WinSock::{AF_INET, AF_UNSPEC, SOCKADDR_IN};
     use windows::Win32::NetworkManagement::IpHelper::{
         GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
@@ -158,6 +157,7 @@ fn platform_ipv4() -> Vec<Ipv4Addr> {
 
 /// Узнать primary локальный IP через UDP connect к публичному адресу.
 /// Не шлёт пакетов — только выбирает маршрут и читает local_addr.
+#[cfg_attr(all(windows, feature = "live-vp9-mf"), allow(dead_code))]
 fn route_trick() -> Vec<Ipv4Addr> {
     use std::net::UdpSocket;
     let mut out = Vec::new();

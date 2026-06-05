@@ -198,7 +198,7 @@ netsh advfirewall firewall add rule name="EvertyDesk-EVRT-UDP" `
 ```powershell
 cargo build --release                          # базовая сборка
 cargo build --release --features live-nvenc-sdk # с NVENC
-cargo test                                      # 78 тестов
+cargo test                                      # 81 тест
 cargo test evrt                                 # только EVRT-тесты
 cargo check 2>&1 | Select-String "warning"      # посмотреть warnings
 ```
