@@ -487,7 +487,7 @@ fn rcas_pixel(src: &[u8], w: u32, h: u32, x: u32, y: u32, sharpness: f32) -> [u8
     // ── Локальный контраст ────────────────────────────────────────────────────
     let l_min = lc.min(ll).min(lr).min(lu).min(ld);
     let l_max = lc.max(ll).max(lr).max(lu).max(ld);
-    let l_range = (l_max - l_min).max(1.0 / 255.0);
+    let _l_range = (l_max - l_min).max(1.0 / 255.0);
 
     // ── Адаптивный вес RCAS (из спецификации AMD) ─────────────────────────────
     // w = -0.25 * (1 - sharpness) / clamp(l_max / l_min, ...)
@@ -1108,7 +1108,7 @@ mod tests {
         assert_eq!(w, 960);
         assert_eq!(h, 540);
 
-        let (w, h) = input_resolution(FsrQuality::UltraQuality, 1920, 1080);
+        let (w, _h) = input_resolution(FsrQuality::UltraQuality, 1920, 1080);
         // 1920/1.3 ≈ 1477
         assert!((w as i32 - 1477).abs() <= 2);
     }

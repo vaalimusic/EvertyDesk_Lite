@@ -459,7 +459,7 @@ impl TransportClient {
         let mut stable_decoded_frames = 0_u32;
         // Quality starts at Balanced for fast encoder warm-up, raised to Best
         // after the stream has been stable for a few seconds.
-        let mut current_quality = ImageQuality::Balanced;
+        let mut _current_quality = ImageQuality::Balanced;
         let mut quality_raise_sent = false;
         let mut h264_decode_failures = 0_u32;
         let mut vp9_decode_failures = 0_u32;
@@ -642,7 +642,7 @@ impl TransportClient {
                             && last_live_bootstrap.elapsed() >= Duration::from_secs(3)
                         {
                             quality_raise_sent = true;
-                            current_quality = ImageQuality::Best;
+                            _current_quality = ImageQuality::Best;
                             let msg = PeerMessage {
                                 union: Some(peer_message::Union::Misc(Misc {
                                     union: Some(misc::Union::Option(
@@ -3547,7 +3547,7 @@ mod tests {
         assert_eq!(login.username, "123");
         let option = login.option.unwrap();
         assert_eq!(option.custom_fps, 60);
-        assert_eq!(option.image_quality, ImageQuality::Best as i32);
+        assert_eq!(option.image_quality, ImageQuality::Balanced as i32);
         assert_eq!(option.custom_image_quality, 0);
         assert!(option.supported_decoding.is_some());
     }

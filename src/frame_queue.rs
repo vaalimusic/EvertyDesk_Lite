@@ -401,7 +401,7 @@ impl FrameQueueHandle {
 // Порт FrameReassembler + AccessUnitChannelReassembler из EvertyGame.
 // Собирает UDP-пакеты в полные кадры.
 
-use crate::evrt::{self, EvrtPacket};
+use crate::evrt::EvrtPacket;
 
 /// Один незавершённый кадр в процессе сборки.
 struct FrameAssembly {

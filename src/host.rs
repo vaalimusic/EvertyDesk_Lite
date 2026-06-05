@@ -61,7 +61,7 @@ use crate::{
         misc, peer_message, rendezvous_message, video_frame, DisplayInfo, EncodedVideoFrame,
         EncodedVideoFrames, Hash, IdPk, ImageQuality, LoginResponse, Misc, PeerInfo, PeerMessage,
         PreferCodec, RegisterPeer, RegisterPk, RelayResponse, RendezvousMessage, RequestRelay,
-        ShellMessage, ShellMessageKind, SignedId, SupportedDecoding, VideoFrame,
+        ShellMessage, ShellMessageKind, SignedId, SupportedDecoding,
     },
     settings::{AppConfig, CodecPreference, EncoderPreference},
     transport::{connect_tcp, encode_frame_len, read_framed, send_framed},
@@ -1172,7 +1172,7 @@ fn relay_session_inner(
     // Если UDP не поднялся за 2 сек — клиент остаётся на TCP relay.
     let evrt_socket = try_open_evrt_socket(config, events);
 
-    if let Some((ref sock, evrt_port)) = evrt_socket {
+    if let Some((ref _sock, evrt_port)) = evrt_socket {
         let misc = PeerMessage {
             union: Some(peer_message::Union::Misc(Misc {
                 union: Some(misc::Union::EvrtUdpPort(evrt_port as u32)),
@@ -1244,7 +1244,7 @@ fn relay_session_inner(
     // recv_cipher здесь — используется для расшифровки входящих
     // MouseEvent/KeyEvent от клиента. send_cipher ушёл в pipeline.
     let mut shell: Option<ShellRuntime> = None;
-    let (peer_out_tx, _peer_out_rx) = mpsc::channel::<PeerMessage>();
+    let (_peer_out_tx, _peer_out_rx) = mpsc::channel::<PeerMessage>();
 
     while !stop.load(Ordering::Relaxed) {
         match recv_peer_rc(&mut relay, &mut recv_cipher) {
@@ -1400,7 +1400,7 @@ pub struct FrameSkipStats {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum VideoEncoderBackend {
+pub(crate) enum VideoEncoderBackend {
     MediaFoundation,
     VideoToolbox,
     Nvenc,

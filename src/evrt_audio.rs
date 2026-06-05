@@ -147,7 +147,7 @@ fn run_audio_capture_windows(
         // ── Формат: PCM 16-bit stereo 48kHz ──────────────────────────────────
         let cfg = AudioConfig::default();
         let block_align = (cfg.channels * cfg.bits_per_sample / 8) as u16;
-        let mut fmt = WAVEFORMATEX {
+        let fmt = WAVEFORMATEX {
             wFormatTag:      WAVE_FORMAT_PCM as u16,
             nChannels:       cfg.channels,
             nSamplesPerSec:  cfg.sample_rate,

@@ -34,7 +34,7 @@ use std::{
 };
 
 use crate::{
-    evrt::{self, ControlMessage, Pressure, ReceiverFeedback, SessionConfig},
+    evrt::{self, Pressure, ReceiverFeedback, SessionConfig},
     frame_queue::{AdaptiveJitter, ChannelReassembler, FrameQueue, FrameQueueConfig},
     transport::SessionEvent,
 };
@@ -191,17 +191,14 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
     let recv_arrival    = last_arrival_us.clone();
     let recv_delta      = arrival_delta_ms.clone();
 
-    // Аудио-плеер (shared между receive loop и audio thread)
-    let audio_player = Arc::new(std::sync::Mutex::new(
-        crate::evrt_audio::AudioPlayer::new()
-    ));
-
+    // WASAPI playback lives inside the receive thread: COM objects stay
+    // on the same thread where they are created and used.
     let recv_handle = thread::spawn(move || {
         let mut reassembler       = ChannelReassembler::new();
         let mut audio_re          = crate::evrt_audio::AudioReassembler::new();
+        let mut audio_player      = crate::evrt_audio::AudioPlayer::new();
         let mut buf               = vec![0u8; evrt::MAX_PACKET_SIZE + 64];
         let mut last_pkt_at       = Instant::now();
-        let audio_player_recv     = audio_player.clone();
         recv_socket.set_read_timeout(Some(Duration::from_millis(500))).ok();
 
         while !recv_stop.load(Ordering::Relaxed) {
@@ -247,16 +244,12 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
                                         audio_cfg.channels,
                                         audio_cfg.bits_per_sample,
                                     ));
-                                    if let Ok(mut player) = audio_player_recv.lock() {
-                                        player.init(&audio_cfg);
-                                    }
+                                    audio_player.init(&audio_cfg);
                                 }
                             }
                             evrt::TYPE_AUDIO_FRAME => {
                                 if let Some(pcm) = audio_re.on_packet(&pkt) {
-                                    if let Ok(mut player) = audio_player_recv.lock() {
-                                        player.play(&pcm);
-                                    }
+                                    audio_player.play(&pcm);
                                 }
                             }
                             // ── ROI — логируем для диагностики ───────────────
