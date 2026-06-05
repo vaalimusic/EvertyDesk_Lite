@@ -1,7 +1,6 @@
 use std::{
     io::{Read, Write},
-    net::TcpStream,
-    net::ToSocketAddrs,
+    net::{SocketAddr, TcpStream, ToSocketAddrs},
     sync::mpsc::{self, Receiver, Sender},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -13,6 +12,7 @@ use openh264::formats::YUVSource;
 use sha2::{Digest, Sha256};
 #[cfg(feature = "live-vpx")]
 use shiguredo_libvpx::{Decoder as VpxDecoder, DecoderCodec, DecoderConfig};
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use crate::{
     rustdesk_proto::{
@@ -35,6 +35,8 @@ const RELAY_BOOTSTRAP_WAIT_SECS: u64 = 12;
 const RELAY_RESPONSE_BOOTSTRAP_WAIT_SECS: u64 = 30;
 const RELAY_AUTH_WAIT_SECS: u64 = 120;
 const RELAY_HANDSHAKE_POLL_MS: u64 = 500;
+const DIRECT_TCP_CONNECT_TIMEOUT_SECS: u64 = 4;
+const DIRECT_TCP_BOOTSTRAP_WAIT_SECS: u64 = 10;
 
 #[derive(Clone, Debug)]
 pub struct ConnectionRequest {
@@ -1222,7 +1224,8 @@ fn establish_session(
     validate_public_key(&request.server.public_key)?;
 
     progress(30, "Connecting to ID server".to_owned());
-    let mut rendezvous = connect_tcp(&request.server.id_server, RENDEZVOUS_PORT)?;
+    let mut rendezvous_stream = connect_tcp(&request.server.id_server, RENDEZVOUS_PORT)?;
+    let direct_local_addr = rendezvous_stream.local_addr().ok();
 
     progress(45, "Connecting to Relay server".to_owned());
     let _relay = connect_tcp(&request.server.relay_server, RELAY_PORT)?;
@@ -1252,15 +1255,16 @@ fn establish_session(
             },
         )),
     };
-    send_framed(&mut rendezvous, &encode_message(&message))?;
+    send_framed(&mut rendezvous_stream, &encode_message(&message))?;
 
     progress(80, "Waiting for rendezvous response".to_owned());
-    rendezvous
+    rendezvous_stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|err| format!("Failed to set read timeout: {err}"))?;
-    let response = read_framed(&mut rendezvous)?;
+    let response = read_framed(&mut rendezvous_stream)?;
     let decoded = decode_message(&response).map_err(|err| format!("Decode failed: {err}"))?;
     let rendezvous_info = describe_rendezvous_response(&decoded);
+    drop(rendezvous_stream);
 
     // Если force_relay=false не сработал (некоторые hbbs конфиги) → ретрай с force_relay=true
     let rendezvous = match rendezvous_info {
@@ -1305,6 +1309,44 @@ fn establish_session(
     let secure_relay = rendezvous.has_signed_pk;
     let initial_video_fps = request.display.target_fps.clamp(5, 60) as i32;
     let codec_preference = request.display.codec;
+    let host_udp_base = rendezvous
+        .peer_udp_addr
+        .as_ref()
+        .and_then(|b| crate::evrt_session::decode_punch_addr(b));
+
+    if let Some(peer_addr) = host_udp_base {
+        progress(86, format!("Trying direct TCP punch → {peer_addr}"));
+        match open_direct_tcp_session(
+            peer_addr,
+            direct_local_addr,
+            &request.password,
+            &request.remote_id,
+            initial_video_fps,
+            codec_preference,
+            progress,
+        ) {
+            Ok((direct_stream, peer_stage, displays, evrt_port_from_misc)) => {
+                let evrt_host_addr = evrt_port_from_misc.map(|port| {
+                    let mut addr = peer_addr;
+                    addr.set_port(port);
+                    addr
+                });
+                return Ok((
+                    direct_stream,
+                    format!("{peer_stage}; transport=direct-tcp"),
+                    displays,
+                    evrt_host_addr,
+                    Some(peer_addr),
+                ));
+            }
+            Err(err) => {
+                progress(
+                    88,
+                    format!("Direct TCP failed; falling back to relay: {err}"),
+                );
+            }
+        }
+    }
 
     // Relay connection: retry because the peer may not have joined the relay
     // stream yet when the operator side opens it.
@@ -1367,11 +1409,6 @@ fn establish_session(
             Ok((peer_stage, displays, evrt_port_from_misc)) => {
                 // Базовый UDP-адрес хоста (IP) от hbbs. Порт может прийти позже
                 // в Misc{EvrtUdpPort} уже в session loop.
-                let host_udp_base = rendezvous
-                    .peer_udp_addr
-                    .as_ref()
-                    .and_then(|b| crate::evrt_session::decode_punch_addr(b));
-
                 // Если порт уже пришёл в handshake — готовый адрес.
                 let evrt_host_addr = evrt_port_from_misc.and_then(|port| {
                     host_udp_base.map(|mut addr| {
@@ -1584,6 +1621,83 @@ fn open_relay_stream(
     };
     send_framed(&mut relay, &encode_message(&request))?;
     Ok(relay)
+}
+
+fn open_direct_tcp_session(
+    peer_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
+    password: &str,
+    remote_id: &str,
+    fps: i32,
+    codec_preference: CodecPreference,
+    progress: &mut impl FnMut(u8, String),
+) -> Result<(TcpStream, String, Vec<RemoteDisplay>, Option<u16>), String> {
+    let bind_addr = local_addr.filter(|addr| addr.is_ipv4() == peer_addr.is_ipv4());
+    let mut stream = match connect_tcp_addr_bound(
+        peer_addr,
+        bind_addr,
+        Duration::from_secs(DIRECT_TCP_CONNECT_TIMEOUT_SECS),
+    ) {
+        Ok(stream) => stream,
+        Err(bind_err) if bind_addr.is_some() && bind_err.contains("bind") => {
+            connect_tcp_addr_bound(
+                peer_addr,
+                None,
+                Duration::from_secs(DIRECT_TCP_CONNECT_TIMEOUT_SECS),
+            )
+            .map_err(|retry_err| {
+                format!("{bind_err}; direct TCP unbound retry failed: {retry_err}")
+            })?
+        }
+        Err(err) => return Err(err),
+    };
+
+    progress(
+        90,
+        format!(
+            "Direct TCP connected{}; waiting for peer login",
+            bind_addr
+                .map(|addr| format!(" from {addr}"))
+                .unwrap_or_default()
+        ),
+    );
+
+    read_initial_peer_stage(
+        &mut stream,
+        password,
+        remote_id,
+        fps,
+        codec_preference,
+        DIRECT_TCP_BOOTSTRAP_WAIT_SECS,
+        progress,
+    )
+    .map(|(peer_stage, displays, evrt_port)| (stream, peer_stage, displays, evrt_port))
+}
+
+fn connect_tcp_addr_bound(
+    peer_addr: SocketAddr,
+    local_addr: Option<SocketAddr>,
+    timeout: Duration,
+) -> Result<TcpStream, String> {
+    let socket = Socket::new(
+        Domain::for_address(peer_addr),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )
+    .map_err(|err| format!("Direct TCP socket create failed: {err}"))?;
+    let _ = socket.set_reuse_address(true);
+    if let Some(local_addr) = local_addr {
+        socket
+            .bind(&SockAddr::from(local_addr))
+            .map_err(|err| format!("Direct TCP bind {local_addr} failed: {err}"))?;
+    }
+    socket
+        .connect_timeout(&SockAddr::from(peer_addr), timeout)
+        .map_err(|err| format!("Direct TCP connect {peer_addr} failed: {err}"))?;
+
+    let stream: TcpStream = socket.into();
+    configure_tcp_stream(&stream);
+    Ok(stream)
 }
 
 fn read_initial_peer_stage(
