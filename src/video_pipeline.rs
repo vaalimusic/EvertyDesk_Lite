@@ -121,6 +121,7 @@ pub fn run(cfg: PipelineConfig) {
     // (≤4 кадра в полёте ≈ 130мс на 30fps). EVRT-канал меньше — UDP latency-critical.
     let (tcp_tx, tcp_rx) = mpsc::sync_channel::<TcpItem>(4);
     let (evrt_tx, evrt_rx) = mpsc::sync_channel::<EncodedFrame>(2);
+    let mut worker_handles = Vec::new();
 
     // ── Флаг: EVRT активен? Устанавливается когда клиент прислал punch ────────
     let evrt_active: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
@@ -129,7 +130,7 @@ pub fn run(cfg: PipelineConfig) {
     {
         let tcp_fwd = tcp_tx.clone();
         let stop_fwd = stop.clone();
-        thread::Builder::new()
+        let handle = thread::Builder::new()
             .name("pipeline-peermsg".into())
             .spawn(move || {
                 while !stop_fwd.load(Ordering::Relaxed) {
@@ -147,6 +148,7 @@ pub fn run(cfg: PipelineConfig) {
                 }
             })
             .expect("spawn peermsg-forwarder");
+        worker_handles.push(handle);
     }
 
     // ── Encoder + Capture thread ─────────────────────────────────────────────
@@ -162,7 +164,7 @@ pub fn run(cfg: PipelineConfig) {
         let evrt_e = evrt_tx;
         let act_e = evrt_active.clone();
 
-        thread::Builder::new()
+        let handle = thread::Builder::new()
             .name("pipeline-encoder".into())
             .spawn(move || {
                 encode_loop(
@@ -180,6 +182,7 @@ pub fn run(cfg: PipelineConfig) {
                 );
             })
             .expect("spawn encoder");
+        worker_handles.push(handle);
     }
 
     // ── TCP Sender thread ─────────────────────────────────────────────────────
@@ -190,12 +193,13 @@ pub fn run(cfg: PipelineConfig) {
         let mut cipher = send_cipher;
         let act_t = evrt_active.clone();
 
-        thread::Builder::new()
+        let handle = thread::Builder::new()
             .name("pipeline-tcp".into())
             .spawn(move || {
                 tcp_send_loop(stop_t, tcp_rx, &mut stream, &mut cipher, act_t, ev_t);
             })
             .expect("spawn tcp-sender");
+        worker_handles.push(handle);
     }
 
     // ── EVRT UDP Sender thread ────────────────────────────────────────────────
@@ -209,7 +213,7 @@ pub fn run(cfg: PipelineConfig) {
         let pid_u = peer_id.clone();
         let act_u = evrt_active.clone();
 
-        thread::Builder::new()
+        let handle = thread::Builder::new()
             .name("pipeline-evrt".into())
             .spawn(move || {
                 evrt_send_loop(
@@ -226,9 +230,10 @@ pub fn run(cfg: PipelineConfig) {
                 );
             })
             .expect("spawn evrt-sender");
+        worker_handles.push(handle);
     } else {
         // Нет EVRT сокета — дропаем evrt_rx чтобы encoder не блокировался
-        thread::spawn(move || while evrt_rx.recv().is_ok() {});
+        worker_handles.push(thread::spawn(move || while evrt_rx.recv().is_ok() {}));
     }
 
     // ── Command loop (этот тред) ───────────────────────────────────────────────
@@ -265,6 +270,11 @@ pub fn run(cfg: PipelineConfig) {
                 break;
             }
         }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    for handle in worker_handles {
+        let _ = handle.join();
     }
 
     log(&events, format!("Pipeline для {peer_id} завершён"));

@@ -1330,14 +1330,21 @@ fn relay_session_inner(
             let _ = done_tx.send(());
         });
         match done_rx.recv_timeout(Duration::from_secs(3)) {
-            Ok(()) => {}
-            Err(_) => eprintln!("[host] pipeline join timeout — detaching"),
+            Ok(()) => host_log(events, format!("Pipeline join complete for {peer_id}")),
+            Err(_) => {
+                host_log(events, format!("Pipeline join timeout for {peer_id}"));
+                eprintln!("[host] pipeline join timeout — detaching");
+            }
         }
     }
 
     // Release any mouse buttons that may be stuck down (the session could end
     // mid-click), so the local desktop stays usable.
     release_stuck_input();
+    host_log(
+        events,
+        format!("Relay session cleanup complete for {peer_id}"),
+    );
 
     Ok(())
 }
