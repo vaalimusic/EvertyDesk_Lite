@@ -1322,6 +1322,9 @@ fn relay_session_inner(
         shell.stop();
     }
 
+    drop(peer_msg_tx);
+    drop(cmd_tx);
+
     // join pipeline с таймаутом 3 сек
     {
         let (done_tx, done_rx) = mpsc::channel::<()>();
@@ -1338,9 +1341,17 @@ fn relay_session_inner(
         }
     }
 
-    // Release any mouse buttons that may be stuck down (the session could end
-    // mid-click), so the local desktop stays usable.
-    release_stuck_input();
+    // Release input out-of-band. On Windows this calls SendInput; it must not
+    // keep the relay session or process shutdown on the critical path.
+    let cleanup_events = events.clone();
+    let cleanup_peer = peer_id.to_owned();
+    thread::spawn(move || {
+        release_stuck_input();
+        host_log(
+            &cleanup_events,
+            format!("Relay session input cleanup complete for {cleanup_peer}"),
+        );
+    });
     host_log(
         events,
         format!("Relay session cleanup complete for {peer_id}"),
