@@ -474,6 +474,7 @@ impl TransportClient {
         let mut last_screenshot_sent: Option<Instant> = None;
         let mut last_qos_feedback_sent: Option<Instant> = None;
         let mut qos_feedback_sent = 0_u64;
+        let mut qos_feedback_failures = 0_u64;
         // Subscribe to display 0 (SwitchDisplay) then trigger video start.
         // SwitchDisplay must come first — it's the one-time subscription trigger.
         let _ = send_switch_display_subscribe(&mut relay, current_display);
@@ -892,8 +893,8 @@ impl TransportClient {
                 Ok(payload) => match decode_peer_message(&payload) {
                     Ok(message) => {
                         peer_messages_seen += 1;
-                        if peer_messages_seen <= 20 {
-                            let desc = describe_peer_message(&message);
+                        let desc = describe_peer_message(&message);
+                        if peer_messages_seen <= 20 || should_log_peer_message(&message) {
                             eprintln!("[session] Peer msg #{peer_messages_seen}: {desc}");
                             let _ = events.send(SessionEvent::Info(format!(
                                 "Peer msg #{peer_messages_seen}: {desc}"
@@ -1035,7 +1036,14 @@ impl TransportClient {
                 .map(|instant| instant.elapsed() >= Duration::from_secs(1))
                 .unwrap_or(true);
             if qos_feedback_due {
-                let _ = send_stream_qos_feedback(&mut relay, target_video_fps);
+                if let Err(err) = send_stream_qos_feedback(&mut relay, target_video_fps) {
+                    qos_feedback_failures = qos_feedback_failures.saturating_add(1);
+                    if qos_feedback_failures == 1 || qos_feedback_failures % 10 == 0 {
+                        let _ = events.send(SessionEvent::Info(format!(
+                            "Video QoS feedback failed: {err}"
+                        )));
+                    }
+                }
                 last_qos_feedback_sent = Some(Instant::now());
                 qos_feedback_sent = qos_feedback_sent.saturating_add(1);
                 if qos_feedback_sent == 1 || qos_feedback_sent % 10 == 0 {
@@ -2321,12 +2329,20 @@ fn handle_session_message(
         }
         Some(peer_message::Union::TestDelay(delay)) => {
             let rtt = if delay.from_client && delay.time > 0 {
-                current_time_millis()
+                let client_rtt = current_time_millis()
                     .saturating_sub(delay.time)
-                    .clamp(0, u32::MAX as i64) as u32
+                    .clamp(0, u32::MAX as i64) as u32;
+                let _ = events.send(SessionEvent::Info(format!(
+                    "TestDelay echo received: {client_rtt} ms"
+                )));
+                client_rtt
             } else {
                 // last_delay is the RTT (ms) the server measured for the previous round-trip.
                 let server_rtt = delay.last_delay;
+                let _ = events.send(SessionEvent::Info(format!(
+                    "TestDelay probe received: last_delay={server_rtt} ms, target_bitrate={} kbps",
+                    delay.target_bitrate
+                )));
                 let _ = echo_test_delay(relay, delay);
                 server_rtt
             };
@@ -3470,6 +3486,10 @@ fn describe_peer_message(message: &PeerMessage) -> String {
         }
         None => "Empty".to_owned(),
     }
+}
+
+fn should_log_peer_message(message: &PeerMessage) -> bool {
+    !matches!(message.union, Some(peer_message::Union::VideoFrame(_)))
 }
 
 fn describe_video_frame(frame: &crate::rustdesk_proto::VideoFrame) -> String {
