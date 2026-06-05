@@ -1161,13 +1161,22 @@ fn establish_session(
 
     progress(45, "Connecting to Relay server".to_owned());
     let _relay = connect_tcp(&request.server.relay_server, RELAY_PORT)?;
-    let udp_nat_port = probe_udp_nat_port(&request.server.id_server);
-    if udp_nat_port > 0 {
-        progress(52, format!("UDP NAT probe ok; mapped port={udp_nat_port}"));
+    let udp_nat = probe_udp_nat_port(&request.server.id_server);
+    if udp_nat.port > 0 {
+        progress(
+            52,
+            format!(
+                "UDP NAT probe ok; mapped port={} ({})",
+                udp_nat.port, udp_nat.detail
+            ),
+        );
     } else {
         progress(
             52,
-            "UDP NAT probe unavailable; direct UDP disabled for this attempt".to_owned(),
+            format!(
+                "UDP NAT probe unavailable; direct UDP disabled for this attempt ({})",
+                udp_nat.detail
+            ),
         );
     }
 
@@ -1189,7 +1198,7 @@ fn establish_session(
                 conn_type: ConnType::DefaultConn as i32,
                 token: String::new(),
                 version: "1.4.6".to_owned(),
-                udp_port: udp_nat_port as i32,
+                udp_port: udp_nat.port as i32,
                 force_relay: false, // ← false: hbbs отдаёт peer_udp_addr
                 upnp_port: 0,
                 socket_addr_v6: Vec::new(),
@@ -1421,10 +1430,18 @@ pub fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, String> {
     ))
 }
 
-fn probe_udp_nat_port(id_server: &str) -> u16 {
+struct UdpNatProbe {
+    port: u16,
+    detail: String,
+}
+
+fn probe_udp_nat_port(id_server: &str) -> UdpNatProbe {
     let (host, port) = split_host_port(id_server, RENDEZVOUS_PORT);
     let Ok(addrs) = (host.as_str(), port).to_socket_addrs() else {
-        return 0;
+        return UdpNatProbe {
+            port: 0,
+            detail: format!("{host}:{port} DNS failed"),
+        };
     };
     let request = RendezvousMessage {
         union: Some(rendezvous_message::Union::TestNatRequest(TestNatRequest {
@@ -1432,6 +1449,7 @@ fn probe_udp_nat_port(id_server: &str) -> u16 {
         })),
     };
     let payload = encode_message(&request);
+    let mut last_detail = "no resolved UDP addresses".to_owned();
 
     for server_addr in addrs {
         let bind_addr = if server_addr.is_ipv4() {
@@ -1440,31 +1458,63 @@ fn probe_udp_nat_port(id_server: &str) -> u16 {
             "[::]:0"
         };
         let Ok(socket) = UdpSocket::bind(bind_addr) else {
+            last_detail = format!("bind {bind_addr} failed");
             continue;
         };
-        let _ = socket.set_read_timeout(Some(Duration::from_millis(250)));
-        let _ = socket.set_write_timeout(Some(Duration::from_millis(250)));
+        if let Err(err) = socket.connect(server_addr) {
+            last_detail = format!("connect {server_addr} failed: {err}");
+            continue;
+        }
+        let _ = socket.set_read_timeout(Some(Duration::from_millis(400)));
+        let _ = socket.set_write_timeout(Some(Duration::from_millis(400)));
         let mut buf = [0_u8; 1500];
+        let mut retry_sleep = Duration::from_millis(20);
 
-        for _ in 0..4 {
-            if socket.send_to(&payload, server_addr).is_err() {
+        for attempt in 1..=12 {
+            if let Err(err) = socket.send(&payload) {
+                last_detail = format!("{server_addr} attempt {attempt}: send failed: {err}");
                 continue;
             }
-            let Ok((len, _)) = socket.recv_from(&mut buf) else {
-                continue;
-            };
-            let Ok(message) = decode_message(&buf[..len]) else {
-                continue;
-            };
-            if let Some(rendezvous_message::Union::TestNatResponse(response)) = message.union {
-                if response.port > 0 && response.port <= u16::MAX as i32 {
-                    return response.port as u16;
+            match socket.recv(&mut buf) {
+                Ok(len) => match decode_message(&buf[..len]) {
+                    Ok(message) => {
+                        if let Some(rendezvous_message::Union::TestNatResponse(response)) =
+                            message.union
+                        {
+                            if response.port > 0 && response.port <= u16::MAX as i32 {
+                                return UdpNatProbe {
+                                    port: response.port as u16,
+                                    detail: format!("{server_addr}, attempt {attempt}"),
+                                };
+                            }
+                            last_detail = format!(
+                                "{server_addr} attempt {attempt}: invalid port {}",
+                                response.port
+                            );
+                        } else {
+                            last_detail =
+                                format!("{server_addr} attempt {attempt}: unexpected UDP response");
+                        }
+                    }
+                    Err(err) => {
+                        last_detail =
+                            format!("{server_addr} attempt {attempt}: decode failed: {err}");
+                    }
+                },
+                Err(err) => {
+                    last_detail = format!("{server_addr} attempt {attempt}: recv failed: {err}");
                 }
             }
+            thread::sleep(retry_sleep);
+            retry_sleep =
+                Duration::from_millis((retry_sleep.as_millis() as u64 * 3 / 2).clamp(20, 200));
         }
     }
 
-    0
+    UdpNatProbe {
+        port: 0,
+        detail: last_detail,
+    }
 }
 
 fn configure_tcp_stream(stream: &TcpStream) {
