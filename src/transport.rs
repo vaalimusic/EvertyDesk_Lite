@@ -2037,6 +2037,10 @@ fn send_stream_qos_feedback(relay: &mut TcpStream, fps: i32) -> Result<(), Strin
     send_video_received(relay)?;
     send_framed(
         relay,
+        &encode_peer_message(&server_test_delay_ack_message()),
+    )?;
+    send_framed(
+        relay,
         &encode_peer_message(&client_test_delay_message(current_time_millis())),
     )
 }
@@ -2067,6 +2071,17 @@ fn client_test_delay_message(now_ms: i64) -> PeerMessage {
         union: Some(peer_message::Union::TestDelay(TestDelay {
             time: now_ms,
             from_client: true,
+            last_delay: 0,
+            target_bitrate: 0,
+        })),
+    }
+}
+
+fn server_test_delay_ack_message() -> PeerMessage {
+    PeerMessage {
+        union: Some(peer_message::Union::TestDelay(TestDelay {
+            time: 0,
+            from_client: false,
             last_delay: 0,
             target_bitrate: 0,
         })),
@@ -3807,6 +3822,16 @@ mod tests {
         };
         assert!(delay.from_client);
         assert_eq!(delay.time, 12345);
+        assert_eq!(delay.last_delay, 0);
+    }
+
+    #[test]
+    fn server_test_delay_ack_looks_like_rustdesk_echo() {
+        let message = server_test_delay_ack_message();
+        let Some(peer_message::Union::TestDelay(delay)) = message.union else {
+            panic!("expected TestDelay message");
+        };
+        assert!(!delay.from_client);
         assert_eq!(delay.last_delay, 0);
     }
 
