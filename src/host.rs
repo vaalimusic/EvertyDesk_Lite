@@ -4107,6 +4107,8 @@ pub struct MultiEncoder {
     active_backend: &'static str,
     /// Логировать активный бэкенд один раз.
     backend_logged: bool,
+    /// Причина почему MF отключился (для диагностики «почему софт вместо железа»).
+    mf_error: Option<String>,
 }
 
 impl MultiEncoder {
@@ -4139,12 +4141,18 @@ impl MultiEncoder {
             yuv: YuvFrame::default(),
             active_backend: "none",
             backend_logged: false,
+            mf_error: None,
         }
     }
 
     /// Реальный бэкенд который выдал последний кадр (MF/VideoToolbox/NVENC/OpenH264/PNG).
     pub fn active_backend(&self) -> &'static str {
         self.active_backend
+    }
+
+    /// Причина отключения MF (если был выбран, но упал). Для диагностики.
+    pub fn take_mf_error(&mut self) -> Option<String> {
+        self.mf_error.take()
     }
 
     /// Краткое описание активной цепочки бэкендов (для логов).
@@ -4205,7 +4213,10 @@ impl MultiEncoder {
                     });
                 }
                 Ok(None) => {}
-                Err(_) => self.mf_disabled = true,
+                Err(e) => {
+                    self.mf_disabled = true;
+                    self.mf_error = Some(e);
+                }
             }
         }
 
@@ -4308,9 +4319,16 @@ fn codec_label(codec: crate::nvenc::NvencCodec) -> &'static str {
 #[cfg(feature = "live-h264")]
 fn build_openh264_encoder() -> Option<openh264::encoder::Encoder> {
     use openh264::encoder::{
-        BitRate, Encoder, EncoderConfig, FrameRate, IntraFramePeriod, RateControlMode,
-        SpsPpsStrategy, UsageType,
+        BitRate, Complexity, Encoder, EncoderConfig, FrameRate, IntraFramePeriod,
+        RateControlMode, SpsPpsStrategy, UsageType,
     };
+    // ★ Многопоточность — главный рычаг скорости софтверного H264.
+    //   На слабом/VM железе без аппаратного MF это разница между 3 и 25 fps.
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get() as u16)
+        .unwrap_or(4)
+        .clamp(1, 16);
+
     let cfg = EncoderConfig::new()
         .usage_type(UsageType::ScreenContentRealTime)
         .rate_control_mode(RateControlMode::Bitrate)
@@ -4318,7 +4336,9 @@ fn build_openh264_encoder() -> Option<openh264::encoder::Encoder> {
         .max_frame_rate(FrameRate::from_hz(MAX_TARGET_FPS as f32))
         .sps_pps_strategy(SpsPpsStrategy::IncreasingId)
         .intra_frame_period(IntraFramePeriod::from_num_frames(MAX_TARGET_FPS * 2))
-        .num_threads(0);
+        // Complexity::Low — приоритет скорости над качеством (для realtime).
+        .complexity(Complexity::Low)
+        .num_threads(cores);
     let api = openh264::OpenH264API::from_source();
     Encoder::with_api_config(api, cfg).ok()
 }

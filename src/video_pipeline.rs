@@ -457,6 +457,10 @@ fn encode_loop(
                 encoder.active_backend(), enc_w, enc_h, fps,
                 encode_dur.as_millis(),
             ));
+            // Если MF упал и мы на софте — печатаем ПОЧЕМУ MF не сработал.
+            if let Some(err) = encoder.take_mf_error() {
+                log(&events, format!("★ MF отключён, причина: {err}"));
+            }
         }
 
         frame_id = frame_id.wrapping_add(1);
