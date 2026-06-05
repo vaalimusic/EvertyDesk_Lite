@@ -323,7 +323,7 @@ impl TransportClient {
         request: ConnectionRequest,
         mut progress: impl FnMut(u8, String),
     ) -> Result<ConnectionState, String> {
-        let (_relay_stream, peer_stage, _displays, _evrt_addr) =
+        let (_relay_stream, peer_stage, _displays, _evrt_addr, _evrt_base) =
             establish_session(request.clone(), &mut progress)?;
 
         progress(99, format!("Login stage: {peer_stage}"));
@@ -386,7 +386,7 @@ impl TransportClient {
             }
         }
 
-        let (mut relay, peer_stage, displays, evrt_host_addr) =
+        let (mut relay, peer_stage, displays, evrt_host_addr, evrt_host_base) =
             match establish_session(request.clone(), &mut emit_progress) {
                 Ok(session) => session,
                 Err(err) => {
@@ -408,7 +408,11 @@ impl TransportClient {
 
         // ★ EVRT: адрес хоста получен за ОДИН запрос к hbbs.
         // IP из PunchHoleResponse.socket_addr, порт из Misc{EvrtUdpPort}.
+        // Порт может прийти в handshake (evrt_host_addr) ИЛИ позже в session loop
+        // (evrt_host_base + late Misc). Флаг не даёт запустить дважды.
+        let mut evrt_started = false;
         if let Some(host_addr) = evrt_host_addr {
+            evrt_started = true;
             let evrt_events = events.clone();
             let evrt_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let evrt_ull = display_config.target_fps >= 60;
@@ -891,7 +895,8 @@ impl TransportClient {
                                 "Peer msg #{peer_messages_seen}: {desc}"
                             )));
                         }
-                        handle_session_message(
+                        let mut evrt_port_seen: Option<u16> = None;
+                        let fs = handle_session_message(
                             message,
                             &mut relay,
                             &events,
@@ -900,7 +905,35 @@ impl TransportClient {
                             current_display,
                             target_video_fps,
                             codec_preference,
-                        )
+                            &mut evrt_port_seen,
+                        );
+                        // ★ EVRT порт пришёл поздно (после LoginResponse) — запускаем
+                        //   прямое UDP-соединение, если ещё не запущено.
+                        if let Some(port) = evrt_port_seen {
+                            if !evrt_started {
+                                if let Some(mut base) = evrt_host_base {
+                                    base.set_port(port);
+                                    evrt_started = true;
+                                    let evrt_events = events.clone();
+                                    let evrt_stop = std::sync::Arc::new(
+                                        std::sync::atomic::AtomicBool::new(false),
+                                    );
+                                    let evrt_ull = initial_video_fps >= 60;
+                                    eprintln!("[evrt-client] late port → прямой UDP → {base}");
+                                    thread::spawn(move || {
+                                        if let Ok(udp) = std::net::UdpSocket::bind("0.0.0.0:0") {
+                                            let udp = std::sync::Arc::new(udp);
+                                            crate::evrt_client::try_evrt_before_relay(
+                                                &udp, base, &evrt_events, evrt_stop, evrt_ull,
+                                            );
+                                        }
+                                    });
+                                } else {
+                                    eprintln!("[evrt-client] EvrtUdpPort={port} но нет host IP — TCP relay");
+                                }
+                            }
+                        }
+                        fs
                     }
                     Err(err) => {
                         eprintln!("[session] Peer decode FAILED: {err}");
@@ -1128,7 +1161,8 @@ fn establish_session(
         TcpStream,
         String,
         Vec<RemoteDisplay>,
-        Option<std::net::SocketAddr>,
+        Option<std::net::SocketAddr>, // готовый EVRT addr (если порт в handshake)
+        Option<std::net::SocketAddr>, // базовый host UDP IP (для позднего порта)
     ),
     String,
 > {
@@ -1287,19 +1321,18 @@ fn establish_session(
             progress,
         ) {
             Ok((peer_stage, displays, evrt_port_from_misc)) => {
-                // Если хост прислал EVRT порт в Misc — используем его.
-                // IP берём из peer_udp_addr который hbbs вернул нам за ОДИН запрос.
+                // Базовый UDP-адрес хоста (IP) от hbbs. Порт может прийти позже
+                // в Misc{EvrtUdpPort} уже в session loop.
+                let host_udp_base = rendezvous
+                    .peer_udp_addr
+                    .as_ref()
+                    .and_then(|b| crate::evrt_session::decode_punch_addr(b));
+
+                // Если порт уже пришёл в handshake — готовый адрес.
                 let evrt_host_addr = evrt_port_from_misc.and_then(|port| {
-                    rendezvous
-                        .peer_udp_addr
-                        .as_ref()
-                        .and_then(|b| crate::evrt_session::decode_punch_addr(b))
-                        .map(|mut addr| {
-                            addr.set_port(port);
-                            addr
-                        })
+                    host_udp_base.map(|mut addr| { addr.set_port(port); addr })
                 });
-                return Ok((relay_stream, peer_stage, displays, evrt_host_addr));
+                return Ok((relay_stream, peer_stage, displays, evrt_host_addr, host_udp_base));
             }
             Err(err) => last_err = err,
         }
@@ -1975,6 +2008,7 @@ fn handle_session_message(
     current_display: i32,
     target_video_fps: i32,
     codec_preference: CodecPreference,
+    evrt_port_out: &mut Option<u16>,
 ) -> Option<FrameSource> {
     match message.union {
         Some(peer_message::Union::ScreenshotResponse(response)) => {
@@ -2247,6 +2281,15 @@ fn handle_session_message(
                 }
                 Some(misc::Union::RefreshVideo(_)) => {
                     eprintln!("[session] Server requests RefreshVideo");
+                }
+                Some(misc::Union::EvrtUdpPort(port)) => {
+                    // ★ Хост сообщил EVRT UDP порт (приходит ПОСЛЕ LoginResponse,
+                    //   поэтому ловим его здесь, в session loop, а не в handshake).
+                    let p = (*port).min(65535) as u16;
+                    if p > 0 {
+                        eprintln!("[session] ★ EvrtUdpPort={p} получен (session loop)");
+                        *evrt_port_out = Some(p);
+                    }
                 }
                 other => {
                     eprintln!(
