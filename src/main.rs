@@ -554,7 +554,9 @@ fn run_cli_connect() -> Option<i32> {
     if command == "--diagnose" {
         let remote_id = normalize_remote_id(&args.next().unwrap_or_default());
         if remote_id.is_empty() {
-            eprintln!("Usage: evertydesk-lite --diagnose <remote-id> [password] [--secs N] [--out DIR]");
+            eprintln!(
+                "Usage: evertydesk-lite --diagnose <remote-id> [password] [--secs N] [--out DIR]"
+            );
             return Some(2);
         }
         let rest: Vec<String> = args.collect();
@@ -569,12 +571,22 @@ fn run_cli_connect() -> Option<i32> {
         let mut it = rest.iter();
         while let Some(a) = it.next() {
             match a.as_str() {
-                "--secs" => if let Some(v) = it.next() { secs = v.parse().unwrap_or(20); },
-                "--out"  => if let Some(v) = it.next() { out_dir = v.clone(); },
+                "--secs" => {
+                    if let Some(v) = it.next() {
+                        secs = v.parse().unwrap_or(20);
+                    }
+                }
+                "--out" => {
+                    if let Some(v) = it.next() {
+                        out_dir = v.clone();
+                    }
+                }
                 _ => {}
             }
         }
-        return Some(crate::diagnostics::run_diagnose(&remote_id, &password, secs, &out_dir));
+        return Some(crate::diagnostics::run_diagnose(
+            &remote_id, &password, secs, &out_dir,
+        ));
     }
 
     if command != "--connect" {
@@ -724,6 +736,10 @@ struct EvertyDeskApp {
     evrt_jitter_ms: u32,
     /// FPS EVRT
     evrt_fps: u32,
+    evrt_packets_received: u64,
+    evrt_frames_assembled: u64,
+    evrt_reassembly_drops: u64,
+    evrt_queue_drops: u64,
     /// Cache of remote cursor images by cursor ID (RGBA + hotspot).
     cursor_cache: HashMap<u64, CursorCacheEntry>,
     /// Pending cursor image to be loaded into a texture in the next frame.
@@ -967,6 +983,10 @@ impl EvertyDeskApp {
             evrt_decode_delta_ms: -1,
             evrt_jitter_ms: 0,
             evrt_fps: 0,
+            evrt_packets_received: 0,
+            evrt_frames_assembled: 0,
+            evrt_reassembly_drops: 0,
+            evrt_queue_drops: 0,
             cursor_cache: HashMap::new(),
             pending_cursor: None,
             cursor_texture: None,
@@ -1459,6 +1479,10 @@ impl EvertyDeskApp {
                 decode_delta_ms,
                 jitter_ms,
                 fps,
+                packets_received,
+                frames_assembled,
+                reassembly_drops,
+                queue_drops,
                 ..
             } => {
                 self.evrt_pressure = pressure;
@@ -1466,6 +1490,10 @@ impl EvertyDeskApp {
                 self.evrt_decode_delta_ms = decode_delta_ms;
                 self.evrt_jitter_ms = jitter_ms;
                 self.evrt_fps = fps;
+                self.evrt_packets_received = packets_received;
+                self.evrt_frames_assembled = frames_assembled;
+                self.evrt_reassembly_drops = reassembly_drops;
+                self.evrt_queue_drops = queue_drops;
             }
             SessionEvent::Failed(err) => {
                 self.busy = false;
@@ -3807,6 +3835,12 @@ impl EvertyDeskApp {
                         ui.label(format!("Δ декод:    {} мс", self.evrt_decode_delta_ms));
                         ui.label(format!("Jitter:     {} мс", self.evrt_jitter_ms));
                         ui.label(format!("FPS:        {}", self.evrt_fps));
+                        ui.label(format!("Пакетов:    {}", self.evrt_packets_received));
+                        ui.label(format!("Кадров:     {}", self.evrt_frames_assembled));
+                        ui.label(format!(
+                            "Потери:     сборка {} / очередь {}",
+                            self.evrt_reassembly_drops, self.evrt_queue_drops
+                        ));
                     });
                 }
 

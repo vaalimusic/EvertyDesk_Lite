@@ -303,10 +303,18 @@ struct Collected {
 
     // EVRT
     evrt_active: bool,
+    evrt_connected: bool,
     evrt_host_addr: String,
     evrt_pressure: Vec<String>,
     evrt_arrival_ms: Vec<i32>,
+    evrt_decode_ms: Vec<i32>,
     evrt_jitter_ms: Vec<u32>,
+    evrt_fps: Vec<u32>,
+    evrt_bitrate_mbps: Vec<f32>,
+    evrt_packets_received: u64,
+    evrt_frames_assembled: u64,
+    evrt_reassembly_drops: u64,
+    evrt_queue_drops: u64,
 
     // Дисплеи
     displays: Vec<RemoteDisplay>,
@@ -370,18 +378,32 @@ impl Collected {
             } => {
                 self.evrt_active = *active;
                 if *active {
+                    self.evrt_connected = true;
                     self.evrt_host_addr = format!("{host_addr}:{port}");
                 }
             }
             SessionEvent::EvrtMetrics {
                 pressure,
                 arrival_delta_ms,
+                decode_delta_ms,
                 jitter_ms,
-                ..
+                bitrate_mbps,
+                fps,
+                packets_received,
+                frames_assembled,
+                reassembly_drops,
+                queue_drops,
             } => {
                 self.evrt_pressure.push(pressure.clone());
                 self.evrt_arrival_ms.push(*arrival_delta_ms);
+                self.evrt_decode_ms.push(*decode_delta_ms);
                 self.evrt_jitter_ms.push(*jitter_ms);
+                self.evrt_fps.push(*fps);
+                self.evrt_bitrate_mbps.push(*bitrate_mbps);
+                self.evrt_packets_received = self.evrt_packets_received.max(*packets_received);
+                self.evrt_frames_assembled = self.evrt_frames_assembled.max(*frames_assembled);
+                self.evrt_reassembly_drops = self.evrt_reassembly_drops.max(*reassembly_drops);
+                self.evrt_queue_drops = self.evrt_queue_drops.max(*queue_drops);
             }
             SessionEvent::Info(msg) => {
                 self.info_log.push(msg.clone());
@@ -414,6 +436,23 @@ fn avg_u32(v: &[u32]) -> u32 {
         (v.iter().map(|x| *x as u64).sum::<u64>() / v.len() as u64) as u32
     }
 }
+
+fn avg_nonzero_u32(v: &[u32]) -> u32 {
+    let mut count = 0_u64;
+    let sum = v
+        .iter()
+        .filter(|value| **value > 0)
+        .map(|value| {
+            count += 1;
+            u64::from(*value)
+        })
+        .sum::<u64>();
+    if count == 0 {
+        0
+    } else {
+        (sum / count) as u32
+    }
+}
 fn avg_i32(v: &[i32]) -> i32 {
     if v.is_empty() {
         0
@@ -421,11 +460,30 @@ fn avg_i32(v: &[i32]) -> i32 {
         (v.iter().map(|x| *x as i64).sum::<i64>() / v.len() as i64) as i32
     }
 }
+fn avg_nonnegative_i32(v: &[i32]) -> i32 {
+    let samples = v.iter().copied().filter(|value| *value >= 0);
+    let (sum, count) = samples.fold((0_i64, 0_i64), |(sum, count), value| {
+        (sum + i64::from(value), count + 1)
+    });
+    if count == 0 {
+        0
+    } else {
+        (sum / count) as i32
+    }
+}
 fn max_f32(v: &[f32]) -> f32 {
     v.iter().cloned().fold(0.0, f32::max)
 }
 fn min_f32(v: &[f32]) -> f32 {
     v.iter().cloned().fold(f32::INFINITY, f32::min)
+}
+
+fn effective_fps(c: &Collected) -> f32 {
+    if c.evrt_connected {
+        avg_nonzero_u32(&c.evrt_fps) as f32
+    } else {
+        avg_f32(&c.input_fps_samples)
+    }
 }
 
 // ─── точка входа CLI ──────────────────────────────────────────────────────────
@@ -534,9 +592,9 @@ fn build_report(c: &Collected, secs: u64) -> String {
         "❌ ПОДКЛЮЧЕНИЕ НЕ УДАЛОСЬ"
     } else if c.frames_received == 0 {
         "⚠️ ПОДКЛЮЧИЛИСЬ, НО ВИДЕО НЕ ПОШЛО"
-    } else if avg_f32(&c.input_fps_samples) >= 20.0 {
+    } else if effective_fps(c) >= 20.0 {
         "✅ РАБОТАЕТ ХОРОШО"
-    } else if avg_f32(&c.input_fps_samples) >= 8.0 {
+    } else if effective_fps(c) >= 8.0 {
         "🟡 РАБОТАЕТ, НО МЕДЛЕННО"
     } else {
         "🔴 ОЧЕНЬ НИЗКИЙ FPS"
@@ -564,7 +622,7 @@ fn build_report(c: &Collected, secs: u64) -> String {
 
     // Транспорт
     s.push_str("## Транспорт\n");
-    if c.evrt_active {
+    if c.evrt_connected {
         s.push_str(&format!(
             "- ⚡ **EVRT прямой UDP** активен → {}\n",
             c.evrt_host_addr
@@ -577,6 +635,22 @@ fn build_report(c: &Collected, secs: u64) -> String {
             s.push_str(&format!(
                 "- EVRT jitter: avg {} мс\n",
                 avg_u32(&c.evrt_jitter_ms)
+            ));
+            s.push_str(&format!(
+                "- EVRT decode FPS: avg {}\n",
+                avg_nonzero_u32(&c.evrt_fps)
+            ));
+            s.push_str(&format!(
+                "- EVRT decode delta: avg {} мс\n",
+                avg_nonnegative_i32(&c.evrt_decode_ms)
+            ));
+            s.push_str(&format!(
+                "- EVRT packets/assembled: {}/{}\n",
+                c.evrt_packets_received, c.evrt_frames_assembled
+            ));
+            s.push_str(&format!(
+                "- EVRT drops: reassembly={} queue={}\n",
+                c.evrt_reassembly_drops, c.evrt_queue_drops
             ));
             let crit = c
                 .evrt_pressure
@@ -615,9 +689,16 @@ fn build_report(c: &Collected, secs: u64) -> String {
     if let Some(ff) = c.first_frame_ms {
         s.push_str(&format!("- Первый кадр через: {} мс\n", ff));
     }
+    if c.evrt_connected {
+        s.push_str(&format!(
+            "- **EVRT FPS**: avg {}\n",
+            avg_nonzero_u32(&c.evrt_fps)
+        ));
+        s.push_str("- TCP FPS ниже относится только к резервному relay-потоку\n");
+    }
     if !c.input_fps_samples.is_empty() {
         s.push_str(&format!(
-            "- **FPS**: avg {:.1}, min {:.1}, max {:.1}\n",
+            "- **TCP FPS**: avg {:.1}, min {:.1}, max {:.1}\n",
             avg_f32(&c.input_fps_samples),
             min_f32(&c.input_fps_samples),
             max_f32(&c.input_fps_samples),
@@ -625,7 +706,7 @@ fn build_report(c: &Collected, secs: u64) -> String {
     }
     if !c.input_kbps_samples.is_empty() {
         s.push_str(&format!(
-            "- **Битрейт**: avg {} kbps\n",
+            "- **TCP битрейт**: avg {} kbps\n",
             avg_u64(&c.input_kbps_samples)
         ));
     }
@@ -671,7 +752,7 @@ fn build_report(c: &Collected, secs: u64) -> String {
     }
 
     // Предупреждение про статичный экран при headless-диагностике
-    if avg_f32(&c.input_fps_samples) < 20.0 && c.frames_received > 0 {
+    if effective_fps(c) < 20.0 && c.frames_received > 0 {
         s.push_str("> ⚠️ Низкий FPS может быть из-за статичного экрана хоста во время теста\n");
         s.push_str("> (детектор изменений пропускает неизменные кадры — это норма).\n");
         s.push_str("> Для реального замера двигай окна/видео на хосте во время диагностики,\n");
@@ -724,6 +805,8 @@ fn build_json(c: &Collected) -> String {
         "first_frame_ms": c.first_frame_ms,
         "codec": c.codec,
         "resolution": format!("{}x{}", c.last_width, c.last_height),
+        "effective_fps_avg": effective_fps(c),
+        "tcp_fps_avg": avg_f32(&c.input_fps_samples),
         "fps_avg": avg_f32(&c.input_fps_samples),
         "fps_min": min_f32(&c.input_fps_samples).max(0.0),
         "fps_max": max_f32(&c.input_fps_samples),
@@ -733,9 +816,17 @@ fn build_json(c: &Collected) -> String {
         "dropped_total": c.dropped_total,
         "latency_ms_avg": avg_u32(&c.latency_samples),
         "evrt_active": c.evrt_active,
+        "evrt_connected": c.evrt_connected,
         "evrt_host_addr": c.evrt_host_addr,
         "evrt_arrival_ms_avg": avg_i32(&c.evrt_arrival_ms),
+        "evrt_decode_ms_avg": avg_nonnegative_i32(&c.evrt_decode_ms),
         "evrt_jitter_ms_avg": avg_u32(&c.evrt_jitter_ms),
+        "evrt_fps_avg": avg_nonzero_u32(&c.evrt_fps),
+        "evrt_bitrate_mbps_avg": avg_f32(&c.evrt_bitrate_mbps),
+        "evrt_packets_received": c.evrt_packets_received,
+        "evrt_frames_assembled": c.evrt_frames_assembled,
+        "evrt_reassembly_drops": c.evrt_reassembly_drops,
+        "evrt_queue_drops": c.evrt_queue_drops,
         "displays": c.displays.iter().map(|display| json!({
             "index": display.index,
             "name": display.name,
@@ -814,18 +905,12 @@ mod tests {
             fs::write(report.join("summary.txt"), "report").unwrap();
         }
 
-        let file_summary = cleanup_files(
-            &logs,
-            Duration::from_secs(365 * 24 * 60 * 60),
-            2,
-            |_| true,
-        );
-        let dir_summary = cleanup_directories(
-            &reports,
-            Duration::from_secs(365 * 24 * 60 * 60),
-            2,
-            |_| true,
-        );
+        let file_summary =
+            cleanup_files(&logs, Duration::from_secs(365 * 24 * 60 * 60), 2, |_| true);
+        let dir_summary =
+            cleanup_directories(&reports, Duration::from_secs(365 * 24 * 60 * 60), 2, |_| {
+                true
+            });
 
         assert_eq!(file_summary.removed_files, 1);
         assert_eq!(dir_summary.removed_dirs, 1);

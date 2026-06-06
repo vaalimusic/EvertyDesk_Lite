@@ -470,6 +470,7 @@ pub struct ChannelReassembler {
     latest_completed_id: Option<u32>,
     waiting_after_loss: bool,
     dropped_frames: u64,
+    last_dropped_id: Option<u32>,
 }
 
 impl ChannelReassembler {
@@ -481,6 +482,7 @@ impl ChannelReassembler {
             latest_completed_id: None,
             waiting_after_loss: false,
             dropped_frames: 0,
+            last_dropped_id: None,
         }
     }
 
@@ -489,6 +491,7 @@ impl ChannelReassembler {
         self.latest_frame_id_seen = None;
         self.latest_completed_id = None;
         self.waiting_after_loss = false;
+        self.last_dropped_id = None;
     }
 
     pub fn set_codec_config(&mut self, payload: Vec<u8>) {
@@ -500,7 +503,7 @@ impl ChannelReassembler {
     pub fn on_packet(&mut self, pkt: &EvrtPacket) -> Option<(Vec<u8>, bool, i32, u64)> {
         // Базовые проверки
         if pkt.packet_count == 0 || pkt.packet_index >= pkt.packet_count {
-            self.dropped_frames += 1;
+            self.mark_frame_dropped(pkt.frame_id);
             return None;
         }
 
@@ -518,7 +521,7 @@ impl ChannelReassembler {
 
         // Ждём IDR после потери
         if self.waiting_after_loss && !pkt.is_key_frame() {
-            self.dropped_frames += 1;
+            self.mark_frame_dropped(pkt.frame_id);
             return None;
         }
 
@@ -533,7 +536,7 @@ impl ChannelReassembler {
 
             if had_incomplete && !pkt.is_key_frame() {
                 self.waiting_after_loss = true;
-                self.dropped_frames += 1;
+                self.mark_frame_dropped(pkt.frame_id);
                 return None;
             }
         }
@@ -581,13 +584,13 @@ impl ChannelReassembler {
             } else {
                 // Нет конфига — ждём следующего
                 self.waiting_after_loss = true;
-                self.dropped_frames += 1;
+                self.mark_frame_dropped(pkt.frame_id);
                 return None;
             }
         }
 
         if self.waiting_after_loss {
-            self.dropped_frames += 1;
+            self.mark_frame_dropped(pkt.frame_id);
             return None;
         }
 
@@ -596,6 +599,13 @@ impl ChannelReassembler {
 
     pub fn dropped_frames(&self) -> u64 {
         self.dropped_frames
+    }
+
+    fn mark_frame_dropped(&mut self, frame_id: u32) {
+        if self.last_dropped_id != Some(frame_id) {
+            self.last_dropped_id = Some(frame_id);
+            self.dropped_frames += 1;
+        }
     }
 
     fn drop_older_than(&mut self, frame_id: u32) -> bool {
@@ -919,6 +929,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn reassembler_counts_a_lost_frame_once_and_recovers_on_keyframe() {
+        let mut ch = ChannelReassembler::new();
+        ch.set_codec_config(vec![0x00, 0x00, 0x00, 0x01]);
+
+        let incomplete = crate::evrt::packetize_video_frame(1, 1000, false, &vec![1u8; 3000]);
+        let first = crate::evrt::parse(&incomplete[0], incomplete[0].len()).unwrap();
+        assert!(ch.on_packet(&first).is_none());
+
+        let dependent = crate::evrt::packetize_video_frame(2, 2000, false, &vec![2u8; 3000]);
+        for raw in &dependent {
+            let packet = crate::evrt::parse(raw, raw.len()).unwrap();
+            assert!(ch.on_packet(&packet).is_none());
+        }
+        assert_eq!(ch.dropped_frames(), 1);
+
+        let keyframe = crate::evrt::packetize_video_frame(3, 3000, true, &vec![3u8; 3000]);
+        let mut recovered = None;
+        for raw in &keyframe {
+            let packet = crate::evrt::parse(raw, raw.len()).unwrap();
+            recovered = ch.on_packet(&packet).or(recovered);
+        }
+        assert!(recovered.is_some());
+        assert_eq!(ch.dropped_frames(), 1);
     }
 
     #[test]

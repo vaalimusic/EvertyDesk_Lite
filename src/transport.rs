@@ -122,6 +122,10 @@ pub enum SessionEvent {
         jitter_ms: u32,
         bitrate_mbps: f32,
         fps: u32,
+        packets_received: u64,
+        frames_assembled: u64,
+        reassembly_drops: u64,
+        queue_drops: u64,
     },
 }
 

@@ -38,6 +38,7 @@ use crate::{
     frame_queue::{AdaptiveJitter, ChannelReassembler, FrameQueue, FrameQueueConfig},
     transport::SessionEvent,
 };
+use socket2::SockRef;
 
 // ─── константы ────────────────────────────────────────────────────────────────
 
@@ -85,6 +86,15 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
     } = params;
 
     evrt_log(&events, format!("EVRT client: punching to {host_addr}"));
+    let socket_ref = SockRef::from(socket.as_ref());
+    let _ = socket_ref.set_recv_buffer_size(4 * 1024 * 1024);
+    let _ = socket_ref.set_send_buffer_size(512 * 1024);
+    if let Ok(size) = socket_ref.recv_buffer_size() {
+        evrt_log(
+            &events,
+            format!("EVRT client UDP receive buffer: {size} bytes"),
+        );
+    }
 
     // ── UDP punch-hole ────────────────────────────────────────────────────────
     for _ in 0..PUNCH_REPEATS {
@@ -160,9 +170,11 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
     let last_arrival_us = Arc::new(AtomicU64::new(0));
     let arrival_delta_ms = Arc::new(AtomicI32::new(-1));
     let decode_delta_ms = Arc::new(AtomicI32::new(-1));
-    let queued_units = Arc::new(AtomicI32::new(0));
-    let dropped_units = Arc::new(AtomicU64::new(0));
-    let decode_fps_atom = Arc::new(AtomicI32::new(0));
+    let decoded_frames = Arc::new(AtomicU64::new(0));
+    let packets_received = Arc::new(AtomicU64::new(0));
+    let frames_assembled = Arc::new(AtomicU64::new(0));
+    let reassembly_drops = Arc::new(AtomicU64::new(0));
+    let configured_bitrate = Arc::new(AtomicU64::new(session_cfg.bitrate as u64));
 
     // ── Очередь кадров ────────────────────────────────────────────────────────
     let queue_cfg = if session_cfg.is_cinema_smooth() {
@@ -177,9 +189,7 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
     let decode_events = events.clone();
     let decode_stop = stop.clone();
     let decode_delta_c = decode_delta_ms.clone();
-    let decode_fps_c = decode_fps_atom.clone();
-    let queued_c = queued_units.clone();
-    let dropped_c = dropped_units.clone();
+    let decoded_frames_c = decoded_frames.clone();
     let cfg_codec = session_cfg.codec.clone();
     let cfg_w = session_cfg.width;
     let cfg_h = session_cfg.height;
@@ -193,9 +203,7 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
             cfg_w,
             cfg_h,
             decode_delta_c,
-            decode_fps_c,
-            queued_c,
-            dropped_c,
+            decoded_frames_c,
         );
     });
 
@@ -206,6 +214,10 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
     let recv_events = events.clone();
     let recv_arrival = last_arrival_us.clone();
     let recv_delta = arrival_delta_ms.clone();
+    let recv_packets = packets_received.clone();
+    let recv_assembled = frames_assembled.clone();
+    let recv_reassembly_drops = reassembly_drops.clone();
+    let recv_bitrate = configured_bitrate.clone();
 
     // WASAPI playback lives inside the receive thread: COM objects stay
     // on the same thread where they are created and used.
@@ -215,6 +227,7 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
         let mut audio_player = crate::evrt_audio::AudioPlayer::new();
         let mut buf = vec![0u8; evrt::MAX_PACKET_SIZE + 64];
         let mut last_pkt_at = Instant::now();
+        let mut last_loss_keyframe_request = Instant::now() - Duration::from_secs(1);
         recv_socket
             .set_read_timeout(Some(Duration::from_millis(10)))
             .ok();
@@ -232,19 +245,34 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
                     last_pkt_at = Instant::now();
 
                     if let Some(pkt) = evrt::parse(&buf, len) {
+                        recv_packets.fetch_add(1, Ordering::Relaxed);
                         match pkt.packet_type {
                             evrt::TYPE_CODEC_CONFIG => {
                                 reassembler.set_codec_config(pkt.payload.clone());
                             }
                             evrt::TYPE_VIDEO_FRAME => {
+                                let drops_before = reassembler.dropped_frames();
                                 if let Some((bytes, key, _delay_ms, pts)) =
                                     reassembler.on_packet(&pkt)
                                 {
+                                    recv_assembled.fetch_add(1, Ordering::Relaxed);
                                     recv_queue.enqueue(bytes, key, pts);
+                                }
+                                let drops_after = reassembler.dropped_frames();
+                                recv_reassembly_drops.store(drops_after, Ordering::Relaxed);
+                                if drops_after > drops_before
+                                    && last_loss_keyframe_request.elapsed()
+                                        >= Duration::from_millis(250)
+                                {
+                                    let _ = recv_socket
+                                        .send_to(&evrt::build_request_key_frame(), host_addr);
+                                    recv_queue.wait_for_keyframe();
+                                    last_loss_keyframe_request = Instant::now();
                                 }
                             }
                             evrt::TYPE_SESSION_CONFIG => {
                                 if let Some(cfg) = SessionConfig::from_json(&pkt.payload) {
+                                    recv_bitrate.store(cfg.bitrate as u64, Ordering::Relaxed);
                                     evrt_log(
                                         &recv_events,
                                         format!(
@@ -317,7 +345,10 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
 
     let mut jitter = AdaptiveJitter::new();
     let mut last_fb_at = Instant::now();
-    let mut queue_drops_seen = 0u64;
+    let mut drops_seen = 0u64;
+    let mut last_fps_at = Instant::now();
+    let mut last_decoded_frames = 0_u64;
+    let mut fps_decoded = 0_u32;
     let cinema = session_cfg.is_cinema_smooth();
 
     socket
@@ -335,11 +366,21 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
         // Собираем метрики
         let arr_delta = arrival_delta_ms.load(Ordering::Relaxed);
         let dec_delta = decode_delta_ms.load(Ordering::Relaxed);
-        let queued = queued_units.load(Ordering::Relaxed).max(0) as u32;
-        let drops = dropped_units.load(Ordering::Relaxed);
-        let new_drops = drops.saturating_sub(queue_drops_seen);
-        queue_drops_seen = drops;
-        let fps_decoded = decode_fps_atom.load(Ordering::Relaxed).max(0) as u32;
+        let queue_stats = queue.stats();
+        let queued = queue_stats.queued_units as u32;
+        let queue_drops = queue_stats.dropped_units;
+        let assembly_drops = reassembly_drops.load(Ordering::Relaxed);
+        let drops = queue_drops.saturating_add(assembly_drops);
+        let new_drops = drops.saturating_sub(drops_seen);
+        drops_seen = drops;
+        if last_fps_at.elapsed() >= Duration::from_secs(1) {
+            let decoded = decoded_frames.load(Ordering::Relaxed);
+            fps_decoded = ((decoded.saturating_sub(last_decoded_frames)) as f64
+                / last_fps_at.elapsed().as_secs_f64())
+            .round() as u32;
+            last_decoded_frames = decoded;
+            last_fps_at = Instant::now();
+        }
 
         // Вычислить pressure
         let pressure = compute_pressure(arr_delta, dec_delta, queued, new_drops, cinema);
@@ -370,8 +411,12 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
             arrival_delta_ms: arr_delta,
             decode_delta_ms: dec_delta,
             jitter_ms,
-            bitrate_mbps: 0.0, // хост сообщает в SessionConfig keepalive
+            bitrate_mbps: configured_bitrate.load(Ordering::Relaxed) as f32 / 1_000_000.0,
             fps: fps_decoded,
+            packets_received: packets_received.load(Ordering::Relaxed),
+            frames_assembled: frames_assembled.load(Ordering::Relaxed),
+            reassembly_drops: assembly_drops,
+            queue_drops,
         });
 
         // Если critical + задержка растёт → запрос keyframe
@@ -407,9 +452,7 @@ fn evrt_decode_loop(
     width: u32,
     height: u32,
     delta_ms: Arc<AtomicI32>,
-    fps_atom: Arc<AtomicI32>,
-    queued: Arc<AtomicI32>,
-    dropped: Arc<AtomicU64>,
+    decoded_frames: Arc<AtomicU64>,
 ) {
     // ── Инициализация декодеров (те же что в decode_frame_loop) ──────────────
     #[cfg(feature = "live-h264")]
@@ -427,18 +470,9 @@ fn evrt_decode_loop(
     let mut h265_mf: Option<crate::mf_video::MfVideoDecoder> = None;
     let mf_status = crate::mf_video::mf_video_decode_status();
 
-    // FPS-счётчик
-    let mut decoded_count = 0u64;
-    let mut fps_window_start = Instant::now();
-
     let mut last_decode_at = Instant::now();
 
     loop {
-        // Обновить статистику очереди
-        let stats = queue.stats();
-        queued.store(stats.queued_units as i32, Ordering::Relaxed);
-        dropped.store(stats.dropped_units, Ordering::Relaxed);
-
         // Взять кадр из очереди
         let Some((bytes, _is_key, _pts)) = queue.dequeue(&stop) else {
             break;
@@ -475,26 +509,17 @@ fn evrt_decode_loop(
             ),
         };
 
-        // FPS-счётчик
-        decoded_count += 1;
-        let fps_elapsed = fps_window_start.elapsed();
-        if fps_elapsed >= Duration::from_secs(1) {
-            let fps = (decoded_count as f64 / fps_elapsed.as_secs_f64()) as i32;
-            fps_atom.store(fps, Ordering::Relaxed);
-            decoded_count = 0;
-            fps_window_start = Instant::now();
-        }
-
         let decode_ms = decode_start.elapsed().as_millis() as u64;
 
         if let Some((rgba, w, h)) = maybe_event {
+            let decoded_id = decoded_frames.fetch_add(1, Ordering::Relaxed) + 1;
             let _ = events.send(SessionEvent::FrameMetrics {
                 bytes: bytes.len(),
                 queue_ms: 0,
                 decode_ms,
                 dropped: 0,
             });
-            let sid = format!("evrt-{decoded_count}");
+            let sid = format!("evrt-{decoded_id}");
             let _ = events.send(SessionEvent::Frame {
                 sid,
                 codec: codec.clone(),

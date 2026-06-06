@@ -213,6 +213,7 @@ pub fn run(cfg: PipelineConfig) {
         let fps_u = target_fps.clone();
         let qual_u = quality_ms.clone();
         let bitrate_scale_u = bitrate_scale_milli.clone();
+        let idr_u = global_idr_tx.clone();
         let pid_u = peer_id.clone();
         let act_u = evrt_active.clone();
 
@@ -229,6 +230,7 @@ pub fn run(cfg: PipelineConfig) {
                     fps_u,
                     qual_u,
                     bitrate_scale_u,
+                    idr_u,
                     pid_u,
                 );
             })
@@ -1009,6 +1011,7 @@ fn evrt_send_loop(
     target_fps: Arc<AtomicU32>,
     quality_ms: Arc<AtomicU32>,
     bitrate_scale_milli: Arc<AtomicU32>,
+    idr_request_tx: Sender<()>,
     peer_id: String,
 ) {
     log(&events, "EVRT UDP sender: ожидание punch…".into());
@@ -1050,6 +1053,7 @@ fn evrt_send_loop(
         target_fps,
         quality_milli: quality_ms,
         bitrate_scale_milli,
+        idr_request_tx,
     };
 
     if let Err(e) = crate::evrt_session::run_evrt_session(params) {

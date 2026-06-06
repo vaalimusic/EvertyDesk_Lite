@@ -36,13 +36,14 @@ use crate::{
     settings::AppConfig,
     video_pipeline::EncodedFrame,
 };
+use socket2::SockRef;
 
 // ─── константы ────────────────────────────────────────────────────────────────
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(8);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
-const IDR_MIN_INTERVAL: Duration = Duration::from_secs(2);
-const SPIN_THRESHOLD: Duration = Duration::from_micros(1_500);
+const SPIN_THRESHOLD: Duration = Duration::from_micros(100);
+const PACER_BURST_PACKETS: u8 = 4;
 
 // ─── публичный интерфейс ──────────────────────────────────────────────────────
 
@@ -72,6 +73,8 @@ pub struct EvrtSessionParams {
     pub quality_milli: Arc<AtomicU32>,
     /// Масштаб bitrate от EVRT feedback: 1000 = полный bitrate, ниже = relief.
     pub bitrate_scale_milli: Arc<AtomicU32>,
+    /// Запрос немедленного IDR в общий encoder pipeline.
+    pub idr_request_tx: Sender<()>,
 }
 
 /// Запустить EVRT сессию. Блокирует до завершения.
@@ -87,6 +90,7 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
         target_fps,
         quality_milli,
         bitrate_scale_milli,
+        idr_request_tx,
     } = params;
 
     // ── Windows performance hints ─────────────────────────────────────────────
@@ -94,6 +98,12 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
 
     evrt_log(&events, format!("EVRT session → {peer_addr}"));
     bitrate_scale_milli.store(1_000, Ordering::Relaxed);
+    let socket_ref = SockRef::from(socket.as_ref());
+    let _ = socket_ref.set_send_buffer_size(4 * 1024 * 1024);
+    let _ = socket_ref.set_recv_buffer_size(512 * 1024);
+    if let Ok(size) = socket_ref.send_buffer_size() {
+        evrt_log(&events, format!("EVRT host UDP send buffer: {size} bytes"));
+    }
 
     // ── SessionConfig ─────────────────────────────────────────────────────────
     let (screen_w, screen_h) = crate::capture::screen_size().unwrap_or((1920, 1080));
@@ -223,14 +233,17 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
 
     // ── Главный цикл: берём кадры из pipeline → пакетизируем → UDP ───────────
     let mut relief = AdaptiveRelief::new(true);
-    let mut last_idr = Instant::now();
     let mut last_keepalive = Instant::now();
+    let mut pacing_bps = bitrate.max(1);
+    let mut pacer = UdpPacer::new();
+    let mut waiting_for_idr = true;
 
     // HNS PTS (как в EvertyGame _sampleTimeHns)
     let mut sample_hns: u64 = 0;
     let hns_per_frame = |fps: u32| 10_000_000u64 / fps.max(1) as u64;
 
     evrt_log(&events, "EVRT: main loop started".into());
+    let _ = idr_request_tx.send(());
 
     while !stop.load(Ordering::Relaxed) {
         // ── Feedback от клиента ───────────────────────────────────────────────
@@ -254,7 +267,14 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
         }
 
         // ── Keyframe request ──────────────────────────────────────────────────
-        let kf_requested = kf_rx.try_recv().is_ok();
+        let mut kf_requested = false;
+        while kf_rx.try_recv().is_ok() {
+            kf_requested = true;
+        }
+        if kf_requested && !waiting_for_idr {
+            waiting_for_idr = true;
+            let _ = idr_request_tx.send(());
+        }
 
         // ── Keepalive SessionConfig ───────────────────────────────────────────
         if last_keepalive.elapsed() > KEEPALIVE_INTERVAL {
@@ -266,6 +286,7 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
                 quality_milli.load(Ordering::Relaxed),
             );
             let cur_bps = scale_bitrate_bps(cur_bps, bitrate_scale_milli.load(Ordering::Relaxed));
+            pacing_bps = cur_bps.max(1);
             let upd = SessionConfig {
                 fps: cur_fps,
                 bitrate: cur_bps,
@@ -286,22 +307,19 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
             Err(_) => break, // pipeline завершился
         };
 
-        // Если клиент запросил IDR или пора по таймеру — сигнализируем pipeline
-        // через следующий цикл (IDR приходит сам по себе из EncoderThread)
-        if kf_requested || last_idr.elapsed() > IDR_MIN_INTERVAL {
-            // IDR запрошен, но мы не можем форсировать энкодер отсюда —
-            // pipeline сам генерирует IDR по своему таймеру.
-            // Просто пропускаем до следующего IDR если нужен.
-            if kf_requested && !frame.is_idr {
-                continue; // дропаем не-IDR кадры пока ждём IDR
-            }
+        // После запроса не посылаем зависимые P-кадры до нового IDR.
+        if waiting_for_idr && !frame.is_idr {
+            continue;
         }
 
         if frame.is_idr {
-            last_idr = Instant::now();
+            waiting_for_idr = false;
             // CodecConfig (SPS/PPS) перед IDR
             if let Some(ref sps_pps) = frame.sps_pps {
-                let _ = send_udp(&socket, &evrt::build_codec_config(sps_pps), peer_addr);
+                let config_packet = evrt::build_codec_config(sps_pps);
+                let _ = send_udp(&socket, &config_packet, peer_addr);
+                thread::sleep(Duration::from_millis(1));
+                let _ = send_udp(&socket, &config_packet, peer_addr);
             }
         }
 
@@ -323,7 +341,7 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
         // ── Пакетизация и отправка ────────────────────────────────────────────
         let pkts = evrt::packetize_video_frame(frame.frame_id, pts_us, frame.is_idr, &frame.bytes);
         for pkt in &pkts {
-            if send_udp(&socket, pkt, peer_addr).is_err() {
+            if pacer.send(&socket, pkt, peer_addr, pacing_bps).is_err() {
                 stop.store(true, Ordering::Relaxed);
                 break;
             }
@@ -426,6 +444,64 @@ fn send_udp(socket: &UdpSocket, data: &[u8], addr: SocketAddr) -> Result<(), Str
     Ok(())
 }
 
+struct UdpPacer {
+    next_send_at: Instant,
+    packets_in_burst: u8,
+}
+
+impl UdpPacer {
+    fn new() -> Self {
+        Self {
+            next_send_at: Instant::now(),
+            packets_in_burst: 0,
+        }
+    }
+
+    fn send(
+        &mut self,
+        socket: &UdpSocket,
+        data: &[u8],
+        addr: SocketAddr,
+        target_bps: u32,
+    ) -> Result<(), String> {
+        if self.packets_in_burst == 0 {
+            let now = Instant::now();
+            if self.next_send_at > now {
+                precise_wait(self.next_send_at - now);
+            } else if now.duration_since(self.next_send_at) > Duration::from_millis(50) {
+                self.next_send_at = now;
+            }
+        }
+
+        send_udp(socket, data, addr)?;
+
+        // 20% headroom accounts for UDP/IP framing and prevents the pacer from
+        // falling behind the encoder's configured payload bitrate.
+        self.next_send_at += packet_spacing(data.len(), target_bps);
+        self.packets_in_burst = (self.packets_in_burst + 1) % PACER_BURST_PACKETS;
+        Ok(())
+    }
+}
+
+fn packet_spacing(bytes: usize, target_bps: u32) -> Duration {
+    let wire_bps = u64::from(target_bps.max(1)).saturating_mul(120) / 100;
+    let spacing_ns = (bytes as u64)
+        .saturating_mul(8)
+        .saturating_mul(1_000_000_000)
+        / wire_bps.max(1);
+    Duration::from_nanos(spacing_ns.max(1))
+}
+
+fn precise_wait(wait: Duration) {
+    let deadline = Instant::now() + wait;
+    if wait > SPIN_THRESHOLD {
+        thread::sleep(wait - SPIN_THRESHOLD);
+    }
+    while Instant::now() < deadline {
+        std::hint::spin_loop();
+    }
+}
+
 fn is_would_block(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut
 }
@@ -482,5 +558,11 @@ mod tests {
     fn decode_invalid() {
         assert!(decode_punch_addr(&[]).is_none());
         assert!(decode_punch_addr(&[1, 2]).is_none());
+    }
+
+    #[test]
+    fn packet_pacing_includes_transport_headroom() {
+        let spacing = packet_spacing(1_200, 12_000_000);
+        assert_eq!(spacing.as_nanos(), 666_666);
     }
 }
