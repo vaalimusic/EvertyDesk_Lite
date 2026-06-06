@@ -6,13 +6,23 @@
 //!
 //! Returns `(width, height, bgra_pixels)`.
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureDisplay {
+    pub index: i32,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub name: String,
+}
+
 #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
 mod win {
     use std::{cell::RefCell, mem::size_of};
 
     use windows::core::{ComInterface, Error as WinError, HRESULT};
     use windows::Win32::{
-        Foundation::{HMODULE, HWND},
+        Foundation::{HMODULE, HWND, RECT},
         Graphics::Gdi::{
             BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreatedHDC, DeleteDC, DeleteObject,
             GetDC, GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
@@ -36,37 +46,50 @@ mod win {
         UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN},
     };
 
+    use super::CaptureDisplay;
+
     thread_local! {
         static DXGI_CAPTURE: RefCell<Option<DxgiCapture>> = const { RefCell::new(None) };
         static GDI_CAPTURE: RefCell<Option<GdiCapture>> = const { RefCell::new(None) };
     }
 
     pub fn capture_into(out: &mut Vec<u8>) -> Option<(u32, u32)> {
-        unsafe { capture_into_inner(out) }
+        capture_display_into(0, out)
     }
 
-    unsafe fn capture_into_inner(out: &mut Vec<u8>) -> Option<(u32, u32)> {
-        let width = GetSystemMetrics(SM_CXSCREEN);
-        let height = GetSystemMetrics(SM_CYSCREEN);
-        if width <= 0 || height <= 0 {
+    pub fn capture_display_into(display: i32, out: &mut Vec<u8>) -> Option<(u32, u32)> {
+        unsafe { capture_into_inner(display, out) }
+    }
+
+    unsafe fn capture_into_inner(display: i32, out: &mut Vec<u8>) -> Option<(u32, u32)> {
+        let info = display_info(display).or_else(|| display_infos().into_iter().next())?;
+        if info.width <= 0 || info.height <= 0 {
             return None;
         }
 
-        if let Some(size) = capture_dxgi_into(out, width as u32, height as u32) {
+        if let Some(size) =
+            capture_dxgi_into(out, info.index, info.width as u32, info.height as u32)
+        {
             return Some(size);
         }
 
-        capture_gdi_into(out, width, height)
+        capture_gdi_into(out, &info)
     }
 
     unsafe fn capture_dxgi_into(
         out: &mut Vec<u8>,
-        screen_w: u32,
-        screen_h: u32,
+        display: i32,
+        width: u32,
+        height: u32,
     ) -> Option<(u32, u32)> {
         DXGI_CAPTURE.with(|cell| {
-            if cell.borrow().is_none() {
-                *cell.borrow_mut() = DxgiCapture::new(screen_w, screen_h).ok();
+            let recreate = cell
+                .borrow()
+                .as_ref()
+                .map(|capture| !capture.matches(display, width, height))
+                .unwrap_or(true);
+            if recreate {
+                *cell.borrow_mut() = DxgiCapture::new(display, width, height).ok();
             }
 
             let result = match cell.borrow_mut().as_mut() {
@@ -91,15 +114,15 @@ mod win {
         })
     }
 
-    unsafe fn capture_gdi_into(out: &mut Vec<u8>, width: i32, height: i32) -> Option<(u32, u32)> {
+    unsafe fn capture_gdi_into(out: &mut Vec<u8>, info: &CaptureDisplay) -> Option<(u32, u32)> {
         GDI_CAPTURE.with(|cell| {
             let recreate = cell
                 .borrow()
                 .as_ref()
-                .map(|capture| !capture.matches(width, height))
+                .map(|capture| !capture.matches(info.x, info.y, info.width, info.height))
                 .unwrap_or(true);
             if recreate {
-                *cell.borrow_mut() = GdiCapture::new(width, height);
+                *cell.borrow_mut() = GdiCapture::new(info.x, info.y, info.width, info.height);
             }
 
             let result = cell
@@ -120,6 +143,7 @@ mod win {
     }
 
     struct DxgiCapture {
+        display: i32,
         width: u32,
         height: u32,
         device: ID3D11Device,
@@ -129,7 +153,7 @@ mod win {
     }
 
     impl DxgiCapture {
-        unsafe fn new(screen_w: u32, screen_h: u32) -> Result<Self, WinError> {
+        unsafe fn new(display: i32, screen_w: u32, screen_h: u32) -> Result<Self, WinError> {
             let mut device = None;
             let mut context = None;
             D3D11CreateDevice(
@@ -147,7 +171,7 @@ mod win {
             let context = context.ok_or_else(|| WinError::from(E_DXGI_CAPTURE_INIT))?;
             let dxgi_device: IDXGIDevice = device.cast()?;
             let adapter = dxgi_device.GetAdapter()?;
-            let output = adapter.EnumOutputs(0)?;
+            let output = adapter.EnumOutputs(display.max(0) as u32)?;
             let output1: IDXGIOutput1 = output.cast()?;
             let duplication = output1.DuplicateOutput(&device)?;
 
@@ -160,6 +184,7 @@ mod win {
             }
 
             Ok(Self {
+                display,
                 width,
                 height,
                 device,
@@ -167,6 +192,10 @@ mod win {
                 duplication,
                 staging: None,
             })
+        }
+
+        fn matches(&self, display: i32, width: u32, height: u32) -> bool {
+            self.display == display && self.width == width && self.height == height
         }
 
         unsafe fn capture_into(&mut self, out: &mut Vec<u8>) -> DxgiCaptureResult {
@@ -292,6 +321,8 @@ mod win {
     }
 
     struct GdiCapture {
+        x: i32,
+        y: i32,
         width: i32,
         height: i32,
         hdc_screen: HDC,
@@ -302,7 +333,7 @@ mod win {
     }
 
     impl GdiCapture {
-        unsafe fn new(width: i32, height: i32) -> Option<Self> {
+        unsafe fn new(x: i32, y: i32, width: i32, height: i32) -> Option<Self> {
             let hdc_screen = GetDC(HWND(0));
             if hdc_screen.is_invalid() {
                 return None;
@@ -337,6 +368,8 @@ mod win {
             };
 
             Some(Self {
+                x,
+                y,
                 width,
                 height,
                 hdc_screen,
@@ -347,8 +380,8 @@ mod win {
             })
         }
 
-        fn matches(&self, width: i32, height: i32) -> bool {
-            self.width == width && self.height == height
+        fn matches(&self, x: i32, y: i32, width: i32, height: i32) -> bool {
+            self.x == x && self.y == y && self.width == width && self.height == height
         }
 
         unsafe fn capture_into(&mut self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
@@ -366,8 +399,8 @@ mod win {
                 self.width,
                 self.height,
                 self.hdc_screen,
-                0,
-                0,
+                self.x,
+                self.y,
                 SRCCOPY | CAPTUREBLT,
             )
             .as_bool()
@@ -391,6 +424,100 @@ mod win {
             // GDI gives us BGRA; that is already the native pixel order for our
             // pipeline.
             Some((w, h))
+        }
+    }
+
+    pub fn display_infos() -> Vec<CaptureDisplay> {
+        unsafe { dxgi_display_infos().unwrap_or_else(fallback_display_infos) }
+    }
+
+    fn display_info(display: i32) -> Option<CaptureDisplay> {
+        let displays = display_infos();
+        displays
+            .iter()
+            .find(|info| info.index == display.max(0))
+            .cloned()
+            .or_else(|| displays.first().cloned())
+    }
+
+    unsafe fn dxgi_display_infos() -> Option<Vec<CaptureDisplay>> {
+        let mut device = None;
+        let mut context = None;
+        D3D11CreateDevice(
+            Option::<&IDXGIAdapter>::None,
+            D3D_DRIVER_TYPE_HARDWARE,
+            HMODULE(0),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            Some(&[D3D_FEATURE_LEVEL_11_0]),
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            Some(&mut context),
+        )
+        .ok()?;
+        let device: ID3D11Device = device?;
+        let dxgi_device: IDXGIDevice = device.cast().ok()?;
+        let adapter = dxgi_device.GetAdapter().ok()?;
+
+        let mut displays = Vec::new();
+        for index in 0..16_u32 {
+            let Ok(output) = adapter.EnumOutputs(index) else {
+                break;
+            };
+            let mut desc = Default::default();
+            output.GetDesc(&mut desc).ok()?;
+            let RECT {
+                left,
+                top,
+                right,
+                bottom,
+            } = desc.DesktopCoordinates;
+            let width = right - left;
+            let height = bottom - top;
+            if width <= 0 || height <= 0 {
+                continue;
+            }
+            let name = utf16_z_to_string(&desc.DeviceName)
+                .unwrap_or_else(|| format!("Display {}", index + 1));
+            displays.push(CaptureDisplay {
+                index: index as i32,
+                x: left,
+                y: top,
+                width,
+                height,
+                name,
+            });
+        }
+        if displays.is_empty() {
+            None
+        } else {
+            Some(displays)
+        }
+    }
+
+    fn fallback_display_infos() -> Vec<CaptureDisplay> {
+        let w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+        let h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+        if w <= 0 || h <= 0 {
+            Vec::new()
+        } else {
+            vec![CaptureDisplay {
+                index: 0,
+                x: 0,
+                y: 0,
+                width: w,
+                height: h,
+                name: "Display 1".to_owned(),
+            }]
+        }
+    }
+
+    fn utf16_z_to_string(buf: &[u16]) -> Option<String> {
+        let len = buf.iter().position(|ch| *ch == 0).unwrap_or(buf.len());
+        if len == 0 {
+            None
+        } else {
+            Some(String::from_utf16_lossy(&buf[..len]))
         }
     }
 
@@ -614,6 +741,16 @@ pub fn capture_screen_into(pixels: &mut Vec<u8>) -> Option<(u32, u32)> {
     None
 }
 
+/// Capture a specific display by the index announced in `display_infos`.
+#[allow(unused)]
+pub fn capture_display_into(display: i32, pixels: &mut Vec<u8>) -> Option<(u32, u32)> {
+    #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
+    return win::capture_display_into(display, pixels);
+
+    let _ = display;
+    capture_screen_into(pixels)
+}
+
 /// Return the primary display size without a full capture.
 #[allow(unused)]
 pub fn screen_size() -> Option<(u32, u32)> {
@@ -640,6 +777,25 @@ pub fn screen_size() -> Option<(u32, u32)> {
         target_os = "linux"
     )))]
     None
+}
+
+#[allow(unused)]
+pub fn display_infos() -> Vec<CaptureDisplay> {
+    #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
+    return win::display_infos();
+
+    screen_size()
+        .map(|(width, height)| {
+            vec![CaptureDisplay {
+                index: 0,
+                x: 0,
+                y: 0,
+                width: width as i32,
+                height: height as i32,
+                name: "Display 1".to_owned(),
+            }]
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(target_os = "linux")]

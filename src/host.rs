@@ -61,7 +61,7 @@ use crate::{
         misc, peer_message, rendezvous_message, video_frame, DisplayInfo, EncodedVideoFrame,
         EncodedVideoFrames, Hash, IdPk, ImageQuality, LoginResponse, Misc, PeerInfo, PeerMessage,
         PreferCodec, RegisterPeer, RegisterPk, RelayResponse, RendezvousMessage, RequestRelay,
-        ShellMessage, ShellMessageKind, SignedId, SupportedDecoding,
+        ShellMessage, ShellMessageKind, SignedId, SupportedDecoding, SwitchDisplay,
     },
     settings::{AppConfig, CodecPreference, EncoderPreference},
     transport::{connect_tcp, encode_frame_len, read_framed, send_framed},
@@ -1164,24 +1164,48 @@ fn relay_session_inner(
     };
 
     // ── 4. Send LoginResponse + display info ─────────────────────────────────
-    let (screen_w, screen_h) = crate::capture::screen_size().unwrap_or((1920, 1080));
     let hostname = hostname();
+    let mut displays: Vec<DisplayInfo> = crate::capture::display_infos()
+        .into_iter()
+        .map(|display| DisplayInfo {
+            x: display.x,
+            y: display.y,
+            width: display.width,
+            height: display.height,
+            name: if display.name.is_empty() {
+                format!("Display {}", display.index + 1)
+            } else {
+                display.name
+            },
+            online: true,
+            cursor_embedded: false,
+            scale: 1.0,
+        })
+        .collect();
+    if displays.is_empty() {
+        let (screen_w, screen_h) = crate::capture::screen_size().unwrap_or((1920, 1080));
+        displays.push(DisplayInfo {
+            x: 0,
+            y: 0,
+            width: screen_w as i32,
+            height: screen_h as i32,
+            name: hostname.clone(),
+            online: true,
+            cursor_embedded: false,
+            scale: 1.0,
+        });
+    }
+    host_log(
+        events,
+        format!("Host displays announced: {}", displays.len()),
+    );
     let peer_info = PeerInfo {
         username: String::new(),
         hostname: hostname.clone(),
         platform: std::env::consts::OS.to_owned(),
         version: "1.4.6".to_owned(),
         current_display: 0,
-        displays: vec![DisplayInfo {
-            x: 0,
-            y: 0,
-            width: screen_w as i32,
-            height: screen_h as i32,
-            name: hostname,
-            online: true,
-            cursor_embedded: false,
-            scale: 1.0,
-        }],
+        displays,
         windows_sessions: None,
     };
     let login_ok = PeerMessage {
@@ -2514,12 +2538,66 @@ fn handle_client_input_pipeline(
                 let _ = cmd_tx.send(PipelineCmd::SetQuality(quality));
             }
         }
+        Some(peer_message::Union::Misc(Misc {
+            union: Some(misc::Union::SwitchDisplay(display)),
+        })) => {
+            let display = display.display.max(0);
+            let _ = cmd_tx.send(PipelineCmd::SetDisplay(display));
+            let _ = cmd_tx.send(PipelineCmd::RequestIdr);
+            send_switch_display_geometry(peer_msg_tx, display);
+        }
+        Some(peer_message::Union::Misc(Misc {
+            union: Some(misc::Union::CaptureDisplays(displays)),
+        })) => {
+            if let Some(display) = displays
+                .set
+                .first()
+                .or_else(|| displays.add.first())
+                .copied()
+                .map(|display| display.max(0))
+            {
+                let _ = cmd_tx.send(PipelineCmd::SetDisplay(display));
+                let _ = cmd_tx.send(PipelineCmd::RequestIdr);
+                send_switch_display_geometry(peer_msg_tx, display);
+            }
+        }
+        Some(peer_message::Union::Misc(Misc {
+            union: Some(misc::Union::MessageQuery(query)),
+        })) => {
+            if query.switch_display >= 0 {
+                send_switch_display_geometry(peer_msg_tx, query.switch_display);
+            }
+        }
         Some(peer_message::Union::Shell(shell_msg)) => {
             // Shell output идёт через peer_msg_tx → pipeline → TCP relay → клиент
             handle_shell_message(shell_msg, peer_msg_tx, shell);
         }
         _ => {}
     }
+}
+
+fn send_switch_display_geometry(outgoing: &Sender<PeerMessage>, display: i32) {
+    let displays = crate::capture::display_infos();
+    let selected = displays
+        .iter()
+        .find(|info| info.index == display.max(0))
+        .or_else(|| displays.first());
+    let Some(info) = selected else {
+        return;
+    };
+    let reply = PeerMessage {
+        union: Some(peer_message::Union::Misc(Misc {
+            union: Some(misc::Union::SwitchDisplay(SwitchDisplay {
+                display: info.index,
+                x: info.x,
+                y: info.y,
+                width: info.width,
+                height: info.height,
+                cursor_embedded: false,
+            })),
+        })),
+    };
+    let _ = outgoing.send(reply);
 }
 
 struct ShellRuntime {

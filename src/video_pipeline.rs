@@ -50,6 +50,7 @@ pub struct EncodedFrame {
     pub is_idr: bool,
     pub frame_id: u32,
     pub pts_us: u64,
+    pub display: i32,
     /// SPS/PPS — только для IDR кадров.
     pub sps_pps: Option<Arc<Vec<u8>>>,
     pub width: u32,
@@ -70,6 +71,7 @@ pub enum PipelineCmd {
     Stop,
     SetFps(u32),
     SetQuality(u32),
+    SetDisplay(i32),
     RequestIdr,
     EvrtPeerConnected(SocketAddr),
     EvrtSessionEnded,
@@ -110,6 +112,7 @@ pub fn run(cfg: PipelineConfig) {
     let target_fps = Arc::new(AtomicU32::new(app_config.display.target_fps.clamp(5, 60)));
     let quality_ms = Arc::new(AtomicU32::new(1_000));
     let bitrate_scale_milli = Arc::new(AtomicU32::new(1_000));
+    let active_display = Arc::new(AtomicU32::new(0));
 
     // IDR request channel: cmd_rx → encoder
     let (idr_tx, idr_rx) = mpsc::channel::<()>();
@@ -157,6 +160,7 @@ pub fn run(cfg: PipelineConfig) {
         let fps_e = target_fps.clone();
         let qual_e = quality_ms.clone();
         let bitrate_scale_e = bitrate_scale_milli.clone();
+        let display_e = active_display.clone();
         let cfg_e = app_config.clone();
         let client_video_e = client_video;
         let ev_e = events.clone();
@@ -172,6 +176,7 @@ pub fn run(cfg: PipelineConfig) {
                     fps_e,
                     qual_e,
                     bitrate_scale_e,
+                    display_e,
                     cfg_e,
                     client_video_e,
                     ev_e,
@@ -249,6 +254,15 @@ pub fn run(cfg: PipelineConfig) {
             Ok(PipelineCmd::SetQuality(q)) => {
                 quality_ms.store(q, Ordering::Relaxed);
             }
+            Ok(PipelineCmd::SetDisplay(display)) => {
+                let display = display.max(0);
+                active_display.store(display as u32, Ordering::Relaxed);
+                let _ = idr_tx.send(());
+                log(
+                    &events,
+                    format!("Pipeline: switched capture to display {}", display + 1),
+                );
+            }
             Ok(PipelineCmd::RequestIdr) => {
                 let _ = idr_tx.send(());
             }
@@ -298,6 +312,7 @@ fn encode_loop(
     target_fps: Arc<AtomicU32>,
     quality_ms: Arc<AtomicU32>,
     bitrate_scale_milli: Arc<AtomicU32>,
+    active_display: Arc<AtomicU32>,
     config: AppConfig,
     client_video: ClientVideoSupport,
     events: Sender<HostEvent>,
@@ -339,7 +354,7 @@ fn encode_loop(
     const TELE_INTERVAL: Duration = Duration::from_secs(10);
 
     // Capture double buffer
-    type CapSlot = Arc<Mutex<Option<(u32, u32, Vec<u8>)>>>;
+    type CapSlot = Arc<Mutex<Option<(i32, u32, u32, Vec<u8>)>>>;
     let cap_slot: CapSlot = Arc::new(Mutex::new(None));
     // Keep the handle so we can join the capture thread before NVENC is
     // destroyed.  Without this join, the DXGI duplication and NVENC D3D11
@@ -347,6 +362,7 @@ fn encode_loop(
     let cap_handle = {
         let cap_stop = stop.clone();
         let cap_fps = target_fps.clone();
+        let cap_display = active_display.clone();
         let cap_slot2 = cap_slot.clone();
         thread::Builder::new()
             .name("pipeline-capture".into())
@@ -357,13 +373,14 @@ fn encode_loop(
                         break;
                     }
                     let fps = cap_fps.load(Ordering::Relaxed).clamp(5, 60);
-                    if let Some((w, h)) = crate::capture::capture_screen_into(&mut buf) {
+                    let display = cap_display.load(Ordering::Relaxed) as i32;
+                    if let Some((w, h)) = crate::capture::capture_display_into(display, &mut buf) {
                         if let Ok(mut slot) = cap_slot2.lock() {
                             match slot.as_mut() {
-                                Some(s) if s.0 == w && s.1 == h => {
-                                    std::mem::swap(&mut s.2, &mut buf);
+                                Some(s) if s.0 == display && s.1 == w && s.2 == h => {
+                                    std::mem::swap(&mut s.3, &mut buf);
                                 }
-                                _ => *slot = Some((w, h, buf.clone())),
+                                _ => *slot = Some((display, w, h, buf.clone())),
                             }
                         }
                     }
@@ -405,7 +422,9 @@ fn encode_loop(
 
         // Захват
         let cap_started = Instant::now();
-        let Some((cap_w, cap_h, bgra_raw)) = cap_slot.lock().ok().and_then(|mut s| s.take()) else {
+        let Some((display, cap_w, cap_h, bgra_raw)) =
+            cap_slot.lock().ok().and_then(|mut s| s.take())
+        else {
             thread::sleep(Duration::from_millis(1));
             continue;
         };
@@ -414,11 +433,7 @@ fn encode_loop(
         // FSR: апскейл происходит in-place в буфере адаптера.
         // Передаём срез напрямую в кодировщик — без лишнего .to_owned()
         // (кодирование синхронно сразу после, буфер FSR жив весь кадр).
-        let (enc_w, enc_h) = if fsr.is_some() {
-            crate::capture::screen_size().unwrap_or((cap_w, cap_h))
-        } else {
-            (cap_w, cap_h)
-        };
+        let (enc_w, enc_h) = (cap_w, cap_h);
         let bgra: &[u8] = match fsr {
             Some(ref mut a) => a.process_bgra(&bgra_raw, cap_w, cap_h, enc_w, enc_h),
             None => &bgra_raw,
@@ -520,6 +535,7 @@ fn encode_loop(
             is_idr,
             frame_id,
             pts_us,
+            display,
             sps_pps: out.sps_pps.map(Arc::new),
             width: enc_w,
             height: enc_h,
@@ -638,7 +654,7 @@ fn make_tcp_video_frame(frame: &EncodedFrame) -> crate::rustdesk_proto::PeerMess
     PeerMessage {
         union: Some(peer_message::Union::VideoFrame(VideoFrame {
             union: Some(union),
-            display: 0,
+            display: frame.display,
         })),
     }
 }
