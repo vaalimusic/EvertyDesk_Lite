@@ -378,6 +378,10 @@ impl TransportClient {
         let mut known_displays = displays;
         if !known_displays.is_empty() {
             let _ = events.send(SessionEvent::Displays(known_displays.clone()));
+        } else {
+            let _ = events.send(SessionEvent::Info(
+                "PeerInfo displays empty; manual monitor selector is enabled".to_owned(),
+            ));
         }
 
         // ★ EVRT: адрес хоста получен за ОДИН запрос к hbbs.
@@ -775,7 +779,7 @@ impl TransportClient {
                         flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
                         current_display = display.index.max(0);
                         live_video_seen = false;
-                        let _ = send_switch_display(&mut relay, current_display, Some(&display));
+                        let _ = send_switch_display(&mut relay, current_display);
                         let _ = send_video_start_messages(
                             &mut relay,
                             current_display,
@@ -2036,15 +2040,10 @@ fn send_video_start_messages(
 /// switch, NOT in the periodic refresh loop (would create a SwitchDisplay feedback loop).
 fn send_switch_display_subscribe(relay: &mut TcpStream, display: i32) -> Result<(), String> {
     let display = display.max(0);
-    let switch_msg = PeerMessage {
-        union: Some(peer_message::Union::Misc(Misc {
-            union: Some(misc::Union::SwitchDisplay(SwitchDisplay {
-                display,
-                ..Default::default()
-            })),
-        })),
-    };
-    send_framed(relay, &encode_peer_message(&switch_msg))?;
+    send_framed(
+        relay,
+        &encode_peer_message(&switch_display_message(display)),
+    )?;
     send_capture_displays_set(relay, display)
 }
 
@@ -2827,10 +2826,8 @@ fn update_displays_from_login_response(
     known_displays: &mut Vec<RemoteDisplay>,
     events: &Sender<SessionEvent>,
 ) {
-    let displays = displays_from_login_response(response);
-    if !displays.is_empty() {
-        *known_displays = displays.clone();
-        let _ = events.send(SessionEvent::Displays(displays));
+    if let Some(crate::rustdesk_proto::login_response::Union::PeerInfo(info)) = &response.union {
+        update_displays_from_peer_info(info, known_displays, events);
     }
 }
 
@@ -2843,7 +2840,52 @@ fn update_displays_from_peer_info(
     if !displays.is_empty() {
         *known_displays = displays.clone();
         let _ = events.send(SessionEvent::Displays(displays));
+    } else {
+        let _ = events.send(SessionEvent::Info(format!(
+            "PeerInfo displays empty: {}",
+            peer_info_context(info)
+        )));
     }
+}
+
+fn peer_info_context(info: &crate::rustdesk_proto::PeerInfo) -> String {
+    format!(
+        "hostname={}, platform={}, version={}, current_display={}, displays={}",
+        info.hostname,
+        info.platform,
+        info.version,
+        info.current_display,
+        peer_info_display_summary(info)
+    )
+}
+
+fn peer_info_display_summary(info: &crate::rustdesk_proto::PeerInfo) -> String {
+    if info.displays.is_empty() {
+        return "0".to_owned();
+    }
+
+    info.displays
+        .iter()
+        .enumerate()
+        .map(|(index, display)| {
+            let name = if display.name.is_empty() {
+                format!("Display {}", index + 1)
+            } else {
+                display.name.clone()
+            };
+            format!(
+                "#{index} {name}: {}x{} @ {},{} online={} cursor={} scale={:.2}",
+                display.width,
+                display.height,
+                display.x,
+                display.y,
+                display.online,
+                display.cursor_embedded,
+                display.scale
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 fn displays_from_login_response(
@@ -3593,27 +3635,25 @@ fn decode_png_rgba(bytes: &[u8]) -> Result<(usize, usize, Vec<u8>), String> {
     ))
 }
 
-fn send_switch_display(
-    relay: &mut TcpStream,
-    display: i32,
-    info: Option<&RemoteDisplay>,
-) -> Result<(), String> {
+fn send_switch_display(relay: &mut TcpStream, display: i32) -> Result<(), String> {
     let display = display.max(0);
+    send_framed(
+        relay,
+        &encode_peer_message(&switch_display_message(display)),
+    )?;
+    send_capture_displays_set(relay, display)
+}
+
+fn switch_display_message(display: i32) -> PeerMessage {
     let switch_display = SwitchDisplay {
-        display,
-        x: info.map(|d| d.x).unwrap_or_default(),
-        y: info.map(|d| d.y).unwrap_or_default(),
-        width: info.map(|d| d.width).unwrap_or_default(),
-        height: info.map(|d| d.height).unwrap_or_default(),
-        cursor_embedded: info.map(|d| d.cursor_embedded).unwrap_or_default(),
+        display: display.max(0),
+        ..Default::default()
     };
-    let message = PeerMessage {
+    PeerMessage {
         union: Some(peer_message::Union::Misc(Misc {
             union: Some(misc::Union::SwitchDisplay(switch_display)),
         })),
-    };
-    send_framed(relay, &encode_peer_message(&message))?;
-    send_capture_displays_set(relay, display)
+    }
 }
 
 fn send_capture_displays_set(relay: &mut TcpStream, display: i32) -> Result<(), String> {
@@ -3775,7 +3815,7 @@ fn describe_peer_message(message: &PeerMessage) -> String {
         ),
         Some(peer_message::Union::LoginResponse(response)) => match &response.union {
             Some(crate::rustdesk_proto::login_response::Union::PeerInfo(info)) => {
-                format!("LoginResponse PeerInfo {} {}", info.hostname, info.version)
+                format!("LoginResponse PeerInfo {}", peer_info_context(info))
             }
             Some(crate::rustdesk_proto::login_response::Union::Error(err)) => {
                 format!("LoginResponse Error {err}")
@@ -3783,7 +3823,7 @@ fn describe_peer_message(message: &PeerMessage) -> String {
             None => "LoginResponse empty".to_owned(),
         },
         Some(peer_message::Union::PeerInfo(info)) => {
-            format!("PeerInfo {} {}", info.hostname, info.version)
+            format!("PeerInfo {}", peer_info_context(info))
         }
         Some(peer_message::Union::Hash(_)) => "Hash".to_owned(),
         Some(peer_message::Union::SignedId(_)) => "SignedId".to_owned(),
@@ -3885,10 +3925,7 @@ fn describe_login_response(
             } else {
                 "peer accepted without password hash"
             };
-            Ok(format!(
-                "{prefix}; peer info: hostname={}, platform={}, version={}",
-                info.hostname, info.platform, info.version
-            ))
+            Ok(format!("{prefix}; peer info: {}", peer_info_context(&info)))
         }
         None => Ok("empty login response".to_owned()),
     }
@@ -4198,6 +4235,22 @@ mod tests {
             panic!("expected CaptureDisplays message");
         };
         assert_eq!(displays.set, vec![0]);
+    }
+
+    #[test]
+    fn switch_display_message_does_not_request_resolution_change() {
+        let message = switch_display_message(2);
+        let Some(peer_message::Union::Misc(misc)) = message.union else {
+            panic!("expected Misc message");
+        };
+        let Some(misc::Union::SwitchDisplay(display)) = misc.union else {
+            panic!("expected SwitchDisplay message");
+        };
+        assert_eq!(display.display, 2);
+        assert_eq!(display.width, 0);
+        assert_eq!(display.height, 0);
+        assert_eq!(display.x, 0);
+        assert_eq!(display.y, 0);
     }
 
     #[test]

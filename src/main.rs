@@ -3266,6 +3266,34 @@ impl EvertyDeskApp {
         self.send_command(SessionCommand::SetDisplay(display));
     }
 
+    fn switch_remote_display_index(&mut self, index: i32) {
+        let index = index.max(0);
+        if let Some(display) = self
+            .remote_displays
+            .iter()
+            .find(|display| display.index == index)
+            .cloned()
+        {
+            self.switch_remote_display(display);
+            return;
+        }
+
+        self.switch_remote_display(self.manual_remote_display(index));
+    }
+
+    fn manual_remote_display(&self, index: i32) -> RemoteDisplay {
+        let index = index.max(0);
+        RemoteDisplay {
+            index,
+            name: format!("Дисплей {} (ручной)", index.saturating_add(1)),
+            width: i32::try_from(self.remote_size[0]).unwrap_or_default(),
+            height: i32::try_from(self.remote_size[1]).unwrap_or_default(),
+            x: 0,
+            y: 0,
+            cursor_embedded: false,
+        }
+    }
+
     fn set_remote_fullscreen(&mut self, ctx: &egui::Context, fullscreen: bool) {
         self.remote_fullscreen = fullscreen;
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen));
@@ -3288,8 +3316,11 @@ impl EvertyDeskApp {
             .position(|display| display.index == self.selected_display)
             .map(|pos| pos + 1)
             .unwrap_or(0);
+        let selected_display_number = self.selected_display.max(0).saturating_add(1);
         let button_text = if display_count == 0 {
-            "▣ 0".to_owned()
+            format!("▣ {selected_display_number}/?")
+        } else if selected_pos == 0 {
+            format!("▣ {selected_display_number}/{display_count}")
         } else {
             format!("▣ {selected_pos}/{display_count}")
         };
@@ -3312,6 +3343,27 @@ impl EvertyDeskApp {
                             self.switch_remote_display(display);
                             ui.close();
                         }
+                    }
+                }
+
+                ui.separator();
+                ui.label("Ручной выбор");
+                for index in [0_i32, 1, 2, 3] {
+                    let known = self
+                        .remote_displays
+                        .iter()
+                        .any(|display| display.index == index);
+                    let label = if known {
+                        format!("Дисплей {} (повторить)", index.saturating_add(1))
+                    } else {
+                        format!("Дисплей {}", index.saturating_add(1))
+                    };
+                    if ui
+                        .selectable_label(self.selected_display == index, label)
+                        .clicked()
+                    {
+                        self.switch_remote_display_index(index);
+                        ui.close();
                     }
                 }
 
@@ -3449,20 +3501,17 @@ impl EvertyDeskApp {
     }
 
     fn refresh_remote_screen(&mut self) {
-        if let Some(display) = self
+        let display = self
             .remote_displays
             .iter()
             .find(|display| display.index == self.selected_display)
             .cloned()
-        {
-            self.send_command(SessionCommand::SetDisplay(display));
-        } else {
-            self.send_command(SessionCommand::RefreshVideo);
-            self.send_command(SessionCommand::Screenshot);
-        }
+            .unwrap_or_else(|| self.manual_remote_display(self.selected_display));
+        self.send_command(SessionCommand::SetDisplay(display));
         self.log(format!(
-            "Remote screen refresh requested; host displays known: {}",
-            self.remote_displays.len()
+            "Remote screen refresh requested; selected display: {}, host displays known: {}",
+            self.selected_display.max(0).saturating_add(1),
+            self.remote_displays.len(),
         ));
     }
 
