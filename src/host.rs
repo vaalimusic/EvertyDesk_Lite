@@ -1292,6 +1292,8 @@ fn relay_session_inner(
         peer_id: peer_id.to_owned(),
         events: events.clone(),
         client_video,
+        initial_target_fps: target_fps,
+        initial_quality_milli: quality_milli,
         relay_stream: write_stream,
         send_cipher,
         evrt_socket: evrt_socket.map(|(s, _)| s),
@@ -1328,6 +1330,7 @@ fn relay_session_inner(
                 msg,
                 &cmd_tx,
                 &peer_msg_tx,
+                events,
                 &mut shell,
                 &shared_target_fps,
                 &shared_quality_milli,
@@ -2517,6 +2520,7 @@ fn handle_client_input_pipeline(
     msg: PeerMessage,
     cmd_tx: &mpsc::Sender<crate::video_pipeline::PipelineCmd>,
     peer_msg_tx: &mpsc::Sender<PeerMessage>,
+    events: &Sender<HostEvent>,
     shell: &mut Option<ShellRuntime>,
     target_fps: &AtomicU32,
     quality_milli: &AtomicU32,
@@ -2542,6 +2546,10 @@ fn handle_client_input_pipeline(
             union: Some(misc::Union::SwitchDisplay(display)),
         })) => {
             let display = display.display.max(0);
+            host_log(
+                events,
+                format!("Host display command: SwitchDisplay {}", display + 1),
+            );
             let _ = cmd_tx.send(PipelineCmd::SetDisplay(display));
             send_switch_display_geometry(peer_msg_tx, display);
         }
@@ -2555,6 +2563,10 @@ fn handle_client_input_pipeline(
                 .copied()
                 .map(|display| display.max(0))
             {
+                host_log(
+                    events,
+                    format!("Host display command: CaptureDisplays {}", display + 1),
+                );
                 let _ = cmd_tx.send(PipelineCmd::SetDisplay(display));
                 send_switch_display_geometry(peer_msg_tx, display);
             }
@@ -2565,6 +2577,17 @@ fn handle_client_input_pipeline(
             if query.switch_display >= 0 {
                 send_switch_display_geometry(peer_msg_tx, query.switch_display);
             }
+        }
+        Some(peer_message::Union::Misc(Misc {
+            union: Some(misc::Union::RefreshVideoDisplay(display)),
+        })) => {
+            let display = display.max(0);
+            host_log(
+                events,
+                format!("Host display command: RefreshVideoDisplay {}", display + 1),
+            );
+            let _ = cmd_tx.send(PipelineCmd::SetDisplay(display));
+            send_switch_display_geometry(peer_msg_tx, display);
         }
         Some(peer_message::Union::Shell(shell_msg)) => {
             // Shell output идёт через peer_msg_tx → pipeline → TCP relay → клиент

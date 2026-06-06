@@ -84,6 +84,8 @@ pub struct PipelineConfig {
     pub peer_id: String,
     pub events: Sender<HostEvent>,
     pub client_video: ClientVideoSupport,
+    pub initial_target_fps: u32,
+    pub initial_quality_milli: u32,
     pub relay_stream: std::net::TcpStream,
     /// Шифрование исходящего TCP потока (видео).
     /// RecvCipher остаётся в relay_session_inner для расшифровки управляющих сообщений.
@@ -101,6 +103,8 @@ pub fn run(cfg: PipelineConfig) {
         peer_id,
         events,
         client_video,
+        initial_target_fps,
+        initial_quality_milli,
         relay_stream,
         send_cipher,
         evrt_socket,
@@ -109,8 +113,8 @@ pub fn run(cfg: PipelineConfig) {
     } = cfg;
 
     let stop = Arc::new(AtomicBool::new(false));
-    let target_fps = Arc::new(AtomicU32::new(app_config.display.target_fps.clamp(5, 60)));
-    let quality_ms = Arc::new(AtomicU32::new(1_000));
+    let target_fps = Arc::new(AtomicU32::new(initial_target_fps.clamp(5, 60)));
+    let quality_ms = Arc::new(AtomicU32::new(initial_quality_milli.max(1)));
     let bitrate_scale_milli = Arc::new(AtomicU32::new(1_000));
     let active_display = Arc::new(AtomicU32::new(0));
 

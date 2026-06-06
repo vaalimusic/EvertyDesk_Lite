@@ -1697,18 +1697,20 @@ fn start_hung_window_guardian() {
                 FindWindowA, SendMessageTimeoutA, ShowWindow, SMTO_ABORTIFHUNG, SW_HIDE, WM_NULL,
             };
 
-            // Wait for the window to fully initialize.
-            thread::sleep(Duration::from_secs(5));
+            // Wait for the window and GPU backend to fully initialize.
+            thread::sleep(Duration::from_secs(10));
+            let mut misses = 0_u32;
 
             loop {
-                thread::sleep(Duration::from_millis(500));
+                thread::sleep(Duration::from_secs(2));
                 unsafe {
                     let hwnd = FindWindowA(None, s!("EvertyDesk Lite"));
                     if hwnd.0 == 0 {
+                        misses = 0;
                         continue;
                     }
-                    // WM_NULL with 3 s timeout: normal render loop processes
-                    // messages every ~16 ms, so this only fires when genuinely stuck.
+                    // WM_NULL with a long timeout. A single miss can happen
+                    // during GPU/DXGI teardown, so require several misses.
                     let mut result = 0usize;
                     let ok = SendMessageTimeoutA(
                         hwnd,
@@ -1716,18 +1718,23 @@ fn start_hung_window_guardian() {
                         WPARAM(0),
                         LPARAM(0),
                         SMTO_ABORTIFHUNG,
-                        3000,
+                        8000,
                         Some(&mut result),
                     );
-                    if ok.0 == 0 {
+                    if ok.0 != 0 {
+                        misses = 0;
+                        continue;
+                    }
+                    misses += 1;
+                    if misses >= 3 {
                         eprintln!("[guardian] Render thread stuck — hiding window");
                         // Hide window immediately via win32k (kernel-level),
                         // bypasses the stuck user-mode render thread.
                         // User sees the window vanish instantly.
                         ShowWindow(hwnd, SW_HIDE);
                         thread::sleep(Duration::from_millis(200));
-                        eprintln!("[guardian] Terminating process");
-                        force_terminate();
+                        eprintln!("[guardian] Exiting process");
+                        std::process::exit(0);
                     }
                 }
             }
