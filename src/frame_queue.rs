@@ -588,17 +588,16 @@ impl ChannelReassembler {
 
         if key {
             self.waiting_after_loss = false;
-            // Prepend codec config (SPS/PPS) к keyframe
+            // Prepend codec config (SPS/PPS) к keyframe when the encoder
+            // exposes it separately. Direct NVENC usually returns Annex-B
+            // keyframes that already contain parameter sets, so do not drop
+            // the frame just because a separate CodecConfig packet is absent.
             if let Some(ref cfg) = self.latest_codec_config {
                 let mut combined = cfg.clone();
                 combined.extend_from_slice(&bytes);
                 return Some((combined, true, delay_ms, pts));
-            } else {
-                // Нет конфига — ждём следующего
-                self.waiting_after_loss = true;
-                self.mark_frame_dropped(pkt.frame_id);
-                return None;
             }
+            return Some((bytes, true, delay_ms, pts));
         }
 
         if self.waiting_after_loss {
@@ -926,6 +925,21 @@ mod tests {
         assert!(key);
         // SPS prepended: [0x00,0x00,0x00,0x01,0xAB,0xCD]
         assert_eq!(&bytes[4..], &[0xAB, 0xCD]);
+    }
+
+    #[test]
+    fn reassembler_accepts_keyframe_without_separate_codec_config() {
+        let mut ch = ChannelReassembler::new();
+
+        let raw = crate::evrt::packetize_video_frame(1, 1000, true, &[0xAB, 0xCD]);
+        let parsed = crate::evrt::parse(&raw[0], raw[0].len()).unwrap();
+        let result = ch.on_packet(&parsed);
+
+        assert!(result.is_some());
+        let (bytes, key, _, _) = result.unwrap();
+        assert!(key);
+        assert_eq!(bytes, vec![0xAB, 0xCD]);
+        assert_eq!(ch.dropped_frames(), 0);
     }
 
     #[test]
