@@ -1381,6 +1381,19 @@ impl EvertyDeskApp {
                 self.shell_output
                     .push_str(&format!("\r\n[console error] {err}\r\n"));
             }
+            SessionEvent::ClipboardText(text) => {
+                let chars = text.chars().count();
+                match write_local_clipboard_text(&text) {
+                    Ok(()) => {
+                        self.clipboard_status = Some(format!("буфер получен: {chars} симв."));
+                        self.log(format!("Clipboard received from remote: {chars} chars"));
+                    }
+                    Err(err) => {
+                        self.clipboard_status = Some("буфер принять не удалось".to_owned());
+                        self.log(format!("Clipboard write failed: {err}"));
+                    }
+                }
+            }
             SessionEvent::Info(message) => self.log(message),
             SessionEvent::EvrtStatus {
                 active,
@@ -4361,10 +4374,9 @@ impl EvertyDeskApp {
             }
             Ok(text) => {
                 let chars = text.chars().count();
-                self.send_command(SessionCommand::KeyText(text));
-                self.request_visual_refresh_after_input();
-                self.clipboard_status = Some(format!("буфер отправлен: {chars} симв."));
-                self.log(format!("Clipboard sent to remote: {chars} chars"));
+                self.send_command(SessionCommand::SetClipboardText(text));
+                self.clipboard_status = Some(format!("буфер синхр.: {chars} симв."));
+                self.log(format!("Clipboard synchronized to remote: {chars} chars"));
             }
             Err(err) => {
                 self.clipboard_status = Some("буфер недоступен".to_owned());
@@ -4637,6 +4649,14 @@ fn read_local_clipboard_text() -> Result<String, String> {
     clipboard
         .get_text()
         .map_err(|err| format!("Clipboard text read failed: {err}"))
+}
+
+fn write_local_clipboard_text(text: &str) -> Result<(), String> {
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|err| format!("Clipboard init failed: {err}"))?;
+    clipboard
+        .set_text(text.to_owned())
+        .map_err(|err| format!("Clipboard text write failed: {err}"))
 }
 
 fn save_rgba_png(

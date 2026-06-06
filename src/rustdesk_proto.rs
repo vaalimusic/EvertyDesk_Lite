@@ -526,11 +526,39 @@ pub struct CursorPosition {
     pub y: i32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Enumeration)]
+#[repr(i32)]
+pub enum ClipboardFormat {
+    Text = 0,
+    Rtf = 1,
+    Html = 2,
+    ImageRgba = 21,
+    ImagePng = 22,
+    ImageSvg = 23,
+    Special = 31,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct Clipboard {
+    #[prost(bool, tag = "1")]
+    pub compress: bool,
+    #[prost(bytes, tag = "2")]
+    pub content: Vec<u8>,
+    #[prost(int32, tag = "3")]
+    pub width: i32,
+    #[prost(int32, tag = "4")]
+    pub height: i32,
+    #[prost(enumeration = "ClipboardFormat", tag = "5")]
+    pub format: i32,
+    #[prost(string, tag = "6")]
+    pub special_name: String,
+}
+
 #[derive(Clone, PartialEq, Message)]
 pub struct PeerMessage {
     #[prost(
         oneof = "peer_message::Union",
-        tags = "3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 19, 25, 29, 30, 99"
+        tags = "3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 19, 25, 29, 30, 99"
     )]
     pub union: Option<peer_message::Union>,
 }
@@ -539,9 +567,9 @@ pub mod peer_message {
     use prost::Oneof;
 
     use super::{
-        CursorData, CursorPosition, Hash, KeyEvent, LoginRequest, LoginResponse, Misc, MouseEvent,
-        PeerInfo, PublicKey, ScreenshotRequest, ScreenshotResponse, ShellMessage, SignedId,
-        TestDelay, VideoFrame,
+        Clipboard, CursorData, CursorPosition, Hash, KeyEvent, LoginRequest, LoginResponse, Misc,
+        MouseEvent, PeerInfo, PublicKey, ScreenshotRequest, ScreenshotResponse, ShellMessage,
+        SignedId, TestDelay, VideoFrame,
     };
 
     #[derive(Clone, PartialEq, Oneof)]
@@ -573,6 +601,8 @@ pub mod peer_message {
         CursorPosition(CursorPosition),
         #[prost(message, tag = "15")]
         KeyEvent(KeyEvent),
+        #[prost(message, tag = "16")]
+        Clipboard(Clipboard),
         #[prost(message, tag = "19")]
         Misc(Misc),
         #[prost(message, tag = "25")]
@@ -723,14 +753,14 @@ pub struct TestDelay {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct Misc {
-    #[prost(oneof = "misc::Union", tags = "5, 7, 10, 12, 28, 31, 35")]
+    #[prost(oneof = "misc::Union", tags = "5, 7, 10, 12, 28, 30, 31, 35")]
     pub union: Option<misc::Union>,
 }
 
 pub mod misc {
     use prost::Oneof;
 
-    use super::SwitchDisplay;
+    use super::{CaptureDisplays, SwitchDisplay};
 
     #[derive(Clone, PartialEq, Oneof)]
     pub enum Union {
@@ -744,6 +774,8 @@ pub mod misc {
         VideoReceived(bool),
         #[prost(uint32, tag = "28")]
         AutoAdjustFps(u32),
+        #[prost(message, tag = "30")]
+        CaptureDisplays(CaptureDisplays),
         #[prost(int32, tag = "31")]
         RefreshVideoDisplay(i32),
         #[prost(uint32, tag = "35")]
@@ -775,6 +807,16 @@ pub struct SwitchDisplay {
     pub height: i32,
     #[prost(bool, tag = "6")]
     pub cursor_embedded: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CaptureDisplays {
+    #[prost(int32, repeated, tag = "1")]
+    pub add: Vec<i32>,
+    #[prost(int32, repeated, tag = "2")]
+    pub sub: Vec<i32>,
+    #[prost(int32, repeated, tag = "3")]
+    pub set: Vec<i32>,
 }
 
 #[derive(Clone, PartialEq, Message)]

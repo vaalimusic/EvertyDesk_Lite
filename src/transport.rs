@@ -17,12 +17,12 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use crate::{
     rustdesk_proto::{
         decode_message, decode_peer_message, encode_message, encode_peer_message, misc,
-        peer_message, rendezvous_message, video_frame, Chroma, CodecAbility, ConnType, ControlKey,
-        CursorData, EncodedVideoFrames, ImageQuality, KeyEvent, KeyboardMode, LoginRequest, Misc,
-        MouseEvent, NatType, OnlineRequest, OptionMessage, PeerMessage, PreferCodec, PublicKey,
-        PunchHoleFailure, PunchHoleRequest, RendezvousMessage, RequestRelay, ScreenshotRequest,
-        ShellMessage, ShellMessageKind, SupportedDecoding, SwitchDisplay, TestDelay,
-        TestNatRequest,
+        peer_message, rendezvous_message, video_frame, CaptureDisplays, Chroma, Clipboard,
+        ClipboardFormat, CodecAbility, ConnType, ControlKey, CursorData, EncodedVideoFrames,
+        ImageQuality, KeyEvent, KeyboardMode, LoginRequest, Misc, MouseEvent, NatType,
+        OnlineRequest, OptionMessage, PeerMessage, PreferCodec, PublicKey, PunchHoleFailure,
+        PunchHoleRequest, RendezvousMessage, RequestRelay, ScreenshotRequest, ShellMessage,
+        ShellMessageKind, SupportedDecoding, SwitchDisplay, TestDelay, TestNatRequest,
     },
     settings::{CodecPreference, DisplayConfig, ServerConfig},
 };
@@ -103,6 +103,7 @@ pub enum SessionEvent {
     },
     /// Round-trip latency measured by the peer's TestDelay heartbeat (milliseconds).
     Latency(u32),
+    ClipboardText(String),
     ShellOutput(String),
     ShellClosed,
     ShellError(String),
@@ -170,6 +171,7 @@ pub enum SessionCommand {
         y: i32,
     },
     KeyText(String),
+    SetClipboardText(String),
     KeyControl(ControlKey),
     KeyControlState {
         key: ControlKey,
@@ -729,6 +731,10 @@ impl TransportClient {
                     SessionCommand::KeyText(text) => {
                         flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
                         let _ = send_text(&mut relay, &text);
+                    }
+                    SessionCommand::SetClipboardText(text) => {
+                        flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
+                        let _ = send_clipboard_text(&mut relay, &text);
                     }
                     SessionCommand::KeyControl(key) => {
                         flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
@@ -1962,6 +1968,7 @@ fn read_initial_peer_stage(
             Some(peer_message::Union::Shell(_)) => {}
             Some(peer_message::Union::MouseEvent(_))
             | Some(peer_message::Union::KeyEvent(_))
+            | Some(peer_message::Union::Clipboard(_))
             | Some(peer_message::Union::ScreenshotRequest(_))
             | Some(peer_message::Union::ScreenshotResponse(_))
             | Some(peer_message::Union::CursorData(_))
@@ -2028,15 +2035,17 @@ fn send_video_start_messages(
 /// display N for this session". Call only at connection startup or explicit display
 /// switch, NOT in the periodic refresh loop (would create a SwitchDisplay feedback loop).
 fn send_switch_display_subscribe(relay: &mut TcpStream, display: i32) -> Result<(), String> {
+    let display = display.max(0);
     let switch_msg = PeerMessage {
         union: Some(peer_message::Union::Misc(Misc {
             union: Some(misc::Union::SwitchDisplay(SwitchDisplay {
-                display: display.max(0),
+                display,
                 ..Default::default()
             })),
         })),
     };
-    send_framed(relay, &encode_peer_message(&switch_msg))
+    send_framed(relay, &encode_peer_message(&switch_msg))?;
+    send_capture_displays_set(relay, display)
 }
 
 fn send_codec_sync_options(
@@ -2231,6 +2240,7 @@ fn wait_for_video_probe(relay: &mut TcpStream) -> Result<String, String> {
             | Some(peer_message::Union::Shell(_))
             | Some(peer_message::Union::MouseEvent(_))
             | Some(peer_message::Union::KeyEvent(_))
+            | Some(peer_message::Union::Clipboard(_))
             | Some(peer_message::Union::ScreenshotRequest(_))
             | Some(peer_message::Union::ScreenshotResponse(_))
             | Some(peer_message::Union::CursorData(_))
@@ -2660,6 +2670,12 @@ fn handle_session_message(
                 Some(misc::Union::RefreshVideo(_)) => {
                     eprintln!("[session] Server requests RefreshVideo");
                 }
+                Some(misc::Union::CaptureDisplays(displays)) => {
+                    eprintln!(
+                        "[session] Server CaptureDisplays add={:?} sub={:?} set={:?}",
+                        displays.add, displays.sub, displays.set
+                    );
+                }
                 Some(misc::Union::EvrtUdpPort(port)) => {
                     // Старый путь: только порт (нужен IP от hbbs punch-hole).
                     let p = (*port).min(65535) as u16;
@@ -2698,6 +2714,24 @@ fn handle_session_message(
                     let _ = events.send(SessionEvent::ShellError(shell.data));
                 }
                 _ => {}
+            }
+            None
+        }
+        Some(peer_message::Union::Clipboard(clipboard)) => {
+            match clipboard_text_from_message(clipboard) {
+                Ok(Some(text)) => {
+                    let _ = events.send(SessionEvent::ClipboardText(text));
+                }
+                Ok(None) => {
+                    let _ = events.send(SessionEvent::Info(
+                        "Clipboard: unsupported format".to_owned(),
+                    ));
+                }
+                Err(err) => {
+                    let _ = events.send(SessionEvent::Info(format!(
+                        "Clipboard decode failed: {err}"
+                    )));
+                }
             }
             None
         }
@@ -3564,6 +3598,7 @@ fn send_switch_display(
     display: i32,
     info: Option<&RemoteDisplay>,
 ) -> Result<(), String> {
+    let display = display.max(0);
     let switch_display = SwitchDisplay {
         display,
         x: info.map(|d| d.x).unwrap_or_default(),
@@ -3577,7 +3612,27 @@ fn send_switch_display(
             union: Some(misc::Union::SwitchDisplay(switch_display)),
         })),
     };
-    send_framed(relay, &encode_peer_message(&message))
+    send_framed(relay, &encode_peer_message(&message))?;
+    send_capture_displays_set(relay, display)
+}
+
+fn send_capture_displays_set(relay: &mut TcpStream, display: i32) -> Result<(), String> {
+    send_framed(
+        relay,
+        &encode_peer_message(&capture_displays_set_message(display)),
+    )
+}
+
+fn capture_displays_set_message(display: i32) -> PeerMessage {
+    PeerMessage {
+        union: Some(peer_message::Union::Misc(Misc {
+            union: Some(misc::Union::CaptureDisplays(CaptureDisplays {
+                add: Vec::new(),
+                sub: Vec::new(),
+                set: vec![display.max(0)],
+            })),
+        })),
+    }
 }
 
 fn send_mouse(relay: &mut TcpStream, mask: i32, x: i32, y: i32) -> Result<(), String> {
@@ -3594,6 +3649,39 @@ fn send_mouse(relay: &mut TcpStream, mask: i32, x: i32, y: i32) -> Result<(), St
 
 fn send_text(relay: &mut TcpStream, text: &str) -> Result<(), String> {
     send_text_with_modifiers(relay, text, &[])
+}
+
+fn send_clipboard_text(relay: &mut TcpStream, text: &str) -> Result<(), String> {
+    send_framed(relay, &encode_peer_message(&clipboard_text_message(text)))
+}
+
+fn clipboard_text_message(text: &str) -> PeerMessage {
+    PeerMessage {
+        union: Some(peer_message::Union::Clipboard(Clipboard {
+            compress: false,
+            content: text.as_bytes().to_vec(),
+            width: 0,
+            height: 0,
+            format: ClipboardFormat::Text as i32,
+            special_name: String::new(),
+        })),
+    }
+}
+
+fn clipboard_text_from_message(clipboard: Clipboard) -> Result<Option<String>, String> {
+    if ClipboardFormat::try_from(clipboard.format) != Ok(ClipboardFormat::Text) {
+        return Ok(None);
+    }
+
+    let content = if clipboard.compress {
+        zstd::decode_all(clipboard.content.as_slice())
+            .map_err(|err| format!("zstd clipboard decode failed: {err}"))?
+    } else {
+        clipboard.content
+    };
+    String::from_utf8(content)
+        .map(Some)
+        .map_err(|err| format!("clipboard text is not UTF-8: {err}"))
 }
 
 fn send_text_with_modifiers(
@@ -3707,6 +3795,14 @@ fn describe_peer_message(message: &PeerMessage) -> String {
         }
         Some(peer_message::Union::MouseEvent(_)) => "MouseEvent".to_owned(),
         Some(peer_message::Union::KeyEvent(_)) => "KeyEvent".to_owned(),
+        Some(peer_message::Union::Clipboard(clipboard)) => {
+            format!(
+                "Clipboard format={} compressed={} bytes={}",
+                clipboard.format,
+                clipboard.compress,
+                clipboard.content.len()
+            )
+        }
         Some(peer_message::Union::LoginRequest(_)) => "LoginRequest".to_owned(),
         Some(peer_message::Union::ScreenshotRequest(_)) => "ScreenshotRequest".to_owned(),
         Some(peer_message::Union::CursorData(cd)) => {
@@ -4076,6 +4172,60 @@ mod tests {
             panic!("expected AutoAdjustFps message");
         };
         assert_eq!(fps, 60);
+    }
+
+    #[test]
+    fn capture_displays_set_selects_single_display() {
+        let message = capture_displays_set_message(2);
+        let Some(peer_message::Union::Misc(misc)) = message.union else {
+            panic!("expected Misc message");
+        };
+        let Some(misc::Union::CaptureDisplays(displays)) = misc.union else {
+            panic!("expected CaptureDisplays message");
+        };
+        assert!(displays.add.is_empty());
+        assert!(displays.sub.is_empty());
+        assert_eq!(displays.set, vec![2]);
+    }
+
+    #[test]
+    fn capture_displays_set_clamps_negative_display() {
+        let message = capture_displays_set_message(-5);
+        let Some(peer_message::Union::Misc(misc)) = message.union else {
+            panic!("expected Misc message");
+        };
+        let Some(misc::Union::CaptureDisplays(displays)) = misc.union else {
+            panic!("expected CaptureDisplays message");
+        };
+        assert_eq!(displays.set, vec![0]);
+    }
+
+    #[test]
+    fn clipboard_text_message_uses_rustdesk_clipboard_field() {
+        let message = clipboard_text_message("привет");
+        let Some(peer_message::Union::Clipboard(clipboard)) = message.union else {
+            panic!("expected Clipboard message");
+        };
+        assert!(!clipboard.compress);
+        assert_eq!(clipboard.format, ClipboardFormat::Text as i32);
+        assert_eq!(clipboard.content, "привет".as_bytes());
+    }
+
+    #[test]
+    fn clipboard_text_from_message_decodes_zstd_text() {
+        let compressed = zstd::encode_all("hello".as_bytes(), 0).unwrap();
+        let clipboard = Clipboard {
+            compress: true,
+            content: compressed,
+            width: 0,
+            height: 0,
+            format: ClipboardFormat::Text as i32,
+            special_name: String::new(),
+        };
+        assert_eq!(
+            clipboard_text_from_message(clipboard).unwrap(),
+            Some("hello".to_owned())
+        );
     }
 
     #[test]
