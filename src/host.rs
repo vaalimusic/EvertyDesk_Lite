@@ -2543,7 +2543,6 @@ fn handle_client_input_pipeline(
         })) => {
             let display = display.display.max(0);
             let _ = cmd_tx.send(PipelineCmd::SetDisplay(display));
-            let _ = cmd_tx.send(PipelineCmd::RequestIdr);
             send_switch_display_geometry(peer_msg_tx, display);
         }
         Some(peer_message::Union::Misc(Misc {
@@ -2557,7 +2556,6 @@ fn handle_client_input_pipeline(
                 .map(|display| display.max(0))
             {
                 let _ = cmd_tx.send(PipelineCmd::SetDisplay(display));
-                let _ = cmd_tx.send(PipelineCmd::RequestIdr);
                 send_switch_display_geometry(peer_msg_tx, display);
             }
         }

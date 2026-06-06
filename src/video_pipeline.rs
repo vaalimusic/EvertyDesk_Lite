@@ -256,12 +256,14 @@ pub fn run(cfg: PipelineConfig) {
             }
             Ok(PipelineCmd::SetDisplay(display)) => {
                 let display = display.max(0);
-                active_display.store(display as u32, Ordering::Relaxed);
-                let _ = idr_tx.send(());
-                log(
-                    &events,
-                    format!("Pipeline: switched capture to display {}", display + 1),
-                );
+                let previous = active_display.swap(display as u32, Ordering::Relaxed) as i32;
+                if previous != display {
+                    let _ = idr_tx.send(());
+                    log(
+                        &events,
+                        format!("Pipeline: switched capture to display {}", display + 1),
+                    );
+                }
             }
             Ok(PipelineCmd::RequestIdr) => {
                 let _ = idr_tx.send(());
