@@ -7,6 +7,7 @@ mod address_book;
 mod capture;
 mod colorconv;
 mod crypto;
+mod diagnostics;
 mod evrt;
 mod evrt_audio;
 mod evrt_client;
@@ -535,6 +536,36 @@ fn run_cli_connect() -> Option<i32> {
                 }
             }
         }
+    }
+
+    // ── Автоматическая диагностика ────────────────────────────────────────────
+    // evertydesk-lite --diagnose <remote-id> [password] [--secs N] [--out DIR]
+    // Подключается, гоняет полную сессию N секунд, собирает телеметрию,
+    // пишет структурированный отчёт (md + json). Заменяет ручной разбор логов.
+    if command == "--diagnose" {
+        let remote_id = normalize_remote_id(&args.next().unwrap_or_default());
+        if remote_id.is_empty() {
+            eprintln!("Usage: evertydesk-lite --diagnose <remote-id> [password] [--secs N] [--out DIR]");
+            return Some(2);
+        }
+        let rest: Vec<String> = args.collect();
+        // password — первый позиционный аргумент, не начинающийся с --
+        let password = rest
+            .iter()
+            .find(|a| !a.starts_with("--"))
+            .cloned()
+            .unwrap_or_default();
+        let mut secs = 20u64;
+        let mut out_dir = "diagnostics".to_owned();
+        let mut it = rest.iter();
+        while let Some(a) = it.next() {
+            match a.as_str() {
+                "--secs" => if let Some(v) = it.next() { secs = v.parse().unwrap_or(20); },
+                "--out"  => if let Some(v) = it.next() { out_dir = v.clone(); },
+                _ => {}
+            }
+        }
+        return Some(crate::diagnostics::run_diagnose(&remote_id, &password, secs, &out_dir));
     }
 
     if command != "--connect" {

@@ -45,20 +45,30 @@ fn find_nv_codec_sdk() -> Option<PathBuf> {
         }
     }
 
+    // Ищем `Video_Codec_SDK_*` в корне проекта И на один уровень вглубь
+    // (например EvertyGame-main/Video_Codec_SDK_13.0.37).
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR")?);
-    let entries = std::fs::read_dir(&manifest_dir).ok()?;
     let mut candidates = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if name.starts_with("Video_Codec_SDK_") && is_nv_codec_sdk(&path) {
-            candidates.push(path);
-        }
-    }
+    collect_sdk_candidates(&manifest_dir, &mut candidates, 2);
     candidates.sort();
     candidates.pop()
+}
+
+/// Рекурсивно (до `depth` уровней) ищет папки `Video_Codec_SDK_*`.
+fn collect_sdk_candidates(dir: &PathBuf, out: &mut Vec<PathBuf>, depth: u32) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        if name.starts_with("Video_Codec_SDK_") && is_nv_codec_sdk(&path) {
+            out.push(path.clone());
+        } else if depth > 1 && path.is_dir()
+            // Не лезем в target/ и .git/ — там SDK не будет
+            && name != "target" && !name.starts_with('.')
+        {
+            collect_sdk_candidates(&path, out, depth - 1);
+        }
+    }
 }
 
 fn is_nv_codec_sdk(path: &PathBuf) -> bool {

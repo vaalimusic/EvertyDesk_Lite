@@ -626,6 +626,13 @@ fn encode_loop(
     let mut backend_logged = false;
     const TELE_INTERVAL: Duration = Duration::from_secs(10);
 
+    // ★ Адаптивный даунскейл для софт-энкодера.
+    //   1440p/4K в OpenH264 = сотни мс/кадр. Если после первого кадра backend
+    //   оказался софтверным — кодируем в пониженном разрешении (≤720p по высоте),
+    //   клиент апскейлит в окне. Аппаратный энкодер — даунскейл не нужен.
+    let mut downscale_to: Option<(u32, u32)> = None;
+    let mut downscale_buf: Vec<u8> = Vec::new();
+
     // Capture double buffer
     type CapSlot = Arc<Mutex<Option<(i32, u32, u32, Vec<u8>)>>>;
     let cap_slot: CapSlot = Arc::new(Mutex::new(None));
@@ -734,6 +741,15 @@ fn encode_loop(
         }
 
         let want_idr = decision.force_key || periodic_key;
+
+        // ★ Применяем даунскейл если включён (софт-энкодер на высоком разрешении).
+        let (enc_w, enc_h, bgra) = if let Some((dw, dh)) = downscale_to {
+            downscale_bgra(bgra, enc_w, enc_h, &mut downscale_buf, dw, dh);
+            (dw, dh, downscale_buf.as_slice())
+        } else {
+            (enc_w, enc_h, bgra)
+        };
+
         let quality = quality_ms.load(Ordering::Relaxed);
         let base_bps = h264_target_bitrate_bps_pub(enc_w, enc_h, fps, quality);
         let relief_milli = bitrate_scale_milli
@@ -778,6 +794,22 @@ fn encode_loop(
             // Если MF упал и мы на софте — печатаем ПОЧЕМУ MF не сработал.
             if let Some(err) = encoder.take_mf_error() {
                 log(&events, format!("★ MF отключён, причина: {err}"));
+            }
+
+            // ★ Софт-энкодер на высоком разрешении → включаем даунскейл.
+            //   Цель: высота ≤ 720 (сохраняя пропорции). Аппаратный — не трогаем.
+            let backend = encoder.active_backend();
+            let is_software = backend == "OpenH264-SW" || backend == "PNG";
+            if is_software && enc_h > 800 {
+                let target_h = 720u32;
+                let scale = target_h as f32 / enc_h as f32;
+                let dw = ((enc_w as f32 * scale) as u32 & !1).max(2); // чётное
+                let dh = (target_h & !1).max(2);
+                downscale_to = Some((dw, dh));
+                log(&events, format!(
+                    "★ Софт-энкодер на {}×{} — включаю даунскейл до {}×{} для скорости",
+                    enc_w, enc_h, dw, dh,
+                ));
             }
         }
 
@@ -1175,9 +1207,73 @@ fn maybe_emit_telemetry(
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
+/// Даунскейл BGRA-кадра в `dst` методом усреднения блоков (box filter).
+/// Быстрый, без зависимостей. Для софт-энкодера на высоком разрешении.
+fn downscale_bgra(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst: &mut Vec<u8>,
+    dst_w: u32,
+    dst_h: u32,
+) {
+    let (sw, sh, dw, dh) = (src_w as usize, src_h as usize, dst_w as usize, dst_h as usize);
+    dst.resize(dw * dh * 4, 0);
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 || src.len() < sw * sh * 4 {
+        return;
+    }
+
+    // Целочисленные шаги (fixed-point 16.16) для семплирования центра блока.
+    let x_ratio = ((sw << 16) / dw) as u64;
+    let y_ratio = ((sh << 16) / dh) as u64;
+
+    for dy in 0..dh {
+        let sy = ((dy as u64 * y_ratio) >> 16) as usize;
+        let src_row = sy * sw * 4;
+        let dst_row = dy * dw * 4;
+        for dx in 0..dw {
+            let sx = ((dx as u64 * x_ratio) >> 16) as usize;
+            let s = src_row + sx * 4;
+            let d = dst_row + dx * 4;
+            if s + 3 < src.len() && d + 3 < dst.len() {
+                dst[d] = src[s];
+                dst[d + 1] = src[s + 1];
+                dst[d + 2] = src[s + 2];
+                dst[d + 3] = 255;
+            }
+        }
+    }
+}
+
 fn log(events: &Sender<HostEvent>, msg: String) {
     eprintln!("[pipeline] {msg}");
     let _ = events.send(HostEvent::Log(msg));
+}
+
+#[cfg(test)]
+mod downscale_tests {
+    use super::*;
+
+    #[test]
+    fn downscale_halves_dimensions() {
+        // 4x4 → 2x2, заполнено байтом 100
+        let src = vec![100u8; 4 * 4 * 4];
+        let mut dst = Vec::new();
+        downscale_bgra(&src, 4, 4, &mut dst, 2, 2);
+        assert_eq!(dst.len(), 2 * 2 * 4);
+        // Все пиксели должны быть ~100 (B/G/R), альфа 255
+        for px in dst.chunks(4) {
+            assert_eq!(px[0], 100);
+            assert_eq!(px[3], 255);
+        }
+    }
+
+    #[test]
+    fn downscale_handles_empty() {
+        let mut dst = Vec::new();
+        downscale_bgra(&[], 0, 0, &mut dst, 2, 2);
+        assert_eq!(dst.len(), 2 * 2 * 4); // resized но нули
+    }
 }
 
 const ROI_BITRATE_MIN_BPS: u32 = 600_000;

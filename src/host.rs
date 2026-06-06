@@ -1106,32 +1106,11 @@ fn relay_session_inner(
                         pw_attempts += 1;
                     }
                 } else if verify_password(&lr.password, &config.local_password, &salt, &challenge) {
-                    host_log(events, "Password OK ✓".to_owned());
-                    if config.security.require_confirmation {
-                        host_log(events, format!("Approval requested for {peer_id}"));
-                        let _ = events.send(HostEvent::ApprovalRequested {
-                            peer_id: peer_id.to_owned(),
-                        });
-                        match wait_for_approval(peer_id, Duration::from_secs(45)) {
-                            Some(true) => {
-                                host_log(
-                                    events,
-                                    format!("Approved incoming connection from {peer_id}"),
-                                );
-                                break lr;
-                            }
-                            Some(false) => {
-                                send_login_error(&mut relay, &mut cipher, "Rejected")?;
-                                return Err("Incoming connection rejected".to_owned());
-                            }
-                            None => {
-                                send_login_error(&mut relay, &mut cipher, "Timeout")?;
-                                return Err("Incoming approval timed out".to_owned());
-                            }
-                        }
-                    } else {
-                        break lr;
-                    }
+                    // ★ Верный пароль = автоматический доступ, без подтверждения.
+                    //   ID+пароль достаточно. Подтверждение остаётся только для
+                    //   подключений с ПУСТЫМ паролем (unattended режим выше).
+                    host_log(events, format!("Password OK ✓ — авто-доступ для {peer_id}"));
+                    break lr;
                 } else {
                     host_log(events, "Wrong password → asking to retry".to_owned());
                     send_login_error(&mut relay, &mut cipher, "Wrong Password")?;

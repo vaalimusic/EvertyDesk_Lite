@@ -1,0 +1,22 @@
+{
+  "connected": true,
+  "connect_ms": 6864,
+  "peer_info": "authorized; peer info: hostname=vaalimusic, platform=Windows, version=1.4.6, current_display=0, displays=#0 \\.\DISPLAY1: 2560x1440 @ 0,0 online=true cursor=false scale=1.00 | #1 \\.\DISPLAY2: 1920x1080 @ 2560,0 online=true cursor=false scale=1.00; screenshot/control channel ready",
+  "fail_reason": null,
+  "frames_received": 164,
+  "first_frame_ms": 7382,
+  "codec": "PNG",
+  "resolution": "2560x1440",
+  "fps_avg": 12.14,
+  "fps_min": 0.24,
+  "fps_max": 29.84,
+  "bitrate_kbps_avg": 1507,
+  "decode_ms_avg": 10,
+  "dropped_total": 1,
+  "latency_ms_avg": 30,
+  "evrt_active": false,
+  "evrt_host_addr": "",
+  "evrt_arrival_ms_avg": 0,
+  "evrt_jitter_ms_avg": 0,
+  "displays": 2
+}
