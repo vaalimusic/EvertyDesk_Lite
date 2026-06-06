@@ -327,6 +327,15 @@ fn run_host_loop(
     commands: Receiver<HostCommand>,
     stop: Arc<AtomicBool>,
 ) {
+    // ★ Штамп сборки запущенного бинаря — видно в консоли хоста, свежий ли он.
+    host_log(
+        &events,
+        format!(
+            "🔧 EvertyDesk Lite ХОСТ запущен | build={} | telemetry+downscale+NVENC-cascade",
+            binary_build_stamp(),
+        ),
+    );
+
     // On Windows, ensure an inbound UDP firewall rule exists for this binary.
     // This is needed because Windows Firewall blocks unsolicited inbound UDP
     // from the ID server (hbbs).  The rule is a no-op on subsequent runs once
@@ -4233,6 +4242,25 @@ pub fn encode_mf_frame_pub(
 /// Публичная обёртка release_stuck_input — нужна для `evrt_session.rs`.
 pub fn release_stuck_input_pub() {
     release_stuck_input();
+}
+
+/// Возраст запущенного бинаря в секундах (по mtime exe-файла).
+/// Позволяет понять, свежий ли хост запущен, без штампов сборки.
+/// Возвращает "HH:MM" локального времени сборки или "?" если недоступно.
+pub fn binary_build_stamp() -> String {
+    let Ok(exe) = std::env::current_exe() else { return "?".into() };
+    let Ok(meta) = std::fs::metadata(&exe) else { return "?".into() };
+    let Ok(mtime) = meta.modified() else { return "?".into() };
+    let unix = mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Локальное HH:MM:SS из unix (грубо, без таймзоны — для сравнения свежести хватает)
+    let secs_of_day = unix % 86400;
+    let h = (secs_of_day / 3600) % 24;
+    let m = (secs_of_day % 3600) / 60;
+    let s = secs_of_day % 60;
+    format!("{h:02}:{m:02}:{s:02}")
 }
 
 // ─── MultiEncoder — единый каскад энкодеров для video_pipeline ─────────────────

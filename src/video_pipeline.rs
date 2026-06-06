@@ -792,10 +792,11 @@ fn encode_loop(
                 union: Some(crate::rustdesk_proto::peer_message::Union::Misc(
                     crate::rustdesk_proto::Misc {
                         union: Some(crate::rustdesk_proto::misc::Union::HostTelemetry(format!(
-                            "backend={} encode_ms={} res={}x{} fps={}",
+                            "backend={} encode_ms={} res={}x{} fps={} build={}",
                             encoder.active_backend(),
                             last_encode_ms,
                             enc_w, enc_h, fps,
+                            crate::host::binary_build_stamp(),
                         ))),
                     },
                 )),
