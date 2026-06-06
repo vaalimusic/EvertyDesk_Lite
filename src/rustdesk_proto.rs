@@ -753,14 +753,14 @@ pub struct TestDelay {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct Misc {
-    #[prost(oneof = "misc::Union", tags = "5, 7, 10, 12, 28, 30, 31, 35")]
+    #[prost(oneof = "misc::Union", tags = "5, 7, 10, 12, 28, 30, 31, 35, 37")]
     pub union: Option<misc::Union>,
 }
 
 pub mod misc {
     use prost::Oneof;
 
-    use super::{CaptureDisplays, SwitchDisplay};
+    use super::{CaptureDisplays, MessageQuery, SwitchDisplay};
 
     #[derive(Clone, PartialEq, Oneof)]
     pub enum Union {
@@ -780,6 +780,8 @@ pub mod misc {
         RefreshVideoDisplay(i32),
         #[prost(uint32, tag = "35")]
         SelectedSid(u32),
+        #[prost(message, tag = "37")]
+        MessageQuery(MessageQuery),
         /// EVRT: хост сообщает свой UDP порт для прямого стриминга.
         /// Клиент получает → punch-hole → переключается на EVRT UDP.
         /// tag 100 — вне диапазона стандартных RustDesk полей.
@@ -817,6 +819,12 @@ pub struct CaptureDisplays {
     pub sub: Vec<i32>,
     #[prost(int32, repeated, tag = "3")]
     pub set: Vec<i32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct MessageQuery {
+    #[prost(int32, tag = "1")]
+    pub switch_display: i32,
 }
 
 #[derive(Clone, PartialEq, Message)]

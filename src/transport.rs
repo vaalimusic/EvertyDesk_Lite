@@ -19,10 +19,11 @@ use crate::{
         decode_message, decode_peer_message, encode_message, encode_peer_message, misc,
         peer_message, rendezvous_message, video_frame, CaptureDisplays, Chroma, Clipboard,
         ClipboardFormat, CodecAbility, ConnType, ControlKey, CursorData, EncodedVideoFrames,
-        ImageQuality, KeyEvent, KeyboardMode, LoginRequest, Misc, MouseEvent, NatType,
-        OnlineRequest, OptionMessage, PeerMessage, PreferCodec, PublicKey, PunchHoleFailure,
-        PunchHoleRequest, RendezvousMessage, RequestRelay, ScreenshotRequest, ShellMessage,
-        ShellMessageKind, SupportedDecoding, SwitchDisplay, TestDelay, TestNatRequest,
+        ImageQuality, KeyEvent, KeyboardMode, LoginRequest, MessageQuery, Misc, MouseEvent,
+        NatType, OnlineRequest, OptionMessage, PeerMessage, PreferCodec, PublicKey,
+        PunchHoleFailure, PunchHoleRequest, RendezvousMessage, RequestRelay, ScreenshotRequest,
+        ShellMessage, ShellMessageKind, SupportedDecoding, SwitchDisplay, TestDelay,
+        TestNatRequest,
     },
     settings::{CodecPreference, DisplayConfig, ServerConfig},
 };
@@ -453,8 +454,9 @@ impl TransportClient {
         let mut stable_decoded_frames = 0_u32;
         // 60 fps sessions are interactive first: start with RustDesk's speed
         // quality, then raise only after the incoming stream proves it is fast.
-        let mut _current_quality = initial_stream_quality(initial_video_fps);
-        let mut quality_raise_sent = false;
+        let mut current_quality = initial_stream_quality(initial_video_fps);
+        let mut last_quality_change = Instant::now();
+        let mut low_input_quality_windows = 0_u32;
         let mut h264_decode_failures = 0_u32;
         let mut vp9_decode_failures = 0_u32;
         let mut h265_decode_failures = 0_u32;
@@ -472,12 +474,13 @@ impl TransportClient {
         // Subscribe to display 0 (SwitchDisplay) then trigger video start.
         // SwitchDisplay must come first — it's the one-time subscription trigger.
         let _ = send_switch_display_subscribe(&mut relay, current_display);
-        let _ = send_video_start_messages(
+        let _ = send_video_start_messages_with_quality(
             &mut relay,
             current_display,
             true,
             target_video_fps,
             codec_preference,
+            current_quality,
         );
         let _ = send_video_received(&mut relay);
         let _ = events.send(SessionEvent::Info(
@@ -506,17 +509,21 @@ impl TransportClient {
                                 );
                                 if next_fps < target_video_fps {
                                     target_video_fps = next_fps;
+                                    current_quality = initial_stream_quality(target_video_fps);
                                     last_decoder_recovery = Some(Instant::now());
                                     last_adaptive_raise = Instant::now();
+                                    last_quality_change = Instant::now();
+                                    low_input_quality_windows = 0;
                                     let _ = events.send(SessionEvent::Info(format!(
                                         "Decoder backlog trimmed ({dropped}); lowering stream to {target_video_fps} fps"
                                     )));
-                                    let _ = send_video_start_messages(
+                                    let _ = send_video_start_messages_with_quality(
                                         &mut relay,
                                         current_display,
                                         false,
                                         target_video_fps,
                                         codec_preference,
+                                        current_quality,
                                     );
                                     last_live_bootstrap = Instant::now();
                                 }
@@ -584,13 +591,17 @@ impl TransportClient {
 
                         if codec_switched {
                             target_video_fps = target_video_fps.min(30).max(min_video_fps);
+                            current_quality = initial_stream_quality(target_video_fps);
                             last_decoder_recovery = Some(Instant::now());
-                            let _ = send_video_start_messages(
+                            last_quality_change = Instant::now();
+                            low_input_quality_windows = 0;
+                            let _ = send_video_start_messages_with_quality(
                                 &mut relay,
                                 current_display,
                                 true,
                                 target_video_fps,
                                 codec_preference,
+                                current_quality,
                             );
                             last_live_bootstrap = Instant::now();
                         } else if adaptive_quality {
@@ -602,17 +613,21 @@ impl TransportClient {
                                     lower_adaptive_fps(target_video_fps, min_video_fps, false);
                                 if next_fps < target_video_fps {
                                     target_video_fps = next_fps;
+                                    current_quality = initial_stream_quality(target_video_fps);
                                     last_decoder_recovery = Some(Instant::now());
                                     last_adaptive_raise = Instant::now();
+                                    last_quality_change = Instant::now();
+                                    low_input_quality_windows = 0;
                                     let _ = events.send(SessionEvent::Info(format!(
                                         "{codec} decode failed; lowering stream to {target_video_fps} fps"
                                     )));
-                                    let _ = send_video_start_messages(
+                                    let _ = send_video_start_messages_with_quality(
                                         &mut relay,
                                         current_display,
                                         false,
                                         target_video_fps,
                                         codec_preference,
+                                        current_quality,
                                     );
                                     last_live_bootstrap = Instant::now();
                                 }
@@ -631,29 +646,36 @@ impl TransportClient {
                             "AV1" => av1_decode_failures = 0,
                             _ => {}
                         }
-                        // Raise quality from Balanced to Best after stream stabilises.
-                        if !quality_raise_sent
-                            && live_video_seen
+                        if live_video_seen
                             && queue_ms <= 200
                             && decode_ms <= 60
-                            && latest_input_fps >= best_quality_min_input_fps(target_video_fps)
-                            && last_live_bootstrap.elapsed() >= Duration::from_secs(6)
+                            && last_quality_change.elapsed() >= Duration::from_secs(8)
                         {
-                            quality_raise_sent = true;
-                            _current_quality = ImageQuality::Best;
-                            let msg = PeerMessage {
-                                union: Some(peer_message::Union::Misc(Misc {
-                                    union: Some(misc::Union::Option(video_option_message_quality(
+                            if let Some(next_quality) = next_quality_after_stability(
+                                current_quality,
+                                target_video_fps,
+                                latest_input_fps,
+                            ) {
+                                let bootstrap_wait = quality_raise_bootstrap_wait(next_quality);
+                                if last_live_bootstrap.elapsed() >= bootstrap_wait {
+                                    current_quality = next_quality;
+                                    last_quality_change = Instant::now();
+                                    low_input_quality_windows = 0;
+                                    let _ = send_video_start_messages_with_quality(
+                                        &mut relay,
+                                        current_display,
+                                        false,
                                         target_video_fps,
                                         codec_preference,
-                                        ImageQuality::Best,
-                                    ))),
-                                })),
-                            };
-                            let _ = send_framed(&mut relay, &encode_peer_message(&msg));
-                            let _ = events.send(SessionEvent::Info(format!(
-                                "Stream stable at {latest_input_fps:.1} fps — raised quality to Best"
-                            )));
+                                        current_quality,
+                                    );
+                                    last_live_bootstrap = Instant::now();
+                                    let _ = events.send(SessionEvent::Info(format!(
+                                        "Stream stable at {latest_input_fps:.1} fps — raised quality to {}",
+                                        image_quality_label(current_quality)
+                                    )));
+                                }
+                            }
                         }
 
                         if adaptive_quality
@@ -670,17 +692,21 @@ impl TransportClient {
                                     raise_adaptive_fps(target_video_fps, initial_video_fps);
                                 if next_fps > target_video_fps {
                                     target_video_fps = next_fps;
+                                    current_quality = initial_stream_quality(target_video_fps);
                                     stable_decoded_frames = 0;
                                     last_adaptive_raise = Instant::now();
+                                    last_quality_change = Instant::now();
+                                    low_input_quality_windows = 0;
                                     let _ = events.send(SessionEvent::Info(format!(
                                         "Video decode is stable; raising stream to {target_video_fps} fps"
                                     )));
-                                    let _ = send_video_start_messages(
+                                    let _ = send_video_start_messages_with_quality(
                                         &mut relay,
                                         current_display,
                                         false,
                                         target_video_fps,
                                         codec_preference,
+                                        current_quality,
                                     );
                                     last_live_bootstrap = Instant::now();
                                 }
@@ -780,12 +806,13 @@ impl TransportClient {
                         current_display = display.index.max(0);
                         live_video_seen = false;
                         let _ = send_switch_display(&mut relay, current_display);
-                        let _ = send_video_start_messages(
+                        let _ = send_video_start_messages_with_quality(
                             &mut relay,
                             current_display,
                             false,
                             target_video_fps,
                             codec_preference,
+                            current_quality,
                         );
                         last_live_bootstrap = Instant::now();
                         request_screenshot_once(
@@ -805,12 +832,13 @@ impl TransportClient {
                         flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
                         auto_refresh = enabled;
                         auto_refresh_millis = millis.max(50);
-                        let _ = send_video_start_messages(
+                        let _ = send_video_start_messages_with_quality(
                             &mut relay,
                             current_display,
                             false,
                             target_video_fps,
                             codec_preference,
+                            current_quality,
                         );
                         last_live_bootstrap = Instant::now();
                     }
@@ -821,28 +849,33 @@ impl TransportClient {
                         let _ = events.send(SessionEvent::Info(format!(
                             "Fresh video requested at {target_video_fps} fps"
                         )));
-                        let _ = send_video_start_messages(
+                        let _ = send_video_start_messages_with_quality(
                             &mut relay,
                             current_display,
                             false,
                             target_video_fps,
                             codec_preference,
+                            current_quality,
                         );
                         last_live_bootstrap = Instant::now();
                     }
                     SessionCommand::SetVideoFps { fps } => {
                         flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
                         target_video_fps = fps.clamp(5, 60);
+                        current_quality = initial_stream_quality(target_video_fps);
                         last_decoder_recovery = Some(Instant::now());
+                        last_quality_change = Instant::now();
+                        low_input_quality_windows = 0;
                         let _ = events.send(SessionEvent::Info(format!(
                             "Video fps set to {target_video_fps}"
                         )));
-                        let _ = send_video_start_messages(
+                        let _ = send_video_start_messages_with_quality(
                             &mut relay,
                             current_display,
                             false,
                             target_video_fps,
                             codec_preference,
+                            current_quality,
                         );
                         last_live_bootstrap = Instant::now();
                     }
@@ -850,18 +883,22 @@ impl TransportClient {
                         flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
                         target_video_fps = fps.clamp(5, 60);
                         codec_preference = codec;
+                        current_quality = initial_stream_quality(target_video_fps);
                         live_video_seen = false;
                         last_decoder_recovery = Some(Instant::now());
+                        last_quality_change = Instant::now();
+                        low_input_quality_windows = 0;
                         let _ = events.send(SessionEvent::Info(format!(
                             "Video profile set to {} at {target_video_fps} fps",
                             codec_preference.label()
                         )));
-                        let _ = send_video_start_messages(
+                        let _ = send_video_start_messages_with_quality(
                             &mut relay,
                             current_display,
                             true,
                             target_video_fps,
                             codec_preference,
+                            current_quality,
                         );
                         last_live_bootstrap = Instant::now();
                     }
@@ -1010,6 +1047,44 @@ impl TransportClient {
                                 input_fps,
                                 input_kbps,
                             });
+                            if adaptive_quality && live_video_seen {
+                                if let Some(next_quality) = downgrade_quality_for_low_input(
+                                    current_quality,
+                                    target_video_fps,
+                                    input_fps,
+                                ) {
+                                    let increment =
+                                        if quality_drop_is_severe(target_video_fps, input_fps) {
+                                            2
+                                        } else {
+                                            1
+                                        };
+                                    low_input_quality_windows =
+                                        low_input_quality_windows.saturating_add(increment);
+                                    if low_input_quality_windows >= 2
+                                        && last_quality_change.elapsed() >= Duration::from_secs(2)
+                                    {
+                                        current_quality = next_quality;
+                                        last_quality_change = Instant::now();
+                                        low_input_quality_windows = 0;
+                                        let _ = send_video_start_messages_with_quality(
+                                            &mut relay,
+                                            current_display,
+                                            false,
+                                            target_video_fps,
+                                            codec_preference,
+                                            current_quality,
+                                        );
+                                        last_live_bootstrap = Instant::now();
+                                        let _ = events.send(SessionEvent::Info(format!(
+                                            "Input stream dropped to {input_fps:.1} fps; downgraded quality to {}",
+                                            image_quality_label(current_quality)
+                                        )));
+                                    }
+                                } else {
+                                    low_input_quality_windows = 0;
+                                }
+                            }
                             video_metric_packets = 0;
                             video_metric_bytes = 0;
                             last_video_packet_metrics = Instant::now();
@@ -1063,12 +1138,13 @@ impl TransportClient {
                 let live_bootstrap_grace =
                     !live_video_seen && last_live_bootstrap.elapsed() < Duration::from_millis(2500);
                 if !live_video_seen && last_live_bootstrap.elapsed() >= Duration::from_secs(3) {
-                    let _ = send_video_start_messages(
+                    let _ = send_video_start_messages_with_quality(
                         &mut relay,
                         current_display,
                         true,
                         target_video_fps,
                         codec_preference,
+                        current_quality,
                     );
                     let _ = send_video_received(&mut relay);
                     last_live_bootstrap = Instant::now();
@@ -1155,11 +1231,72 @@ fn raise_adaptive_fps(current: i32, max_fps: i32) -> i32 {
 fn best_quality_min_input_fps(target_fps: i32) -> f32 {
     let target = target_fps.clamp(5, 60);
     if target >= 45 {
-        24.0
+        target as f32 * 0.85
+    } else if target >= 30 {
+        target as f32 * 0.8
+    } else {
+        (target as f32 * 0.75).max(10.0)
+    }
+}
+
+fn balanced_quality_min_input_fps(target_fps: i32) -> f32 {
+    let target = target_fps.clamp(5, 60);
+    if target >= 45 {
+        30.0
     } else if target >= 30 {
         18.0
     } else {
-        12.0
+        10.0
+    }
+}
+
+fn next_quality_after_stability(
+    current: ImageQuality,
+    target_fps: i32,
+    input_fps: f32,
+) -> Option<ImageQuality> {
+    match current {
+        ImageQuality::Low if input_fps >= balanced_quality_min_input_fps(target_fps) => {
+            Some(ImageQuality::Balanced)
+        }
+        ImageQuality::Balanced if input_fps >= best_quality_min_input_fps(target_fps) => {
+            Some(ImageQuality::Best)
+        }
+        _ => None,
+    }
+}
+
+fn quality_raise_bootstrap_wait(next_quality: ImageQuality) -> Duration {
+    match next_quality {
+        ImageQuality::Best => Duration::from_secs(12),
+        _ => Duration::from_secs(6),
+    }
+}
+
+fn quality_drop_is_severe(target_fps: i32, input_fps: f32) -> bool {
+    let target = target_fps.clamp(5, 60) as f32;
+    input_fps < (target * 0.15).max(6.0)
+}
+
+fn downgrade_quality_for_low_input(
+    current: ImageQuality,
+    target_fps: i32,
+    input_fps: f32,
+) -> Option<ImageQuality> {
+    let target = target_fps.clamp(5, 60) as f32;
+    match current {
+        ImageQuality::Best if input_fps < (target * 0.35).max(10.0) => Some(ImageQuality::Balanced),
+        ImageQuality::Balanced if input_fps < (target * 0.25).max(8.0) => Some(ImageQuality::Low),
+        _ => None,
+    }
+}
+
+fn image_quality_label(quality: ImageQuality) -> &'static str {
+    match quality {
+        ImageQuality::Low => "Low",
+        ImageQuality::Balanced => "Balanced",
+        ImageQuality::Best => "Best",
+        ImageQuality::NotSet => "NotSet",
     }
 }
 
@@ -2015,7 +2152,25 @@ fn send_video_start_messages(
     fps: i32,
     codec_preference: CodecPreference,
 ) -> Result<(), String> {
-    send_codec_sync_options(relay, fps, codec_preference)?;
+    send_video_start_messages_with_quality(
+        relay,
+        display,
+        refresh_all,
+        fps,
+        codec_preference,
+        initial_stream_quality(fps),
+    )
+}
+
+fn send_video_start_messages_with_quality(
+    relay: &mut TcpStream,
+    display: i32,
+    refresh_all: bool,
+    fps: i32,
+    codec_preference: CodecPreference,
+    quality: ImageQuality,
+) -> Result<(), String> {
+    send_codec_sync_options_quality(relay, fps, codec_preference, quality)?;
 
     if refresh_all {
         let refresh_all_msg = PeerMessage {
@@ -2026,7 +2181,10 @@ fn send_video_start_messages(
         send_framed(relay, &encode_peer_message(&refresh_all_msg))?;
     }
 
-    // RefreshVideoDisplay nudges the server to restart capture for this display.
+    send_refresh_video_display(relay, display)
+}
+
+fn send_refresh_video_display(relay: &mut TcpStream, display: i32) -> Result<(), String> {
     let refresh_display = PeerMessage {
         union: Some(peer_message::Union::Misc(Misc {
             union: Some(misc::Union::RefreshVideoDisplay(display.max(0))),
@@ -2044,7 +2202,8 @@ fn send_switch_display_subscribe(relay: &mut TcpStream, display: i32) -> Result<
         relay,
         &encode_peer_message(&switch_display_message(display)),
     )?;
-    send_capture_displays_set(relay, display)
+    send_capture_displays_set(relay, display)?;
+    send_message_query_switch_display(relay, display)
 }
 
 fn send_codec_sync_options(
@@ -2052,11 +2211,21 @@ fn send_codec_sync_options(
     fps: i32,
     codec_preference: CodecPreference,
 ) -> Result<(), String> {
+    send_codec_sync_options_quality(relay, fps, codec_preference, initial_stream_quality(fps))
+}
+
+fn send_codec_sync_options_quality(
+    relay: &mut TcpStream,
+    fps: i32,
+    codec_preference: CodecPreference,
+    quality: ImageQuality,
+) -> Result<(), String> {
     let message = PeerMessage {
         union: Some(peer_message::Union::Misc(Misc {
-            union: Some(misc::Union::Option(video_option_message(
+            union: Some(misc::Union::Option(video_option_message_quality(
                 fps,
                 codec_preference,
+                quality,
             ))),
         })),
     };
@@ -2660,9 +2829,10 @@ fn handle_session_message(
                 }
                 Some(misc::Union::SwitchDisplay(sd)) => {
                     eprintln!(
-                        "[session] Server SwitchDisplay confirmed: display={} {}x{}",
-                        sd.display, sd.width, sd.height
+                        "[session] Server SwitchDisplay confirmed: display={} {}x{} @ {},{}",
+                        sd.display, sd.width, sd.height, sd.x, sd.y
                     );
+                    update_display_from_switch(&sd, known_displays, events);
                     // No response needed — just log. Sending SwitchDisplay back
                     // would create an infinite SwitchDisplay ↔ SwitchDisplay loop.
                 }
@@ -2673,6 +2843,12 @@ fn handle_session_message(
                     eprintln!(
                         "[session] Server CaptureDisplays add={:?} sub={:?} set={:?}",
                         displays.add, displays.sub, displays.set
+                    );
+                }
+                Some(misc::Union::MessageQuery(query)) => {
+                    eprintln!(
+                        "[session] Server MessageQuery switch_display={}",
+                        query.switch_display
                     );
                 }
                 Some(misc::Union::EvrtUdpPort(port)) => {
@@ -2846,6 +3022,55 @@ fn update_displays_from_peer_info(
             peer_info_context(info)
         )));
     }
+}
+
+fn update_display_from_switch(
+    display: &SwitchDisplay,
+    known_displays: &mut Vec<RemoteDisplay>,
+    events: &Sender<SessionEvent>,
+) {
+    let index = display.display.max(0);
+    if display.width <= 0 || display.height <= 0 {
+        let _ = events.send(SessionEvent::Info(format!(
+            "SwitchDisplay confirmed display {}, but geometry is empty",
+            index.saturating_add(1)
+        )));
+        return;
+    }
+
+    let updated = RemoteDisplay {
+        index,
+        name: known_displays
+            .iter()
+            .find(|known| known.index == index)
+            .map(|known| known.name.clone())
+            .unwrap_or_else(|| format!("Display {}", index.saturating_add(1))),
+        width: display.width,
+        height: display.height,
+        x: display.x,
+        y: display.y,
+        cursor_embedded: display.cursor_embedded,
+    };
+
+    if let Some(existing) = known_displays
+        .iter_mut()
+        .find(|known| known.index == updated.index)
+    {
+        *existing = updated;
+    } else {
+        known_displays.push(updated);
+        known_displays.sort_by_key(|display| display.index);
+    }
+
+    let _ = events.send(SessionEvent::Info(format!(
+        "SwitchDisplay geometry received: display {} {}x{} @ {},{}",
+        index.saturating_add(1),
+        display.width,
+        display.height,
+        display.x,
+        display.y
+    )));
+    let _ = events.send(SessionEvent::Displays(known_displays.clone()));
 }
 
 fn peer_info_context(info: &crate::rustdesk_proto::PeerInfo) -> String {
@@ -3641,7 +3866,8 @@ fn send_switch_display(relay: &mut TcpStream, display: i32) -> Result<(), String
         relay,
         &encode_peer_message(&switch_display_message(display)),
     )?;
-    send_capture_displays_set(relay, display)
+    send_capture_displays_set(relay, display)?;
+    send_message_query_switch_display(relay, display)
 }
 
 fn switch_display_message(display: i32) -> PeerMessage {
@@ -3661,6 +3887,23 @@ fn send_capture_displays_set(relay: &mut TcpStream, display: i32) -> Result<(), 
         relay,
         &encode_peer_message(&capture_displays_set_message(display)),
     )
+}
+
+fn send_message_query_switch_display(relay: &mut TcpStream, display: i32) -> Result<(), String> {
+    send_framed(
+        relay,
+        &encode_peer_message(&message_query_switch_display_message(display)),
+    )
+}
+
+fn message_query_switch_display_message(display: i32) -> PeerMessage {
+    PeerMessage {
+        union: Some(peer_message::Union::Misc(Misc {
+            union: Some(misc::Union::MessageQuery(MessageQuery {
+                switch_display: display.max(0),
+            })),
+        })),
+    }
 }
 
 fn capture_displays_set_message(display: i32) -> PeerMessage {
@@ -4238,6 +4481,47 @@ mod tests {
     }
 
     #[test]
+    fn message_query_requests_switch_display_geometry() {
+        let message = message_query_switch_display_message(2);
+        let Some(peer_message::Union::Misc(misc)) = message.union else {
+            panic!("expected Misc message");
+        };
+        let Some(misc::Union::MessageQuery(query)) = misc.union else {
+            panic!("expected MessageQuery message");
+        };
+        assert_eq!(query.switch_display, 2);
+    }
+
+    #[test]
+    fn switch_display_response_updates_known_displays() {
+        let (tx, rx) = mpsc::channel();
+        let mut known = Vec::new();
+
+        update_display_from_switch(
+            &SwitchDisplay {
+                display: 1,
+                x: 1920,
+                y: 0,
+                width: 2560,
+                height: 1440,
+                cursor_embedded: true,
+            },
+            &mut known,
+            &tx,
+        );
+
+        assert_eq!(known.len(), 1);
+        assert_eq!(known[0].index, 1);
+        assert_eq!(known[0].width, 2560);
+        assert_eq!(known[0].height, 1440);
+        assert_eq!(known[0].x, 1920);
+        assert!(known[0].cursor_embedded);
+        assert!(rx
+            .try_iter()
+            .any(|event| matches!(event, SessionEvent::Displays(displays) if displays.len() == 1 && displays[0].index == 1)));
+    }
+
+    #[test]
     fn switch_display_message_does_not_request_resolution_change() {
         let message = switch_display_message(2);
         let Some(peer_message::Union::Misc(misc)) = message.union else {
@@ -4381,10 +4665,44 @@ mod tests {
 
     #[test]
     fn best_quality_requires_real_incoming_fps() {
-        assert_eq!(best_quality_min_input_fps(60), 24.0);
-        assert_eq!(best_quality_min_input_fps(45), 24.0);
-        assert_eq!(best_quality_min_input_fps(30), 18.0);
-        assert_eq!(best_quality_min_input_fps(20), 12.0);
+        assert_eq!(best_quality_min_input_fps(60), 51.0);
+        assert_eq!(best_quality_min_input_fps(45), 38.25);
+        assert_eq!(best_quality_min_input_fps(30), 24.0);
+        assert_eq!(best_quality_min_input_fps(20), 15.0);
+    }
+
+    #[test]
+    fn high_fps_quality_raises_in_steps() {
+        assert_eq!(
+            next_quality_after_stability(ImageQuality::Low, 60, 40.0),
+            Some(ImageQuality::Balanced)
+        );
+        assert_eq!(
+            next_quality_after_stability(ImageQuality::Balanced, 60, 39.0),
+            None
+        );
+        assert_eq!(
+            next_quality_after_stability(ImageQuality::Balanced, 60, 52.0),
+            Some(ImageQuality::Best)
+        );
+    }
+
+    #[test]
+    fn low_input_downgrades_quality_after_best_collapse() {
+        assert_eq!(
+            downgrade_quality_for_low_input(ImageQuality::Best, 60, 2.3),
+            Some(ImageQuality::Balanced)
+        );
+        assert_eq!(
+            downgrade_quality_for_low_input(ImageQuality::Balanced, 60, 6.0),
+            Some(ImageQuality::Low)
+        );
+        assert_eq!(
+            downgrade_quality_for_low_input(ImageQuality::Low, 60, 2.0),
+            None
+        );
+        assert!(quality_drop_is_severe(60, 2.3));
+        assert!(!quality_drop_is_severe(60, 10.4));
     }
 
     #[test]
