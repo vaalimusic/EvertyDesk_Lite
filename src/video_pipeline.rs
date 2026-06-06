@@ -784,6 +784,8 @@ fn encode_loop(
         last_encode_ms = encode_dur.as_millis();
 
         // ★ Периодически шлём телеметрию хоста клиенту (надёжнее одноразовой).
+        //   БЛОКИРУЮЩИЙ send — try_send дропался когда канал забит видео-кадрами.
+        //   Телеметрия раз в 2с, блокировка на пару мс приемлема и гарантирует доставку.
         if last_host_tele_at.elapsed() >= HOST_TELE_INTERVAL {
             last_host_tele_at = Instant::now();
             let tele_msg = crate::rustdesk_proto::PeerMessage {
@@ -798,7 +800,7 @@ fn encode_loop(
                     },
                 )),
             };
-            let _ = tcp_tx.try_send(TcpItem::Peer(tele_msg));
+            let _ = tcp_tx.send(TcpItem::Peer(tele_msg));
         }
 
         // ★ Один раз логируем РЕАЛЬНЫЙ бэкенд (MediaFoundation/OpenH264-SW/PNG).
