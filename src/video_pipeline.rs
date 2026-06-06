@@ -668,11 +668,26 @@ fn encode_loop(
             .name(format!("pipeline-capture-d{}", display + 1))
             .spawn(move || {
                 let mut buf = Vec::new();
+                let mut next_capture_due = Instant::now();
+                let capture_spin = Duration::from_micros(500);
                 loop {
                     if cap_stop.load(Ordering::Relaxed) {
                         break;
                     }
                     let fps = cap_fps.load(Ordering::Relaxed).clamp(5, 60);
+                    let frame_interval = Duration::from_nanos(1_000_000_000 / fps as u64);
+                    let now = Instant::now();
+                    if now < next_capture_due {
+                        let wait = next_capture_due - now;
+                        if wait > capture_spin {
+                            thread::sleep(wait - capture_spin);
+                        } else {
+                            std::hint::spin_loop();
+                        }
+                        continue;
+                    }
+                    next_capture_due += frame_interval;
+
                     let capture_started = Instant::now();
                     let captured = crate::capture::capture_display_into(display, &mut buf);
                     let capture_us = capture_started
@@ -693,8 +708,9 @@ fn encode_loop(
                             }
                         }
                     }
-                    let sleep_us = 1_000_000u64 / fps.max(1) as u64;
-                    thread::sleep(Duration::from_micros(sleep_us.saturating_sub(500)));
+                    if next_capture_due < Instant::now() {
+                        next_capture_due = Instant::now() + frame_interval;
+                    }
                 }
             })
             .expect("spawn capture")
