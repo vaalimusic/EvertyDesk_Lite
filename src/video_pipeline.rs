@@ -26,6 +26,7 @@
 //! - EvrtSender получает все кадры, упаковывает в EVRT UDP
 
 use std::{
+    collections::{HashMap, HashSet},
     net::{SocketAddr, UdpSocket},
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -72,9 +73,20 @@ pub enum PipelineCmd {
     SetFps(u32),
     SetQuality(u32),
     SetDisplay(i32),
+    SetSubscribedDisplays(Vec<i32>),
+    AddSubscribedDisplays(Vec<i32>),
+    RemoveSubscribedDisplays(Vec<i32>),
+    RefreshDisplay(i32),
+    SendSwitchDisplay(i32),
     RequestIdr,
     EvrtPeerConnected(SocketAddr),
     EvrtSessionEnded,
+}
+
+struct VideoServiceHandle {
+    stop: Arc<AtomicBool>,
+    idr_tx: Sender<()>,
+    handle: thread::JoinHandle<()>,
 }
 
 // ─── Pipeline config ──────────────────────────────────────────────────────────
@@ -116,10 +128,9 @@ pub fn run(cfg: PipelineConfig) {
     let target_fps = Arc::new(AtomicU32::new(initial_target_fps.clamp(5, 60)));
     let quality_ms = Arc::new(AtomicU32::new(initial_quality_milli.max(1)));
     let bitrate_scale_milli = Arc::new(AtomicU32::new(1_000));
-    let active_display = Arc::new(AtomicU32::new(0));
 
     // IDR request channel: cmd_rx → encoder
-    let (idr_tx, idr_rx) = mpsc::channel::<()>();
+    let (global_idr_tx, global_idr_rx) = mpsc::channel::<()>();
 
     // ── TCP канал несёт И видео, И control (shell output) ──────────────────────
     // TcpItem::Video — видеокадры (с приоритетом latency, буфер 2)
@@ -129,6 +140,8 @@ pub fn run(cfg: PipelineConfig) {
     let (tcp_tx, tcp_rx) = mpsc::sync_channel::<TcpItem>(4);
     let (evrt_tx, evrt_rx) = mpsc::sync_channel::<EncodedFrame>(2);
     let mut worker_handles = Vec::new();
+    let mut video_services: HashMap<i32, VideoServiceHandle> = HashMap::new();
+    let mut subscribed_displays: HashSet<i32> = HashSet::new();
 
     // ── Флаг: EVRT активен? Устанавливается когда клиент прислал punch ────────
     let evrt_active: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
@@ -159,40 +172,21 @@ pub fn run(cfg: PipelineConfig) {
     }
 
     // ── Encoder + Capture thread ─────────────────────────────────────────────
-    {
-        let stop_e = stop.clone();
-        let fps_e = target_fps.clone();
-        let qual_e = quality_ms.clone();
-        let bitrate_scale_e = bitrate_scale_milli.clone();
-        let display_e = active_display.clone();
-        let cfg_e = app_config.clone();
-        let client_video_e = client_video;
-        let ev_e = events.clone();
-        let tcp_e = tcp_tx;
-        let evrt_e = evrt_tx;
-        let act_e = evrt_active.clone();
-
-        let handle = thread::Builder::new()
-            .name("pipeline-encoder".into())
-            .spawn(move || {
-                encode_loop(
-                    stop_e,
-                    fps_e,
-                    qual_e,
-                    bitrate_scale_e,
-                    display_e,
-                    cfg_e,
-                    client_video_e,
-                    ev_e,
-                    tcp_e,
-                    evrt_e,
-                    act_e,
-                    idr_rx,
-                );
-            })
-            .expect("spawn encoder");
-        worker_handles.push(handle);
-    }
+    set_subscribed_displays(
+        vec![0],
+        &mut video_services,
+        &mut subscribed_displays,
+        &tcp_tx,
+        &evrt_tx,
+        &stop,
+        &target_fps,
+        &quality_ms,
+        &bitrate_scale_milli,
+        &app_config,
+        client_video,
+        &events,
+        &evrt_active,
+    );
 
     // ── TCP Sender thread ─────────────────────────────────────────────────────
     {
@@ -247,6 +241,12 @@ pub fn run(cfg: PipelineConfig) {
 
     // ── Command loop (этот тред) ───────────────────────────────────────────────
     while !stop.load(Ordering::Relaxed) {
+        while let Ok(()) = global_idr_rx.try_recv() {
+            for service in video_services.values() {
+                let _ = service.idr_tx.send(());
+            }
+        }
+
         match cmd_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(PipelineCmd::Stop) => {
                 stop.store(true, Ordering::Relaxed);
@@ -260,17 +260,94 @@ pub fn run(cfg: PipelineConfig) {
             }
             Ok(PipelineCmd::SetDisplay(display)) => {
                 let display = display.max(0);
-                let previous = active_display.swap(display as u32, Ordering::Relaxed) as i32;
-                if previous != display {
-                    let _ = idr_tx.send(());
-                    log(
-                        &events,
-                        format!("Pipeline: switched capture to display {}", display + 1),
-                    );
+                set_subscribed_displays(
+                    vec![display],
+                    &mut video_services,
+                    &mut subscribed_displays,
+                    &tcp_tx,
+                    &evrt_tx,
+                    &stop,
+                    &target_fps,
+                    &quality_ms,
+                    &bitrate_scale_milli,
+                    &app_config,
+                    client_video,
+                    &events,
+                    &evrt_active,
+                );
+            }
+            Ok(PipelineCmd::SetSubscribedDisplays(displays)) => {
+                set_subscribed_displays(
+                    displays,
+                    &mut video_services,
+                    &mut subscribed_displays,
+                    &tcp_tx,
+                    &evrt_tx,
+                    &stop,
+                    &target_fps,
+                    &quality_ms,
+                    &bitrate_scale_milli,
+                    &app_config,
+                    client_video,
+                    &events,
+                    &evrt_active,
+                );
+            }
+            Ok(PipelineCmd::AddSubscribedDisplays(displays)) => {
+                let mut next: Vec<i32> = subscribed_displays.iter().copied().collect();
+                next.extend(displays.into_iter().map(|display| display.max(0)));
+                set_subscribed_displays(
+                    next,
+                    &mut video_services,
+                    &mut subscribed_displays,
+                    &tcp_tx,
+                    &evrt_tx,
+                    &stop,
+                    &target_fps,
+                    &quality_ms,
+                    &bitrate_scale_milli,
+                    &app_config,
+                    client_video,
+                    &events,
+                    &evrt_active,
+                );
+            }
+            Ok(PipelineCmd::RemoveSubscribedDisplays(displays)) => {
+                let removed: HashSet<i32> =
+                    displays.into_iter().map(|display| display.max(0)).collect();
+                let next: Vec<i32> = subscribed_displays
+                    .iter()
+                    .filter(|display| !removed.contains(display))
+                    .copied()
+                    .collect();
+                set_subscribed_displays(
+                    next,
+                    &mut video_services,
+                    &mut subscribed_displays,
+                    &tcp_tx,
+                    &evrt_tx,
+                    &stop,
+                    &target_fps,
+                    &quality_ms,
+                    &bitrate_scale_milli,
+                    &app_config,
+                    client_video,
+                    &events,
+                    &evrt_active,
+                );
+            }
+            Ok(PipelineCmd::RefreshDisplay(display)) => {
+                let display = display.max(0);
+                if let Some(service) = video_services.get(&display) {
+                    let _ = service.idr_tx.send(());
                 }
+                send_ordered_switch_display(&tcp_tx, &stop, display);
+            }
+            Ok(PipelineCmd::SendSwitchDisplay(display)) => {
+                send_ordered_switch_display(&tcp_tx, &stop, display.max(0));
             }
             Ok(PipelineCmd::RequestIdr) => {
-                let _ = idr_tx.send(());
+                let _ = global_idr_tx.send(());
             }
             Ok(PipelineCmd::EvrtPeerConnected(addr)) => {
                 if let Ok(mut g) = evrt_active.lock() {
@@ -293,11 +370,17 @@ pub fn run(cfg: PipelineConfig) {
     }
 
     stop.store(true, Ordering::Relaxed);
+    for service in video_services.values() {
+        service.stop.store(true, Ordering::Relaxed);
+    }
     let join_events = events.clone();
     let join_peer = peer_id.clone();
     thread::Builder::new()
         .name("pipeline-joiner".into())
         .spawn(move || {
+            for (_, service) in video_services {
+                let _ = service.handle.join();
+            }
             for handle in worker_handles {
                 let _ = handle.join();
             }
@@ -313,12 +396,193 @@ pub fn run(cfg: PipelineConfig) {
 
 // ─── Encode + Capture loop ────────────────────────────────────────────────────
 
+fn set_subscribed_displays(
+    displays: Vec<i32>,
+    services: &mut HashMap<i32, VideoServiceHandle>,
+    subscribed: &mut HashSet<i32>,
+    tcp_tx: &SyncSender<TcpItem>,
+    evrt_tx: &SyncSender<EncodedFrame>,
+    pipeline_stop: &Arc<AtomicBool>,
+    target_fps: &Arc<AtomicU32>,
+    quality_ms: &Arc<AtomicU32>,
+    bitrate_scale_milli: &Arc<AtomicU32>,
+    config: &AppConfig,
+    client_video: ClientVideoSupport,
+    events: &Sender<HostEvent>,
+    evrt_active: &Arc<Mutex<Option<SocketAddr>>>,
+) {
+    // RustDesk-compatible service model: switching displays changes the
+    // subscribed service set instead of mutating capture state inside a worker.
+    let mut next: HashSet<i32> = displays.into_iter().map(|display| display.max(0)).collect();
+    if next.is_empty() {
+        next.insert(0);
+    }
+
+    let removed: Vec<i32> = subscribed.difference(&next).copied().collect();
+    for display in removed {
+        if let Some(service) = services.remove(&display) {
+            service.stop.store(true, Ordering::Relaxed);
+            let _ = service.handle.join();
+            log(
+                events,
+                format!("VideoService display={} stopped", display + 1),
+            );
+        }
+    }
+
+    let added: Vec<i32> = next.difference(subscribed).copied().collect();
+    for display in added {
+        let service = start_video_service(
+            display,
+            tcp_tx.clone(),
+            evrt_tx.clone(),
+            pipeline_stop.clone(),
+            target_fps.clone(),
+            quality_ms.clone(),
+            bitrate_scale_milli.clone(),
+            config.clone(),
+            client_video,
+            events.clone(),
+            evrt_active.clone(),
+        );
+        services.insert(display, service);
+    }
+
+    *subscribed = next;
+    let mut ordered: Vec<i32> = subscribed.iter().copied().collect();
+    ordered.sort_unstable();
+    log(
+        events,
+        format!(
+            "CaptureDisplays set={ordered:?} conn=(relay); services={}",
+            services.len()
+        ),
+    );
+    if let Some(display) = ordered.first().copied() {
+        send_ordered_switch_display(tcp_tx, pipeline_stop, display);
+    }
+}
+
+fn start_video_service(
+    display: i32,
+    tcp_tx: SyncSender<TcpItem>,
+    evrt_tx: SyncSender<EncodedFrame>,
+    pipeline_stop: Arc<AtomicBool>,
+    target_fps: Arc<AtomicU32>,
+    quality_ms: Arc<AtomicU32>,
+    bitrate_scale_milli: Arc<AtomicU32>,
+    config: AppConfig,
+    client_video: ClientVideoSupport,
+    events: Sender<HostEvent>,
+    evrt_active: Arc<Mutex<Option<SocketAddr>>>,
+) -> VideoServiceHandle {
+    let service_stop = Arc::new(AtomicBool::new(false));
+    let loop_stop = Arc::new(AtomicBool::new(false));
+    let (idr_tx, idr_rx) = mpsc::channel::<()>();
+    let service_stop_for_thread = service_stop.clone();
+    let loop_stop_for_thread = loop_stop.clone();
+    let events_for_log = events.clone();
+
+    let handle = thread::Builder::new()
+        .name(format!("video-service-d{}", display + 1))
+        .spawn(move || {
+            log(
+                &events_for_log,
+                format!(
+                    "VideoService display={} started fps={} codec={:?}",
+                    display + 1,
+                    target_fps.load(Ordering::Relaxed),
+                    config.display.codec
+                ),
+            );
+
+            let watcher_stop = loop_stop_for_thread.clone();
+            let watcher = thread::Builder::new()
+                .name(format!("video-service-stop-d{}", display + 1))
+                .spawn(move || {
+                    while !pipeline_stop.load(Ordering::Relaxed)
+                        && !service_stop_for_thread.load(Ordering::Relaxed)
+                        && !watcher_stop.load(Ordering::Relaxed)
+                    {
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    watcher_stop.store(true, Ordering::Relaxed);
+                })
+                .ok();
+
+            encode_loop(
+                display,
+                loop_stop_for_thread,
+                target_fps,
+                quality_ms,
+                bitrate_scale_milli,
+                config,
+                client_video,
+                events_for_log,
+                tcp_tx,
+                evrt_tx,
+                evrt_active,
+                idr_rx,
+            );
+
+            if let Some(watcher) = watcher {
+                let _ = watcher.join();
+            }
+        })
+        .expect("spawn video service");
+
+    VideoServiceHandle {
+        stop: service_stop,
+        idr_tx,
+        handle,
+    }
+}
+
+fn send_ordered_switch_display(tcp_tx: &SyncSender<TcpItem>, stop: &Arc<AtomicBool>, display: i32) {
+    let Some(msg) = switch_display_message(display) else {
+        return;
+    };
+
+    while !stop.load(Ordering::Relaxed) {
+        match tcp_tx.try_send(TcpItem::Peer(msg.clone())) {
+            Ok(()) => break,
+            Err(mpsc::TrySendError::Full(_)) => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => break,
+        }
+    }
+}
+
+fn switch_display_message(display: i32) -> Option<crate::rustdesk_proto::PeerMessage> {
+    use crate::rustdesk_proto::{misc, peer_message, Misc, PeerMessage, SwitchDisplay};
+
+    let displays = crate::capture::display_infos();
+    let selected = displays
+        .iter()
+        .find(|info| info.index == display.max(0))
+        .or_else(|| displays.first())?;
+
+    Some(PeerMessage {
+        union: Some(peer_message::Union::Misc(Misc {
+            union: Some(misc::Union::SwitchDisplay(SwitchDisplay {
+                display: selected.index,
+                x: selected.x,
+                y: selected.y,
+                width: selected.width,
+                height: selected.height,
+                cursor_embedded: false,
+            })),
+        })),
+    })
+}
+
 fn encode_loop(
+    display: i32,
     stop: Arc<AtomicBool>,
     target_fps: Arc<AtomicU32>,
     quality_ms: Arc<AtomicU32>,
     bitrate_scale_milli: Arc<AtomicU32>,
-    active_display: Arc<AtomicU32>,
     config: AppConfig,
     client_video: ClientVideoSupport,
     events: Sender<HostEvent>,
@@ -329,7 +593,10 @@ fn encode_loop(
 ) {
     use crate::host::{h264_target_bitrate_bps_pub, MultiEncoder};
 
-    log(&events, "Encoder loop started".into());
+    log(
+        &events,
+        format!("VideoService display={} encoder loop started", display + 1),
+    );
 
     // ★ Единый каскад энкодеров: MF → VideoToolbox → NVENC → OpenH264 → PNG
     let mut encoder = MultiEncoder::new(config.display.encoder, config.display.codec, client_video);
@@ -368,10 +635,9 @@ fn encode_loop(
     let cap_handle = {
         let cap_stop = stop.clone();
         let cap_fps = target_fps.clone();
-        let cap_display = active_display.clone();
         let cap_slot2 = cap_slot.clone();
         thread::Builder::new()
-            .name("pipeline-capture".into())
+            .name(format!("pipeline-capture-d{}", display + 1))
             .spawn(move || {
                 let mut buf = Vec::new();
                 loop {
@@ -379,7 +645,6 @@ fn encode_loop(
                         break;
                     }
                     let fps = cap_fps.load(Ordering::Relaxed).clamp(5, 60);
-                    let display = cap_display.load(Ordering::Relaxed) as i32;
                     if let Some((w, h)) = crate::capture::capture_display_into(display, &mut buf) {
                         if let Ok(mut slot) = cap_slot2.lock() {
                             match slot.as_mut() {
@@ -596,9 +861,12 @@ fn encode_loop(
     // Intentionally leaking the encoder avoids this entirely. The OS frees
     // all VRAM when the process exits (normal or via TerminateProcess watchdog).
     encoder.leak_gpu_resources();
-    let _ = cap_handle; // keep alive until capture notices stop (~100 ms)
+    let _ = cap_handle.join();
 
-    log(&events, "Encoder loop stopped".into());
+    log(
+        &events,
+        format!("VideoService display={} encoder loop stopped", display + 1),
+    );
 }
 
 // ─── TCP Sender loop ──────────────────────────────────────────────────────────

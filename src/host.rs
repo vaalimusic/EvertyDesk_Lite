@@ -61,7 +61,7 @@ use crate::{
         misc, peer_message, rendezvous_message, video_frame, DisplayInfo, EncodedVideoFrame,
         EncodedVideoFrames, Hash, IdPk, ImageQuality, LoginResponse, Misc, PeerInfo, PeerMessage,
         PreferCodec, RegisterPeer, RegisterPk, RelayResponse, RendezvousMessage, RequestRelay,
-        ShellMessage, ShellMessageKind, SignedId, SupportedDecoding, SwitchDisplay,
+        ShellMessage, ShellMessageKind, SignedId, SupportedDecoding,
     },
     settings::{AppConfig, CodecPreference, EncoderPreference},
     transport::{connect_tcp, encode_frame_len, read_framed, send_framed},
@@ -1165,7 +1165,17 @@ fn relay_session_inner(
 
     // ── 4. Send LoginResponse + display info ─────────────────────────────────
     let hostname = hostname();
-    let mut displays: Vec<DisplayInfo> = crate::capture::display_infos()
+    let capture_displays = crate::capture::display_infos();
+    for display in &capture_displays {
+        host_log(
+            events,
+            format!(
+                "Display list: idx={} name={} x={} y={} width={} height={} source=gdi/dxgi",
+                display.index, display.name, display.x, display.y, display.width, display.height
+            ),
+        );
+    }
+    let mut displays: Vec<DisplayInfo> = capture_displays
         .into_iter()
         .map(|display| DisplayInfo {
             x: display.x,
@@ -2551,31 +2561,53 @@ fn handle_client_input_pipeline(
                 format!("Host display command: SwitchDisplay {}", display + 1),
             );
             let _ = cmd_tx.send(PipelineCmd::SetDisplay(display));
-            send_switch_display_geometry(peer_msg_tx, display);
         }
         Some(peer_message::Union::Misc(Misc {
             union: Some(misc::Union::CaptureDisplays(displays)),
         })) => {
-            if let Some(display) = displays
-                .set
-                .first()
-                .or_else(|| displays.add.first())
-                .copied()
-                .map(|display| display.max(0))
-            {
+            if !displays.set.is_empty() {
+                let set: Vec<i32> = displays
+                    .set
+                    .iter()
+                    .map(|display| (*display).max(0))
+                    .collect();
                 host_log(
                     events,
-                    format!("Host display command: CaptureDisplays {}", display + 1),
+                    format!("Host display command: CaptureDisplays.set {set:?}"),
                 );
-                let _ = cmd_tx.send(PipelineCmd::SetDisplay(display));
-                send_switch_display_geometry(peer_msg_tx, display);
+                let _ = cmd_tx.send(PipelineCmd::SetSubscribedDisplays(set));
+            } else {
+                if !displays.add.is_empty() {
+                    let add: Vec<i32> = displays
+                        .add
+                        .iter()
+                        .map(|display| (*display).max(0))
+                        .collect();
+                    host_log(
+                        events,
+                        format!("Host display command: CaptureDisplays.add {add:?}"),
+                    );
+                    let _ = cmd_tx.send(PipelineCmd::AddSubscribedDisplays(add));
+                }
+                if !displays.sub.is_empty() {
+                    let sub: Vec<i32> = displays
+                        .sub
+                        .iter()
+                        .map(|display| (*display).max(0))
+                        .collect();
+                    host_log(
+                        events,
+                        format!("Host display command: CaptureDisplays.sub {sub:?}"),
+                    );
+                    let _ = cmd_tx.send(PipelineCmd::RemoveSubscribedDisplays(sub));
+                }
             }
         }
         Some(peer_message::Union::Misc(Misc {
             union: Some(misc::Union::MessageQuery(query)),
         })) => {
             if query.switch_display >= 0 {
-                send_switch_display_geometry(peer_msg_tx, query.switch_display);
+                let _ = cmd_tx.send(PipelineCmd::SendSwitchDisplay(query.switch_display));
             }
         }
         Some(peer_message::Union::Misc(Misc {
@@ -2586,8 +2618,7 @@ fn handle_client_input_pipeline(
                 events,
                 format!("Host display command: RefreshVideoDisplay {}", display + 1),
             );
-            let _ = cmd_tx.send(PipelineCmd::SetDisplay(display));
-            send_switch_display_geometry(peer_msg_tx, display);
+            let _ = cmd_tx.send(PipelineCmd::RefreshDisplay(display));
         }
         Some(peer_message::Union::Shell(shell_msg)) => {
             // Shell output идёт через peer_msg_tx → pipeline → TCP relay → клиент
@@ -2595,30 +2626,6 @@ fn handle_client_input_pipeline(
         }
         _ => {}
     }
-}
-
-fn send_switch_display_geometry(outgoing: &Sender<PeerMessage>, display: i32) {
-    let displays = crate::capture::display_infos();
-    let selected = displays
-        .iter()
-        .find(|info| info.index == display.max(0))
-        .or_else(|| displays.first());
-    let Some(info) = selected else {
-        return;
-    };
-    let reply = PeerMessage {
-        union: Some(peer_message::Union::Misc(Misc {
-            union: Some(misc::Union::SwitchDisplay(SwitchDisplay {
-                display: info.index,
-                x: info.x,
-                y: info.y,
-                width: info.width,
-                height: info.height,
-                cursor_embedded: false,
-            })),
-        })),
-    };
-    let _ = outgoing.send(reply);
 }
 
 struct ShellRuntime {

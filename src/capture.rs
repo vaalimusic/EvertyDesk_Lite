@@ -20,13 +20,15 @@ pub struct CaptureDisplay {
 mod win {
     use std::{cell::RefCell, mem::size_of};
 
-    use windows::core::{ComInterface, Error as WinError, HRESULT};
+    use windows::core::{ComInterface, Error as WinError, HRESULT, PCWSTR};
     use windows::Win32::{
         Foundation::{HMODULE, HWND, RECT},
         Graphics::Gdi::{
             BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreatedHDC, DeleteDC, DeleteObject,
-            GetDC, GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-            CAPTUREBLT, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, RGBQUAD, SRCCOPY,
+            EnumDisplayDevicesW, GetDC, GetDIBits, ReleaseDC, SelectObject, BITMAPINFO,
+            BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS, DISPLAY_DEVICEW,
+            DISPLAY_DEVICE_ACTIVE, DISPLAY_DEVICE_MIRRORING_DRIVER, HBITMAP, HDC, HGDIOBJ, RGBQUAD,
+            SRCCOPY,
         },
         Graphics::{
             Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0},
@@ -428,7 +430,11 @@ mod win {
     }
 
     pub fn display_infos() -> Vec<CaptureDisplay> {
-        unsafe { dxgi_display_infos().unwrap_or_else(fallback_display_infos) }
+        unsafe {
+            dxgi_display_infos()
+                .map(reorder_dxgi_by_gdi)
+                .unwrap_or_else(fallback_display_infos)
+        }
     }
 
     fn display_info(display: i32) -> Option<CaptureDisplay> {
@@ -493,6 +499,99 @@ mod win {
         } else {
             Some(displays)
         }
+    }
+
+    // RustDesk-derived display ordering idea: keep Windows GDI monitor order,
+    // then match DXGI outputs by device name so announced indexes equal capture indexes.
+    fn reorder_dxgi_by_gdi(dxgi: Vec<CaptureDisplay>) -> Vec<CaptureDisplay> {
+        let gdi = unsafe { gdi_display_names() };
+        reorder_dxgi_by_names(dxgi, &gdi)
+    }
+
+    fn reorder_dxgi_by_names(dxgi: Vec<CaptureDisplay>, gdi: &[String]) -> Vec<CaptureDisplay> {
+        if gdi.is_empty() {
+            return dxgi;
+        }
+
+        let mut ordered = Vec::with_capacity(dxgi.len());
+        let mut used = vec![false; dxgi.len()];
+        for name in gdi {
+            if let Some((pos, display)) = dxgi
+                .iter()
+                .enumerate()
+                .find(|(idx, display)| !used[*idx] && display.name.eq_ignore_ascii_case(name))
+            {
+                used[pos] = true;
+                ordered.push(display.clone());
+            }
+        }
+        for (idx, display) in dxgi.iter().enumerate() {
+            if !used[idx] {
+                ordered.push(display.clone());
+            }
+        }
+        for (idx, display) in ordered.iter_mut().enumerate() {
+            display.index = idx as i32;
+        }
+        ordered
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn gdi_order_reindexes_dxgi_outputs() {
+            let dxgi = vec![
+                CaptureDisplay {
+                    index: 0,
+                    x: 2560,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                    name: "\\\\.\\DISPLAY2".to_owned(),
+                },
+                CaptureDisplay {
+                    index: 1,
+                    x: 0,
+                    y: 0,
+                    width: 2560,
+                    height: 1440,
+                    name: "\\\\.\\DISPLAY1".to_owned(),
+                },
+            ];
+
+            let ordered = reorder_dxgi_by_names(
+                dxgi,
+                &["\\\\.\\DISPLAY1".to_owned(), "\\\\.\\DISPLAY2".to_owned()],
+            );
+
+            assert_eq!(ordered[0].name, "\\\\.\\DISPLAY1");
+            assert_eq!(ordered[0].index, 0);
+            assert_eq!(ordered[1].name, "\\\\.\\DISPLAY2");
+            assert_eq!(ordered[1].index, 1);
+        }
+    }
+
+    unsafe fn gdi_display_names() -> Vec<String> {
+        let mut displays = Vec::new();
+        for device_index in 0..32_u32 {
+            let mut device = DISPLAY_DEVICEW::default();
+            device.cb = size_of::<DISPLAY_DEVICEW>() as u32;
+            if !EnumDisplayDevicesW(PCWSTR::null(), device_index, &mut device, 0).as_bool() {
+                break;
+            }
+            if device.StateFlags & DISPLAY_DEVICE_ACTIVE == 0 {
+                continue;
+            }
+            if device.StateFlags & DISPLAY_DEVICE_MIRRORING_DRIVER != 0 {
+                continue;
+            }
+            if let Some(name) = utf16_z_to_string(&device.DeviceName) {
+                displays.push(name);
+            }
+        }
+        displays
     }
 
     fn fallback_display_infos() -> Vec<CaptureDisplay> {
