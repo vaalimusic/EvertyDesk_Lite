@@ -29,7 +29,7 @@ use std::{
     collections::{HashMap, HashSet},
     net::{SocketAddr, UdpSocket},
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender, SyncSender},
         Arc, Mutex,
     },
@@ -631,7 +631,14 @@ fn encode_loop(
     // ★ Периодическая отправка телеметрии хоста КЛИЕНТУ (для --diagnose).
     //   Не один раз, а каждые 2с — надёжно доходит даже при дропах/статике.
     let mut last_host_tele_at = Instant::now();
-    let mut last_encode_ms: u128 = 0;
+    let mut host_tele_sent_base = 0_u64;
+    let mut host_tele_skipped_base = 0_u64;
+    let mut host_tele_samples_base = 0_u64;
+    let mut host_tele_capture_base = 0_u64;
+    let mut host_tele_change_base = 0_u64;
+    let mut host_tele_encode_base = 0_u64;
+    let mut host_tele_capture_thread_samples_base = 0_u64;
+    let mut host_tele_capture_thread_us_base = 0_u64;
     const HOST_TELE_INTERVAL: Duration = Duration::from_secs(2);
 
     // ★ Адаптивный даунскейл для софт-энкодера.
@@ -644,6 +651,9 @@ fn encode_loop(
     // Capture double buffer
     type CapSlot = Arc<Mutex<Option<(i32, u32, u32, Vec<u8>)>>>;
     let cap_slot: CapSlot = Arc::new(Mutex::new(None));
+    let capture_thread_samples = Arc::new(AtomicU64::new(0));
+    let capture_thread_us_total = Arc::new(AtomicU64::new(0));
+    let capture_thread_us_max = Arc::new(AtomicU64::new(0));
     // Keep the handle so we can join the capture thread before NVENC is
     // destroyed.  Without this join, the DXGI duplication and NVENC D3D11
     // devices overlap during teardown → GPU TDR → system freeze.
@@ -651,6 +661,9 @@ fn encode_loop(
         let cap_stop = stop.clone();
         let cap_fps = target_fps.clone();
         let cap_slot2 = cap_slot.clone();
+        let cap_samples = capture_thread_samples.clone();
+        let cap_us_total = capture_thread_us_total.clone();
+        let cap_us_max = capture_thread_us_max.clone();
         thread::Builder::new()
             .name(format!("pipeline-capture-d{}", display + 1))
             .spawn(move || {
@@ -660,7 +673,17 @@ fn encode_loop(
                         break;
                     }
                     let fps = cap_fps.load(Ordering::Relaxed).clamp(5, 60);
-                    if let Some((w, h)) = crate::capture::capture_display_into(display, &mut buf) {
+                    let capture_started = Instant::now();
+                    let captured = crate::capture::capture_display_into(display, &mut buf);
+                    let capture_us = capture_started
+                        .elapsed()
+                        .as_micros()
+                        .min(u128::from(u64::MAX)) as u64;
+                    cap_samples.fetch_add(1, Ordering::Relaxed);
+                    cap_us_total.fetch_add(capture_us, Ordering::Relaxed);
+                    cap_us_max.fetch_max(capture_us, Ordering::Relaxed);
+
+                    if let Some((w, h)) = captured {
                         if let Ok(mut slot) = cap_slot2.lock() {
                             match slot.as_mut() {
                                 Some(s) if s.0 == display && s.1 == w && s.2 == h => {
@@ -670,8 +693,8 @@ fn encode_loop(
                             }
                         }
                     }
-                    let us = 1_000_000u64 / fps.max(1) as u64;
-                    thread::sleep(Duration::from_micros(us.saturating_sub(500)));
+                    let sleep_us = 1_000_000u64 / fps.max(1) as u64;
+                    thread::sleep(Duration::from_micros(sleep_us.saturating_sub(500)));
                 }
             })
             .expect("spawn capture")
@@ -783,17 +806,71 @@ fn encode_loop(
         };
         let encode_dur = encode_started.elapsed();
         tele.mark_encode(encode_dur);
-        last_encode_ms = encode_dur.as_millis();
+        let encode_ms = encode_dur.as_millis();
 
         // ★ Периодически шлём телеметрию хоста клиенту (надёжнее одноразовой).
         //   БЛОКИРУЮЩИЙ send — try_send дропался когда канал забит видео-кадрами.
         //   Телеметрия раз в 2с, блокировка на пару мс приемлема и гарантирует доставку.
         if last_host_tele_at.elapsed() >= HOST_TELE_INTERVAL {
+            let host_tele_elapsed = last_host_tele_at.elapsed();
             last_host_tele_at = Instant::now();
+            let capture_thread_samples_now = capture_thread_samples.load(Ordering::Relaxed);
+            let capture_thread_us_now = capture_thread_us_total.load(Ordering::Relaxed);
+            let capture_thread_max_us = capture_thread_us_max.swap(0, Ordering::Relaxed);
+
+            if tele.sent_frames < host_tele_sent_base
+                || tele.skipped_frames < host_tele_skipped_base
+                || tele.samples < host_tele_samples_base
+                || tele.capture_us_total < host_tele_capture_base
+                || tele.change_us_total < host_tele_change_base
+                || tele.encode_us_total < host_tele_encode_base
+                || capture_thread_samples_now < host_tele_capture_thread_samples_base
+                || capture_thread_us_now < host_tele_capture_thread_us_base
+            {
+                host_tele_sent_base = 0;
+                host_tele_skipped_base = 0;
+                host_tele_samples_base = 0;
+                host_tele_capture_base = 0;
+                host_tele_change_base = 0;
+                host_tele_encode_base = 0;
+                host_tele_capture_thread_samples_base = 0;
+                host_tele_capture_thread_us_base = 0;
+            }
+
+            let sent_delta = tele.sent_frames.saturating_sub(host_tele_sent_base);
+            let skipped_delta = tele.skipped_frames.saturating_sub(host_tele_skipped_base);
+            let sample_delta = tele.samples.saturating_sub(host_tele_samples_base).max(1);
+            let slot_us_delta = tele.capture_us_total.saturating_sub(host_tele_capture_base);
+            let change_us_delta = tele.change_us_total.saturating_sub(host_tele_change_base);
+            let encode_us_delta = tele.encode_us_total.saturating_sub(host_tele_encode_base);
+            let capture_thread_samples_delta = capture_thread_samples_now
+                .saturating_sub(host_tele_capture_thread_samples_base)
+                .max(1);
+            let capture_thread_us_delta =
+                capture_thread_us_now.saturating_sub(host_tele_capture_thread_us_base);
+            let actual_fps = sent_delta as f64 / host_tele_elapsed.as_secs_f64().max(0.001);
+            let capture_avg_ms = capture_thread_us_delta / capture_thread_samples_delta / 1000;
+            let slot_avg_ms = slot_us_delta / sample_delta / 1000;
+            let change_avg_ms = change_us_delta / sample_delta / 1000;
+            let encode_avg_ms = if sent_delta > 0 {
+                encode_us_delta / sent_delta / 1000
+            } else {
+                0
+            };
+
             let info = format!(
-                "backend={} encode_ms={} res={}x{} fps={} build={}",
+                "backend={} encode_ms={} encode_avg_ms={} capture_avg_ms={} capture_max_ms={} slot_avg_ms={} change_avg_ms={} actual_fps={:.1} sent={} skipped={} interval_ms={} res={}x{} fps={} build={}",
                 encoder.active_backend(),
-                last_encode_ms,
+                encode_ms,
+                encode_avg_ms,
+                capture_avg_ms,
+                capture_thread_max_us / 1000,
+                slot_avg_ms,
+                change_avg_ms,
+                actual_fps,
+                sent_delta,
+                skipped_delta,
+                host_tele_elapsed.as_millis(),
                 enc_w, enc_h, fps,
                 crate::host::binary_build_stamp(),
             );
@@ -801,13 +878,30 @@ fn encode_loop(
             let tele_msg = crate::rustdesk_proto::PeerMessage {
                 union: Some(crate::rustdesk_proto::peer_message::Union::Misc(
                     crate::rustdesk_proto::Misc {
-                        union: Some(crate::rustdesk_proto::misc::Union::HostTelemetry(info.clone())),
+                        union: Some(crate::rustdesk_proto::misc::Union::HostTelemetry(
+                            info.clone(),
+                        )),
                     },
                 )),
             };
             let _ = tcp_tx.send(TcpItem::Peer(tele_msg));
             // ★ ПИШЕМ свою диагностику в файл — видно хост напрямую, без клиента.
-            write_host_diag(&info, tele.skipped_total(), tele.sent_total());
+            write_host_diag(
+                &info,
+                skipped_delta,
+                sent_delta,
+                host_tele_elapsed.as_millis(),
+                actual_fps,
+            );
+
+            host_tele_sent_base = tele.sent_total();
+            host_tele_skipped_base = tele.skipped_total();
+            host_tele_samples_base = tele.samples;
+            host_tele_capture_base = tele.capture_us_total;
+            host_tele_change_base = tele.change_us_total;
+            host_tele_encode_base = tele.encode_us_total;
+            host_tele_capture_thread_samples_base = capture_thread_samples_now;
+            host_tele_capture_thread_us_base = capture_thread_us_now;
         }
 
         // ★ Один раз логируем РЕАЛЬНЫЙ бэкенд (MediaFoundation/OpenH264-SW/PNG).
@@ -840,10 +934,13 @@ fn encode_loop(
                 let dw = ((enc_w as f32 * scale) as u32 & !1).max(2); // чётное
                 let dh = (target_h & !1).max(2);
                 downscale_to = Some((dw, dh));
-                log(&events, format!(
-                    "★ Софт-энкодер на {}×{} — включаю даунскейл до {}×{} для скорости",
-                    enc_w, enc_h, dw, dh,
-                ));
+                log(
+                    &events,
+                    format!(
+                        "★ Софт-энкодер на {}×{} — включаю даунскейл до {}×{} для скорости",
+                        enc_w, enc_h, dw, dh,
+                    ),
+                );
             }
         }
 
@@ -1251,15 +1348,13 @@ fn maybe_emit_telemetry(
 
 /// Даунскейл BGRA-кадра в `dst` методом усреднения блоков (box filter).
 /// Быстрый, без зависимостей. Для софт-энкодера на высоком разрешении.
-fn downscale_bgra(
-    src: &[u8],
-    src_w: u32,
-    src_h: u32,
-    dst: &mut Vec<u8>,
-    dst_w: u32,
-    dst_h: u32,
-) {
-    let (sw, sh, dw, dh) = (src_w as usize, src_h as usize, dst_w as usize, dst_h as usize);
+fn downscale_bgra(src: &[u8], src_w: u32, src_h: u32, dst: &mut Vec<u8>, dst_w: u32, dst_h: u32) {
+    let (sw, sh, dw, dh) = (
+        src_w as usize,
+        src_h as usize,
+        dst_w as usize,
+        dst_h as usize,
+    );
     dst.resize(dw * dh * 4, 0);
     if sw == 0 || sh == 0 || dw == 0 || dh == 0 || src.len() < sw * sh * 4 {
         return;
@@ -1294,15 +1389,20 @@ fn log(events: &Sender<HostEvent>, msg: String) {
 
 /// ★ Хост пишет свою диагностику в файл — видно энкодер/fps/build напрямую,
 /// без клиента и без догадок. Перезаписывается каждые 2с активной сессии.
-fn write_host_diag(info: &str, skipped: u64, sent: u64) {
+fn write_host_diag(info: &str, skipped: u64, sent: u64, interval_ms: u128, actual_fps: f64) {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let body = format!(
         "# Хост-диагностика EvertyDesk Lite (живая)\n\n\
          Обновлено: unix {ts}\n\n\
          ## Энкодер\n\
          {info}\n\n\
-         ## Кадры за интервал\n\
+         ## Кадры за последний интервал\n\
+         - interval_ms: {interval_ms}\n\
+         - actual_fps: {actual_fps:.1}\n\
          - sent: {sent}\n\
          - skipped (статика): {skipped}\n\n\
          > Это пишет САМ ХОСТ из encode_loop. Если файл свежий (unix растёт) и\n\
