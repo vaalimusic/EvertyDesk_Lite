@@ -108,6 +108,25 @@ impl NvencEncoder {
             Err("Direct NVENC encoder backend is available only on Windows builds with live-nvenc-sdk".to_owned())
         }
     }
+
+    pub fn encode_texture(
+        &mut self,
+        shared_handle: *mut std::ffi::c_void,
+        force_key: bool,
+    ) -> Result<Option<NvencPacket>, String> {
+        #[cfg(all(nvenc_api_ffi, windows))]
+        {
+            return self
+                .inner
+                .encode_texture(self.codec, shared_handle, force_key);
+        }
+
+        #[cfg(not(all(nvenc_api_ffi, windows)))]
+        {
+            let _ = (shared_handle, force_key);
+            Err("Direct NVENC texture input is available only on Windows builds with live-nvenc-sdk".to_owned())
+        }
+    }
 }
 
 pub fn nvenc_encoder_codecs() -> Vec<NvencCodec> {

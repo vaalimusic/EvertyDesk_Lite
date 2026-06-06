@@ -1,7 +1,7 @@
 use eframe::egui;
 
 use crate::settings::{
-    self as settings_mod, AppConfig, CodecPreference, EncoderPreference, LlmProvider,
+    self as settings_mod, AppConfig, CodecPreference, EncoderPreference, LlmProvider, StreamingMode,
 };
 use crate::ui::widgets::{language_button, settings_section, settings_text_row};
 use crate::{
@@ -152,6 +152,26 @@ impl EvertyDeskApp {
                         );
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
+                            ui.label(tr(selected_lang, "Р РµР¶РёРј", "Mode"));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    for mode in [
+                                        StreamingMode::Game,
+                                        StreamingMode::Interactive,
+                                        StreamingMode::Support,
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut draft.display.streaming_mode,
+                                            mode,
+                                            mode.label(),
+                                        );
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
                             ui.label(tr(selected_lang, "Целевой FPS", "Target FPS"));
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -233,7 +253,8 @@ impl EvertyDeskApp {
                             || new_cfg.server.public_key != self.config.server.public_key
                             || new_cfg.display.target_fps != self.config.display.target_fps
                             || new_cfg.display.codec != self.config.display.codec
-                            || new_cfg.display.encoder != self.config.display.encoder;
+                            || new_cfg.display.encoder != self.config.display.encoder
+                            || new_cfg.display.streaming_mode != self.config.display.streaming_mode;
                         let next_video_fps = new_cfg.display.target_fps.clamp(5, 60) as i32;
                         if host_reconfigure_needed {
                             if let Some(svc) = &self.host_service {
@@ -317,6 +338,7 @@ impl EvertyDeskApp {
             current_config.display.target_fps,
             current_config.display.codec,
             current_config.display.encoder,
+            current_config.display.streaming_mode,
         );
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -434,6 +456,23 @@ impl EvertyDeskApp {
                     .size(12.0)
                     .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
                 );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(tr(selected_lang, "Р РµР¶РёРј", "Mode"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        for mode in [
+                            StreamingMode::Game,
+                            StreamingMode::Interactive,
+                            StreamingMode::Support,
+                        ] {
+                            ui.selectable_value(
+                                &mut draft.display.streaming_mode,
+                                mode,
+                                mode.label(),
+                            );
+                        }
+                    });
+                });
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.label(tr(selected_lang, "Целевой FPS", "Target FPS"));
@@ -557,7 +596,8 @@ impl EvertyDeskApp {
                     || new_cfg.server.public_key != host_reconfigure_source.2
                     || new_cfg.display.target_fps != host_reconfigure_source.3
                     || new_cfg.display.codec != host_reconfigure_source.4
-                    || new_cfg.display.encoder != host_reconfigure_source.5;
+                    || new_cfg.display.encoder != host_reconfigure_source.5
+                    || new_cfg.display.streaming_mode != host_reconfigure_source.6;
                 let next_video_fps = new_cfg.display.target_fps.clamp(5, 60) as i32;
                 if host_reconfigure_needed {
                     if let Some(svc) = &self.host_service {

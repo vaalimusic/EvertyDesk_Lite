@@ -606,6 +606,15 @@ fn encode_loop(
         &events,
         format!("Encoder каскад: {}", encoder.backend_label()),
     );
+    let allow_static_skip = config.display.streaming_mode.allows_static_skip();
+    log(
+        &events,
+        format!(
+            "Streaming mode: {} (static_skip={})",
+            config.display.streaming_mode.label(),
+            allow_static_skip
+        ),
+    );
 
     // FSR
     let mut fsr = config.display.fsr_quality.to_fsr_quality().map(|q| {
@@ -769,7 +778,7 @@ fn encode_loop(
         let decision = change_detector.decide(enc_w, enc_h, bgra, periodic_key);
         tele.mark_change(change_started.elapsed());
 
-        if !decision.send {
+        if !decision.send && allow_static_skip {
             // Кадр не изменился — не кодируем, не шлём. Экономия трафика и CPU.
             tele.mark_skipped();
             // Backoff при долгой статике — снижаем частоту опроса

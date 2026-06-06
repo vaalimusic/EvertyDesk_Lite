@@ -143,6 +143,29 @@ impl FsrQualitySetting {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamingMode {
+    #[default]
+    Support,
+    Interactive,
+    Game,
+}
+
+impl StreamingMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Support => "Support",
+            Self::Interactive => "Interactive",
+            Self::Game => "Game",
+        }
+    }
+
+    pub fn allows_static_skip(self) -> bool {
+        !matches!(self, Self::Game)
+    }
+}
+
 fn default_fsr_sharpness() -> f32 {
     0.875
 }
@@ -159,6 +182,8 @@ pub struct DisplayConfig {
     pub adaptive_quality: bool,
     #[serde(default = "default_min_fps")]
     pub min_fps: u32,
+    #[serde(default)]
+    pub streaming_mode: StreamingMode,
 
     /// AMD FidelityFX Super Resolution — режим качества апскейла.
     /// `Off` = FSR не используется (нативный захват).
@@ -179,6 +204,7 @@ impl Default for DisplayConfig {
             target_fps: default_target_fps(),
             adaptive_quality: default_adaptive_quality(),
             min_fps: default_min_fps(),
+            streaming_mode: StreamingMode::Support,
             fsr_quality: FsrQualitySetting::Off,
             fsr_sharpness: default_fsr_sharpness(),
         }
