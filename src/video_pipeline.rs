@@ -788,20 +788,24 @@ fn encode_loop(
         //   Телеметрия раз в 2с, блокировка на пару мс приемлема и гарантирует доставку.
         if last_host_tele_at.elapsed() >= HOST_TELE_INTERVAL {
             last_host_tele_at = Instant::now();
+            let info = format!(
+                "backend={} encode_ms={} res={}x{} fps={} build={}",
+                encoder.active_backend(),
+                last_encode_ms,
+                enc_w, enc_h, fps,
+                crate::host::binary_build_stamp(),
+            );
+            // Шлём клиенту
             let tele_msg = crate::rustdesk_proto::PeerMessage {
                 union: Some(crate::rustdesk_proto::peer_message::Union::Misc(
                     crate::rustdesk_proto::Misc {
-                        union: Some(crate::rustdesk_proto::misc::Union::HostTelemetry(format!(
-                            "backend={} encode_ms={} res={}x{} fps={} build={}",
-                            encoder.active_backend(),
-                            last_encode_ms,
-                            enc_w, enc_h, fps,
-                            crate::host::binary_build_stamp(),
-                        ))),
+                        union: Some(crate::rustdesk_proto::misc::Union::HostTelemetry(info.clone())),
                     },
                 )),
             };
             let _ = tcp_tx.send(TcpItem::Peer(tele_msg));
+            // ★ ПИШЕМ свою диагностику в файл — видно хост напрямую, без клиента.
+            write_host_diag(&info, tele.skipped_total(), tele.sent_total());
         }
 
         // ★ Один раз логируем РЕАЛЬНЫЙ бэкенд (MediaFoundation/OpenH264-SW/PNG).
@@ -1148,6 +1152,12 @@ impl PipelineTelemetry {
     fn mark_skipped(&mut self) {
         self.skipped_frames += 1;
     }
+    fn skipped_total(&self) -> u64 {
+        self.skipped_frames
+    }
+    fn sent_total(&self) -> u64 {
+        self.sent_frames
+    }
     fn reset(&mut self) {
         self.sent_frames = 0;
         self.skipped_frames = 0;
@@ -1276,6 +1286,28 @@ fn downscale_bgra(
 fn log(events: &Sender<HostEvent>, msg: String) {
     eprintln!("[pipeline] {msg}");
     let _ = events.send(HostEvent::Log(msg));
+}
+
+/// ★ Хост пишет свою диагностику в файл — видно энкодер/fps/build напрямую,
+/// без клиента и без догадок. Перезаписывается каждые 2с активной сессии.
+fn write_host_diag(info: &str, skipped: u64, sent: u64) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let body = format!(
+        "# Хост-диагностика EvertyDesk Lite (живая)\n\n\
+         Обновлено: unix {ts}\n\n\
+         ## Энкодер\n\
+         {info}\n\n\
+         ## Кадры за интервал\n\
+         - sent: {sent}\n\
+         - skipped (статика): {skipped}\n\n\
+         > Это пишет САМ ХОСТ из encode_loop. Если файл свежий (unix растёт) и\n\
+         > backend/encode_ms заполнены — хост точно на свежем билде.\n\
+         > `backend=OpenH264-SW encode_ms>100` = софт (нет NVENC/MF аппаратного).\n\
+         > `backend=NVENC encode_ms<10` = аппаратный RTX.\n",
+    );
+    let _ = std::fs::create_dir_all("diagnostics");
+    let _ = std::fs::write("diagnostics/host_diag.md", body);
 }
 
 #[cfg(test)]
