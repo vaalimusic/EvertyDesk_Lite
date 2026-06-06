@@ -470,8 +470,6 @@ fn evrt_decode_loop(
     let mut h265_mf: Option<crate::mf_video::MfVideoDecoder> = None;
     let mf_status = crate::mf_video::mf_video_decode_status();
 
-    let mut last_decode_at = Instant::now();
-
     loop {
         // Взять кадр из очереди
         let Some((bytes, _is_key, _pts)) = queue.dequeue(&stop) else {
@@ -479,12 +477,6 @@ fn evrt_decode_loop(
         };
 
         let decode_start = Instant::now();
-
-        // delta между декодами
-        let now = Instant::now();
-        let d = now.duration_since(last_decode_at).as_millis() as i32;
-        delta_ms.store(d, Ordering::Relaxed);
-        last_decode_at = now;
 
         // Декодировать в зависимости от кодека
         let maybe_event = match codec.to_ascii_uppercase().as_str() {
@@ -510,6 +502,7 @@ fn evrt_decode_loop(
         };
 
         let decode_ms = decode_start.elapsed().as_millis() as u64;
+        delta_ms.store(decode_ms.min(i32::MAX as u64) as i32, Ordering::Relaxed);
 
         if let Some((rgba, w, h)) = maybe_event {
             let decoded_id = decoded_frames.fetch_add(1, Ordering::Relaxed) + 1;
@@ -622,13 +615,17 @@ fn compute_pressure(
         (22, 34, 2, 1)
     };
 
-    let crit = arrival_delta_ms >= crit_ms
-        || decode_delta_ms >= crit_ms
+    // `arrival_delta_ms` is an inter-packet/frame gap. It grows on static
+    // desktop content because the host legitimately sends fewer frames, so it
+    // must not create receiver pressure by itself.
+    let arrival_strained = arrival_delta_ms >= high_ms && (backlog > 0 || new_drops > 0);
+
+    let crit = decode_delta_ms >= crit_ms
         || backlog >= backlog_crit
         || new_drops >= 3;
 
     let high = crit
-        || arrival_delta_ms >= high_ms
+        || arrival_strained
         || decode_delta_ms >= high_ms
         || backlog >= backlog_high
         || new_drops >= 1;
@@ -771,16 +768,22 @@ mod tests {
     }
 
     #[test]
+    fn pressure_normal_on_sparse_clean_stream() {
+        let p = compute_pressure(125, 10, 0, 0, false);
+        assert_eq!(p, Pressure::Normal);
+    }
+
+    #[test]
     fn cinema_mode_higher_thresholds() {
-        // В game-режиме: delta=25 >= high_ms=22 → High
+        // В game-режиме: decode=25 >= high_ms=22 → High
         let p_game = compute_pressure(25, 25, 0, 0, false);
         assert_eq!(p_game, Pressure::High);
 
-        // В cinema-режиме: delta=25 < high_ms=30, backlog=0 → Normal
+        // В cinema-режиме: decode=25 < high_ms=30, backlog=0 → Normal
         let p_cinema = compute_pressure(25, 25, 0, 0, true);
         assert_eq!(p_cinema, Pressure::Normal);
 
-        // В cinema-режиме: delta=35 >= high_ms=30 → High (но < crit_ms=44)
+        // В cinema-режиме: decode=35 >= high_ms=30 → High (но < crit_ms=44)
         let p_cinema_high = compute_pressure(35, 35, 0, 0, true);
         assert_eq!(p_cinema_high, Pressure::High);
     }
