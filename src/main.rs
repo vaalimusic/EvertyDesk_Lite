@@ -58,6 +58,8 @@ use ui::widgets::*;
 
 const APP_NAME: &str = "EvertyDesk Lite";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const MAX_SESSION_LOG_LINES: usize = 4_000;
+const SESSION_LOG_TRIM_LINES: usize = 500;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AppMode {
@@ -88,6 +90,13 @@ fn tr(lang: UiLang, ru: &'static str, en: &'static str) -> &'static str {
 }
 
 fn main() -> eframe::Result<()> {
+    let cleanup = diagnostics::cleanup_default_artifacts();
+    if cleanup.removed_total() > 0 || cleanup.errors > 0 {
+        eprintln!(
+            "[diagnostics] cleanup: removed_files={} removed_dirs={} errors={}",
+            cleanup.removed_files, cleanup.removed_dirs, cleanup.errors
+        );
+    }
     if let Some(exit_code) = run_cli_connect() {
         std::process::exit(exit_code);
     }
@@ -1669,6 +1678,10 @@ impl EvertyDeskApp {
     fn log(&mut self, message: String) {
         let line = format!("{}  {message}", unix_timestamp_secs());
         self.session_log.push(line.clone());
+        if self.session_log.len() > MAX_SESSION_LOG_LINES {
+            let trim = SESSION_LOG_TRIM_LINES.min(self.session_log.len());
+            self.session_log.drain(..trim);
+        }
         self.events.push(line);
         if self.events.len() > 80 {
             self.events.remove(0);
@@ -4785,6 +4798,7 @@ fn save_rgba_png(
 }
 
 fn save_session_log(remote_id: &str, lines: &[String]) -> Result<PathBuf, String> {
+    let _ = diagnostics::cleanup_session_logs();
     let dir = PathBuf::from("logs");
     fs::create_dir_all(&dir).map_err(|err| format!("Create logs dir failed: {err}"))?;
     let timestamp = unix_timestamp_secs();
@@ -4799,10 +4813,12 @@ fn save_session_log(remote_id: &str, lines: &[String]) -> Result<PathBuf, String
         body.push('\n');
     }
     fs::write(&path, body).map_err(|err| format!("Write log failed: {err}"))?;
+    let _ = diagnostics::cleanup_session_logs();
     Ok(path)
 }
 
 fn save_support_report_bundle(report: SupportReport) -> Result<PathBuf, String> {
+    let _ = diagnostics::cleanup_support_reports();
     let timestamp = unix_timestamp_secs();
     let id = sanitize_filename(&report.remote_id);
     let dir = PathBuf::from("reports").join(format!("evertydesk-{id}-{timestamp}"));
@@ -4834,6 +4850,7 @@ fn save_support_report_bundle(report: SupportReport) -> Result<PathBuf, String> 
         .map_err(|err| format!("Write report screen failed: {err}"))?;
     }
 
+    let _ = diagnostics::cleanup_support_reports();
     Ok(dir)
 }
 

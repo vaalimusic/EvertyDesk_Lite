@@ -12,54 +12,307 @@
 // =============================================================================
 
 use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
     sync::mpsc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use serde_json::json;
+
+use crate::settings::AppConfig;
 use crate::transport::{
     ConnectionRequest, RemoteDisplay, SessionCommand, SessionEvent, TransportClient,
 };
-use crate::settings::AppConfig;
+
+const DIAGNOSTIC_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+const SESSION_LOG_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const SUPPORT_REPORT_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const MAX_DIAGNOSTIC_RUNS: usize = 10;
+const MAX_SESSION_LOGS: usize = 20;
+const MAX_SUPPORT_REPORTS: usize = 10;
+
+#[derive(Default, Debug, Clone, Copy)]
+pub struct CleanupSummary {
+    pub removed_files: usize,
+    pub removed_dirs: usize,
+    pub errors: usize,
+}
+
+impl CleanupSummary {
+    fn add(&mut self, other: Self) {
+        self.removed_files += other.removed_files;
+        self.removed_dirs += other.removed_dirs;
+        self.errors += other.errors;
+    }
+
+    pub fn removed_total(self) -> usize {
+        self.removed_files + self.removed_dirs
+    }
+}
+
+#[derive(Debug)]
+struct ArtifactGroup {
+    key: String,
+    paths: Vec<PathBuf>,
+    modified: SystemTime,
+}
+
+pub fn cleanup_default_artifacts() -> CleanupSummary {
+    let mut summary = cleanup_diagnostic_runs(Path::new("diagnostics"));
+    summary.add(cleanup_session_logs());
+    summary.add(cleanup_support_reports());
+    summary
+}
+
+pub fn cleanup_session_logs() -> CleanupSummary {
+    cleanup_files(
+        Path::new("logs"),
+        SESSION_LOG_RETENTION,
+        MAX_SESSION_LOGS,
+        |path| {
+            path.extension().and_then(|ext| ext.to_str()) == Some("log")
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("evertydesk-"))
+        },
+    )
+}
+
+pub fn cleanup_support_reports() -> CleanupSummary {
+    cleanup_directories(
+        Path::new("reports"),
+        SUPPORT_REPORT_RETENTION,
+        MAX_SUPPORT_REPORTS,
+        |path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("evertydesk-"))
+        },
+    )
+}
+
+pub fn cleanup_diagnostic_runs(dir: &Path) -> CleanupSummary {
+    cleanup_diagnostic_runs_with_limits(dir, DIAGNOSTIC_RETENTION, MAX_DIAGNOSTIC_RUNS)
+}
+
+fn cleanup_diagnostic_runs_with_limits(
+    dir: &Path,
+    max_age: Duration,
+    max_runs: usize,
+) -> CleanupSummary {
+    let mut summary = CleanupSummary::default();
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return summary,
+        Err(_) => {
+            summary.errors += 1;
+            return summary;
+        }
+    };
+
+    let mut groups: HashMap<String, ArtifactGroup> = HashMap::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                summary.errors += 1;
+                continue;
+            }
+        };
+        let path = entry.path();
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if !stem.starts_with("diag_")
+            || !matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("md" | "json")
+            )
+        {
+            continue;
+        }
+        let modified = modified_time(&path, &mut summary);
+        let group = groups
+            .entry(stem.to_owned())
+            .or_insert_with(|| ArtifactGroup {
+                key: stem.to_owned(),
+                paths: Vec::new(),
+                modified,
+            });
+        group.modified = group.modified.max(modified);
+        group.paths.push(path);
+    }
+
+    let mut groups = groups.into_values().collect::<Vec<_>>();
+    groups.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| b.key.cmp(&a.key)));
+    let now = SystemTime::now();
+    for (index, group) in groups.into_iter().enumerate() {
+        let expired = now
+            .duration_since(group.modified)
+            .map(|age| age > max_age)
+            .unwrap_or(false);
+        if !expired && index < max_runs {
+            continue;
+        }
+        for path in group.paths {
+            match fs::remove_file(path) {
+                Ok(()) => summary.removed_files += 1,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => summary.errors += 1,
+            }
+        }
+    }
+    summary
+}
+
+fn cleanup_files(
+    dir: &Path,
+    max_age: Duration,
+    max_files: usize,
+    include: impl Fn(&Path) -> bool,
+) -> CleanupSummary {
+    let mut summary = CleanupSummary::default();
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return summary,
+        Err(_) => {
+            summary.errors += 1;
+            return summary;
+        }
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                summary.errors += 1;
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.is_file() && include(&path) {
+            files.push((modified_time(&path, &mut summary), path));
+        }
+    }
+    files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    let now = SystemTime::now();
+    for (index, (modified, path)) in files.into_iter().enumerate() {
+        let expired = now
+            .duration_since(modified)
+            .map(|age| age > max_age)
+            .unwrap_or(false);
+        if !expired && index < max_files {
+            continue;
+        }
+        match fs::remove_file(path) {
+            Ok(()) => summary.removed_files += 1,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => summary.errors += 1,
+        }
+    }
+    summary
+}
+
+fn cleanup_directories(
+    dir: &Path,
+    max_age: Duration,
+    max_dirs: usize,
+    include: impl Fn(&Path) -> bool,
+) -> CleanupSummary {
+    let mut summary = CleanupSummary::default();
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return summary,
+        Err(_) => {
+            summary.errors += 1;
+            return summary;
+        }
+    };
+    let mut directories = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                summary.errors += 1;
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.is_dir() && include(&path) {
+            directories.push((modified_time(&path, &mut summary), path));
+        }
+    }
+    directories.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    let now = SystemTime::now();
+    for (index, (modified, path)) in directories.into_iter().enumerate() {
+        let expired = now
+            .duration_since(modified)
+            .map(|age| age > max_age)
+            .unwrap_or(false);
+        if !expired && index < max_dirs {
+            continue;
+        }
+        match fs::remove_dir_all(path) {
+            Ok(()) => summary.removed_dirs += 1,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => summary.errors += 1,
+        }
+    }
+    summary
+}
+
+fn modified_time(path: &Path, summary: &mut CleanupSummary) -> SystemTime {
+    match fs::metadata(path).and_then(|metadata| metadata.modified()) {
+        Ok(modified) => modified,
+        Err(_) => {
+            summary.errors += 1;
+            UNIX_EPOCH
+        }
+    }
+}
 
 // ─── собранные метрики ────────────────────────────────────────────────────────
 
 #[derive(Default)]
 struct Collected {
     // Подключение
-    connected:       bool,
-    connect_ms:      u64,
-    peer_info:       String,
-    fail_reason:     Option<String>,
+    connected: bool,
+    connect_ms: u64,
+    peer_info: String,
+    fail_reason: Option<String>,
 
     // Видео
     frames_received: u64,
-    first_frame_ms:  Option<u64>,
-    codec:           String,
-    last_width:      usize,
-    last_height:     usize,
+    first_frame_ms: Option<u64>,
+    codec: String,
+    last_width: usize,
+    last_height: usize,
 
     // FPS/битрейт (из VideoPacketMetrics / FrameMetrics)
-    input_fps_samples:   Vec<f32>,
-    input_kbps_samples:  Vec<u64>,
-    decode_ms_samples:   Vec<u64>,
-    queue_ms_samples:    Vec<u64>,
-    dropped_total:       usize,
+    input_fps_samples: Vec<f32>,
+    input_kbps_samples: Vec<u64>,
+    decode_ms_samples: Vec<u64>,
+    queue_ms_samples: Vec<u64>,
+    dropped_total: usize,
 
     // Latency
     latency_samples: Vec<u32>,
 
     // EVRT
-    evrt_active:      bool,
-    evrt_host_addr:   String,
-    evrt_pressure:    Vec<String>,
-    evrt_arrival_ms:  Vec<i32>,
-    evrt_jitter_ms:   Vec<u32>,
+    evrt_active: bool,
+    evrt_host_addr: String,
+    evrt_pressure: Vec<String>,
+    evrt_arrival_ms: Vec<i32>,
+    evrt_jitter_ms: Vec<u32>,
 
     // Дисплеи
-    displays:        Vec<RemoteDisplay>,
+    displays: Vec<RemoteDisplay>,
 
     // Сырой журнал Info/Progress (для ★ строк бэкенда и EVRT)
-    info_log:        Vec<String>,
+    info_log: Vec<String>,
 }
 
 impl Collected {
@@ -73,7 +326,12 @@ impl Collected {
             SessionEvent::Failed(err) => {
                 self.fail_reason = Some(err.clone());
             }
-            SessionEvent::Frame { codec, width, height, .. } => {
+            SessionEvent::Frame {
+                codec,
+                width,
+                height,
+                ..
+            } => {
                 self.frames_received += 1;
                 if self.first_frame_ms.is_none() {
                     self.first_frame_ms = Some(started.elapsed().as_millis() as u64);
@@ -82,12 +340,20 @@ impl Collected {
                 self.last_width = *width;
                 self.last_height = *height;
             }
-            SessionEvent::FrameMetrics { queue_ms, decode_ms, dropped, .. } => {
+            SessionEvent::FrameMetrics {
+                queue_ms,
+                decode_ms,
+                dropped,
+                ..
+            } => {
                 self.queue_ms_samples.push(*queue_ms);
                 self.decode_ms_samples.push(*decode_ms);
                 self.dropped_total += *dropped;
             }
-            SessionEvent::VideoPacketMetrics { input_fps, input_kbps } => {
+            SessionEvent::VideoPacketMetrics {
+                input_fps,
+                input_kbps,
+            } => {
                 self.input_fps_samples.push(*input_fps);
                 self.input_kbps_samples.push(*input_kbps);
             }
@@ -97,13 +363,22 @@ impl Collected {
             SessionEvent::Displays(d) => {
                 self.displays = d.clone();
             }
-            SessionEvent::EvrtStatus { active, host_addr, port } => {
+            SessionEvent::EvrtStatus {
+                active,
+                host_addr,
+                port,
+            } => {
                 self.evrt_active = *active;
                 if *active {
                     self.evrt_host_addr = format!("{host_addr}:{port}");
                 }
             }
-            SessionEvent::EvrtMetrics { pressure, arrival_delta_ms, jitter_ms, .. } => {
+            SessionEvent::EvrtMetrics {
+                pressure,
+                arrival_delta_ms,
+                jitter_ms,
+                ..
+            } => {
                 self.evrt_pressure.push(pressure.clone());
                 self.evrt_arrival_ms.push(*arrival_delta_ms);
                 self.evrt_jitter_ms.push(*jitter_ms);
@@ -119,16 +394,32 @@ impl Collected {
 // ─── статистика ───────────────────────────────────────────────────────────────
 
 fn avg_f32(v: &[f32]) -> f32 {
-    if v.is_empty() { 0.0 } else { v.iter().sum::<f32>() / v.len() as f32 }
+    if v.is_empty() {
+        0.0
+    } else {
+        v.iter().sum::<f32>() / v.len() as f32
+    }
 }
 fn avg_u64(v: &[u64]) -> u64 {
-    if v.is_empty() { 0 } else { v.iter().sum::<u64>() / v.len() as u64 }
+    if v.is_empty() {
+        0
+    } else {
+        v.iter().sum::<u64>() / v.len() as u64
+    }
 }
 fn avg_u32(v: &[u32]) -> u32 {
-    if v.is_empty() { 0 } else { (v.iter().map(|x| *x as u64).sum::<u64>() / v.len() as u64) as u32 }
+    if v.is_empty() {
+        0
+    } else {
+        (v.iter().map(|x| *x as u64).sum::<u64>() / v.len() as u64) as u32
+    }
 }
 fn avg_i32(v: &[i32]) -> i32 {
-    if v.is_empty() { 0 } else { (v.iter().map(|x| *x as i64).sum::<i64>() / v.len() as i64) as i32 }
+    if v.is_empty() {
+        0
+    } else {
+        (v.iter().map(|x| *x as i64).sum::<i64>() / v.len() as i64) as i32
+    }
 }
 fn max_f32(v: &[f32]) -> f32 {
     v.iter().cloned().fold(0.0, f32::max)
@@ -157,7 +448,7 @@ pub fn run_diagnose(remote_id: &str, password: &str, secs: u64, out_dir: &str) -
     eprintln!();
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>();
-    let (ev_tx, ev_rx)   = mpsc::channel::<SessionEvent>();
+    let (ev_tx, ev_rx) = mpsc::channel::<SessionEvent>();
 
     let started = Instant::now();
     let session = std::thread::spawn(move || {
@@ -174,11 +465,14 @@ pub fn run_diagnose(remote_id: &str, password: &str, secs: u64, out_dir: &str) -
                 // Печатаем важные строки в реальном времени
                 match &ev {
                     SessionEvent::Progress(p, m) => eprintln!("  [{p}%] {m}"),
-                    SessionEvent::Connected(i)   => eprintln!("  ✓ Подключено: {i}"),
-                    SessionEvent::Failed(e)      => eprintln!("  ✗ Ошибка: {e}"),
+                    SessionEvent::Connected(i) => eprintln!("  ✓ Подключено: {i}"),
+                    SessionEvent::Failed(e) => eprintln!("  ✗ Ошибка: {e}"),
                     SessionEvent::Info(m) if m.contains('★') => eprintln!("  {m}"),
-                    SessionEvent::EvrtStatus { active: true, host_addr, port } =>
-                        eprintln!("  ⚡ EVRT активен → {host_addr}:{port}"),
+                    SessionEvent::EvrtStatus {
+                        active: true,
+                        host_addr,
+                        port,
+                    } => eprintln!("  ⚡ EVRT активен → {host_addr}:{port}"),
                     _ => {}
                 }
                 collected.ingest(&ev, started);
@@ -202,16 +496,22 @@ pub fn run_diagnose(remote_id: &str, password: &str, secs: u64, out_dir: &str) -
     eprintln!("\n{report}\n");
 
     // Записываем файлы
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let _ = std::fs::create_dir_all(out_dir);
-    let md_path   = format!("{out_dir}/diag_{ts}.md");
-    let json_path = format!("{out_dir}/diag_{ts}.json");
-    if std::fs::write(&md_path, &report).is_ok() {
-        eprintln!("📄 Markdown отчёт: {md_path}");
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let out_dir = Path::new(out_dir);
+    let _ = cleanup_diagnostic_runs(out_dir);
+    let _ = fs::create_dir_all(out_dir);
+    let md_path = out_dir.join(format!("diag_{ts}.md"));
+    let json_path = out_dir.join(format!("diag_{ts}.json"));
+    if fs::write(&md_path, &report).is_ok() {
+        eprintln!("📄 Markdown отчёт: {}", md_path.display());
     }
-    if std::fs::write(&json_path, build_json(&collected)).is_ok() {
-        eprintln!("📊 JSON данные:    {json_path}");
+    if fs::write(&json_path, build_json(&collected)).is_ok() {
+        eprintln!("📊 JSON данные:    {}", json_path.display());
     }
+    let _ = cleanup_diagnostic_runs(out_dir);
 
     // Exit code: 0 если подключились и получили кадры, иначе ошибка
     if collected.fail_reason.is_some() && !collected.connected {
@@ -245,7 +545,14 @@ fn build_report(c: &Collected, secs: u64) -> String {
 
     // Подключение
     s.push_str("## Подключение\n");
-    s.push_str(&format!("- Статус: {}\n", if c.connected { "✓ подключено" } else { "✗ не подключено" }));
+    s.push_str(&format!(
+        "- Статус: {}\n",
+        if c.connected {
+            "✓ подключено"
+        } else {
+            "✗ не подключено"
+        }
+    ));
     if c.connected {
         s.push_str(&format!("- Время подключения: {} мс\n", c.connect_ms));
         s.push_str(&format!("- Хост: {}\n", c.peer_info));
@@ -258,12 +565,29 @@ fn build_report(c: &Collected, secs: u64) -> String {
     // Транспорт
     s.push_str("## Транспорт\n");
     if c.evrt_active {
-        s.push_str(&format!("- ⚡ **EVRT прямой UDP** активен → {}\n", c.evrt_host_addr));
+        s.push_str(&format!(
+            "- ⚡ **EVRT прямой UDP** активен → {}\n",
+            c.evrt_host_addr
+        ));
         if !c.evrt_arrival_ms.is_empty() {
-            s.push_str(&format!("- EVRT arrival delta: avg {} мс\n", avg_i32(&c.evrt_arrival_ms)));
-            s.push_str(&format!("- EVRT jitter: avg {} мс\n", avg_u32(&c.evrt_jitter_ms)));
-            let crit = c.evrt_pressure.iter().filter(|p| p.as_str() == "critical").count();
-            s.push_str(&format!("- EVRT pressure critical: {}/{} тиков\n", crit, c.evrt_pressure.len()));
+            s.push_str(&format!(
+                "- EVRT arrival delta: avg {} мс\n",
+                avg_i32(&c.evrt_arrival_ms)
+            ));
+            s.push_str(&format!(
+                "- EVRT jitter: avg {} мс\n",
+                avg_u32(&c.evrt_jitter_ms)
+            ));
+            let crit = c
+                .evrt_pressure
+                .iter()
+                .filter(|p| p.as_str() == "critical")
+                .count();
+            s.push_str(&format!(
+                "- EVRT pressure critical: {}/{} тиков\n",
+                crit,
+                c.evrt_pressure.len()
+            ));
         }
     } else {
         s.push_str("- 📡 TCP relay (EVRT не активировался)\n");
@@ -276,9 +600,18 @@ fn build_report(c: &Collected, secs: u64) -> String {
 
     // Видео
     s.push_str("## Видео\n");
-    s.push_str(&format!("- Кодек: {}\n", if c.codec.is_empty() { "—" } else { &c.codec }));
-    s.push_str(&format!("- Разрешение: {}x{}\n", c.last_width, c.last_height));
-    s.push_str(&format!("- Кадров получено: {} за {}s\n", c.frames_received, secs));
+    s.push_str(&format!(
+        "- Кодек: {}\n",
+        if c.codec.is_empty() { "—" } else { &c.codec }
+    ));
+    s.push_str(&format!(
+        "- Разрешение: {}x{}\n",
+        c.last_width, c.last_height
+    ));
+    s.push_str(&format!(
+        "- Кадров получено: {} за {}s\n",
+        c.frames_received, secs
+    ));
     if let Some(ff) = c.first_frame_ms {
         s.push_str(&format!("- Первый кадр через: {} мс\n", ff));
     }
@@ -291,16 +624,32 @@ fn build_report(c: &Collected, secs: u64) -> String {
         ));
     }
     if !c.input_kbps_samples.is_empty() {
-        s.push_str(&format!("- **Битрейт**: avg {} kbps\n", avg_u64(&c.input_kbps_samples)));
+        s.push_str(&format!(
+            "- **Битрейт**: avg {} kbps\n",
+            avg_u64(&c.input_kbps_samples)
+        ));
     }
     if !c.decode_ms_samples.is_empty() {
-        s.push_str(&format!("- Декод: avg {} мс\n", avg_u64(&c.decode_ms_samples)));
+        s.push_str(&format!(
+            "- Декод: avg {} мс\n",
+            avg_u64(&c.decode_ms_samples)
+        ));
+    }
+    if !c.queue_ms_samples.is_empty() {
+        s.push_str(&format!(
+            "- Очередь декодера: avg {} мс\n",
+            avg_u64(&c.queue_ms_samples)
+        ));
     }
     s.push_str(&format!("- Дропнуто кадров: {}\n", c.dropped_total));
     s.push('\n');
 
     // ── Хост-энкодер (из HostTelemetry) ───────────────────────────────────────
-    let host_enc: Vec<_> = c.info_log.iter().filter(|m| m.contains("Хост-энкодер")).collect();
+    let host_enc: Vec<_> = c
+        .info_log
+        .iter()
+        .filter(|m| m.contains("Хост-энкодер"))
+        .collect();
     if let Some(last) = host_enc.last() {
         s.push_str("## Хост-энкодер (реальный)\n");
         s.push_str(&format!("- {}\n", last.replace("★ Хост-энкодер: ", "")));
@@ -332,7 +681,10 @@ fn build_report(c: &Collected, secs: u64) -> String {
     // Latency
     if !c.latency_samples.is_empty() {
         s.push_str("## Задержка\n");
-        s.push_str(&format!("- RTT: avg {} мс\n\n", avg_u32(&c.latency_samples)));
+        s.push_str(&format!(
+            "- RTT: avg {} мс\n\n",
+            avg_u32(&c.latency_samples)
+        ));
     }
 
     // Дисплеи
@@ -341,8 +693,10 @@ fn build_report(c: &Collected, secs: u64) -> String {
         s.push_str("- (не получены)\n");
     } else {
         for d in &c.displays {
-            s.push_str(&format!("- #{}: {}x{} @ ({},{}) {}\n",
-                d.index, d.width, d.height, d.x, d.y, d.name));
+            s.push_str(&format!(
+                "- #{}: {}x{} @ ({},{}) {}\n",
+                d.index, d.width, d.height, d.x, d.y, d.name
+            ));
         }
     }
     s.push('\n');
@@ -361,49 +715,122 @@ fn build_report(c: &Collected, secs: u64) -> String {
 }
 
 fn build_json(c: &Collected) -> String {
-    format!(
-        r#"{{
-  "connected": {},
-  "connect_ms": {},
-  "peer_info": "{}",
-  "fail_reason": {},
-  "frames_received": {},
-  "first_frame_ms": {},
-  "codec": "{}",
-  "resolution": "{}x{}",
-  "fps_avg": {:.2},
-  "fps_min": {:.2},
-  "fps_max": {:.2},
-  "bitrate_kbps_avg": {},
-  "decode_ms_avg": {},
-  "dropped_total": {},
-  "latency_ms_avg": {},
-  "evrt_active": {},
-  "evrt_host_addr": "{}",
-  "evrt_arrival_ms_avg": {},
-  "evrt_jitter_ms_avg": {},
-  "displays": {}
-}}
-"#,
-        c.connected,
-        c.connect_ms,
-        c.peer_info.replace('"', "'"),
-        c.fail_reason.as_ref().map(|e| format!("\"{}\"", e.replace('"', "'"))).unwrap_or_else(|| "null".into()),
-        c.frames_received,
-        c.first_frame_ms.map(|v| v.to_string()).unwrap_or_else(|| "null".into()),
-        c.codec,
-        c.last_width, c.last_height,
-        avg_f32(&c.input_fps_samples),
-        min_f32(&c.input_fps_samples).max(0.0),
-        max_f32(&c.input_fps_samples),
-        avg_u64(&c.input_kbps_samples),
-        avg_u64(&c.decode_ms_samples),
-        c.dropped_total,
-        avg_u32(&c.latency_samples),
-        c.evrt_active,
-        c.evrt_host_addr,
-        avg_i32(&c.evrt_arrival_ms),
-        avg_u32(&c.evrt_jitter_ms),
-        c.displays.len(),
-    )
+    serde_json::to_string_pretty(&json!({
+        "connected": c.connected,
+        "connect_ms": c.connect_ms,
+        "peer_info": c.peer_info,
+        "fail_reason": c.fail_reason,
+        "frames_received": c.frames_received,
+        "first_frame_ms": c.first_frame_ms,
+        "codec": c.codec,
+        "resolution": format!("{}x{}", c.last_width, c.last_height),
+        "fps_avg": avg_f32(&c.input_fps_samples),
+        "fps_min": min_f32(&c.input_fps_samples).max(0.0),
+        "fps_max": max_f32(&c.input_fps_samples),
+        "bitrate_kbps_avg": avg_u64(&c.input_kbps_samples),
+        "decode_ms_avg": avg_u64(&c.decode_ms_samples),
+        "queue_ms_avg": avg_u64(&c.queue_ms_samples),
+        "dropped_total": c.dropped_total,
+        "latency_ms_avg": avg_u32(&c.latency_samples),
+        "evrt_active": c.evrt_active,
+        "evrt_host_addr": c.evrt_host_addr,
+        "evrt_arrival_ms_avg": avg_i32(&c.evrt_arrival_ms),
+        "evrt_jitter_ms_avg": avg_u32(&c.evrt_jitter_ms),
+        "displays": c.displays.iter().map(|display| json!({
+            "index": display.index,
+            "name": display.name,
+            "width": display.width,
+            "height": display.height,
+            "x": display.x,
+            "y": display.y,
+            "cursor_embedded": display.cursor_embedded,
+        })).collect::<Vec<_>>(),
+    }))
+    .unwrap_or_else(|err| format!(r#"{{"error":"JSON serialization failed: {err}"}}"#))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("evertydesk-{name}-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn diagnostic_cleanup_removes_oldest_run_as_a_pair() {
+        let dir = temp_dir("diagnostic-cleanup");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("host_diag.md"), "keep").unwrap();
+        for run in 1..=3 {
+            fs::write(dir.join(format!("diag_{run}.md")), "report").unwrap();
+            fs::write(dir.join(format!("diag_{run}.json")), "{}").unwrap();
+        }
+
+        let summary =
+            cleanup_diagnostic_runs_with_limits(&dir, Duration::from_secs(365 * 24 * 60 * 60), 2);
+
+        assert_eq!(summary.removed_files, 2);
+        assert!(!dir.join("diag_1.md").exists());
+        assert!(!dir.join("diag_1.json").exists());
+        assert!(dir.join("diag_2.md").exists());
+        assert!(dir.join("diag_3.json").exists());
+        assert!(dir.join("host_diag.md").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn diagnostic_json_escapes_windows_display_names() {
+        let collected = Collected {
+            peer_info: r#"hostname=host displays=\\.\DISPLAY1"#.to_owned(),
+            displays: vec![RemoteDisplay {
+                index: 0,
+                name: r#"\\.\DISPLAY1"#.to_owned(),
+                width: 2560,
+                height: 1440,
+                x: 0,
+                y: 0,
+                cursor_embedded: false,
+            }],
+            ..Collected::default()
+        };
+
+        let body = build_json(&collected);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["displays"][0]["name"], r#"\\.\DISPLAY1"#);
+    }
+
+    #[test]
+    fn file_and_directory_cleanup_respect_count_limits() {
+        let root = temp_dir("artifact-cleanup");
+        let logs = root.join("logs");
+        let reports = root.join("reports");
+        fs::create_dir_all(&logs).unwrap();
+        fs::create_dir_all(&reports).unwrap();
+        for index in 1..=3 {
+            fs::write(logs.join(format!("evertydesk-{index}.log")), "log").unwrap();
+            let report = reports.join(format!("evertydesk-{index}"));
+            fs::create_dir_all(&report).unwrap();
+            fs::write(report.join("summary.txt"), "report").unwrap();
+        }
+
+        let file_summary = cleanup_files(
+            &logs,
+            Duration::from_secs(365 * 24 * 60 * 60),
+            2,
+            |_| true,
+        );
+        let dir_summary = cleanup_directories(
+            &reports,
+            Duration::from_secs(365 * 24 * 60 * 60),
+            2,
+            |_| true,
+        );
+
+        assert_eq!(file_summary.removed_files, 1);
+        assert_eq!(dir_summary.removed_dirs, 1);
+        assert_eq!(fs::read_dir(&logs).unwrap().count(), 2);
+        assert_eq!(fs::read_dir(&reports).unwrap().count(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
