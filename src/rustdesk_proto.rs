@@ -792,6 +792,11 @@ pub mod misc {
         /// Решает проблему мультихоминга (VPN: у хоста несколько IP).
         #[prost(string, tag = "101")]
         EvrtEndpoints(String),
+        /// Телеметрия хоста для автодиагностики: реальный энкодер, encode_ms, fps.
+        /// Формат: "backend=NVENC encode_ms=3 fps=60 res=2560x1440".
+        /// Клиент показывает в --diagnose отчёте — видно скорость БЕЗ консоли хоста.
+        #[prost(string, tag = "102")]
+        HostTelemetry(String),
     }
 }
 

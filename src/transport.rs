@@ -2868,6 +2868,11 @@ fn handle_session_message(
                         }
                     }
                 }
+                Some(misc::Union::HostTelemetry(info)) => {
+                    // ★ Телеметрия хоста — пробрасываем в --diagnose отчёт.
+                    eprintln!("[session] ★ Хост-энкодер: {info}");
+                    let _ = events.send(SessionEvent::Info(format!("★ Хост-энкодер: {info}")));
+                }
                 other => {
                     eprintln!(
                         "[session] Server Misc: {:?}",

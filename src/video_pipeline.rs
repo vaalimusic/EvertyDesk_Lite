@@ -796,6 +796,21 @@ fn encode_loop(
                 log(&events, format!("★ MF отключён, причина: {err}"));
             }
 
+            // ★ Шлём телеметрию хоста КЛИЕНТУ — видно энкодер в --diagnose без консоли хоста.
+            let tele_msg = crate::rustdesk_proto::PeerMessage {
+                union: Some(crate::rustdesk_proto::peer_message::Union::Misc(
+                    crate::rustdesk_proto::Misc {
+                        union: Some(crate::rustdesk_proto::misc::Union::HostTelemetry(format!(
+                            "backend={} encode_ms={} res={}x{} fps={}",
+                            encoder.active_backend(),
+                            encode_dur.as_millis(),
+                            enc_w, enc_h, fps,
+                        ))),
+                    },
+                )),
+            };
+            let _ = tcp_tx.try_send(TcpItem::Peer(tele_msg));
+
             // ★ Софт-энкодер на высоком разрешении → включаем даунскейл.
             //   Цель: высота ≤ 720 (сохраняя пропорции). Аппаратный — не трогаем.
             let backend = encoder.active_backend();

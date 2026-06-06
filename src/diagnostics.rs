@@ -299,6 +299,29 @@ fn build_report(c: &Collected, secs: u64) -> String {
     s.push_str(&format!("- Дропнуто кадров: {}\n", c.dropped_total));
     s.push('\n');
 
+    // ── Хост-энкодер (из HostTelemetry) ───────────────────────────────────────
+    let host_enc: Vec<_> = c.info_log.iter().filter(|m| m.contains("Хост-энкодер")).collect();
+    if let Some(last) = host_enc.last() {
+        s.push_str("## Хост-энкодер (реальный)\n");
+        s.push_str(&format!("- {}\n", last.replace("★ Хост-энкодер: ", "")));
+        if last.contains("OpenH264-SW") {
+            s.push_str("- ⚠️ СОФТВЕРНЫЙ энкодер! Нет аппаратного (NVENC/MF). Соберите хост с NV Codec SDK.\n");
+        } else if last.contains("NVENC") {
+            s.push_str("- ✅ Аппаратный NVENC\n");
+        } else if last.contains("MediaFoundation") {
+            s.push_str("- ✅ Аппаратный Media Foundation\n");
+        }
+        s.push('\n');
+    }
+
+    // Предупреждение про статичный экран при headless-диагностике
+    if avg_f32(&c.input_fps_samples) < 20.0 && c.frames_received > 0 {
+        s.push_str("> ⚠️ Низкий FPS может быть из-за статичного экрана хоста во время теста\n");
+        s.push_str("> (детектор изменений пропускает неизменные кадры — это норма).\n");
+        s.push_str("> Для реального замера двигай окна/видео на хосте во время диагностики,\n");
+        s.push_str("> и смотри `encode_ms` хост-энкодера выше — он от активности не зависит.\n\n");
+    }
+
     // Latency
     if !c.latency_samples.is_empty() {
         s.push_str("## Задержка\n");
