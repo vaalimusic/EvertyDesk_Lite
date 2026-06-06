@@ -53,6 +53,7 @@ mod win {
     thread_local! {
         static DXGI_CAPTURE: RefCell<Option<DxgiCapture>> = const { RefCell::new(None) };
         static GDI_CAPTURE: RefCell<Option<GdiCapture>> = const { RefCell::new(None) };
+        static DISPLAY_INFO_CACHE: RefCell<Vec<CaptureDisplay>> = const { RefCell::new(Vec::new()) };
     }
 
     pub fn capture_into(out: &mut Vec<u8>) -> Option<(u32, u32)> {
@@ -64,8 +65,9 @@ mod win {
     }
 
     unsafe fn capture_into_inner(display: i32, out: &mut Vec<u8>) -> Option<(u32, u32)> {
-        let info = display_info(display).or_else(|| display_infos().into_iter().next())?;
+        let info = cached_display_info(display)?;
         if info.width <= 0 || info.height <= 0 {
+            invalidate_display_info_cache();
             return None;
         }
 
@@ -75,7 +77,41 @@ mod win {
             return Some(size);
         }
 
-        capture_gdi_into(out, &info)
+        let result = capture_gdi_into(out, &info);
+        if result.is_none() {
+            invalidate_display_info_cache();
+        }
+        result
+    }
+
+    fn cached_display_info(display: i32) -> Option<CaptureDisplay> {
+        let target = display.max(0);
+        DISPLAY_INFO_CACHE.with(|cell| {
+            {
+                let cached = cell.borrow();
+                if let Some(info) = cached.iter().find(|info| info.index == target).cloned() {
+                    return Some(info);
+                }
+                if target == 0 {
+                    if let Some(info) = cached.first().cloned() {
+                        return Some(info);
+                    }
+                }
+            }
+
+            let infos = display_infos();
+            let selected = infos
+                .iter()
+                .find(|info| info.index == target)
+                .cloned()
+                .or_else(|| infos.first().cloned());
+            *cell.borrow_mut() = infos;
+            selected
+        })
+    }
+
+    fn invalidate_display_info_cache() {
+        DISPLAY_INFO_CACHE.with(|cell| cell.borrow_mut().clear());
     }
 
     unsafe fn capture_dxgi_into(
