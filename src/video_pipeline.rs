@@ -626,6 +626,12 @@ fn encode_loop(
     let mut backend_logged = false;
     const TELE_INTERVAL: Duration = Duration::from_secs(10);
 
+    // ★ Периодическая отправка телеметрии хоста КЛИЕНТУ (для --diagnose).
+    //   Не один раз, а каждые 2с — надёжно доходит даже при дропах/статике.
+    let mut last_host_tele_at = Instant::now();
+    let mut last_encode_ms: u128 = 0;
+    const HOST_TELE_INTERVAL: Duration = Duration::from_secs(2);
+
     // ★ Адаптивный даунскейл для софт-энкодера.
     //   1440p/4K в OpenH264 = сотни мс/кадр. Если после первого кадра backend
     //   оказался софтверным — кодируем в пониженном разрешении (≤720p по высоте),
@@ -775,6 +781,25 @@ fn encode_loop(
         };
         let encode_dur = encode_started.elapsed();
         tele.mark_encode(encode_dur);
+        last_encode_ms = encode_dur.as_millis();
+
+        // ★ Периодически шлём телеметрию хоста клиенту (надёжнее одноразовой).
+        if last_host_tele_at.elapsed() >= HOST_TELE_INTERVAL {
+            last_host_tele_at = Instant::now();
+            let tele_msg = crate::rustdesk_proto::PeerMessage {
+                union: Some(crate::rustdesk_proto::peer_message::Union::Misc(
+                    crate::rustdesk_proto::Misc {
+                        union: Some(crate::rustdesk_proto::misc::Union::HostTelemetry(format!(
+                            "backend={} encode_ms={} res={}x{} fps={}",
+                            encoder.active_backend(),
+                            last_encode_ms,
+                            enc_w, enc_h, fps,
+                        ))),
+                    },
+                )),
+            };
+            let _ = tcp_tx.try_send(TcpItem::Peer(tele_msg));
+        }
 
         // ★ Один раз логируем РЕАЛЬНЫЙ бэкенд (MediaFoundation/OpenH264-SW/PNG).
         //   Критично для диагностики: показывает, аппаратный энкодер или софт.
@@ -795,21 +820,6 @@ fn encode_loop(
             if let Some(err) = encoder.take_mf_error() {
                 log(&events, format!("★ MF отключён, причина: {err}"));
             }
-
-            // ★ Шлём телеметрию хоста КЛИЕНТУ — видно энкодер в --diagnose без консоли хоста.
-            let tele_msg = crate::rustdesk_proto::PeerMessage {
-                union: Some(crate::rustdesk_proto::peer_message::Union::Misc(
-                    crate::rustdesk_proto::Misc {
-                        union: Some(crate::rustdesk_proto::misc::Union::HostTelemetry(format!(
-                            "backend={} encode_ms={} res={}x{} fps={}",
-                            encoder.active_backend(),
-                            encode_dur.as_millis(),
-                            enc_w, enc_h, fps,
-                        ))),
-                    },
-                )),
-            };
-            let _ = tcp_tx.try_send(TcpItem::Peer(tele_msg));
 
             // ★ Софт-энкодер на высоком разрешении → включаем даунскейл.
             //   Цель: высота ≤ 720 (сохраняя пропорции). Аппаратный — не трогаем.
