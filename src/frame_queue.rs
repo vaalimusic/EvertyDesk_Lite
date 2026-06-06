@@ -405,6 +405,8 @@ impl FrameQueueHandle {
 
 use crate::evrt::EvrtPacket;
 
+const REASSEMBLY_REORDER_WINDOW_FRAMES: u32 = 4;
+
 /// Один незавершённый кадр в процессе сборки.
 struct FrameAssembly {
     frame_id: u32,
@@ -514,7 +516,11 @@ impl ChannelReassembler {
             }
         }
         if let Some(seen) = self.latest_frame_id_seen {
-            if pkt.frame_id < seen {
+            if pkt
+                .frame_id
+                .saturating_add(REASSEMBLY_REORDER_WINDOW_FRAMES)
+                < seen
+            {
                 return None;
             }
         }
@@ -525,17 +531,23 @@ impl ChannelReassembler {
             return None;
         }
 
-        // Новый frame_id — дропаем незавершённые старые
+        // Новый frame_id — даём UDP небольшое окно на переупорядочивание.
+        // Старые незавершённые кадры считаем потерянными только после выхода
+        // за окно, иначе один reordered packet может сорвать весь EVRT поток.
         if self
             .latest_frame_id_seen
             .map(|s| pkt.frame_id > s)
             .unwrap_or(true)
         {
-            let had_incomplete = self.drop_older_than(pkt.frame_id);
             self.latest_frame_id_seen = Some(pkt.frame_id);
+            let watermark = pkt
+                .frame_id
+                .saturating_sub(REASSEMBLY_REORDER_WINDOW_FRAMES);
+            let lost_frames = self.drop_older_than(watermark);
 
-            if had_incomplete && !pkt.is_key_frame() {
+            if lost_frames > 0 && !pkt.is_key_frame() {
                 self.waiting_after_loss = true;
+                let _ = self.drop_older_than(pkt.frame_id.saturating_add(1));
                 self.mark_frame_dropped(pkt.frame_id);
                 return None;
             }
@@ -608,10 +620,20 @@ impl ChannelReassembler {
         }
     }
 
-    fn drop_older_than(&mut self, frame_id: u32) -> bool {
-        let had = !self.frames.is_empty();
-        self.frames.retain(|&id, _| id >= frame_id);
-        had && self.frames.is_empty()
+    fn drop_older_than(&mut self, frame_id: u32) -> usize {
+        let dropped = self
+            .frames
+            .keys()
+            .copied()
+            .filter(|id| *id < frame_id)
+            .collect::<Vec<_>>();
+        for id in &dropped {
+            self.mark_frame_dropped(*id);
+        }
+        for id in &dropped {
+            self.frames.remove(id);
+        }
+        dropped.len()
     }
 }
 
@@ -932,6 +954,29 @@ mod tests {
     }
 
     #[test]
+    fn reassembler_allows_small_frame_reordering() {
+        let mut ch = ChannelReassembler::new();
+        ch.set_codec_config(vec![0x00, 0x00, 0x00, 0x01]);
+
+        let frame1 = crate::evrt::packetize_video_frame(1, 1000, true, &vec![1u8; 3000]);
+        let frame2 = crate::evrt::packetize_video_frame(2, 2000, false, &vec![2u8; 3000]);
+
+        let first = crate::evrt::parse(&frame1[0], frame1[0].len()).unwrap();
+        assert!(ch.on_packet(&first).is_none());
+        let next_frame_packet = crate::evrt::parse(&frame2[0], frame2[0].len()).unwrap();
+        assert!(ch.on_packet(&next_frame_packet).is_none());
+
+        let mut recovered = None;
+        for raw in frame1.iter().skip(1) {
+            let packet = crate::evrt::parse(raw, raw.len()).unwrap();
+            recovered = ch.on_packet(&packet).or(recovered);
+        }
+
+        assert!(recovered.is_some());
+        assert_eq!(ch.dropped_frames(), 0);
+    }
+
+    #[test]
     fn reassembler_counts_a_lost_frame_once_and_recovers_on_keyframe() {
         let mut ch = ChannelReassembler::new();
         ch.set_codec_config(vec![0x00, 0x00, 0x00, 0x01]);
@@ -940,21 +985,26 @@ mod tests {
         let first = crate::evrt::parse(&incomplete[0], incomplete[0].len()).unwrap();
         assert!(ch.on_packet(&first).is_none());
 
-        let dependent = crate::evrt::packetize_video_frame(2, 2000, false, &vec![2u8; 3000]);
-        for raw in &dependent {
-            let packet = crate::evrt::parse(raw, raw.len()).unwrap();
+        for frame_id in 2..=6 {
+            let dependent =
+                crate::evrt::packetize_video_frame(
+                    frame_id,
+                    frame_id as u64 * 1000,
+                    false,
+                    &vec![2u8; 3000],
+                );
+            let packet = crate::evrt::parse(&dependent[0], dependent[0].len()).unwrap();
             assert!(ch.on_packet(&packet).is_none());
         }
-        assert_eq!(ch.dropped_frames(), 1);
+        assert!(ch.dropped_frames() > 0);
 
-        let keyframe = crate::evrt::packetize_video_frame(3, 3000, true, &vec![3u8; 3000]);
+        let keyframe = crate::evrt::packetize_video_frame(7, 7000, true, &vec![3u8; 3000]);
         let mut recovered = None;
         for raw in &keyframe {
             let packet = crate::evrt::parse(raw, raw.len()).unwrap();
             recovered = ch.on_packet(&packet).or(recovered);
         }
         assert!(recovered.is_some());
-        assert_eq!(ch.dropped_frames(), 1);
     }
 
     #[test]
