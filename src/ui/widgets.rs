@@ -545,6 +545,117 @@ fn draw_line_icon(p: &egui::Painter, rect: egui::Rect, icon: &str, color: egui::
     }
 }
 
+/// Залить скруглённый прямоугольник вертикальным градиентом `top` → `bottom`.
+/// Сначала рисуем скруглённый фон (bottom), затем градиентный меш с отступом
+/// на радиус — так острые углы меша остаются внутри скруглённой формы.
+pub(crate) fn gradient_rect(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    top: egui::Color32,
+    bottom: egui::Color32,
+    corner: f32,
+) {
+    use egui::epaint::{Mesh, Vertex};
+    // Скруглённый фон — закрывает углы мягко.
+    painter.rect_filled(rect, egui::CornerRadius::same(corner as u8), bottom);
+    // Градиентный меш внутри (отступ на радиус, чтобы не задеть углы).
+    let inner = rect.shrink(corner * 0.5);
+    let t_in = lerp_color(top, bottom, (corner * 0.5) / rect.height().max(1.0));
+    let mut mesh = Mesh::default();
+    let tl = Vertex { pos: inner.left_top(),     uv: egui::epaint::WHITE_UV, color: t_in };
+    let tr = Vertex { pos: inner.right_top(),    uv: egui::epaint::WHITE_UV, color: t_in };
+    let br = Vertex { pos: inner.right_bottom(), uv: egui::epaint::WHITE_UV, color: bottom };
+    let bl = Vertex { pos: inner.left_bottom(),  uv: egui::epaint::WHITE_UV, color: bottom };
+    mesh.vertices.extend([tl, tr, br, bl]);
+    mesh.indices.extend([0, 1, 2, 0, 2, 3]);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
+    egui::Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
+}
+
+/// Кликабельный чип (для недавних ID). Возвращает Response.
+pub(crate) fn recent_chip(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    let pad_x = 12.0;
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        egui::FontId::proportional(13.0),
+        egui::Color32::from_rgb(0x20, 0x24, 0x2D),
+    );
+    let w = galley.size().x + pad_x * 2.0;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(w, 30.0), egui::Sense::click());
+    let fill = if response.hovered() {
+        egui::Color32::from_rgb(0xEC, 0xFD, 0xF3) // зеленоватый hover
+    } else {
+        egui::Color32::from_rgb(0xF5, 0xF7, 0xFA)
+    };
+    let stroke = if response.hovered() {
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(0x12, 0xC9, 0x72))
+    } else {
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(0xE3, 0xE6, 0xEC))
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, egui::CornerRadius::same(15), fill);
+    p.rect_stroke(rect, egui::CornerRadius::same(15), stroke, egui::StrokeKind::Inside);
+    p.galley(
+        egui::pos2(rect.left() + pad_x, rect.center().y - galley.size().y / 2.0),
+        galley,
+        egui::Color32::PLACEHOLDER,
+    );
+    response
+}
+
+/// Компактная «пилюля» статуса: цветная точка + label + значение.
+/// Используется в нижней панели стрима вместо простыни текста.
+pub(crate) fn stat_pill(
+    ui: &mut egui::Ui,
+    dot: Option<egui::Color32>,
+    text: &str,
+    value_color: egui::Color32,
+) -> egui::Response {
+    let font = egui::FontId::proportional(11.5);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font, value_color);
+    let dot_w = if dot.is_some() { 14.0 } else { 0.0 };
+    let pad = 9.0;
+    let w = galley.size().x + dot_w + pad * 2.0;
+    let h = 22.0;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(
+        rect,
+        egui::CornerRadius::same(11),
+        egui::Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 16),
+    );
+    let mut x = rect.left() + pad;
+    if let Some(c) = dot {
+        p.circle_filled(egui::pos2(x + 3.0, rect.center().y), 3.5, c);
+        x += dot_w;
+    }
+    p.galley(
+        egui::pos2(x, rect.center().y - galley.size().y / 2.0),
+        galley,
+        egui::Color32::PLACEHOLDER,
+    );
+    response
+}
+
+/// Заголовок + крупное значение для карточки деталей.
+pub(crate) fn info_metric(ui: &mut egui::Ui, label: &str, value: &str, color: egui::Color32) {
+    ui.vertical(|ui| {
+        ui.label(
+            egui::RichText::new(label)
+                .size(11.0)
+                .color(egui::Color32::from_rgb(0x8A, 0x93, 0xA3)),
+        );
+        ui.label(egui::RichText::new(value).size(17.0).strong().color(color));
+    });
+}
+
 pub(crate) fn secondary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     let width = ui.available_width().min(156.0);
     ui.add(

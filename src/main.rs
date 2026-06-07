@@ -740,6 +740,8 @@ struct EvertyDeskApp {
     evrt_frames_assembled: u64,
     evrt_reassembly_drops: u64,
     evrt_queue_drops: u64,
+    /// Показывать окно с детальной диагностикой стрима.
+    show_stream_info: bool,
     /// Cache of remote cursor images by cursor ID (RGBA + hotspot).
     cursor_cache: HashMap<u64, CursorCacheEntry>,
     /// Pending cursor image to be loaded into a texture in the next frame.
@@ -987,6 +989,7 @@ impl EvertyDeskApp {
             evrt_frames_assembled: 0,
             evrt_reassembly_drops: 0,
             evrt_queue_drops: 0,
+            show_stream_info: false,
             cursor_cache: HashMap::new(),
             pending_cursor: None,
             cursor_texture: None,
@@ -2427,36 +2430,161 @@ impl EvertyDeskApp {
         });
     }
 
+    /// HERO-баннер страницы подключения: градиентная плашка с логотипом,
+    /// названием продукта и капсулой статуса справа.
+    fn connect_hero(&mut self, ui: &mut egui::Ui) {
+        let lang = self.ui_lang;
+        let online = self.host_state.is_online();
+        let host_label = self.host_state.label().to_owned();
+
+        // Высота баннера
+        let banner_h = 92.0;
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), banner_h),
+            egui::Sense::hover(),
+        );
+
+        // Градиент: глубокий тёмно-сине-зелёный → фирменный зелёный акцент
+        let top = egui::Color32::from_rgb(0x0E, 0x1B, 0x2B);
+        let bottom = egui::Color32::from_rgb(0x10, 0x3A, 0x32);
+        gradient_rect(ui.painter(), rect, top, bottom, 18.0);
+        // Скруглённый контур поверх для мягких краёв
+        ui.painter().rect_stroke(
+            rect,
+            egui::CornerRadius::same(18),
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(0x1B, 0x4A, 0x3E)),
+            egui::StrokeKind::Inside,
+        );
+
+        // Декоративный зелёный блик-круг справа
+        ui.painter().circle_filled(
+            egui::pos2(rect.right() - 70.0, rect.top() - 10.0),
+            70.0,
+            egui::Color32::from_rgba_unmultiplied(0x12, 0xC9, 0x72, 22),
+        );
+
+        let pad = 18.0;
+        // Логотип слева (в скруглённой белой плашке)
+        let logo_sz = 56.0;
+        let logo_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + pad, rect.center().y - logo_sz / 2.0),
+            egui::vec2(logo_sz, logo_sz),
+        );
+        ui.painter().rect_filled(
+            logo_rect,
+            egui::CornerRadius::same(14),
+            egui::Color32::from_rgb(0xFC, 0xFD, 0xFF),
+        );
+        if let Some(tex) = self.ensure_app_logo_texture(ui.ctx()) {
+            ui.painter().image(
+                tex.id(),
+                logo_rect.shrink(8.0),
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+
+        // Текст: название + подпись
+        let text_x = logo_rect.right() + 16.0;
+        let title = tr(lang, "EvertyDesk Lite", "EvertyDesk Lite");
+        ui.painter().text(
+            egui::pos2(text_x, rect.center().y - 16.0),
+            egui::Align2::LEFT_TOP,
+            title,
+            egui::FontId::proportional(24.0),
+            egui::Color32::from_rgb(0xFF, 0xFF, 0xFF),
+        );
+        let subtitle = tr(
+            lang,
+            "Быстрый защищённый удалённый доступ",
+            "Fast secure remote access",
+        );
+        ui.painter().text(
+            egui::pos2(text_x, rect.center().y + 12.0),
+            egui::Align2::LEFT_TOP,
+            subtitle,
+            egui::FontId::proportional(13.0),
+            egui::Color32::from_rgb(0xA7, 0xC9, 0xBE),
+        );
+
+        // Капсула статуса справа
+        let dot_color = if online {
+            egui::Color32::from_rgb(0x12, 0xC9, 0x72)
+        } else {
+            egui::Color32::from_rgb(0xF5, 0xA6, 0x23)
+        };
+        let cap_label = if online {
+            tr(lang, "В сети", "Online")
+        } else {
+            &host_label
+        };
+        let cap_galley = ui.painter().layout_no_wrap(
+            cap_label.to_owned(),
+            egui::FontId::proportional(12.5),
+            egui::Color32::from_rgb(0xE8, 0xF5, 0xEF),
+        );
+        let cap_w = cap_galley.size().x + 34.0;
+        let cap_h = 28.0;
+        let cap_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - pad - cap_w, rect.center().y - cap_h / 2.0),
+            egui::vec2(cap_w, cap_h),
+        );
+        ui.painter().rect_filled(
+            cap_rect,
+            egui::CornerRadius::same(14),
+            egui::Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 20),
+        );
+        ui.painter()
+            .circle_filled(egui::pos2(cap_rect.left() + 15.0, cap_rect.center().y), 4.5, dot_color);
+        ui.painter().galley(
+            egui::pos2(cap_rect.left() + 26.0, cap_rect.center().y - cap_galley.size().y / 2.0),
+            cap_galley,
+            egui::Color32::PLACEHOLDER,
+        );
+    }
+
+    /// Чипы недавних подключений — клик подставляет ID в поле.
+    fn recent_chips(&mut self, ui: &mut egui::Ui) {
+        let recents: Vec<String> = self
+            .config
+            .ui
+            .recent_remote_ids
+            .iter()
+            .filter(|id| !id.is_empty())
+            .take(5)
+            .cloned()
+            .collect();
+        if recents.is_empty() {
+            return;
+        }
+        ui.add_space(10.0);
+        ui.label(
+            egui::RichText::new(self.text("Недавние", "Recent"))
+                .size(12.0)
+                .color(egui::Color32::from_rgb(0x8A, 0x93, 0xA3)),
+        );
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            for id in recents {
+                let shown = format_peer_id(&id);
+                if recent_chip(ui, &shown).clicked() {
+                    self.remote_id = id.clone();
+                    self.last_error = None;
+                }
+                ui.add_space(6.0);
+            }
+        });
+    }
+
     fn connect_ui_commercial(&mut self, ui: &mut egui::Ui) {
         ui.add_space(0.0);
+        // ── HERO-баннер: градиент + логотип + название + статус ───────────────
+        self.connect_hero(ui);
+        ui.add_space(14.0);
+
         workspace_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            let title = self.text("Удаленное управление", "Remote control");
-            let subtitle = self.text(
-                "Быстрый RustDesk-совместимый доступ через desk.everty.ru",
-                "Fast RustDesk-compatible access through desk.everty.ru",
-            );
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new(title)
-                            .size(28.0)
-                            .strong()
-                            .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
-                    );
-                    ui.add_space(3.0);
-                    ui.label(
-                        egui::RichText::new(subtitle)
-                            .size(13.0)
-                            .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
-                    );
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    self.status_capsule(ui);
-                });
-            });
-
-            ui.add_space(16.0);
+            ui.add_space(2.0);
             let two_gap = 18.0;
             let right_width = 340.0_f32.min((ui.available_width() - two_gap) * 0.42);
             let two_left = (ui.available_width() - two_gap - right_width).clamp(320.0, 430.0);
@@ -2585,6 +2713,9 @@ impl EvertyDeskApp {
                                 self.check_remote_online();
                             }
                         });
+
+                        // ── Чипы недавних подключений (быстрый коннект) ───────
+                        self.recent_chips(ui);
                     });
                 });
                 ui.add_space(two_gap);
@@ -3708,182 +3839,298 @@ impl EvertyDeskApp {
         });
 
         egui::Panel::bottom("software-remote-statusbar").show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                ui.add_space(4.0);
+                // Разрешение
                 if self.remote_size[0] > 0 {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{}x{}",
-                            self.remote_size[0], self.remote_size[1]
-                        ))
-                        .monospace()
-                        .size(11.0),
+                    let _ = stat_pill(
+                        ui,
+                        None,
+                        &format!("{}×{}", self.remote_size[0], self.remote_size[1]),
+                        egui::Color32::from_rgb(0xC8, 0xD0, 0xDD),
                     );
-                    ui.separator();
+                    ui.add_space(6.0);
                 }
-
-                let fps_color = if self.display_fps >= 20.0 {
-                    egui::Color32::from_rgb(80, 200, 100)
-                } else if self.display_fps >= 8.0 {
-                    egui::Color32::from_rgb(220, 180, 60)
-                } else {
-                    egui::Color32::from_rgb(220, 80, 80)
-                };
-                ui.label(
-                    egui::RichText::new(format!("{:.1} fps", self.display_fps))
-                        .monospace()
-                        .size(11.0)
-                        .color(fps_color),
+                // FPS
+                let (fps_dot, _) = health_dot(self.display_fps);
+                let _ = stat_pill(
+                    ui,
+                    Some(fps_dot),
+                    &format!("{:.0} fps", self.display_fps),
+                    egui::Color32::from_rgb(0xE8, 0xEE, 0xF6),
                 );
-                ui.separator();
-                let input_color = if self.stream_input_fps >= 20.0 {
-                    egui::Color32::from_rgb(80, 200, 100)
-                } else if self.stream_input_fps >= 8.0 {
-                    egui::Color32::from_rgb(220, 180, 60)
-                } else {
-                    egui::Color32::from_rgb(220, 80, 80)
-                };
-                ui.label(
-                    egui::RichText::new(format!(
-                        "in {:.1}/s {} kbps",
-                        self.stream_input_fps, self.stream_input_kbps
-                    ))
-                    .monospace()
-                    .size(11.0)
-                    .color(input_color),
-                )
-                .on_hover_text("Входящие live-video пакеты до декодера");
-                ui.separator();
-
+                ui.add_space(6.0);
+                // Кодек
                 let (codec_label, codec_color) = match self.last_frame_codec.as_str() {
                     "H264" | "H265" | "AV1" | "VP9" => (
                         self.last_frame_codec.as_str(),
-                        egui::Color32::from_rgb(80, 220, 110),
+                        egui::Color32::from_rgb(0x5A, 0xE0, 0x9A),
                     ),
-                    "PNG" => ("PNG", egui::Color32::from_rgb(220, 180, 60)),
-                    _ => ("no frame", egui::Color32::GRAY),
+                    "PNG" => ("PNG", egui::Color32::from_rgb(0xF0, 0xC0, 0x50)),
+                    _ => ("—", egui::Color32::GRAY),
                 };
-                ui.label(
-                    egui::RichText::new(codec_label)
-                        .strong()
-                        .size(12.5)
-                        .color(codec_color),
-                );
-                ui.separator();
-                ui.label(
-                    egui::RichText::new(crate::video::build_codec_label())
-                        .monospace()
-                        .size(11.0)
-                        .color(egui::Color32::from_rgb(145, 160, 175)),
-                );
-
+                let _ = stat_pill(ui, None, codec_label, codec_color);
+                ui.add_space(6.0);
+                // Задержка
                 if let Some(ms) = self.latency_ms {
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new(format!("{ms} ms"))
-                            .monospace()
-                            .size(11.0),
-                    );
-                }
-                if self.frame_bytes > 0 {
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} KB q:{}ms dec:{}ms",
-                            self.frame_bytes / 1024,
-                            self.frame_queue_ms,
-                            self.frame_decode_ms
-                        ))
-                        .monospace()
-                        .size(11.0),
-                    );
-                }
-                if self.frame_dropped > 0 {
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new(format!("drop {}", self.frame_dropped))
-                            .monospace()
-                            .size(11.0)
-                            .color(egui::Color32::from_rgb(220, 110, 80)),
-                    );
-                }
-                ui.separator();
-                ui.label(
-                    egui::RichText::new(&self.stream_health)
-                        .size(11.0)
-                        .color(stream_health_color(&self.stream_health)),
-                );
-
-                // ── EVRT бейдж ────────────────────────────────────────────────
-                if self.evrt_active {
-                    ui.separator();
-                    let pressure_color = match self.evrt_pressure.as_str() {
-                        "critical" => egui::Color32::from_rgb(220, 70, 70),
-                        "high" => egui::Color32::from_rgb(220, 170, 50),
-                        _ => egui::Color32::from_rgb(50, 200, 120),
+                    let lat_color = if ms <= 40 {
+                        egui::Color32::from_rgb(0x5A, 0xE0, 0x9A)
+                    } else if ms <= 90 {
+                        egui::Color32::from_rgb(0xF0, 0xC0, 0x50)
+                    } else {
+                        egui::Color32::from_rgb(0xE0, 0x70, 0x70)
                     };
-                    ui.label(
-                        egui::RichText::new("⚡ EVRT")
-                            .strong()
-                            .size(12.0)
-                            .color(pressure_color),
-                    )
-                    .on_hover_ui(|ui| {
-                        ui.label(format!("Прямой UDP: {}", self.evrt_host_addr));
-                        ui.separator();
-                        ui.label(format!("Давление:  {}", self.evrt_pressure));
-                        ui.label(format!("Δ прибытие: {} мс", self.evrt_arrival_delta_ms));
-                        ui.label(format!("Δ декод:    {} мс", self.evrt_decode_delta_ms));
-                        ui.label(format!("Jitter:     {} мс", self.evrt_jitter_ms));
-                        ui.label(format!("FPS:        {}", self.evrt_fps));
-                        ui.label(format!("Пакетов:    {}", self.evrt_packets_received));
-                        ui.label(format!("Кадров:     {}", self.evrt_frames_assembled));
-                        ui.label(format!(
-                            "Потери:     сборка {} / очередь {}",
-                            self.evrt_reassembly_drops, self.evrt_queue_drops
-                        ));
-                    });
+                    let _ = stat_pill(ui, None, &format!("{ms} ms"), lat_color);
+                    ui.add_space(6.0);
+                }
+                // EVRT бейдж
+                if self.evrt_active {
+                    let pressure_color = match self.evrt_pressure.as_str() {
+                        "critical" => egui::Color32::from_rgb(0xE0, 0x60, 0x60),
+                        "high" => egui::Color32::from_rgb(0xF0, 0xC0, 0x50),
+                        _ => egui::Color32::from_rgb(0x32, 0xD8, 0x8C),
+                    };
+                    let _ = stat_pill(ui, Some(pressure_color), "⚡ EVRT", pressure_color);
+                    ui.add_space(6.0);
                 }
 
-                for status in [
-                    self.clipboard_status.as_deref(),
-                    self.screenshot_status.as_deref(),
-                    self.log_status.as_deref(),
-                    self.report_status.as_deref(),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new(status)
-                            .size(11.0)
-                            .color(egui::Color32::from_rgb(150, 160, 170)),
+                // Справа: кнопка деталей + индикатор ввода
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(4.0);
+                    if self.screenshot_pending {
+                        ui.spinner();
+                        ui.add_space(6.0);
+                    }
+                    let info_btn = ui.add(
+                        egui::Button::new(
+                            egui::RichText::new("ℹ Детали").size(11.5).color(
+                                if self.show_stream_info {
+                                    egui::Color32::from_rgb(0x12, 0xC9, 0x72)
+                                } else {
+                                    egui::Color32::from_rgb(0xB0, 0xB8, 0xC4)
+                                },
+                            ),
+                        )
+                        .frame(false),
                     );
-                }
-
-                ui.separator();
-                if self.remote_input_focused {
-                    ui.label(
-                        egui::RichText::new("input captured [Esc]")
-                            .size(11.0)
-                            .color(egui::Color32::from_rgb(45, 160, 230)),
+                    if info_btn.clicked() {
+                        self.show_stream_info = !self.show_stream_info;
+                    }
+                    ui.add_space(8.0);
+                    // Краткое здоровье потока
+                    let _ = stat_pill(
+                        ui,
+                        Some(stream_health_color(&self.stream_health)),
+                        &self.stream_health,
+                        egui::Color32::from_rgb(0xB8, 0xC2, 0xD0),
                     );
-                } else {
-                    ui.label(
-                        egui::RichText::new("hover/click remote screen for input")
-                            .size(11.0)
-                            .color(egui::Color32::GRAY),
-                    );
-                }
-                if self.screenshot_pending {
-                    ui.spinner();
-                }
+                    if self.remote_input_focused {
+                        ui.add_space(6.0);
+                        let _ = stat_pill(
+                            ui,
+                            Some(egui::Color32::from_rgb(0x2D, 0xA0, 0xE6)),
+                            "ввод захвачен [Esc]",
+                            egui::Color32::from_rgb(0x7A, 0xC0, 0xF0),
+                        );
+                    }
+                });
             });
+            ui.add_space(3.0);
         });
+
+        // ── Окно детальной диагностики ────────────────────────────────────────
+        self.stream_info_window(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             self.remote_screen_ui(ui);
         });
+    }
+
+    /// Красивое окно с детальной диагностикой стрима (по кнопке ℹ Детали).
+    fn stream_info_window(&mut self, ctx: &egui::Context) {
+        if !self.show_stream_info {
+            return;
+        }
+        let mut open = self.show_stream_info;
+        egui::Window::new(self.text("Диагностика потока", "Stream diagnostics"))
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(380.0)
+            .anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, -56.0])
+            .show(ctx, |ui| {
+                let green = egui::Color32::from_rgb(0x12, 0xC9, 0x72);
+                let white = egui::Color32::from_rgb(0x1A, 0x1F, 0x2A);
+                let amber = egui::Color32::from_rgb(0xE0, 0xA0, 0x30);
+
+                // ── Видео ──────────────────────────────────────────────────────
+                ui.label(
+                    egui::RichText::new(self.text("ВИДЕО", "VIDEO"))
+                        .size(11.0)
+                        .strong()
+                        .color(green),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    info_metric(
+                        ui,
+                        self.text("Разрешение", "Resolution"),
+                        &format!("{}×{}", self.remote_size[0], self.remote_size[1]),
+                        white,
+                    );
+                    ui.add_space(24.0);
+                    info_metric(ui, "FPS", &format!("{:.1}", self.display_fps), white);
+                    ui.add_space(24.0);
+                    info_metric(
+                        ui,
+                        self.text("Кодек", "Codec"),
+                        &self.last_frame_codec,
+                        white,
+                    );
+                });
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(12.0);
+
+                // ── Сеть ───────────────────────────────────────────────────────
+                ui.label(
+                    egui::RichText::new(self.text("СЕТЬ", "NETWORK"))
+                        .size(11.0)
+                        .strong()
+                        .color(green),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    info_metric(
+                        ui,
+                        self.text("Входящий", "Inbound"),
+                        &format!("{:.1}/s", self.stream_input_fps),
+                        white,
+                    );
+                    ui.add_space(20.0);
+                    info_metric(
+                        ui,
+                        self.text("Битрейт", "Bitrate"),
+                        &format!("{} kbps", self.stream_input_kbps),
+                        white,
+                    );
+                    ui.add_space(20.0);
+                    info_metric(
+                        ui,
+                        self.text("Пинг", "Ping"),
+                        &self
+                            .latency_ms
+                            .map(|m| format!("{m} ms"))
+                            .unwrap_or_else(|| "—".into()),
+                        white,
+                    );
+                });
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(12.0);
+
+                // ── Декод ──────────────────────────────────────────────────────
+                ui.label(
+                    egui::RichText::new(self.text("ДЕКОД", "DECODE"))
+                        .size(11.0)
+                        .strong()
+                        .color(green),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    info_metric(
+                        ui,
+                        self.text("Кадр", "Frame"),
+                        &format!("{} KB", self.frame_bytes / 1024),
+                        white,
+                    );
+                    ui.add_space(20.0);
+                    info_metric(
+                        ui,
+                        self.text("Очередь", "Queue"),
+                        &format!("{} ms", self.frame_queue_ms),
+                        white,
+                    );
+                    ui.add_space(20.0);
+                    info_metric(
+                        ui,
+                        self.text("Декод", "Decode"),
+                        &format!("{} ms", self.frame_decode_ms),
+                        white,
+                    );
+                    ui.add_space(20.0);
+                    info_metric(
+                        ui,
+                        self.text("Дропы", "Drops"),
+                        &self.frame_dropped.to_string(),
+                        if self.frame_dropped > 0 { amber } else { white },
+                    );
+                });
+
+                // ── EVRT (если активен) ────────────────────────────────────────
+                if self.evrt_active {
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("⚡ EVRT")
+                                .size(11.0)
+                                .strong()
+                                .color(green),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("→ {}", self.evrt_host_addr))
+                                .size(11.0)
+                                .color(egui::Color32::from_rgb(0x8A, 0x93, 0xA3)),
+                        );
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let pc = match self.evrt_pressure.as_str() {
+                            "critical" => egui::Color32::from_rgb(0xE0, 0x60, 0x60),
+                            "high" => amber,
+                            _ => green,
+                        };
+                        info_metric(ui, self.text("Давление", "Pressure"), &self.evrt_pressure, pc);
+                        ui.add_space(16.0);
+                        info_metric(
+                            ui,
+                            "Δ arrive",
+                            &format!("{} ms", self.evrt_arrival_delta_ms),
+                            white,
+                        );
+                        ui.add_space(16.0);
+                        info_metric(ui, "Jitter", &format!("{} ms", self.evrt_jitter_ms), white);
+                        ui.add_space(16.0);
+                        info_metric(ui, "FPS", &self.evrt_fps.to_string(), white);
+                    });
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{}: сборка {} / очередь {}  •  пакетов {}",
+                            self.text("Потери", "Loss"),
+                            self.evrt_reassembly_drops,
+                            self.evrt_queue_drops,
+                            self.evrt_packets_received,
+                        ))
+                        .size(11.0)
+                        .color(egui::Color32::from_rgb(0x8A, 0x93, 0xA3)),
+                    );
+                } else {
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new(self.text(
+                            "📡 TCP relay (EVRT не активен)",
+                            "📡 TCP relay (EVRT inactive)",
+                        ))
+                        .size(11.5)
+                        .color(egui::Color32::from_rgb(0x8A, 0x93, 0xA3)),
+                    );
+                }
+            });
+        self.show_stream_info = open;
     }
 
     #[allow(deprecated)]
@@ -4743,6 +4990,17 @@ fn stream_health_color(text: &str) -> egui::Color32 {
         egui::Color32::from_rgb(220, 180, 60)
     } else {
         egui::Color32::from_rgb(220, 110, 80)
+    }
+}
+
+/// Цвет точки и порог здоровья по FPS: зелёный/жёлтый/красный.
+fn health_dot(fps: f32) -> (egui::Color32, bool) {
+    if fps >= 20.0 {
+        (egui::Color32::from_rgb(0x32, 0xD8, 0x8C), true)
+    } else if fps >= 8.0 {
+        (egui::Color32::from_rgb(0xF0, 0xC0, 0x50), false)
+    } else {
+        (egui::Color32::from_rgb(0xE0, 0x70, 0x70), false)
     }
 }
 
