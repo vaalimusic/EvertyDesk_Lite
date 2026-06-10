@@ -18,6 +18,7 @@ use crate::{configure_style, configure_ui_scale, video, EvertyDeskApp, APP_NAME}
 
 const WIDTH: usize = 1100;
 const HEIGHT: usize = 760;
+const MAX_SOFTWARE_FRAMEBUFFER_PIXELS: usize = 3840 * 2160;
 
 type Chars = Rc<RefCell<Vec<u32>>>;
 
@@ -71,9 +72,18 @@ pub fn run_software_ui() -> Result<(), String> {
     let mut input_state = SoftwareInputState::default();
 
     while window.is_open() && !window.is_key_down(MiniKey::Escape) {
+        let frame_started = Instant::now();
         let (width, height) = window.get_size();
-        if pixels.len() != width * height {
-            pixels.resize(width * height, 0);
+        let pixel_count = width
+            .checked_mul(height)
+            .ok_or_else(|| "CPU egui window size overflow".to_owned())?;
+        if pixel_count > MAX_SOFTWARE_FRAMEBUFFER_PIXELS {
+            return Err(format!(
+                "CPU egui framebuffer too large: {width}x{height}; switching to headless"
+            ));
+        }
+        if pixels.len() != pixel_count {
+            pixels.resize(pixel_count, 0);
         }
 
         let raw_input = collect_input(
@@ -105,6 +115,7 @@ pub fn run_software_ui() -> Result<(), String> {
         window
             .update_with_buffer(&pixels, width, height)
             .map_err(|err| format!("CPU egui window update failed: {err}"))?;
+        sleep_for_software_frame_budget(repaint_delay, frame_started.elapsed());
     }
 
     app.shutdown();
@@ -212,6 +223,23 @@ fn tune_frame_pacing(window: &mut Window, repaint_after: Duration) {
         8
     };
     window.set_target_fps(fps);
+}
+
+fn sleep_for_software_frame_budget(repaint_after: Duration, elapsed: Duration) {
+    let target = if repaint_after <= Duration::from_millis(18) {
+        Duration::from_millis(16)
+    } else if repaint_after <= Duration::from_millis(40) {
+        Duration::from_millis(33)
+    } else if repaint_after <= Duration::from_millis(100) {
+        Duration::from_millis(66)
+    } else {
+        Duration::from_millis(125)
+    };
+    if elapsed < target {
+        std::thread::sleep(target - elapsed);
+    } else {
+        std::thread::yield_now();
+    }
 }
 
 fn collect_input(

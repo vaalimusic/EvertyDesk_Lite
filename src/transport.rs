@@ -3065,6 +3065,9 @@ fn update_display_from_switch(
         .iter_mut()
         .find(|known| known.index == updated.index)
     {
+        if display_geometry_matches(existing, &updated) {
+            return;
+        }
         *existing = updated;
     } else {
         known_displays.push(updated);
@@ -3080,6 +3083,16 @@ fn update_display_from_switch(
         display.y
     )));
     let _ = events.send(SessionEvent::Displays(known_displays.clone()));
+}
+
+fn display_geometry_matches(a: &RemoteDisplay, b: &RemoteDisplay) -> bool {
+    a.index == b.index
+        && a.name == b.name
+        && a.width == b.width
+        && a.height == b.height
+        && a.x == b.x
+        && a.y == b.y
+        && a.cursor_embedded == b.cursor_embedded
 }
 
 fn peer_info_context(info: &crate::rustdesk_proto::PeerInfo) -> String {

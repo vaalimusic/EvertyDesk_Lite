@@ -2525,8 +2525,16 @@ fn handle_client_input_pipeline(
 ) {
     use crate::video_pipeline::PipelineCmd;
     match msg.union {
-        Some(peer_message::Union::MouseEvent(ev)) => inject_mouse(ev),
-        Some(peer_message::Union::KeyEvent(ev)) => inject_key(ev),
+        Some(peer_message::Union::MouseEvent(ev)) => {
+            if mouse_event_should_log(&ev) {
+                host_log(events, format!("Host input: {}", mouse_event_summary(&ev)));
+            }
+            inject_mouse(ev);
+        }
+        Some(peer_message::Union::KeyEvent(ev)) => {
+            host_log(events, format!("Host input: {}", key_event_summary(&ev)));
+            inject_key(ev);
+        }
         Some(peer_message::Union::Misc(Misc {
             union: Some(misc::Union::Option(option)),
         })) => {
@@ -2614,6 +2622,40 @@ fn handle_client_input_pipeline(
         }
         _ => {}
     }
+}
+
+fn mouse_event_should_log(ev: &crate::rustdesk_proto::MouseEvent) -> bool {
+    (ev.mask & 0x7) != 0
+}
+
+fn mouse_event_summary(ev: &crate::rustdesk_proto::MouseEvent) -> String {
+    let kind = match ev.mask & 0x7 {
+        0 => "move",
+        1 => "down",
+        2 => "up",
+        3 => "wheel",
+        _ => "unknown",
+    };
+    let button = match ev.mask >> 3 {
+        1 => "left",
+        2 => "right",
+        4 => "middle",
+        8 => "back",
+        16 => "forward",
+        _ => "none",
+    };
+    format!("mouse {kind} button={button} x={} y={} mask={}", ev.x, ev.y, ev.mask)
+}
+
+fn key_event_summary(ev: &crate::rustdesk_proto::KeyEvent) -> String {
+    let key = match &ev.union {
+        Some(crate::rustdesk_proto::key_event::Union::ControlKey(key)) => {
+            format!("control={key}")
+        }
+        Some(crate::rustdesk_proto::key_event::Union::Unicode(ch)) => format!("unicode={ch}"),
+        None => "none".to_owned(),
+    };
+    format!("key {key} down={} press={}", ev.down, ev.press)
 }
 
 struct ShellRuntime {

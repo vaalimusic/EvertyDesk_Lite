@@ -430,15 +430,25 @@ impl AppConfig {
         let path = config_path();
         if let Ok(raw) = fs::read_to_string(&path) {
             if let Ok(mut config) = serde_json::from_str::<Self>(&raw) {
+                let mut changed = false;
                 // Lazily generate the stable sign key pair for older configs.
                 if config.host_sign_pk.len() != 32 || config.host_sign_sk.len() != 64 {
                     let (pk, sk) = crate::crypto::gen_sign_keypair();
                     config.host_sign_pk = pk;
                     config.host_sign_sk = sk;
-                    config.save();
+                    changed = true;
                 }
                 if config.ui.agent_machine_id.trim().is_empty() {
                     config.ui.agent_machine_id = generate_agent_machine_id();
+                    changed = true;
+                }
+                if config.display.streaming_mode == StreamingMode::Support
+                    && config.display.target_fps > default_target_fps()
+                {
+                    config.display.target_fps = default_target_fps();
+                    changed = true;
+                }
+                if changed {
                     config.save();
                 }
                 return config;
@@ -488,7 +498,7 @@ fn default_fit_to_window() -> bool {
     true
 }
 fn default_target_fps() -> u32 {
-    60
+    30
 }
 fn default_adaptive_quality() -> bool {
     true

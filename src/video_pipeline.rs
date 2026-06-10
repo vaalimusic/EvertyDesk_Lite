@@ -656,6 +656,7 @@ fn encode_loop(
     //   клиент апскейлит в окне. Аппаратный энкодер — даунскейл не нужен.
     let mut downscale_to: Option<(u32, u32)> = None;
     let mut downscale_buf: Vec<u8> = Vec::new();
+    let mut software_profile_active = false;
 
     // Capture double buffer
     type CapSlot = Arc<Mutex<Option<(i32, u32, u32, Vec<u8>)>>>;
@@ -732,6 +733,12 @@ fn encode_loop(
     const SPIN: Duration = Duration::from_micros(1_500);
 
     while !stop.load(Ordering::Relaxed) {
+        if software_profile_active {
+            let current = target_fps.load(Ordering::Relaxed);
+            if current > 15 {
+                target_fps.store(15, Ordering::Relaxed);
+            }
+        }
         let fps = target_fps.load(Ordering::Relaxed).clamp(5, 60);
         let frame_interval = Duration::from_nanos(1_000_000_000 / fps as u64);
 
@@ -822,6 +829,9 @@ fn encode_loop(
         if !evrt_on {
             const RELAY_MAX_BPS: u32 = 5_000_000; // безопасно для hbbr relay
             eff_bps = eff_bps.min(RELAY_MAX_BPS);
+        }
+        if software_profile_active {
+            eff_bps = eff_bps.min(2_000_000);
         }
 
         // ── Кодирование через единый каскад ───────────────────────────────────
@@ -953,17 +963,34 @@ fn encode_loop(
             //   Цель: высота ≤ 720 (сохраняя пропорции). Аппаратный — не трогаем.
             let backend = encoder.active_backend();
             let is_software = backend == "OpenH264-SW" || backend == "PNG";
-            if is_software && enc_h > 800 {
-                let target_h = 720u32;
-                let scale = target_h as f32 / enc_h as f32;
-                let dw = ((enc_w as f32 * scale) as u32 & !1).max(2); // чётное
-                let dh = (target_h & !1).max(2);
-                downscale_to = Some((dw, dh));
+            if is_software {
+                software_profile_active = true;
+
+                let software_fps = target_fps.load(Ordering::Relaxed).min(15).max(5);
+                if software_fps < fps {
+                    target_fps.store(software_fps, Ordering::Relaxed);
+                    next_frame_due = Instant::now();
+                }
+                let software_quality = quality_ms.load(Ordering::Relaxed).min(800).max(1);
+                quality_ms.store(software_quality, Ordering::Relaxed);
+
+                let (dw, dh) = if enc_h > 720 || enc_w > 1280 {
+                    let scale_w = 1280.0_f32 / enc_w as f32;
+                    let scale_h = 720.0_f32 / enc_h as f32;
+                    let scale = scale_w.min(scale_h).min(1.0);
+                    let dw = ((enc_w as f32 * scale) as u32 & !1).max(2);
+                    let dh = ((enc_h as f32 * scale) as u32 & !1).max(2);
+                    downscale_to = Some((dw, dh));
+                    (dw, dh)
+                } else {
+                    (enc_w, enc_h)
+                };
+
                 log(
                     &events,
                     format!(
-                        "★ Софт-энкодер на {}×{} — включаю даунскейл до {}×{} для скорости",
-                        enc_w, enc_h, dw, dh,
+                        "Software encoder profile: {}x{} -> {}x{} @ {}fps, bitrate <= 2Mbps",
+                        enc_w, enc_h, dw, dh, software_fps,
                     ),
                 );
             }

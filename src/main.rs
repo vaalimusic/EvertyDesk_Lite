@@ -106,6 +106,20 @@ fn main() -> eframe::Result<()> {
         .unwrap_or_else(|_| "auto".to_owned())
         .to_ascii_lowercase();
 
+    if renderer_mode != "host" && renderer_mode != "headless" && is_headless_graphics_session() {
+        eprintln!(
+            "[EvertyDesk] No interactive graphics session detected. Starting headless host mode."
+        );
+        run_headless_host();
+        return Ok(());
+    }
+    if renderer_mode == "auto" {
+        if let Some(reason) = server_basic_display_warning() {
+            eprintln!("[EvertyDesk] {reason}");
+            eprintln!("[EvertyDesk] GUI will still be attempted. Use --host for headless mode.");
+        }
+    }
+
     #[cfg(target_os = "linux")]
     if renderer_mode == "auto" && std::env::var_os("EVERTYDESK_LINUX_AUTOSTART_CHILD").is_none() {
         return run_linux_auto_gui();
@@ -172,10 +186,12 @@ fn main() -> eframe::Result<()> {
                         {
                             eprintln!("\n[EvertyDesk] Нет подходящего графического режима.");
                             eprintln!(
-                            "[EvertyDesk] Запускаю в режиме без GUI (--host). Для окна нужен X11/Wayland + OpenGL/Vulkan.\n"
-                        );
-                            run_software_ui_or_headless();
-                            Ok(())
+                                "[EvertyDesk] GUI renderer failed. For a GUI window this system needs working OpenGL/Vulkan."
+                            );
+                            eprintln!(
+                                "[EvertyDesk] CPU software UI is available only when explicitly requested with EVERTYDESK_RENDERER=software."
+                            );
+                            Err(glow_error)
                         } else {
                             Err(glow_error)
                         }
@@ -188,6 +204,13 @@ fn main() -> eframe::Result<()> {
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn run_software_ui_or_headless() {
+    if is_headless_graphics_session() {
+        eprintln!(
+            "[EvertyDesk] No graphics session for CPU software UI; using headless host mode."
+        );
+        run_headless_host();
+        return;
+    }
     eprintln!("[EvertyDesk] Trying CPU software UI backend (no OpenGL/Vulkan)...");
     match software_ui::run_software_ui() {
         Ok(()) => {}
@@ -207,6 +230,12 @@ fn run_software_ui_or_headless() {
 
 #[cfg(target_os = "linux")]
 fn run_linux_auto_gui() -> eframe::Result<()> {
+    if is_headless_graphics_session() {
+        eprintln!("[EvertyDesk] No desktop session detected. Starting headless host mode.");
+        run_headless_host();
+        return Ok(());
+    }
+
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(err) => {
@@ -303,12 +332,6 @@ fn run_linux_auto_gui() -> eframe::Result<()> {
         }
     }
 
-    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
-        eprintln!("[EvertyDesk] No desktop session detected. Starting headless host mode.");
-        run_headless_host();
-        return Ok(());
-    }
-
     eprintln!("[EvertyDesk] No GUI renderer worked on this Linux desktop.");
     eprintln!("[EvertyDesk] This system rejected both OpenGL/GLX and WGPU/Vulkan.");
     eprintln!("[EvertyDesk] Starting CPU software UI backend...");
@@ -316,6 +339,118 @@ fn run_linux_auto_gui() -> eframe::Result<()> {
         eprintln!("[EvertyDesk] Software UI failed: {err}");
     }
     Ok(())
+}
+
+fn is_headless_graphics_session() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+fn server_basic_display_warning() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows_basic_display_warning()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_basic_display_warning() -> Option<String> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_DESC1};
+
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1().ok()? };
+    let mut hardware = Vec::new();
+    let mut software = Vec::new();
+
+    for index in 0..16_u32 {
+        let Ok(adapter) = (unsafe { factory.EnumAdapters1(index) }) else {
+            break;
+        };
+        let mut desc = DXGI_ADAPTER_DESC1::default();
+        if unsafe { adapter.GetDesc1(&mut desc) }.is_err() {
+            continue;
+        }
+        let name = utf16_z_to_string(&desc.Description).unwrap_or_else(|| "unknown".to_owned());
+        let software_adapter = (desc.Flags & 0x2) != 0;
+        let info = WindowsDisplayAdapter {
+            name,
+            vendor_id: desc.VendorId,
+            software: software_adapter,
+        };
+        if software_adapter {
+            software.push(info);
+        } else {
+            hardware.push(info);
+        }
+    }
+
+    if hardware.is_empty() && !software.is_empty() {
+        let names = software
+            .iter()
+            .map(|adapter| adapter.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(format!(
+            "Only software DXGI adapters detected ({names}); GUI may be slow on this server."
+        ));
+    }
+
+    if !hardware.is_empty() && hardware.iter().all(WindowsDisplayAdapter::is_server_basic) {
+        let names = hardware
+            .iter()
+            .map(|adapter| format!("{} vendor=0x{:04x}", adapter.name, adapter.vendor_id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(format!(
+            "Server/basic display adapter detected ({names}); GUI may be slow on this server."
+        ));
+    }
+
+    None
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsDisplayAdapter {
+    name: String,
+    vendor_id: u32,
+    software: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsDisplayAdapter {
+    fn is_server_basic(&self) -> bool {
+        self.software
+            || matches!(
+                self.vendor_id,
+                0x1414 // Microsoft Basic Render Driver / WARP
+                    | 0x1a03 // ASPEED BMC adapters common on Supermicro servers
+                    | 0x102b // Matrox server/BMC adapters
+            )
+            || {
+                let name = self.name.to_ascii_lowercase();
+                name.contains("microsoft basic")
+                    || name.contains("aspeed")
+                    || name.contains("matrox")
+                    || name.contains("basic render")
+                    || name.contains("basic display")
+            }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn utf16_z_to_string(buf: &[u16]) -> Option<String> {
+    let len = buf.iter().position(|ch| *ch == 0).unwrap_or(buf.len());
+    let text = String::from_utf16_lossy(&buf[..len]).trim().to_owned();
+    (!text.is_empty()).then_some(text)
 }
 
 #[cfg(target_os = "linux")]
@@ -1347,6 +1482,7 @@ impl EvertyDeskApp {
                 }
             }
             SessionEvent::Displays(displays) => {
+                let previous_selected_display = self.selected_display;
                 // Запоминаем нативное разрешение хоста для FSR апскейла.
                 // Используем первый (primary) дисплей.
                 if let Some(primary) = displays.first() {
@@ -1366,7 +1502,7 @@ impl EvertyDeskApp {
                         .map(|display| display.index)
                         .unwrap_or_default();
                 }
-                if self.connected {
+                if self.connected && self.selected_display != previous_selected_display {
                     if let Some(display) = self
                         .remote_displays
                         .iter()
@@ -1803,13 +1939,10 @@ fn start_hung_window_guardian() {
                     misses += 1;
                     if misses >= 3 {
                         eprintln!("[guardian] Render thread stuck — hiding window");
-                        // Hide window immediately via win32k (kernel-level),
-                        // bypasses the stuck user-mode render thread.
-                        // User sees the window vanish instantly.
                         ShowWindow(hwnd, SW_HIDE);
                         thread::sleep(Duration::from_millis(200));
-                        eprintln!("[guardian] Exiting process");
-                        std::process::exit(0);
+                        eprintln!("[guardian] Terminating process");
+                        force_terminate();
                     }
                 }
             }
@@ -1864,18 +1997,26 @@ impl EvertyDeskApp {
             || self.host_check_busy
             || self.remote_check_busy
             || self.terminal_ai_rx.is_some()
+            || self.host_pending_peer.is_some()
             || self.host_state.is_online()
         {
-            // Poll faster when live video is streaming to reduce decode→render lag.
             let repaint_ms = if self.connected
                 && self
                     .last_live_frame_at
                     .map(|t| t.elapsed() < Duration::from_secs(3))
                     .unwrap_or(false)
             {
-                16 // ~60fps poll when stream is active
+                16 // ~60fps poll when stream is active.
+            } else if self.connected
+                || self.busy
+                || self.host_check_busy
+                || self.remote_check_busy
+                || self.terminal_ai_rx.is_some()
+                || self.host_pending_peer.is_some()
+            {
+                33 // ~30fps while an interactive operation is pending.
             } else {
-                33 // ~30fps otherwise
+                1000 // Idle registered host: do not burn CPU on weak server GPUs.
             };
             ctx.request_repaint_after(Duration::from_millis(repaint_ms));
         }
@@ -4744,7 +4885,7 @@ impl EvertyDeskApp {
         self.last_frame_codec != "PNG"
             && self
                 .last_live_frame_at
-                .map(|instant| instant.elapsed() < Duration::from_secs(2))
+                .map(|instant| instant.elapsed() < Duration::from_secs(5))
                 .unwrap_or(false)
     }
 
@@ -4850,10 +4991,25 @@ impl EvertyDeskApp {
     }
 
     fn remote_point_from_local(&self, x: f32, y: f32) -> (i32, i32) {
-        let max_x = self.remote_size[0].saturating_sub(1) as f32;
-        let max_y = self.remote_size[1].saturating_sub(1) as f32;
-        let x = x.clamp(0.0, max_x).round() as i32;
-        let y = y.clamp(0.0, max_y).round() as i32;
+        let frame_w = self.remote_size[0].max(1) as f32;
+        let frame_h = self.remote_size[1].max(1) as f32;
+        let (target_w, target_h) = self
+            .remote_displays
+            .iter()
+            .find(|display| display.index == self.selected_display)
+            .map(|display| {
+                (
+                    display.width.max(1) as f32,
+                    display.height.max(1) as f32,
+                )
+            })
+            .unwrap_or((frame_w, frame_h));
+        let x = (x.clamp(0.0, frame_w - 1.0) * (target_w / frame_w))
+            .clamp(0.0, target_w - 1.0)
+            .round() as i32;
+        let y = (y.clamp(0.0, frame_h - 1.0) * (target_h / frame_h))
+            .clamp(0.0, target_h - 1.0)
+            .round() as i32;
         let (offset_x, offset_y) = self.coordinate_offset();
         (offset_x + x, offset_y + y)
     }

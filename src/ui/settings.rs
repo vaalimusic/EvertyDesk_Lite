@@ -1,7 +1,8 @@
 use eframe::egui;
 
 use crate::settings::{
-    self as settings_mod, AppConfig, CodecPreference, EncoderPreference, LlmProvider, StreamingMode,
+    self as settings_mod, AppConfig, CodecPreference, EncoderPreference, FsrQualitySetting,
+    LlmProvider, StreamingMode,
 };
 use crate::ui::widgets::{language_button, settings_section, settings_text_row};
 use crate::{
@@ -210,6 +211,22 @@ impl EvertyDeskApp {
                                 },
                             );
                         });
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label("FSR");
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    for quality in fsr_quality_order() {
+                                        ui.selectable_value(
+                                            &mut draft.display.fsr_quality,
+                                            quality,
+                                            quality.label(),
+                                        );
+                                    }
+                                },
+                            );
+                        });
                     });
 
                     ui.add_space(8.0);
@@ -254,7 +271,11 @@ impl EvertyDeskApp {
                             || new_cfg.display.target_fps != self.config.display.target_fps
                             || new_cfg.display.codec != self.config.display.codec
                             || new_cfg.display.encoder != self.config.display.encoder
-                            || new_cfg.display.streaming_mode != self.config.display.streaming_mode;
+                            || new_cfg.display.streaming_mode != self.config.display.streaming_mode
+                            || new_cfg.display.fsr_quality != self.config.display.fsr_quality
+                            || (new_cfg.display.fsr_sharpness - self.config.display.fsr_sharpness)
+                                .abs()
+                                > f32::EPSILON;
                         let next_video_fps = new_cfg.display.target_fps.clamp(5, 60) as i32;
                         if host_reconfigure_needed {
                             if let Some(svc) = &self.host_service {
@@ -262,6 +283,8 @@ impl EvertyDeskApp {
                             }
                         }
                         self.config = new_cfg;
+                        self.fsr_viewer = make_fsr_adapter(&self.config.display);
+                        self.fsr_native_size = None;
                         self.video_fps = next_video_fps;
                         self.config.save();
                         if self.connected {
@@ -339,6 +362,8 @@ impl EvertyDeskApp {
             current_config.display.codec,
             current_config.display.encoder,
             current_config.display.streaming_mode,
+            current_config.display.fsr_quality,
+            current_config.display.fsr_sharpness,
         );
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -503,6 +528,19 @@ impl EvertyDeskApp {
                         }
                     });
                 });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("FSR");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        for quality in fsr_quality_order() {
+                            ui.selectable_value(
+                                &mut draft.display.fsr_quality,
+                                quality,
+                                quality.label(),
+                            );
+                        }
+                    });
+                });
             });
 
             ui.add_space(8.0);
@@ -597,7 +635,10 @@ impl EvertyDeskApp {
                     || new_cfg.display.target_fps != host_reconfigure_source.3
                     || new_cfg.display.codec != host_reconfigure_source.4
                     || new_cfg.display.encoder != host_reconfigure_source.5
-                    || new_cfg.display.streaming_mode != host_reconfigure_source.6;
+                    || new_cfg.display.streaming_mode != host_reconfigure_source.6
+                    || new_cfg.display.fsr_quality != host_reconfigure_source.7
+                    || (new_cfg.display.fsr_sharpness - host_reconfigure_source.8).abs()
+                        > f32::EPSILON;
                 let next_video_fps = new_cfg.display.target_fps.clamp(5, 60) as i32;
                 if host_reconfigure_needed {
                     if let Some(svc) = &self.host_service {
@@ -605,6 +646,8 @@ impl EvertyDeskApp {
                     }
                 }
                 self.config = new_cfg.clone();
+                self.fsr_viewer = make_fsr_adapter(&self.config.display);
+                self.fsr_native_size = None;
                 self.video_fps = next_video_fps;
                 self.config.save();
                 if self.connected {
@@ -830,6 +873,27 @@ fn encoder_preference_order() -> [EncoderPreference; 3] {
         EncoderPreference::Nvenc,
         EncoderPreference::Auto,
     ]
+}
+
+fn fsr_quality_order() -> [FsrQualitySetting; 6] {
+    [
+        FsrQualitySetting::Performance,
+        FsrQualitySetting::Balanced,
+        FsrQualitySetting::Quality,
+        FsrQualitySetting::UltraQuality,
+        FsrQualitySetting::Native,
+        FsrQualitySetting::Off,
+    ]
+}
+
+fn make_fsr_adapter(display: &settings_mod::DisplayConfig) -> Option<crate::fsr::FsrAdapter> {
+    display
+        .fsr_quality
+        .to_fsr_quality()
+        .map(|quality| crate::fsr::FsrAdapter::new(crate::fsr::FsrConfig {
+            quality,
+            sharpness: display.fsr_sharpness,
+        }))
 }
 
 fn default_config_from(config: &AppConfig) -> AppConfig {
