@@ -3,8 +3,17 @@ name = "evertydesk-lite"
 version = "0.1.0"
 edition = "2021"
 
+# Библиотека для Android (.so через JNI) + обычный бинарь для desktop.
+# `lib` — для тестов/desktop, `cdylib` — нативная либа для Android.
+[lib]
+name = "evertydesk_core"
+path = "src/lib.rs"
+crate-type = ["lib", "cdylib"]
+
 [features]
 default = ["live-h264", "live-vp9-mf", "live-nvenc-sdk"]
+# Android клиент: собирается как cdylib с JNI-мостом, без desktop GUI.
+android-client = ["dep:jni"]
 live-h264  = ["dep:openh264"]
 # FSR: параллельная обработка строк через rayon (быстрее на многоядерных CPU)
 # Подключи rayon в [dependencies] и включи фичу: cargo build --features fsr-parallel
@@ -53,6 +62,14 @@ zstd = { version = "0.13", default-features = false }
 # libsodium-compatible NaCl crypto (pure Rust) for the RustDesk secure
 # handshake: Ed25519 sign, crypto_box (X25519+XSalsa20), secretbox.
 dryoc = "0.7"
+
+# JNI-зависимость только для Android-сборки (по фиче android-client).
+jni = { version = "0.21", optional = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# Логи Android logcat
+android_logger = "0.14"
+log = "0.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 font8x8 = "0.3"
