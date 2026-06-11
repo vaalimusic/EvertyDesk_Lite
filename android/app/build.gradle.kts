@@ -7,6 +7,8 @@ android {
     namespace = "ru.everty.desklite"
     compileSdk = 34
 
+    ndkVersion = "28.2.13676358"
+
     defaultConfig {
         applicationId = "ru.everty.desklite"
         minSdk = 24          // Android 7.0 — нужен для современного MediaCodec/NDK
@@ -22,6 +24,7 @@ android {
     // Нативные .so кладутся в src/main/jniLibs/<abi>/libevertydesk_core.so
     // (собираются через cargo-ndk — см. android/README.md)
     sourceSets["main"].jniLibs.srcDirs("src/main/jniLibs")
+
 
     buildTypes {
         release {
