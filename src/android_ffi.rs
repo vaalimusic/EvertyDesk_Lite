@@ -20,7 +20,7 @@ use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jint, jintArray, jlong};
 use jni::JNIEnv;
 
-use crate::settings::AppConfig;
+use crate::settings::{AppConfig, ServerConfig};
 use crate::transport::{ConnectionRequest, SessionCommand, SessionEvent, TransportClient};
 
 /// Последний полученный кадр (RGBA).
@@ -41,8 +41,6 @@ struct AndroidSession {
     /// Текстовый статус (прогресс/ошибка) для UI.
     status: Arc<Mutex<String>>,
     connected: Arc<AtomicBool>,
-    /// Размер удалённого экрана (для пересчёта координат тача).
-    remote_size: Arc<Mutex<(u32, u32)>>,
 }
 
 // ─── helper: лог ───────────────────────────────────────────────────────────────
@@ -55,13 +53,17 @@ fn jni_log(msg: &str) {
 
 /// Запустить сессию. Возвращает handle (указатель) или 0 при ошибке.
 ///
-/// Kotlin: `external fun nativeStart(id: String, password: String): Long`
+/// Kotlin: `external fun nativeStart(id, password, apiUrl, idServer, relayServer, publicKey): Long`
 #[no_mangle]
 pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeStart(
     mut env: JNIEnv,
     _class: JClass,
     id: JString,
     password: JString,
+    api_url: JString,
+    id_server: JString,
+    relay_server: JString,
+    public_key: JString,
 ) -> jlong {
     // Инициализируем android_logger один раз
     init_android_logger();
@@ -78,10 +80,16 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeStart(
     jni_log(&format!("nativeStart id={remote_id}"));
 
     let config = AppConfig::load_or_create();
+    let server = ServerConfig {
+        api_url: jstring_or(&mut env, &api_url, config.server.api_url.clone()),
+        id_server: jstring_or(&mut env, &id_server, config.server.id_server.clone()),
+        relay_server: jstring_or(&mut env, &relay_server, config.server.relay_server.clone()),
+        public_key: jstring_or(&mut env, &public_key, config.server.public_key.clone()),
+    };
     let request = ConnectionRequest {
         remote_id,
         password,
-        server: config.server.clone(),
+        server,
         display: config.display.clone(),
     };
 
@@ -119,7 +127,6 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeStart(
         stop,
         status,
         connected,
-        remote_size,
     });
     Box::into_raw(session) as jlong
 }
@@ -189,7 +196,7 @@ fn collect_events(
 /// узнаёт размер через nativeFrameSize, аллоцирует, потом poll.
 #[no_mangle]
 pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativePollFrame(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     handle: jlong,
     out: jintArray,
@@ -280,6 +287,60 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeRightClick(
     let _ = session.cmd_tx.send(SessionCommand::MouseRightUp { x, y });
 }
 
+/// Ввод текста (Unicode-строка). Kotlin: `external fun nativeKeyText(handle: Long, text: String)`
+#[no_mangle]
+pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeKeyText(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    text: JString,
+) {
+    let Some(session) = session_ref(handle) else { return };
+    let s: String = match env.get_string(&text) {
+        Ok(v) => v.into(),
+        Err(_) => return,
+    };
+    let _ = session.cmd_tx.send(crate::transport::SessionCommand::KeyText(s));
+}
+
+/// Управляющая клавиша по числовому коду ControlKey.
+/// Kotlin: `external fun nativeKeyControl(handle: Long, code: Int)`
+#[no_mangle]
+pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeKeyControl(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    code: jint,
+) {
+    let Some(session) = session_ref(handle) else { return };
+    use crate::rustdesk_proto::ControlKey;
+    let key = ControlKey::try_from(code).unwrap_or(ControlKey::Unknown);
+    if key != ControlKey::Unknown {
+        let _ = session.cmd_tx.send(crate::transport::SessionCommand::KeyControl(key));
+    }
+}
+
+/// Ctrl+символ. Kotlin: `external fun nativeKeyCtrl(handle: Long, ch: String)`
+#[no_mangle]
+pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeKeyCtrl(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    ch: JString,
+) {
+    let Some(session) = session_ref(handle) else { return };
+    let s: String = match env.get_string(&ch) {
+        Ok(v) => v.into(),
+        Err(_) => return,
+    };
+    use crate::rustdesk_proto::ControlKey;
+    use crate::transport::SessionCommand;
+    let _ = session.cmd_tx.send(SessionCommand::KeyTextWithModifiers {
+        text: s,
+        modifiers: vec![ControlKey::Control],
+    });
+}
+
 /// Прокрутка колеса мыши. delta_y > 0 — вниз, < 0 — вверх (единицы: условные шаги).
 /// Kotlin: `external fun nativeScroll(handle: Long, x: Int, y: Int, deltaY: Int)`
 #[no_mangle]
@@ -288,7 +349,7 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeScroll(
     _class: JClass,
     handle: jlong,
     x: jint,
-    y: jint,
+    _y: jint,
     delta_y: jint,
 ) {
     let Some(session) = session_ref(handle) else { return };
@@ -366,4 +427,18 @@ fn init_android_logger() {
                 .with_tag("EvertyDesk"),
         );
     });
+}
+
+fn jstring_or(env: &mut JNIEnv, value: &JString, fallback: String) -> String {
+    match env.get_string(value) {
+        Ok(raw) => {
+            let text: String = raw.into();
+            if text.trim().is_empty() {
+                fallback
+            } else {
+                text
+            }
+        }
+        Err(_) => fallback,
+    }
 }

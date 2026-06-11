@@ -384,6 +384,7 @@ mod windows_nvenc {
         }
     }
 
+    #[link(name = "everty_nvenc_shim", kind = "static")]
     extern "C" {
         fn everty_nvenc_supported_codecs(
             mask: *mut u32,

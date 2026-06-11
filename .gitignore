@@ -24,6 +24,17 @@ config.json
 diag_stdout.txt
 diag_stderr.txt
 
+# Android / Gradle local build artifacts
+/android/.gradle/
+/android/**/build/
+/android/local.properties
+/android/.kotlin/
+/android/captures/
+/android/app/src/main/jniLibs/**/*.so
+*.apk
+*.aab
+*.ap_
+
 # Optional local experiments
 /engine/
 /screenshots/

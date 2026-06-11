@@ -6,7 +6,6 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
-import android.graphics.RectF
 import android.os.Handler
 import android.os.Looper
 import android.view.GestureDetector
@@ -18,16 +17,15 @@ import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
-import kotlin.math.sqrt
 
 /**
- * Удалённый экран с жестами:
- *  • 1 палец tap           → левый клик
- *  • 1 палец drag          → мышь с зажатой левой кнопкой
+ * Удалённый экран — trackpad-режим (как в RustDesk):
+ *  • 1 палец move          → MouseMove (курсор без нажатия)
+ *  • 1 палец tap           → левый клик (down+up на месте касания)
  *  • Long press            → правый клик (вибрация)
  *  • 2 пальца pinch        → зум
  *  • 2 пальца drag         → пан по зумленной картинке
- *  • 2 пальца scroll (fling вертикаль) → колесо мыши
+ *  • 2 пальца scroll       → колесо мыши
  */
 class RemoteView(context: Context, private val client: NativeClient) : View(context) {
 
@@ -50,18 +48,21 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
     private var panX = 0f
     private var panY = 0f
 
-    // Системный порог drag: палец должен сдвинуться дальше этого (px) чтобы
-    // начать drag. Защищает от случайного MouseDown при обычном тапе.
-    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
+    // Порог (px): если палец не сдвинулся дальше — это тап, иначе — drag.
+    private val tapSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
 
-    // ── состояние мыши + курсор ──────────────────────────────────────────────
-    private var mouseDown = false
+    // ── состояние курсора (трекпад-режим) ───────────────────────────────────
+    // Текущая позиция курсора на УДАЛЁННОМ экране. Обновляется дельтами.
     private var lastRemoteX = 0
     private var lastRemoteY = 0
-    // Координаты пальца в момент ACTION_DOWN (для измерения дистанции drag)
+    // Позиция пальца в предыдущем событии (для вычисления дельты движения)
+    private var prevFingerX = 0f
+    private var prevFingerY = 0f
+    // Координаты VIEW при ACTION_DOWN (для различия тапа и drag)
     private var downViewX = 0f
     private var downViewY = 0f
-    private var dragStarted = false   // true как только превысили touchSlop
+    // Long press уже сработал → не посылать клик при поднятии пальца
+    private var longPressFired = false
     // Позиция курсора в view-координатах для отрисовки (обновляется при каждом move)
     private var cursorViewX = -1f
     private var cursorViewY = -1f
@@ -88,30 +89,13 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
     // ── детекторы жестов ────────────────────────────────────────────────────
     private val gestureDetector = GestureDetector(context,
         object : GestureDetector.SimpleOnGestureListener() {
-
-            override fun onSingleTapUp(e: MotionEvent): Boolean {
-                if (twoFingerMode) return false
-                val (rx, ry) = viewToRemote(e.x, e.y)
-                showCursorAt(e.x, e.y)
-                // Проверяем режим «следующий тап = правый клик»
-                if (rightClickCallback?.invoke(rx, ry) == true) return true
-                client.touch(rx, ry, 0)
-                client.touch(rx, ry, 2)
-                return true
-            }
-
             override fun onLongPress(e: MotionEvent) {
                 if (twoFingerMode) return
-                val (rx, ry) = viewToRemote(e.x, e.y)
-                showCursorAt(e.x, e.y)
+                longPressFired = true
+                // Трекпад: правый клик там где стоит курсор, не где палец
                 performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
-                client.rightClick(rx, ry)
+                client.rightClick(lastRemoteX, lastRemoteY)
             }
-
-            override fun onScroll(
-                e1: MotionEvent?, e2: MotionEvent,
-                distanceX: Float, distanceY: Float
-            ): Boolean = false  // обрабатываем вручную в onTouchEvent
         }
     )
 
@@ -223,14 +207,9 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
         when (event.actionMasked) {
 
             MotionEvent.ACTION_POINTER_DOWN -> {
-                // Второй палец — переходим в режим зума/пана
                 if (pointerCount == 2) {
                     twoFingerMode = true
-                    // Если была зажата мышь — отпускаем
-                    if (mouseDown) {
-                        client.touch(lastRemoteX, lastRemoteY, 2)
-                        mouseDown = false
-                    }
+                    longPressFired = false
                     prevMidX = (event.getX(0) + event.getX(1)) / 2f
                     prevMidY = (event.getY(0) + event.getY(1)) / 2f
                     prevSpan = span(event)
@@ -245,11 +224,12 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
 
             MotionEvent.ACTION_DOWN -> {
                 if (!twoFingerMode) {
-                    val (rx, ry) = viewToRemote(event.x, event.y)
-                    lastRemoteX = rx; lastRemoteY = ry
+                    longPressFired = false
                     downViewX = event.x; downViewY = event.y
-                    dragStarted = false
-                    showCursorAt(event.x, event.y)
+                    prevFingerX = event.x; prevFingerY = event.y
+                    // Трекпад: при касании курсор НЕ прыгает, остаётся где был
+                    val (cvx, cvy) = remoteToView(lastRemoteX, lastRemoteY)
+                    showCursorAt(cvx, cvy)
                 }
             }
 
@@ -275,32 +255,42 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
                         client.scroll(rx, ry, -scrollSteps)
                     }
                 } else if (!twoFingerMode) {
-                    val dist = hypot(event.x - downViewX, event.y - downViewY)
-                    // Начинаем drag только после превышения порога touchSlop
-                    if (!dragStarted && dist > touchSlop) {
-                        dragStarted = true
-                        // MouseDown в начальной точке касания (не там где уже сдвинулись)
-                        client.touch(lastRemoteX, lastRemoteY, 0)
-                        mouseDown = true
+                    // Трекпад: дельта пальца → дельта курсора (без абсолютного прыжка)
+                    val totalScale = baseFit * userZoom
+                    val dx = (event.x - prevFingerX) / totalScale
+                    val dy = (event.y - prevFingerY) / totalScale
+                    prevFingerX = event.x; prevFingerY = event.y
+                    val newRx = (lastRemoteX + dx).toInt().coerceIn(0, frameW - 1)
+                    val newRy = (lastRemoteY + dy).toInt().coerceIn(0, frameH - 1)
+                    if (newRx != lastRemoteX || newRy != lastRemoteY) {
+                        lastRemoteX = newRx; lastRemoteY = newRy
+                        client.touch(lastRemoteX, lastRemoteY, 1)
                     }
-                    if (dragStarted) {
-                        val (rx, ry) = viewToRemote(event.x, event.y)
-                        showCursorAt(event.x, event.y)
-                        if (rx != lastRemoteX || ry != lastRemoteY) {
-                            client.touch(rx, ry, 1)
-                            lastRemoteX = rx; lastRemoteY = ry
-                        }
-                    }
+                    // При зуме двигаем картинку за курсором, чтобы он всегда был виден
+                    if (userZoom > 1f) followCursor()
+                    val (cvx, cvy) = remoteToView(lastRemoteX, lastRemoteY)
+                    showCursorAt(cvx, cvy)
                 }
             }
 
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                twoFingerMode = false
-                dragStarted = false
-                if (mouseDown) {
-                    client.touch(lastRemoteX, lastRemoteY, 2)
-                    mouseDown = false
+            MotionEvent.ACTION_UP -> {
+                if (!twoFingerMode && !longPressFired) {
+                    val dist = hypot(event.x - downViewX, event.y - downViewY)
+                    if (dist < tapSlop) {
+                        // Тап: кликаем там где стоит курсор (не где был палец)
+                        if (rightClickCallback?.invoke(lastRemoteX, lastRemoteY) != true) {
+                            client.touch(lastRemoteX, lastRemoteY, 0)
+                            client.touch(lastRemoteX, lastRemoteY, 2)
+                        }
+                    }
                 }
+                twoFingerMode = false
+                longPressFired = false
+            }
+
+            MotionEvent.ACTION_CANCEL -> {
+                twoFingerMode = false
+                longPressFired = false
             }
         }
         return true
@@ -357,6 +347,30 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
         rebuildMatrix(); invalidate()
     }
 
+    /**
+     * Сдвигаем пан так, чтобы курсор всегда оставался в зоне видимости
+     * (с отступом [margin] от краёв). Вызывается только при userZoom > 1.
+     */
+    private fun followCursor() {
+        val margin = 48f * resources.displayMetrics.density
+        val (cvx, cvy) = remoteToView(lastRemoteX, lastRemoteY)
+        var changed = false
+        if (cvx < margin) {
+            panX += margin - cvx; changed = true
+        } else if (cvx > width - margin) {
+            panX -= cvx - (width - margin); changed = true
+        }
+        if (cvy < margin) {
+            panY += margin - cvy; changed = true
+        } else if (cvy > height - margin) {
+            panY -= cvy - (height - margin); changed = true
+        }
+        if (changed) {
+            clampPan()
+            rebuildMatrix()
+        }
+    }
+
     // ── курсор ───────────────────────────────────────────────────────────────
 
     private fun showCursorAt(vx: Float, vy: Float) {
@@ -377,6 +391,13 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
         val rx = pts[0].roundToInt().coerceIn(0, (frameW - 1).coerceAtLeast(0))
         val ry = pts[1].roundToInt().coerceIn(0, (frameH - 1).coerceAtLeast(0))
         return Pair(rx, ry)
+    }
+
+    /** Позиция удалённого курсора в координатах view (для отрисовки crosshair). */
+    private fun remoteToView(rx: Int, ry: Int): Pair<Float, Float> {
+        val pts = floatArrayOf(rx.toFloat(), ry.toFloat())
+        matrix.mapPoints(pts)
+        return Pair(pts[0], pts[1])
     }
 
     private fun span(e: MotionEvent): Float {

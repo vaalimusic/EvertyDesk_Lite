@@ -8,6 +8,7 @@
 ```
 ┌─────────── Android (Kotlin) ───────────┐
 │ MainActivity  — экран подключения        │
+│ AddressBookApi — login + /api/ab/*        │
 │ RemoteView    — отрисовка кадров + тачи  │
 │ NativeClient  — JNI обёртка               │
 │        ↕ JNI (libevertydesk_core.so)     │
@@ -71,13 +72,17 @@ cd android
 1. Подключи телефон (USB-отладка) или эмулятор
 2. `./gradlew installDebug` или Run в Android Studio
 3. Введи ID хоста + пароль → Подключиться
+4. Во вкладке «Контакты» можно войти в `desk.everty.ru`, синхронизировать
+   адресную книгу и подключаться к устройствам из списка.
 
 ## Поток данных
 
 | Шаг | Где |
 |-----|-----|
 | Ввод ID/пароль | `MainActivity.connect()` |
-| `nativeStart` → запуск сессии | `android_ffi.rs` → `TransportClient::run_session` |
+| API/login + адресная книга | `AddressBookApi` + `MainActivity.showContactsScreen()` |
+| Настройки API/ID/relay/public key | `MainActivity.showSettingsScreen()` → `SharedPreferences`; встроенный профиль в UI маскируется |
+| `nativeStart` → запуск сессии | `NativeClient.start()` → `android_ffi.rs` → `TransportClient::run_session` |
 | Приём H264 + декод | Rust `transport` + `decode_frame_loop` (OpenH264) |
 | RGBA кадр → `latest` | `android_ffi.rs::collect_events` |
 | `nativePollFrame` → Bitmap | `RemoteView.pullFrame` (16мс опрос) |
@@ -87,10 +92,12 @@ cd android
 
 - [ ] **MediaCodec** аппаратный H264-декод (сейчас OpenH264 софт — медленнее)
 - [ ] **SurfaceView** вместо View+Bitmap (zero-copy отрисовка)
+- [x] Базовая адресная книга через `desk.everty.ru`
+- [x] Настройки API / ID server / relay / public key
+- [x] Сохранение недавнего ID
 - [ ] Жесты: правый клик (long-press), скролл (два пальца), клавиатура
 - [ ] EVRT прямой UDP на Android (сейчас работает TCP relay)
 - [ ] Аудио воспроизведение (AudioTrack)
-- [ ] Сохранение недавних ID, адресная книга
 
 ## Известные нюансы
 
@@ -99,9 +106,10 @@ cd android
   не соберётся — альтернатива: декод через Android MediaCodec в Kotlin (тогда
   Rust отдаёт сырые H264 access units, а не RGBA — будущая доработка).
 - **minSdk 24**: для современного рантайма. Можно понизить если нужно.
-- Конфиг (адрес ID-сервера) берётся из `AppConfig::load_or_create()` —
-  на Android это путь в data-каталоге приложения. Сервер по умолчанию из
-  `settings.rs`.
+- Конфиг подключения на Android задаётся во вкладке «Настройки» и передаётся
+  в `nativeStart`. Встроенный профиль EvertyDesk в UI показывается как
+  `********`; свои серверы можно включить только полным набором:
+  API URL, ID server, relay server и public key.
 
 ---
 

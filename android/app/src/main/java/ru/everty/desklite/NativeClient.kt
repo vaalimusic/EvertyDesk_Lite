@@ -3,8 +3,15 @@ package ru.everty.desklite
 class NativeClient {
     private var handle: Long = 0
 
-    fun start(id: String, password: String): Boolean {
-        handle = nativeStart(id, password)
+    fun start(
+        id: String,
+        password: String,
+        apiUrl: String,
+        idServer: String,
+        relayServer: String,
+        publicKey: String,
+    ): Boolean {
+        handle = nativeStart(id, password, apiUrl, idServer, relayServer, publicKey)
         return handle != 0L
     }
 
@@ -37,6 +44,25 @@ class NativeClient {
         if (handle != 0L) nativeScroll(handle, x, y, deltaY)
     }
 
+    /** Ввод текста на удалённом хосте */
+    fun keyText(text: String) {
+        if (handle != 0L) nativeKeyText(handle, text)
+    }
+
+    /**
+     * Управляющая клавиша. Коды (ControlKey):
+     *   2=Backspace, 4=Ctrl, 5=Delete, 6=↓, 7=End, 8=Esc, 21=Home,
+     *   22=←, 27=Enter, 28=→, 29=Shift, 31=Tab, 32=↑
+     */
+    fun keyControl(code: Int) {
+        if (handle != 0L) nativeKeyControl(handle, code)
+    }
+
+    /** Ctrl+символ: зажать Ctrl, нажать ch, отпустить Ctrl */
+    fun keyCtrl(ch: String) {
+        if (handle != 0L) nativeKeyCtrl(handle, ch)
+    }
+
     fun status(): String = if (handle == 0L) "—" else nativeStatus(handle)
     fun isConnected(): Boolean = handle != 0L && nativeIsConnected(handle)
 
@@ -44,12 +70,22 @@ class NativeClient {
         if (handle != 0L) { nativeStop(handle); handle = 0 }
     }
 
-    private external fun nativeStart(id: String, password: String): Long
+    private external fun nativeStart(
+        id: String,
+        password: String,
+        apiUrl: String,
+        idServer: String,
+        relayServer: String,
+        publicKey: String,
+    ): Long
     private external fun nativeFrameSize(handle: Long): Long
     private external fun nativePollFrame(handle: Long, out: IntArray): Long
     private external fun nativeTouch(handle: Long, x: Int, y: Int, action: Int)
     private external fun nativeRightClick(handle: Long, x: Int, y: Int)
     private external fun nativeScroll(handle: Long, x: Int, y: Int, deltaY: Int)
+    private external fun nativeKeyText(handle: Long, text: String)
+    private external fun nativeKeyControl(handle: Long, code: Int)
+    private external fun nativeKeyCtrl(handle: Long, ch: String)
     private external fun nativeStatus(handle: Long): String
     private external fun nativeIsConnected(handle: Long): Boolean
     private external fun nativeStop(handle: Long)
