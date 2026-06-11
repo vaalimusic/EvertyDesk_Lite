@@ -264,6 +264,37 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeTouch(
     let _ = session.cmd_tx.send(cmd);
 }
 
+/// Правый клик (down + up). x,y — координаты удалённого экрана.
+/// Kotlin: `external fun nativeRightClick(handle: Long, x: Int, y: Int)`
+#[no_mangle]
+pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeRightClick(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    x: jint,
+    y: jint,
+) {
+    let Some(session) = session_ref(handle) else { return };
+    let _ = session.cmd_tx.send(SessionCommand::MouseMove { x, y });
+    let _ = session.cmd_tx.send(SessionCommand::MouseRightDown { x, y });
+    let _ = session.cmd_tx.send(SessionCommand::MouseRightUp { x, y });
+}
+
+/// Прокрутка колеса мыши. delta_y > 0 — вниз, < 0 — вверх (единицы: условные шаги).
+/// Kotlin: `external fun nativeScroll(handle: Long, x: Int, y: Int, deltaY: Int)`
+#[no_mangle]
+pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeScroll(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    x: jint,
+    y: jint,
+    delta_y: jint,
+) {
+    let Some(session) = session_ref(handle) else { return };
+    let _ = session.cmd_tx.send(SessionCommand::MouseWheel { x, y: delta_y });
+}
+
 // ─── status / connected ──────────────────────────────────────────────────────
 
 /// Текущий статус (строка). Kotlin: `external fun nativeStatus(handle: Long): String`
