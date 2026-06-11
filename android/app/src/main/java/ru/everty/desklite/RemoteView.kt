@@ -16,6 +16,7 @@ import android.view.View
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
 /**
  * Удалённый экран с жестами:
@@ -47,10 +48,16 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
     private var panX = 0f
     private var panY = 0f
 
-    // ── состояние мыши ───────────────────────────────────────────────────────
+    // ── состояние мыши + курсор ──────────────────────────────────────────────
     private var mouseDown = false
     private var lastRemoteX = 0
     private var lastRemoteY = 0
+    // Позиция курсора в view-координатах для отрисовки (обновляется при каждом move)
+    private var cursorViewX = -1f
+    private var cursorViewY = -1f
+    // Скрываем курсор через 2 сек после последнего касания
+    private var cursorVisible = false
+    private val hideCursorRunnable = Runnable { cursorVisible = false; invalidate() }
 
     // ── двухпальцевый режим ──────────────────────────────────────────────────
     private var twoFingerMode = false
@@ -75,6 +82,7 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
             override fun onSingleTapUp(e: MotionEvent): Boolean {
                 if (twoFingerMode) return false
                 val (rx, ry) = viewToRemote(e.x, e.y)
+                showCursorAt(e.x, e.y)
                 // Проверяем режим «следующий тап = правый клик»
                 if (rightClickCallback?.invoke(rx, ry) == true) return true
                 client.touch(rx, ry, 0)
@@ -83,9 +91,9 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
             }
 
             override fun onLongPress(e: MotionEvent) {
-                // Long press — правый клик
                 if (twoFingerMode) return
                 val (rx, ry) = viewToRemote(e.x, e.y)
+                showCursorAt(e.x, e.y)
                 performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
                 client.rightClick(rx, ry)
             }
@@ -154,25 +162,44 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
         val bmp = bitmap ?: return
         canvas.drawBitmap(bmp, matrix, paint)
 
-        // Курсор: маленький крест на последней позиции мыши (только при зуме)
-        if (userZoom > 1.1f && mouseDown) {
-            val pts = floatArrayOf(lastRemoteX.toFloat(), lastRemoteY.toFloat())
-            matrix.mapPoints(pts)
-            drawCursor(canvas, pts[0], pts[1])
+        // Курсор: рисуем всегда пока видим (исчезает через 2 сек после касания)
+        if (cursorVisible && cursorViewX >= 0f) {
+            drawCursor(canvas, cursorViewX, cursorViewY)
         }
     }
 
-    private val cursorPaint = Paint().apply {
+    // Курсор: белый с чёрной обводкой — виден на любом фоне
+    private val cursorStrokePaint = Paint().apply {
+        color = Color.BLACK
+        strokeWidth = 4f
+        style = Paint.Style.STROKE
+        isAntiAlias = true
+    }
+    private val cursorFillPaint = Paint().apply {
         color = Color.WHITE
         strokeWidth = 2f
         style = Paint.Style.STROKE
         isAntiAlias = true
     }
+    private val cursorDotPaint = Paint().apply {
+        color = Color.WHITE
+        style = Paint.Style.FILL
+        isAntiAlias = true
+    }
+
     private fun drawCursor(canvas: Canvas, cx: Float, cy: Float) {
-        val s = 12f
-        canvas.drawLine(cx - s, cy, cx + s, cy, cursorPaint)
-        canvas.drawLine(cx, cy - s, cx, cy + s, cursorPaint)
-        canvas.drawCircle(cx, cy, 4f, cursorPaint)
+        val arm = 14f
+        val gap = 5f
+        // Чёрная обводка (рисуем первой — она шире)
+        for (p in listOf(cursorStrokePaint, cursorFillPaint)) {
+            canvas.drawLine(cx - arm, cy, cx - gap, cy, p)
+            canvas.drawLine(cx + gap, cy, cx + arm, cy, p)
+            canvas.drawLine(cx, cy - arm, cx, cy - gap, p)
+            canvas.drawLine(cx, cy + gap, cx, cy + arm, p)
+            canvas.drawCircle(cx, cy, 4f, p)
+        }
+        // Центральная точка
+        canvas.drawCircle(cx, cy, 2.5f, cursorDotPaint)
     }
 
     // ── жесты ────────────────────────────────────────────────────────────────
@@ -210,8 +237,7 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
                 if (!twoFingerMode) {
                     val (rx, ry) = viewToRemote(event.x, event.y)
                     lastRemoteX = rx; lastRemoteY = ry
-                    // Не посылаем MouseDown сразу — ждём drag или tap
-                    // (GestureDetector разберёт tap vs drag)
+                    showCursorAt(event.x, event.y)
                 }
             }
 
@@ -241,8 +267,8 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
                     }
                 } else if (!twoFingerMode) {
                     val (rx, ry) = viewToRemote(event.x, event.y)
+                    showCursorAt(event.x, event.y)
                     if (!mouseDown) {
-                        // Первый move после DOWN — начинаем drag
                         client.touch(lastRemoteX, lastRemoteY, 0)
                         mouseDown = true
                     }
@@ -313,6 +339,18 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
     fun resetZoom() {
         userZoom = 1f; panX = 0f; panY = 0f
         rebuildMatrix(); invalidate()
+    }
+
+    // ── курсор ───────────────────────────────────────────────────────────────
+
+    private fun showCursorAt(vx: Float, vy: Float) {
+        cursorViewX = vx
+        cursorViewY = vy
+        cursorVisible = true
+        // Перезапускаем таймер исчезновения
+        handler.removeCallbacks(hideCursorRunnable)
+        handler.postDelayed(hideCursorRunnable, 2000)
+        invalidate()
     }
 
     // ── координаты ──────────────────────────────────────────────────────────
