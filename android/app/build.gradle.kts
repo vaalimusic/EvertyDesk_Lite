@@ -1,3 +1,18 @@
+import java.util.Properties
+
+val releaseKeystorePropertiesFile = rootProject.file("keystore.properties")
+val releaseKeystoreProperties = Properties().apply {
+    if (releaseKeystorePropertiesFile.exists()) {
+        releaseKeystorePropertiesFile.inputStream().use { load(it) }
+    }
+}
+val hasReleaseKeystore = releaseKeystorePropertiesFile.exists()
+
+fun Properties.signingProperty(name: String): String =
+    getProperty(name)
+        ?: getProperty("\uFEFF$name")
+        ?: error("Missing release signing property: $name")
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -25,10 +40,23 @@ android {
     // (собираются через cargo-ndk — см. android/README.md)
     sourceSets["main"].jniLibs.srcDirs("src/main/jniLibs")
 
+    if (hasReleaseKeystore) {
+        signingConfigs {
+            create("release") {
+                storeFile = rootProject.file(releaseKeystoreProperties.signingProperty("storeFile"))
+                storePassword = releaseKeystoreProperties.signingProperty("storePassword")
+                keyAlias = releaseKeystoreProperties.signingProperty("keyAlias")
+                keyPassword = releaseKeystoreProperties.signingProperty("keyPassword")
+            }
+        }
+    }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+            if (hasReleaseKeystore) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
     compileOptions {

@@ -28,6 +28,8 @@ diag_stderr.txt
 /android/.gradle/
 /android/**/build/
 /android/local.properties
+/android/keystore.properties
+/android/keystore/
 /android/.kotlin/
 /android/captures/
 /android/app/src/main/jniLibs/**/*.so
