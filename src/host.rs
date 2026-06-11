@@ -1262,6 +1262,12 @@ fn relay_session_inner(
         peer_id: peer_id.to_owned(),
     });
 
+    // Block the host's physical mouse while the remote session is active so the
+    // host user can't interfere with the remote client's cursor control.
+    // BlockInput requires elevation; if it fails we continue silently.
+    #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
+    let _block_guard = WindowsInputBlocker::new();
+
     // ── Единый пайплайн: один захват → один энкодер → TCP + UDP ──────────────
     //
     // Заменяет старую схему двух параллельных систем (video_loop + evrt_session).
@@ -2766,6 +2772,40 @@ fn send_shell_out(outgoing: &Sender<PeerMessage>, kind: ShellMessageKind, data: 
 }
 
 /// Release mouse buttons (and common modifier keys) that may have been left
+/// RAII guard: calls BlockInput(TRUE) on construction, BlockInput(FALSE) on drop.
+/// Prevents the host's physical mouse/keyboard from interfering with injected
+/// remote input while a session is active.
+/// BlockInput requires elevation; if the process is not elevated the call is a
+/// no-op and we fall through silently — remote control still works, the host
+/// user can just interfere more easily.
+#[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
+struct WindowsInputBlocker;
+
+#[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
+impl WindowsInputBlocker {
+    fn new() -> Self {
+        unsafe {
+            use windows::Win32::UI::Input::KeyboardAndMouse::BlockInput;
+            let ok = BlockInput(true);
+            if ok.as_bool() {
+                eprintln!("[host] Physical input blocked for remote session");
+            }
+        }
+        Self
+    }
+}
+
+#[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
+impl Drop for WindowsInputBlocker {
+    fn drop(&mut self) {
+        unsafe {
+            use windows::Win32::UI::Input::KeyboardAndMouse::BlockInput;
+            BlockInput(false);
+            eprintln!("[host] Physical input unblocked");
+        }
+    }
+}
+
 /// "down" when a session ended mid-click — otherwise the local desktop becomes
 /// unusable (e.g. Start menu not clickable).
 #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]

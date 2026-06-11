@@ -1561,7 +1561,14 @@ impl EvertyDeskApp {
                 }
             }
             SessionEvent::CursorPosition { x, y } => {
-                self.cursor_pos = Some(egui::pos2(x as f32, y as f32));
+                // When the local pointer is actively over the remote screen we
+                // already update cursor_pos from the local mouse position in
+                // real-time (zero latency). Applying the host's echo of that
+                // same position (with RTT latency) would cause the cursor to
+                // stutter. Only accept remote position when we're not hovering.
+                if !self.remote_input_focused {
+                    self.cursor_pos = Some(egui::pos2(x as f32, y as f32));
+                }
             }
             SessionEvent::Latency(ms) => {
                 self.latency_ms = Some(ms);
