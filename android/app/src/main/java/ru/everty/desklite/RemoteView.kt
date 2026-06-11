@@ -13,6 +13,8 @@ import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
+import android.view.ViewConfiguration
+import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -48,10 +50,18 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
     private var panX = 0f
     private var panY = 0f
 
+    // Системный порог drag: палец должен сдвинуться дальше этого (px) чтобы
+    // начать drag. Защищает от случайного MouseDown при обычном тапе.
+    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
+
     // ── состояние мыши + курсор ──────────────────────────────────────────────
     private var mouseDown = false
     private var lastRemoteX = 0
     private var lastRemoteY = 0
+    // Координаты пальца в момент ACTION_DOWN (для измерения дистанции drag)
+    private var downViewX = 0f
+    private var downViewY = 0f
+    private var dragStarted = false   // true как только превысили touchSlop
     // Позиция курсора в view-координатах для отрисовки (обновляется при каждом move)
     private var cursorViewX = -1f
     private var cursorViewY = -1f
@@ -237,6 +247,8 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
                 if (!twoFingerMode) {
                     val (rx, ry) = viewToRemote(event.x, event.y)
                     lastRemoteX = rx; lastRemoteY = ry
+                    downViewX = event.x; downViewY = event.y
+                    dragStarted = false
                     showCursorAt(event.x, event.y)
                 }
             }
@@ -247,11 +259,9 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
                     val midY = (event.getY(0) + event.getY(1)) / 2f
                     val curSpan = span(event)
 
-                    // Зум по pinch
                     if (prevSpan > 0f) {
                         applyZoom(curSpan / prevSpan, midX, midY)
                     }
-                    // Пан по движению середины
                     val dx = midX - prevMidX
                     val dy = midY - prevMidY
                     if (dx != 0f || dy != 0f) applyPan(dx, dy)
@@ -259,28 +269,34 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
                     prevMidX = midX; prevMidY = midY
                     prevSpan = curSpan
 
-                    // Вертикальный сдвиг двух пальцев = колесо мыши
                     val scrollSteps = (dy / 40f).roundToInt()
                     if (scrollSteps != 0) {
                         val (rx, ry) = viewToRemote(midX, midY)
                         client.scroll(rx, ry, -scrollSteps)
                     }
                 } else if (!twoFingerMode) {
-                    val (rx, ry) = viewToRemote(event.x, event.y)
-                    showCursorAt(event.x, event.y)
-                    if (!mouseDown) {
+                    val dist = hypot(event.x - downViewX, event.y - downViewY)
+                    // Начинаем drag только после превышения порога touchSlop
+                    if (!dragStarted && dist > touchSlop) {
+                        dragStarted = true
+                        // MouseDown в начальной точке касания (не там где уже сдвинулись)
                         client.touch(lastRemoteX, lastRemoteY, 0)
                         mouseDown = true
                     }
-                    if (rx != lastRemoteX || ry != lastRemoteY) {
-                        client.touch(rx, ry, 1)
-                        lastRemoteX = rx; lastRemoteY = ry
+                    if (dragStarted) {
+                        val (rx, ry) = viewToRemote(event.x, event.y)
+                        showCursorAt(event.x, event.y)
+                        if (rx != lastRemoteX || ry != lastRemoteY) {
+                            client.touch(rx, ry, 1)
+                            lastRemoteX = rx; lastRemoteY = ry
+                        }
                     }
                 }
             }
 
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 twoFingerMode = false
+                dragStarted = false
                 if (mouseDown) {
                     client.touch(lastRemoteX, lastRemoteY, 2)
                     mouseDown = false
