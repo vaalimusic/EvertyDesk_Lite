@@ -11,7 +11,9 @@ path = "src/lib.rs"
 crate-type = ["lib", "cdylib"]
 
 [features]
-default = ["live-h264", "live-vp9-mf", "live-nvenc-sdk"]
+default = ["live-h264", "live-vp9-mf", "live-nvenc-sdk", "desktop-gui"]
+# Desktop GUI: eframe + arboard. Excluded from Android builds.
+desktop-gui = ["dep:eframe", "dep:arboard"]
 # Android клиент: собирается как cdylib с JNI-мостом, без desktop GUI.
 android-client = ["dep:jni"]
 live-h264  = ["dep:openh264"]
@@ -37,9 +39,9 @@ live-nvenc-sdk = []
 cc = "1"
 
 [dependencies]
-arboard = "3.6"
+arboard = { version = "3.6", optional = true }
 base64 = "0.22"
-eframe = { version = "0.34", default-features = false, features = [
+eframe = { version = "0.34", optional = true, default-features = false, features = [
     "wgpu",          # Vulkan/DX12/Metal + software fallback — no OpenGL 2.0 required
     "glow",          # OpenGL fallback for conservative Linux desktops
     "x11",           # Linux X11 desktops, including Astra's classic desktop sessions
