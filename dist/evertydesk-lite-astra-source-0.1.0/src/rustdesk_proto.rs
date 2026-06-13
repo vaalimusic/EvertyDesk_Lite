@@ -753,7 +753,10 @@ pub struct TestDelay {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct Misc {
-    #[prost(oneof = "misc::Union", tags = "5, 7, 10, 12, 28, 30, 31, 35, 37, 100, 101, 102")]
+    #[prost(
+        oneof = "misc::Union",
+        tags = "5, 7, 10, 12, 28, 30, 31, 35, 37, 100, 101, 102"
+    )]
     pub union: Option<misc::Union>,
 }
 

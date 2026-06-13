@@ -9,6 +9,7 @@
 // =============================================================================
 
 // ── Core-модули (нужны клиентскому пути transport → evrt_client → декод) ──────
+pub mod capture;
 pub mod colorconv;
 pub mod crypto;
 pub mod evrt;
@@ -29,7 +30,6 @@ pub mod video;
 pub mod video_pipeline;
 pub mod videotoolbox;
 pub mod vp9_mf;
-pub mod capture;
 
 #[cfg(feature = "live-vpx-system")]
 pub mod vpx_system;

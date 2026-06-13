@@ -34,11 +34,38 @@ const RELAY_PORT: u16 = 21117;
 const SESSION_TICK_MS: u64 = 16; // ~60 fps poll; keeps command latency ≤16 ms
 const RELAY_STREAM_ATTEMPTS: u8 = 3;
 const RELAY_BOOTSTRAP_WAIT_SECS: u64 = 12;
-const RELAY_RESPONSE_BOOTSTRAP_WAIT_SECS: u64 = 30;
+const RELAY_RESPONSE_BOOTSTRAP_WAIT_SECS: u64 = 12;
 const RELAY_AUTH_WAIT_SECS: u64 = 120;
-const RELAY_HANDSHAKE_POLL_MS: u64 = 500;
-const DIRECT_TCP_CONNECT_TIMEOUT_SECS: u64 = 4;
+const RELAY_HANDSHAKE_POLL_MS: u64 = 150;
+const DIRECT_TCP_CONNECT_TIMEOUT_SECS: u64 = 2;
 const DIRECT_TCP_BOOTSTRAP_WAIT_SECS: u64 = 10;
+
+fn env_flag(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default,
+        },
+        Err(_) => default,
+    }
+}
+
+fn relay_first_fast_path() -> bool {
+    env_flag("EVERTYDESK_CONNECT_RELAY_FIRST", true)
+}
+
+fn blocking_udp_nat_probe_enabled() -> bool {
+    env_flag("EVERTYDESK_CONNECT_UDP_PROBE", false)
+}
+
+fn direct_tcp_probe_enabled() -> bool {
+    env_flag("EVERTYDESK_TRY_DIRECT_TCP", false)
+}
+
+fn elapsed_ms(started: &Instant) -> u128 {
+    started.elapsed().as_millis()
+}
 
 #[derive(Clone, Debug)]
 pub struct ConnectionRequest {
@@ -46,6 +73,7 @@ pub struct ConnectionRequest {
     pub password: String,
     pub server: ServerConfig,
     pub display: DisplayConfig,
+    pub control_only: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -118,6 +146,7 @@ pub enum SessionEvent {
     EvrtMetrics {
         pressure: String, // "normal" / "high" / "critical"
         arrival_delta_ms: i32,
+        assembly_delay_ms: i32,
         decode_delta_ms: i32,
         jitter_ms: u32,
         bitrate_mbps: f32,
@@ -348,6 +377,7 @@ impl TransportClient {
         events: Sender<SessionEvent>,
     ) {
         let display_config = request.display.clone();
+        let control_only = request.control_only;
         let mut codec_preference = display_config.codec;
         let initial_video_fps = display_config.target_fps.clamp(5, 60) as i32;
         let adaptive_quality = display_config.adaptive_quality;
@@ -388,13 +418,19 @@ impl TransportClient {
                 "PeerInfo displays empty; manual monitor selector is enabled".to_owned(),
             ));
         }
+        if control_only {
+            let _ = events.send(SessionEvent::Info(
+                "Control-only session: video and screenshots disabled".to_owned(),
+            ));
+        }
 
         // ★ EVRT: адрес хоста получен за ОДИН запрос к hbbs.
         // IP из PunchHoleResponse.socket_addr, порт из Misc{EvrtUdpPort}.
         // Порт может прийти в handshake (evrt_host_addr) ИЛИ позже в session loop
         // (evrt_host_base + late Misc). Флаг не даёт запустить дважды.
         let mut evrt_started = false;
-        if let Some(host_addr) = evrt_host_addr {
+        if !control_only {
+            if let Some(host_addr) = evrt_host_addr {
             evrt_started = true;
             let evrt_events = events.clone();
             let evrt_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -414,8 +450,9 @@ impl TransportClient {
                     );
                 }
             });
+            }
         }
-        if !evrt_started && !early_evrt_candidates.is_empty() {
+        if !control_only && !evrt_started && !early_evrt_candidates.is_empty() {
             evrt_started = true;
             let evrt_events = events.clone();
             let evrt_ull = display_config.target_fps >= 60;
@@ -433,8 +470,13 @@ impl TransportClient {
         }
         let (frame_tx, frame_rx) = mpsc::channel::<DecoderInput>();
         let (decoder_feedback_tx, decoder_feedback_rx) = mpsc::channel::<DecoderFeedback>();
-        let frame_events = events.clone();
-        thread::spawn(move || decode_frame_loop(frame_rx, frame_events, decoder_feedback_tx));
+        if control_only {
+            drop(frame_rx);
+            drop(decoder_feedback_tx);
+        } else {
+            let frame_events = events.clone();
+            thread::spawn(move || decode_frame_loop(frame_rx, frame_events, decoder_feedback_tx));
+        }
 
         let _ = relay.set_read_timeout(Some(Duration::from_millis(SESSION_TICK_MS)));
         let mut screenshot_id = 0_u64;
@@ -477,20 +519,27 @@ impl TransportClient {
         let mut qos_feedback_failures = 0_u64;
         // Subscribe to display 0 (SwitchDisplay) then trigger video start.
         // SwitchDisplay must come first — it's the one-time subscription trigger.
-        let _ = send_switch_display_subscribe(&mut relay, current_display);
-        let _ = send_video_start_messages_with_quality(
-            &mut relay,
-            current_display,
-            true,
-            target_video_fps,
-            codec_preference,
-            current_quality,
-        );
-        let _ = send_video_received(&mut relay);
-        let _ = events.send(SessionEvent::Info(
-            "Display subscribed; waiting for first frame".to_owned(),
-        ));
-        screenshot_pending = false;
+        if control_only {
+            screenshot_pending = false;
+        } else {
+            let _ = send_switch_display_subscribe(&mut relay, current_display);
+            let _ = send_video_start_messages_with_quality(
+                &mut relay,
+                current_display,
+                true,
+                target_video_fps,
+                codec_preference,
+                current_quality,
+            );
+            let _ = send_video_received(&mut relay);
+            request_screenshot_once(&mut relay, &mut screenshot_id, current_display, &events);
+            last_screenshot_sent = Some(Instant::now());
+            let _ = events.send(SessionEvent::Info(
+                "Display subscribed; initial screenshot requested while live video starts"
+                    .to_owned(),
+            ));
+            screenshot_pending = true;
+        }
         let _ = events.send(SessionEvent::ScreenshotStats {
             received: screenshots_received,
             pending: screenshot_pending,
@@ -792,6 +841,9 @@ impl TransportClient {
                     }
                     SessionCommand::Screenshot => {
                         flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
+                        if control_only {
+                            continue;
+                        }
                         request_screenshot_once(
                             &mut relay,
                             &mut screenshot_id,
@@ -808,6 +860,9 @@ impl TransportClient {
                     SessionCommand::SetDisplay(display) => {
                         flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
                         current_display = display.index.max(0);
+                        if control_only {
+                            continue;
+                        }
                         live_video_seen = false;
                         let _ = send_switch_display(&mut relay, current_display);
                         let _ = send_video_start_messages_with_quality(
@@ -836,6 +891,9 @@ impl TransportClient {
                         flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
                         auto_refresh = enabled;
                         auto_refresh_millis = millis.max(50);
+                        if control_only {
+                            continue;
+                        }
                         let _ = send_video_start_messages_with_quality(
                             &mut relay,
                             current_display,
@@ -848,6 +906,9 @@ impl TransportClient {
                     }
                     SessionCommand::RefreshVideo => {
                         flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
+                        if control_only {
+                            continue;
+                        }
                         live_video_seen = false;
                         last_decoder_recovery = Some(Instant::now());
                         let _ = events.send(SessionEvent::Info(format!(
@@ -867,6 +928,9 @@ impl TransportClient {
                         flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
                         target_video_fps = fps.clamp(5, 60);
                         current_quality = initial_stream_quality(target_video_fps);
+                        if control_only {
+                            continue;
+                        }
                         last_decoder_recovery = Some(Instant::now());
                         last_quality_change = Instant::now();
                         low_input_quality_windows = 0;
@@ -888,6 +952,9 @@ impl TransportClient {
                         target_video_fps = fps.clamp(5, 60);
                         codec_preference = codec;
                         current_quality = initial_stream_quality(target_video_fps);
+                        if control_only {
+                            continue;
+                        }
                         live_video_seen = false;
                         last_decoder_recovery = Some(Instant::now());
                         last_quality_change = Instant::now();
@@ -950,13 +1017,14 @@ impl TransportClient {
                             current_display,
                             target_video_fps,
                             codec_preference,
+                            control_only,
                             &mut evrt_port_seen,
                             &mut evrt_candidates,
                         );
                         // ★ EVRT (после LoginResponse). Собираем кандидаты:
                         //   1) список EvrtEndpoints (LAN+VPN) — основной путь
                         //   2) host IP от hbbs punch-hole + EvrtUdpPort — запасной
-                        if !evrt_started {
+                        if !control_only && !evrt_started {
                             let mut candidates = evrt_candidates;
                             if let (Some(port), Some(mut base)) = (evrt_port_seen, evrt_host_base) {
                                 base.set_port(port);
@@ -1109,7 +1177,8 @@ impl TransportClient {
                 None => {}
             }
 
-            let qos_feedback_due = last_qos_feedback_sent
+            let qos_feedback_due = !control_only
+                && last_qos_feedback_sent
                 .map(|instant| instant.elapsed() >= Duration::from_secs(1))
                 .unwrap_or(true);
             if qos_feedback_due {
@@ -1132,7 +1201,7 @@ impl TransportClient {
 
             // Time-based auto-refresh. Keep this to one display and avoid piling up PNG
             // screenshot requests; otherwise the UI shows old frames from the relay backlog.
-            if auto_refresh {
+            if auto_refresh && !control_only {
                 let elapsed =
                     last_screenshot_sent.map_or(Duration::from_secs(999), |t| t.elapsed());
                 let request_expired =
@@ -1318,6 +1387,12 @@ fn establish_session(
     ),
     String,
 > {
+    let session_started = Instant::now();
+    let relay_first = relay_first_fast_path();
+    let udp_probe = blocking_udp_nat_probe_enabled();
+    let direct_tcp_probe = direct_tcp_probe_enabled();
+    let control_only = request.control_only;
+
     progress(5, "Validating input".to_owned());
     if request.remote_id.is_empty() {
         return Err("Enter remote ID".to_owned());
@@ -1330,12 +1405,38 @@ fn establish_session(
     validate_public_key(&request.server.public_key)?;
 
     progress(30, "Connecting to ID server".to_owned());
+    let id_connect_started = Instant::now();
     let mut rendezvous_stream = connect_tcp(&request.server.id_server, RENDEZVOUS_PORT)?;
     let direct_local_addr = rendezvous_stream.local_addr().ok();
+    progress(
+        35,
+        format!(
+            "ID server connected in {} ms",
+            elapsed_ms(&id_connect_started)
+        ),
+    );
 
-    progress(45, "Connecting to Relay server".to_owned());
-    let _relay = connect_tcp(&request.server.relay_server, RELAY_PORT)?;
-    let udp_nat = probe_udp_nat_port(&request.server.id_server);
+    if relay_first {
+        progress(
+            45,
+            "Fast connect: relay-first; direct probes are opt-in".to_owned(),
+        );
+    } else {
+        progress(
+            45,
+            "Fast connect disabled; direct probes may run".to_owned(),
+        );
+    }
+
+    let udp_nat = if udp_probe {
+        probe_udp_nat_port(&request.server.id_server)
+    } else {
+        UdpNatProbe {
+            port: 0,
+            detail: "skipped by fast connect; set EVERTYDESK_CONNECT_UDP_PROBE=1 to enable"
+                .to_owned(),
+        }
+    };
     if udp_nat.port > 0 {
         progress(
             52,
@@ -1347,10 +1448,7 @@ fn establish_session(
     } else {
         progress(
             52,
-            format!(
-                "UDP NAT probe unavailable; direct UDP disabled for this attempt ({})",
-                udp_nat.detail
-            ),
+            format!("UDP NAT probe unavailable ({})", udp_nat.detail),
         );
     }
 
@@ -1382,6 +1480,7 @@ fn establish_session(
     send_framed(&mut rendezvous_stream, &encode_message(&message))?;
 
     progress(80, "Waiting for rendezvous response".to_owned());
+    let rendezvous_wait_started = Instant::now();
     rendezvous_stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|err| format!("Failed to set read timeout: {err}"))?;
@@ -1425,7 +1524,14 @@ fn establish_session(
         }
     };
 
-    progress(85, "Rendezvous protobuf response decoded".to_owned());
+    progress(
+        85,
+        format!(
+            "Rendezvous response decoded in {} ms (total {} ms)",
+            elapsed_ms(&rendezvous_wait_started),
+            elapsed_ms(&session_started)
+        ),
+    );
     let relay_uuid_from_rendezvous = rendezvous.relay_uuid.clone();
     let relay_server = rendezvous
         .relay_server
@@ -1438,17 +1544,20 @@ fn establish_session(
         .as_ref()
         .and_then(|b| crate::evrt_session::decode_punch_addr(b));
 
-    if let Some(peer_addr) = host_udp_base.filter(|_| !rendezvous.peer_is_udp) {
+    if let Some(peer_addr) =
+        host_udp_base.filter(|_| !rendezvous.peer_is_udp && direct_tcp_probe && !relay_first)
+    {
         progress(86, format!("Trying direct TCP punch → {peer_addr}"));
         match open_direct_tcp_session(
             peer_addr,
             direct_local_addr,
             &request.password,
             &request.remote_id,
-            initial_video_fps,
-            codec_preference,
-            progress,
-        ) {
+                initial_video_fps,
+                codec_preference,
+                control_only,
+                progress,
+            ) {
             Ok((
                 direct_stream,
                 peer_stage,
@@ -1478,12 +1587,26 @@ fn establish_session(
             }
         }
     } else if let Some(peer_addr) = host_udp_base {
-        progress(
-            86,
-            format!(
-                "Rendezvous returned UDP/KCP direct candidate → {peer_addr}; KCP backend pending, using relay fallback"
-            ),
-        );
+        if !rendezvous.peer_is_udp && relay_first {
+            progress(
+                86,
+                format!("Direct TCP candidate {peer_addr}; using relay-first fast path"),
+            );
+        } else if !rendezvous.peer_is_udp {
+            progress(
+                86,
+                format!(
+                    "Direct TCP candidate {peer_addr}; disabled, set EVERTYDESK_TRY_DIRECT_TCP=1 to test it"
+                ),
+            );
+        } else {
+            progress(
+                86,
+                format!(
+                    "Rendezvous returned UDP/KCP direct candidate -> {peer_addr}; KCP backend pending, using relay fallback"
+                ),
+            );
+        }
     } else if relay_uuid_from_rendezvous.is_some() {
         progress(
             86,
@@ -1531,6 +1654,7 @@ fn establish_session(
         };
 
         progress(92, "Opening relay stream".to_owned());
+        let relay_open_started = Instant::now();
         let mut relay_stream = open_relay_stream(
             &relay_server,
             &request.remote_id,
@@ -1538,8 +1662,16 @@ fn establish_session(
             &request.server.public_key,
             secure_relay,
         )?;
+        progress(
+            94,
+            format!(
+                "Relay stream opened in {} ms",
+                elapsed_ms(&relay_open_started)
+            ),
+        );
 
         progress(96, "Waiting for peer secure/login response".to_owned());
+        let peer_login_started = Instant::now();
         match read_initial_peer_stage(
             &mut relay_stream,
             &request.password,
@@ -1547,9 +1679,18 @@ fn establish_session(
             initial_video_fps,
             codec_preference,
             bootstrap_wait_secs,
+            control_only,
             progress,
         ) {
             Ok((peer_stage, displays, evrt_port_from_misc, early_evrt_candidates)) => {
+                progress(
+                    98,
+                    format!(
+                        "Peer login ready in {} ms (total {} ms)",
+                        elapsed_ms(&peer_login_started),
+                        elapsed_ms(&session_started)
+                    ),
+                );
                 // Базовый UDP-адрес хоста (IP) от hbbs. Порт может прийти позже
                 // в Misc{EvrtUdpPort} уже в session loop.
                 // Если порт уже пришёл в handshake — готовый адрес.
@@ -1861,6 +2002,7 @@ fn open_direct_tcp_session(
     remote_id: &str,
     fps: i32,
     codec_preference: CodecPreference,
+    control_only: bool,
     progress: &mut impl FnMut(u8, String),
 ) -> Result<
     (
@@ -1909,6 +2051,7 @@ fn open_direct_tcp_session(
         fps,
         codec_preference,
         DIRECT_TCP_BOOTSTRAP_WAIT_SECS,
+        control_only,
         progress,
     )
     .map(|(peer_stage, displays, evrt_port, evrt_candidates)| {
@@ -1949,6 +2092,7 @@ fn read_initial_peer_stage(
     fps: i32,
     codec_preference: CodecPreference,
     bootstrap_wait_secs: u64,
+    control_only: bool,
     progress: &mut impl FnMut(u8, String),
 ) -> Result<(String, Vec<RemoteDisplay>, Option<u16>, Vec<SocketAddr>), String> {
     relay
@@ -2058,10 +2202,17 @@ fn read_initial_peer_stage(
                 send_selected_windows_session(relay, &response)?;
                 let displays = displays_from_login_response(&response);
                 let login = describe_login_response(response, sent_login)?;
-                send_switch_display_subscribe(relay, 0)?;
-                send_video_start_messages(relay, 0, true, fps, codec_preference)?;
+                if !control_only {
+                    send_switch_display_subscribe(relay, 0)?;
+                    send_video_start_messages(relay, 0, true, fps, codec_preference)?;
+                }
+                let channel = if control_only {
+                    "control channel ready"
+                } else {
+                    "screenshot/control channel ready"
+                };
                 return Ok((
-                    format!("{login}; screenshot/control channel ready"),
+                    format!("{login}; {channel}"),
                     displays,
                     evrt_port,
                     evrt_candidates,
@@ -2074,10 +2225,17 @@ fn read_initial_peer_stage(
                     info.hostname, info.platform, info.version
                 );
                 let displays = displays_from_peer_info(&info);
-                send_switch_display_subscribe(relay, 0)?;
-                send_video_start_messages(relay, 0, true, fps, codec_preference)?;
+                if !control_only {
+                    send_switch_display_subscribe(relay, 0)?;
+                    send_video_start_messages(relay, 0, true, fps, codec_preference)?;
+                }
+                let channel = if control_only {
+                    "control channel ready"
+                } else {
+                    "screenshot/control channel ready"
+                };
                 return Ok((
-                    format!("{login}; screenshot/control channel ready"),
+                    format!("{login}; {channel}"),
                     displays,
                     evrt_port,
                     evrt_candidates,
@@ -2552,11 +2710,15 @@ fn handle_session_message(
     current_display: i32,
     target_video_fps: i32,
     codec_preference: CodecPreference,
+    control_only: bool,
     evrt_port_out: &mut Option<u16>,
     evrt_candidates_out: &mut Vec<std::net::SocketAddr>,
 ) -> Option<FrameSource> {
     match message.union {
         Some(peer_message::Union::ScreenshotResponse(response)) => {
+            if control_only {
+                return None;
+            }
             if response.msg.is_empty() && !response.data.is_empty() {
                 match frame_tx.send(DecoderInput::Png {
                     sid: response.sid,
@@ -2583,6 +2745,9 @@ fn handle_session_message(
             }
         }
         Some(peer_message::Union::VideoFrame(frame)) => {
+            if control_only {
+                return None;
+            }
             let _ = send_video_received(relay);
             let description = describe_video_frame(&frame);
             match frame.union {
@@ -2771,13 +2936,15 @@ fn handle_session_message(
         Some(peer_message::Union::LoginResponse(response)) => {
             update_displays_from_login_response(&response, known_displays, events);
             let _ = send_selected_windows_session(relay, &response);
-            let _ = send_video_start_messages(
-                relay,
-                current_display,
-                false,
-                target_video_fps,
-                codec_preference,
-            );
+            if !control_only {
+                let _ = send_video_start_messages(
+                    relay,
+                    current_display,
+                    false,
+                    target_video_fps,
+                    codec_preference,
+                );
+            }
             if login_response_is_remote_accept_wait(&response) {
                 let _ = events.send(SessionEvent::Info("Waiting for remote accept".to_owned()));
             }
@@ -2786,13 +2953,15 @@ fn handle_session_message(
         Some(peer_message::Union::PeerInfo(info)) => {
             update_displays_from_peer_info(&info, known_displays, events);
             let _ = send_selected_windows_session_from_peer_info(relay, &info);
-            let _ = send_video_start_messages(
-                relay,
-                current_display,
-                false,
-                target_video_fps,
-                codec_preference,
-            );
+            if !control_only {
+                let _ = send_video_start_messages(
+                    relay,
+                    current_display,
+                    false,
+                    target_video_fps,
+                    codec_preference,
+                );
+            }
             None
         }
         Some(peer_message::Union::CursorData(cd)) => {
@@ -3973,7 +4142,7 @@ fn clipboard_text_message(text: &str) -> PeerMessage {
     }
 }
 
-fn clipboard_text_from_message(clipboard: Clipboard) -> Result<Option<String>, String> {
+pub(crate) fn clipboard_text_from_message(clipboard: Clipboard) -> Result<Option<String>, String> {
     if ClipboardFormat::try_from(clipboard.format) != Ok(ClipboardFormat::Text) {
         return Ok(None);
     }

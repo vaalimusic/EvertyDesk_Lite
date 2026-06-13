@@ -307,6 +307,7 @@ struct Collected {
     evrt_host_addr: String,
     evrt_pressure: Vec<String>,
     evrt_arrival_ms: Vec<i32>,
+    evrt_assembly_ms: Vec<i32>,
     evrt_decode_ms: Vec<i32>,
     evrt_jitter_ms: Vec<u32>,
     evrt_fps: Vec<u32>,
@@ -385,6 +386,7 @@ impl Collected {
             SessionEvent::EvrtMetrics {
                 pressure,
                 arrival_delta_ms,
+                assembly_delay_ms,
                 decode_delta_ms,
                 jitter_ms,
                 bitrate_mbps,
@@ -396,6 +398,7 @@ impl Collected {
             } => {
                 self.evrt_pressure.push(pressure.clone());
                 self.evrt_arrival_ms.push(*arrival_delta_ms);
+                self.evrt_assembly_ms.push(*assembly_delay_ms);
                 self.evrt_decode_ms.push(*decode_delta_ms);
                 self.evrt_jitter_ms.push(*jitter_ms);
                 self.evrt_fps.push(*fps);
@@ -496,6 +499,7 @@ pub fn run_diagnose(remote_id: &str, password: &str, secs: u64, out_dir: &str) -
         password: password.to_owned(),
         server: config.server.clone(),
         display: config.display.clone(),
+        control_only: false,
     };
 
     eprintln!("╔══════════════════════════════════════════════════════════╗");
@@ -631,6 +635,10 @@ fn build_report(c: &Collected, secs: u64) -> String {
             s.push_str(&format!(
                 "- EVRT arrival delta: avg {} мс\n",
                 avg_i32(&c.evrt_arrival_ms)
+            ));
+            s.push_str(&format!(
+                "- EVRT assembly delay: avg {} ms\n",
+                avg_nonnegative_i32(&c.evrt_assembly_ms)
             ));
             s.push_str(&format!(
                 "- EVRT jitter: avg {} мс\n",
@@ -819,6 +827,7 @@ fn build_json(c: &Collected) -> String {
         "evrt_connected": c.evrt_connected,
         "evrt_host_addr": c.evrt_host_addr,
         "evrt_arrival_ms_avg": avg_i32(&c.evrt_arrival_ms),
+        "evrt_assembly_ms_avg": avg_nonnegative_i32(&c.evrt_assembly_ms),
         "evrt_decode_ms_avg": avg_nonnegative_i32(&c.evrt_decode_ms),
         "evrt_jitter_ms_avg": avg_u32(&c.evrt_jitter_ms),
         "evrt_fps_avg": avg_nonzero_u32(&c.evrt_fps),

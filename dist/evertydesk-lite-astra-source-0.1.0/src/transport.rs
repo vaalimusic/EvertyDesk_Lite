@@ -3973,7 +3973,7 @@ fn clipboard_text_message(text: &str) -> PeerMessage {
     }
 }
 
-fn clipboard_text_from_message(clipboard: Clipboard) -> Result<Option<String>, String> {
+pub(crate) fn clipboard_text_from_message(clipboard: Clipboard) -> Result<Option<String>, String> {
     if ClipboardFormat::try_from(clipboard.format) != Ok(ClipboardFormat::Text) {
         return Ok(None);
     }

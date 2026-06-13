@@ -247,6 +247,12 @@ fn run_linux_auto_gui() -> eframe::Result<()> {
 
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let mut attempts: Vec<LinuxGuiAttempt> = Vec::new();
+    let prefer_cpu = linux_prefers_cpu_renderer();
+
+    if prefer_cpu {
+        eprintln!("[EvertyDesk] Linux CPU-first renderer policy is active.");
+        attempts.push(linux_cpu_gui_attempt());
+    }
 
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
         attempts.push(LinuxGuiAttempt {
@@ -295,19 +301,20 @@ fn run_linux_auto_gui() -> eframe::Result<()> {
     // Pure-CPU framebuffer (minifb) — no OpenGL/GLX/Vulkan. Guaranteed to work
     // on VMs with broken GLX (Astra/SVGA3D "GLXBadContextTag"). Tried as a
     // child so a crash in earlier GL attempts can't take us down with it.
-    attempts.push(LinuxGuiAttempt {
-        title: "CPU software framebuffer (minifb)",
-        renderer: "software",
-        envs: &[],
-    });
+    if !prefer_cpu {
+        attempts.push(linux_cpu_gui_attempt());
+    }
 
-    attempts.push(LinuxGuiAttempt {
-        title: "WGPU auto",
-        renderer: "wgpu",
-        envs: &[],
-    });
+    if linux_env_truthy("EVERTYDESK_LINUX_AUTO_WGPU") {
+        attempts.push(LinuxGuiAttempt {
+            title: "WGPU auto",
+            renderer: "wgpu",
+            envs: &[],
+        });
+    }
 
     eprintln!("[EvertyDesk] Linux GUI autostart: checking available renderer...");
+    let stable_after = linux_gui_child_stable_after();
     for attempt in attempts {
         eprintln!("[EvertyDesk] Trying {}...", attempt.title);
         let mut cmd = std::process::Command::new(&exe);
@@ -315,16 +322,36 @@ fn run_linux_auto_gui() -> eframe::Result<()> {
             .env("EVERTYDESK_LINUX_AUTOSTART_CHILD", "1")
             .env("EVERTYDESK_RENDERER", attempt.renderer)
             .env("RUST_BACKTRACE", "0")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit());
         for (name, value) in attempt.envs {
             cmd.env(name, value);
         }
 
-        match cmd.status() {
-            Ok(status) if status.success() => return Ok(()),
-            Ok(status) => {
-                eprintln!("[EvertyDesk] {} failed: {status}", attempt.title);
+        match cmd.spawn() {
+            Ok(mut child) => {
+                let started = Instant::now();
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) if status.success() => return Ok(()),
+                        Ok(Some(status)) => {
+                            eprintln!("[EvertyDesk] {} failed: {status}", attempt.title);
+                            break;
+                        }
+                        Ok(None) if started.elapsed() >= stable_after => {
+                            eprintln!(
+                                "[EvertyDesk] {} is still running after {:?}; using it.",
+                                attempt.title, stable_after
+                            );
+                            return Ok(());
+                        }
+                        Ok(None) => thread::sleep(Duration::from_millis(100)),
+                        Err(err) => {
+                            eprintln!("[EvertyDesk] {} status failed: {err}", attempt.title);
+                            break;
+                        }
+                    }
+                }
             }
             Err(err) => {
                 eprintln!("[EvertyDesk] {} failed to start: {err}", attempt.title);
@@ -333,7 +360,7 @@ fn run_linux_auto_gui() -> eframe::Result<()> {
     }
 
     eprintln!("[EvertyDesk] No GUI renderer worked on this Linux desktop.");
-    eprintln!("[EvertyDesk] This system rejected both OpenGL/GLX and WGPU/Vulkan.");
+    eprintln!("[EvertyDesk] This system rejected the automatic Linux GUI attempts.");
     eprintln!("[EvertyDesk] Starting CPU software UI backend...");
     if let Err(err) = software_ui::run_software_ui() {
         eprintln!("[EvertyDesk] Software UI failed: {err}");
@@ -458,6 +485,52 @@ struct LinuxGuiAttempt {
     title: &'static str,
     renderer: &'static str,
     envs: &'static [(&'static str, &'static str)],
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cpu_gui_attempt() -> LinuxGuiAttempt {
+    LinuxGuiAttempt {
+        title: "CPU software framebuffer (minifb)",
+        renderer: "software",
+        envs: &[],
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_prefers_cpu_renderer() -> bool {
+    if linux_env_truthy("EVERTYDESK_LINUX_GL_AUTO") {
+        return false;
+    }
+    if linux_env_truthy("EVERTYDESK_LINUX_PREFER_CPU") {
+        return true;
+    }
+    fs::read_to_string("/etc/os-release")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .contains("astra")
+}
+
+#[cfg(target_os = "linux")]
+fn linux_gui_child_stable_after() -> Duration {
+    const DEFAULT_MS: u64 = 3_000;
+    let ms = std::env::var("EVERTYDESK_LINUX_GUI_STABLE_AFTER_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MS)
+        .clamp(500, 30_000);
+    Duration::from_millis(ms)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_env_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 /// Decode the embedded EvertyDesk logo (`edesk_lite_logo.png`) into a window
@@ -745,6 +818,7 @@ fn run_cli_connect() -> Option<i32> {
         password,
         server: config.server,
         display: config.display,
+        control_only: false,
     };
 
     match TransportClient::connect_with_progress(request, |pct, message| {
@@ -801,7 +875,6 @@ struct EvertyDeskApp {
     session_tx: Option<mpsc::Sender<SessionCommand>>,
     busy: bool,
     host_check_busy: bool,
-    remote_check_busy: bool,
     connected: bool,
     remote_viewer_open: bool,
     remote_viewer_window_spawned: bool,
@@ -865,6 +938,7 @@ struct EvertyDeskApp {
     evrt_pressure: String,
     /// Задержка прибытия пакетов (мс)
     evrt_arrival_delta_ms: i32,
+    evrt_assembly_delay_ms: i32,
     /// Задержка декодирования (мс)
     evrt_decode_delta_ms: i32,
     /// Jitter буфер (мс)
@@ -924,10 +998,6 @@ struct CursorCacheEntry {
 enum WorkerEvent {
     Session(SessionEvent),
     HostServerCheck(Result<(), String>),
-    RemoteOnlineCheck {
-        remote_id: String,
-        result: Result<bool, String>,
-    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1061,7 +1131,6 @@ impl EvertyDeskApp {
             session_tx: None,
             busy: false,
             host_check_busy: false,
-            remote_check_busy: false,
             connected: false,
             remote_viewer_open: false,
             remote_viewer_window_spawned: false,
@@ -1117,6 +1186,7 @@ impl EvertyDeskApp {
             evrt_host_addr: String::new(),
             evrt_pressure: "normal".to_owned(),
             evrt_arrival_delta_ms: -1,
+            evrt_assembly_delay_ms: -1,
             evrt_decode_delta_ms: -1,
             evrt_jitter_ms: 0,
             evrt_fps: 0,
@@ -1162,6 +1232,7 @@ impl EvertyDeskApp {
             password: self.password.clone(),
             server: self.config.server.clone(),
             display: self.config.display.clone(),
+            control_only: false,
         };
 
         if request.remote_id.is_empty() {
@@ -1271,29 +1342,6 @@ impl EvertyDeskApp {
                         }
                     }
                 }
-                Ok(WorkerEvent::RemoteOnlineCheck { remote_id, result }) => {
-                    self.remote_check_busy = false;
-                    match result {
-                        Ok(true) => {
-                            self.progress = 100;
-                            self.status = format!("{remote_id}: онлайн");
-                            self.last_error = None;
-                            self.log(format!("Online check: {remote_id} is online"));
-                        }
-                        Ok(false) => {
-                            self.progress = 0;
-                            self.status = format!("{remote_id}: не в сети на этом ID server");
-                            self.last_error = Some(self.status.clone());
-                            self.log(format!("Online check: {remote_id} is offline"));
-                        }
-                        Err(err) => {
-                            self.progress = 0;
-                            self.status = format!("Проверка ID не удалась: {err}");
-                            self.last_error = Some(self.status.clone());
-                            self.log(format!("Online check failed: {err}"));
-                        }
-                    }
-                }
                 Err(mpsc::TryRecvError::Empty) => {
                     if let Some(frame) = latest_frame {
                         self.handle_session_event(frame);
@@ -1307,7 +1355,6 @@ impl EvertyDeskApp {
                     }
                     self.busy = false;
                     self.host_check_busy = false;
-                    self.remote_check_busy = false;
                     if self.connected {
                         self.set_error("Background task stopped unexpectedly");
                     } else {
@@ -1355,6 +1402,18 @@ impl EvertyDeskApp {
                 height,
                 rgba,
             } => {
+                let expected_len = width.saturating_mul(height).saturating_mul(4);
+                if width == 0 || height == 0 || rgba.len() != expected_len {
+                    self.stream_health = format!(
+                        "bad frame geometry: {}x{}, rgba={} expected={}",
+                        width,
+                        height,
+                        rgba.len(),
+                        expected_len
+                    );
+                    self.log(format!("Dropped frame: {}", self.stream_health));
+                    return;
+                }
                 if codec == "PNG" {
                     // Discard PNG screenshot frames while live video (VP9/H264) is
                     // actively streaming — they only cause codec badge flicker and
@@ -1491,6 +1550,10 @@ impl EvertyDeskApp {
                     }
                 }
                 self.remote_displays = displays;
+                self.remote_texture = None;
+                self.pending_image = None;
+                self.last_frame_rgba.clear();
+                self.remote_size = [0, 0];
                 if !self
                     .remote_displays
                     .iter()
@@ -1588,15 +1651,20 @@ impl EvertyDeskApp {
                     .push_str(&format!("\r\n[console error] {err}\r\n"));
             }
             SessionEvent::ClipboardText(text) => {
-                let chars = text.chars().count();
-                match write_local_clipboard_text(&text) {
-                    Ok(()) => {
-                        self.clipboard_status = Some(format!("буфер получен: {chars} симв."));
-                        self.log(format!("Clipboard received from remote: {chars} chars"));
-                    }
-                    Err(err) => {
-                        self.clipboard_status = Some("буфер принять не удалось".to_owned());
-                        self.log(format!("Clipboard write failed: {err}"));
+                if !self.config.security.allow_clipboard {
+                    self.clipboard_status = Some("буфер отключен в настройках".to_owned());
+                    self.log("Clipboard ignored: disabled by local security policy".to_owned());
+                } else {
+                    let chars = text.chars().count();
+                    match write_local_clipboard_text(&text) {
+                        Ok(()) => {
+                            self.clipboard_status = Some(format!("буфер получен: {chars} симв."));
+                            self.log(format!("Clipboard received from remote: {chars} chars"));
+                        }
+                        Err(err) => {
+                            self.clipboard_status = Some("буфер принять не удалось".to_owned());
+                            self.log(format!("Clipboard write failed: {err}"));
+                        }
                     }
                 }
             }
@@ -1622,6 +1690,7 @@ impl EvertyDeskApp {
             SessionEvent::EvrtMetrics {
                 pressure,
                 arrival_delta_ms,
+                assembly_delay_ms,
                 decode_delta_ms,
                 jitter_ms,
                 fps,
@@ -1633,6 +1702,7 @@ impl EvertyDeskApp {
             } => {
                 self.evrt_pressure = pressure;
                 self.evrt_arrival_delta_ms = arrival_delta_ms;
+                self.evrt_assembly_delay_ms = assembly_delay_ms;
                 self.evrt_decode_delta_ms = decode_delta_ms;
                 self.evrt_jitter_ms = jitter_ms;
                 self.evrt_fps = fps;
@@ -2002,7 +2072,6 @@ impl EvertyDeskApp {
         if self.busy
             || self.connected
             || self.host_check_busy
-            || self.remote_check_busy
             || self.terminal_ai_rx.is_some()
             || self.host_pending_peer.is_some()
             || self.host_state.is_online()
@@ -2017,7 +2086,6 @@ impl EvertyDeskApp {
             } else if self.connected
                 || self.busy
                 || self.host_check_busy
-                || self.remote_check_busy
                 || self.terminal_ai_rx.is_some()
                 || self.host_pending_peer.is_some()
             {
@@ -2183,15 +2251,6 @@ impl EvertyDeskApp {
             }
             if ui
                 .add_enabled(
-                    !self.busy && !self.connected && !self.remote_check_busy,
-                    egui::Button::new("Проверить ID").min_size(egui::vec2(120.0, 32.0)),
-                )
-                .clicked()
-            {
-                self.check_remote_online();
-            }
-            if ui
-                .add_enabled(
                     self.connected || self.busy,
                     egui::Button::new("Отключиться").min_size(egui::vec2(140.0, 32.0)),
                 )
@@ -2217,7 +2276,7 @@ impl EvertyDeskApp {
             }
         });
         ui.add_space(10.0);
-        if self.progress > 0 || self.busy || self.connected || self.remote_check_busy {
+        if self.progress > 0 || self.busy || self.connected {
             ui.add(
                 egui::ProgressBar::new(self.progress as f32 / 100.0)
                     .text(format!("{}%", self.progress)),
@@ -2373,73 +2432,6 @@ impl EvertyDeskApp {
         }
     }
 
-    /// Monochrome connection-status indicator (`● Ready` / `Connecting` …).
-    /// Drawn inside a right-to-left layout, so the label is added first
-    /// (rightmost) and the 8 px dot to its left. Connecting pulses softly.
-    /// Connection-status pill (`╭ ○ Ready ╮`) — content-sized capsule that sits
-    /// inside the Remote Control header, below the subtitle. The ring pulses
-    /// softly while connecting.
-    fn status_capsule(&self, ui: &mut egui::Ui) {
-        use egui::Color32;
-        let (label, base, pulse) = if self.last_error.is_some() {
-            (
-                self.text("Ошибка", "Error"),
-                Color32::from_rgb(0xFF, 0x55, 0x55),
-                false,
-            )
-        } else if self.connected {
-            (
-                self.text("Подключено", "Connected"),
-                Color32::from_rgb(0x12, 0xC9, 0x72),
-                false,
-            )
-        } else if self.busy {
-            (
-                self.text("Подключение", "Connecting"),
-                Color32::from_rgb(0xE5, 0xA1, 0x00),
-                true,
-            )
-        } else {
-            (
-                self.text("Готово", "Ready"),
-                Color32::from_rgb(0x12, 0xC9, 0x72),
-                false,
-            )
-        };
-        // Left-align the (content-sized) pill.
-        ui.horizontal(|ui| {
-            egui::Frame::NONE
-                .fill(Color32::from_rgb(0xFF, 0xFF, 0xFF))
-                .stroke(egui::Stroke::new(1.0, Color32::from_rgb(0xE3, 0xE6, 0xEC)))
-                .corner_radius(egui::CornerRadius::same(20))
-                .inner_margin(egui::Margin::symmetric(12, 6))
-                .show(ui, |ui| {
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                    let col = if pulse {
-                        let t = ui.input(|i| i.time);
-                        let a = 0.55 + 0.45 * (t * std::f64::consts::TAU / 0.9).sin();
-                        ui.ctx().request_repaint();
-                        Color32::from_rgba_unmultiplied(
-                            base.r(),
-                            base.g(),
-                            base.b(),
-                            (a * 255.0) as u8,
-                        )
-                    } else {
-                        base
-                    };
-                    ui.painter().circle_filled(rect.center(), 5.0, col);
-                    ui.add_space(7.0);
-                    ui.label(
-                        egui::RichText::new(label)
-                            .size(13.0)
-                            .color(Color32::from_rgb(0x20, 0x24, 0x2D)),
-                    );
-                });
-        });
-    }
-
     #[allow(dead_code)]
     fn status_indicator(&self, ui: &mut egui::Ui) {
         use egui::Color32;
@@ -2578,62 +2570,27 @@ impl EvertyDeskApp {
         });
     }
 
-    /// HERO-баннер страницы подключения: градиентная плашка с логотипом,
-    /// названием продукта и капсулой статуса справа.
+    /// HERO banner for the connection page: clean green header, product title,
+    /// subtitle, and a compact status label.
     fn connect_hero(&mut self, ui: &mut egui::Ui) {
         let lang = self.ui_lang;
         let online = self.host_state.is_online();
         let host_label = self.host_state.label().to_owned();
 
-        // Высота баннера
-        let banner_h = 92.0;
+        let banner_h = 78.0;
         let (rect, _) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), banner_h),
             egui::Sense::hover(),
         );
 
-        // Градиент: глубокий тёмно-сине-зелёный → фирменный зелёный акцент
-        let top = egui::Color32::from_rgb(0x0E, 0x1B, 0x2B);
-        let bottom = egui::Color32::from_rgb(0x10, 0x3A, 0x32);
-        gradient_rect(ui.painter(), rect, top, bottom, 18.0);
-        // Скруглённый контур поверх для мягких краёв
-        ui.painter().rect_stroke(
-            rect,
-            egui::CornerRadius::same(18),
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(0x1B, 0x4A, 0x3E)),
-            egui::StrokeKind::Inside,
-        );
-
-        // Декоративный зелёный блик-круг справа
-        ui.painter().circle_filled(
-            egui::pos2(rect.right() - 70.0, rect.top() - 10.0),
-            70.0,
-            egui::Color32::from_rgba_unmultiplied(0x12, 0xC9, 0x72, 22),
-        );
-
-        let pad = 18.0;
-        // Логотип слева (в скруглённой белой плашке)
-        let logo_sz = 56.0;
-        let logo_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.left() + pad, rect.center().y - logo_sz / 2.0),
-            egui::vec2(logo_sz, logo_sz),
-        );
         ui.painter().rect_filled(
-            logo_rect,
+            rect,
             egui::CornerRadius::same(14),
-            egui::Color32::from_rgb(0xFC, 0xFD, 0xFF),
+            egui::Color32::from_rgb(0x12, 0x8C, 0x55),
         );
-        if let Some(tex) = self.ensure_app_logo_texture(ui.ctx()) {
-            ui.painter().image(
-                tex.id(),
-                logo_rect.shrink(8.0),
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
-        }
 
-        // Текст: название + подпись
-        let text_x = logo_rect.right() + 16.0;
+        let pad = 22.0;
+        let text_x = rect.left() + pad;
         let title = tr(lang, "EvertyDesk Lite", "EvertyDesk Lite");
         ui.painter().text(
             egui::pos2(text_x, rect.center().y - 16.0),
@@ -2655,11 +2612,10 @@ impl EvertyDeskApp {
             egui::Color32::from_rgb(0xA7, 0xC9, 0xBE),
         );
 
-        // Капсула статуса справа
         let dot_color = if online {
-            egui::Color32::from_rgb(0x12, 0xC9, 0x72)
+            egui::Color32::WHITE
         } else {
-            egui::Color32::from_rgb(0xF5, 0xA6, 0x23)
+            egui::Color32::from_rgb(0xFF, 0xD1, 0x6A)
         };
         let cap_label = if online {
             tr(lang, "В сети", "Online")
@@ -2671,21 +2627,12 @@ impl EvertyDeskApp {
             egui::FontId::proportional(12.5),
             egui::Color32::from_rgb(0xE8, 0xF5, 0xEF),
         );
-        let cap_w = cap_galley.size().x + 34.0;
-        let cap_h = 28.0;
-        let cap_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.right() - pad - cap_w, rect.center().y - cap_h / 2.0),
-            egui::vec2(cap_w, cap_h),
-        );
-        ui.painter().rect_filled(
-            cap_rect,
-            egui::CornerRadius::same(14),
-            egui::Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 20),
-        );
+        let cap_right = rect.right() - pad;
+        let dot_x = cap_right - cap_galley.size().x - 13.0;
         ui.painter()
-            .circle_filled(egui::pos2(cap_rect.left() + 15.0, cap_rect.center().y), 4.5, dot_color);
+            .circle_filled(egui::pos2(dot_x, rect.center().y), 4.5, dot_color);
         ui.painter().galley(
-            egui::pos2(cap_rect.left() + 26.0, cap_rect.center().y - cap_galley.size().y / 2.0),
+            egui::pos2(dot_x + 12.0, rect.center().y - cap_galley.size().y / 2.0),
             cap_galley,
             egui::Color32::PLACEHOLDER,
         );
@@ -2744,7 +2691,7 @@ impl EvertyDeskApp {
                     ui.set_max_width(two_left);
                     card_frame().show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
-                        ui.set_min_height(214.0);
+                        ui.set_min_height(196.0);
                         ui.horizontal(|ui| {
                             let segment_width = (ui.available_width() - 8.0) / 2.0;
                             if mode_segment_button(
@@ -2845,23 +2792,6 @@ impl EvertyDeskApp {
                             self.connect();
                         }
 
-                        ui.add_space(10.0);
-                        let check_label = self.text("Проверить ID", "Check ID");
-                        ui.horizontal(|ui| {
-                            if secondary_button(ui, check_label)
-                                .on_hover_text(self.text(
-                                    "Проверить, онлайн ли этот ID",
-                                    "Check whether this ID is online",
-                                ))
-                                .clicked()
-                                && !self.busy
-                                && !self.connected
-                                && !self.remote_check_busy
-                            {
-                                self.check_remote_online();
-                            }
-                        });
-
                         // ── Чипы недавних подключений (быстрый коннект) ───────
                         self.recent_chips(ui);
                     });
@@ -2876,7 +2806,7 @@ impl EvertyDeskApp {
         }); // ── close workspace container ───────────────────────────────────
 
         ui.add_space(6.0);
-        if self.progress > 0 || self.busy || self.connected || self.remote_check_busy {
+        if self.progress > 0 || self.busy || self.connected {
             ui.add(
                 egui::ProgressBar::new(self.progress as f32 / 100.0)
                     .desired_width(f32::INFINITY)
@@ -2884,7 +2814,7 @@ impl EvertyDeskApp {
             );
             ui.add_space(4.0);
         }
-        if self.last_error.is_some() || self.busy || self.connected || self.remote_check_busy {
+        if self.last_error.is_some() || self.busy || self.connected {
             let status_color = if self.last_error.is_some() {
                 egui::Color32::from_rgb(238, 95, 95)
             } else if self.connected {
@@ -3568,35 +3498,6 @@ impl EvertyDeskApp {
 
     // ── Settings window ───────────────────────────────────────────────────────
 
-    fn check_remote_online(&mut self) {
-        if self.remote_check_busy || self.busy || self.connected {
-            return;
-        }
-        let remote_id = normalize_remote_id(&self.remote_id);
-        if remote_id.is_empty() {
-            self.set_error("Введите ID удаленного ПК");
-            return;
-        }
-        if is_own_remote_id(&remote_id, &self.config.local_id) {
-            self.set_error("Это ID этого компьютера. Для подключения нужен ID другого ПК.");
-            return;
-        }
-        self.remote_id = remote_id.clone();
-        self.remote_check_busy = true;
-        self.progress = 10;
-        self.last_error = None;
-        self.status = format!("Проверяем ID {remote_id}...");
-        self.log(self.status.clone());
-        let server = self.config.server.clone();
-        let local_id = self.config.local_id.clone();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let result = TransportClient::query_peer_online(&server, &local_id, &remote_id);
-            let _ = tx.send(WorkerEvent::RemoteOnlineCheck { remote_id, result });
-        });
-        self.worker = Some(rx);
-    }
-
     fn close_remote_viewer_panel(&mut self) {
         self.remote_viewer_open = false;
         self.remote_viewer_window_spawned = false;
@@ -4051,15 +3952,13 @@ impl EvertyDeskApp {
                         ui.add_space(6.0);
                     }
                     let info_btn = ui.add(
-                        egui::Button::new(
-                            egui::RichText::new("ℹ Детали").size(11.5).color(
-                                if self.show_stream_info {
-                                    egui::Color32::from_rgb(0x12, 0xC9, 0x72)
-                                } else {
-                                    egui::Color32::from_rgb(0xB0, 0xB8, 0xC4)
-                                },
-                            ),
-                        )
+                        egui::Button::new(egui::RichText::new("ℹ Детали").size(11.5).color(
+                            if self.show_stream_info {
+                                egui::Color32::from_rgb(0x12, 0xC9, 0x72)
+                            } else {
+                                egui::Color32::from_rgb(0xB0, 0xB8, 0xC4)
+                            },
+                        ))
                         .frame(false),
                     );
                     if info_btn.clicked() {
@@ -4241,12 +4140,24 @@ impl EvertyDeskApp {
                             "high" => amber,
                             _ => green,
                         };
-                        info_metric(ui, self.text("Давление", "Pressure"), &self.evrt_pressure, pc);
+                        info_metric(
+                            ui,
+                            self.text("Давление", "Pressure"),
+                            &self.evrt_pressure,
+                            pc,
+                        );
                         ui.add_space(16.0);
                         info_metric(
                             ui,
                             "Δ arrive",
                             &format!("{} ms", self.evrt_arrival_delta_ms),
+                            white,
+                        );
+                        ui.add_space(16.0);
+                        info_metric(
+                            ui,
+                            "Assemble",
+                            &format!("{} ms", self.evrt_assembly_delay_ms),
                             white,
                         );
                         ui.add_space(16.0);
@@ -4897,6 +4808,12 @@ impl EvertyDeskApp {
     }
 
     fn paste_local_clipboard_to_remote(&mut self) {
+        if !self.config.security.allow_clipboard {
+            self.clipboard_status = Some("буфер отключен в настройках".to_owned());
+            self.log("Clipboard paste blocked: disabled by local security policy".to_owned());
+            return;
+        }
+
         match read_local_clipboard_text() {
             Ok(text) if text.trim().is_empty() => {
                 self.clipboard_status = Some("буфер пуст".to_owned());
@@ -5004,12 +4921,7 @@ impl EvertyDeskApp {
             .remote_displays
             .iter()
             .find(|display| display.index == self.selected_display)
-            .map(|display| {
-                (
-                    display.width.max(1) as f32,
-                    display.height.max(1) as f32,
-                )
-            })
+            .map(|display| (display.width.max(1) as f32, display.height.max(1) as f32))
             .unwrap_or((frame_w, frame_h));
         let x = (x.clamp(0.0, frame_w - 1.0) * (target_w / frame_w))
             .clamp(0.0, target_w - 1.0)

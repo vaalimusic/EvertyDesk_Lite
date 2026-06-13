@@ -887,13 +887,12 @@ fn fsr_quality_order() -> [FsrQualitySetting; 6] {
 }
 
 fn make_fsr_adapter(display: &settings_mod::DisplayConfig) -> Option<crate::fsr::FsrAdapter> {
-    display
-        .fsr_quality
-        .to_fsr_quality()
-        .map(|quality| crate::fsr::FsrAdapter::new(crate::fsr::FsrConfig {
+    display.fsr_quality.to_fsr_quality().map(|quality| {
+        crate::fsr::FsrAdapter::new(crate::fsr::FsrConfig {
             quality,
             sharpness: display.fsr_sharpness,
-        }))
+        })
+    })
 }
 
 fn default_config_from(config: &AppConfig) -> AppConfig {

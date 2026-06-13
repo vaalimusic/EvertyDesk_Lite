@@ -47,6 +47,8 @@ pub const VERSION: u8 = 3;
 pub const HEADER_SIZE: usize = 24;
 pub const MAX_PACKET_SIZE: usize = 1200;
 pub const MAX_PAYLOAD_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE;
+pub const MAX_FRAME_PACKET_COUNT: usize = 16 * 1024;
+pub const MAX_FRAME_PAYLOAD_SIZE: usize = MAX_PAYLOAD_SIZE * MAX_FRAME_PACKET_COUNT;
 
 // ─── типы пакетов ─────────────────────────────────────────────────────────────
 
@@ -90,7 +92,7 @@ impl EvrtPacket {
 /// Разобрать UDP-датаграмму в `EvrtPacket`.
 /// Возвращает `None` если датаграмма слишком короткая, magic/version не совпадают.
 pub fn parse(buf: &[u8], len: usize) -> Option<EvrtPacket> {
-    if len < HEADER_SIZE {
+    if len < HEADER_SIZE || len > MAX_PACKET_SIZE || len > buf.len() {
         return None;
     }
     let b = &buf[..len];
@@ -108,6 +110,12 @@ pub fn parse(buf: &[u8], len: usize) -> Option<EvrtPacket> {
     let frame_id = u32::from_be_bytes([b[8], b[9], b[10], b[11]]);
     let packet_index = u16::from_be_bytes([b[12], b[13]]);
     let packet_count = u16::from_be_bytes([b[14], b[15]]);
+    if packet_count == 0
+        || packet_index >= packet_count
+        || packet_count as usize > MAX_FRAME_PACKET_COUNT
+    {
+        return None;
+    }
     let presentation_time_us =
         u64::from_be_bytes([b[16], b[17], b[18], b[19], b[20], b[21], b[22], b[23]]);
     let payload = b[HEADER_SIZE..].to_vec();
@@ -296,6 +304,9 @@ fn packetize(
         return Vec::new();
     }
     let packet_count = payload.len().div_ceil(MAX_PAYLOAD_SIZE);
+    if packet_count > MAX_FRAME_PACKET_COUNT {
+        return Vec::new();
+    }
     let mut packets = Vec::with_capacity(packet_count);
 
     for (i, chunk) in payload.chunks(MAX_PAYLOAD_SIZE).enumerate() {
@@ -569,6 +580,53 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_oversized_datagram() {
+        let pkt = build_packet(
+            TYPE_VIDEO_FRAME,
+            0,
+            1,
+            0,
+            1,
+            0,
+            &vec![0u8; MAX_PAYLOAD_SIZE + 1],
+        );
+        assert_eq!(pkt.len(), MAX_PACKET_SIZE + 1);
+        assert!(parse(&pkt, pkt.len()).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_declared_len_beyond_buffer() {
+        let pkt = build_packet(TYPE_VIDEO_FRAME, 0, 1, 0, 1, 0, &[1]);
+        assert!(parse(&pkt, pkt.len() + 1).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_invalid_fragment_header() {
+        let zero_count = build_packet(TYPE_VIDEO_FRAME, 0, 1, 0, 0, 0, &[1]);
+        assert!(parse(&zero_count, zero_count.len()).is_none());
+
+        let index_out_of_range = build_packet(TYPE_VIDEO_FRAME, 0, 1, 2, 2, 0, &[1]);
+        assert!(parse(&index_out_of_range, index_out_of_range.len()).is_none());
+
+        let excessive_packet_count = build_packet(
+            TYPE_VIDEO_FRAME,
+            0,
+            1,
+            0,
+            (MAX_FRAME_PACKET_COUNT as u16) + 1,
+            0,
+            &[1],
+        );
+        assert!(parse(&excessive_packet_count, excessive_packet_count.len()).is_none());
+    }
+
+    #[test]
+    fn packetize_rejects_oversized_frame_before_u16_wrap() {
+        let payload = vec![0u8; MAX_FRAME_PAYLOAD_SIZE + 1];
+        assert!(packetize_video_frame(1, 0, true, &payload).is_empty());
+    }
+
+    #[test]
     fn feedback_roundtrip() {
         let fb = ReceiverFeedback {
             pressure: Pressure::Critical,
@@ -591,6 +649,7 @@ mod tests {
                 assert_eq!(f.pressure, Pressure::Critical);
                 assert_eq!(f.backlog_frames, 3);
                 assert_eq!(f.decode_fps, 45);
+                assert_eq!(f.assembly_delay_ms, 12);
                 assert_eq!(f.arrival_delta_ms, 8);
             }
             _ => panic!("wrong kind"),

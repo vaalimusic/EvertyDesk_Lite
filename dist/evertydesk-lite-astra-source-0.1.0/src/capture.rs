@@ -16,6 +16,69 @@ pub struct CaptureDisplay {
     pub name: String,
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn sort_and_reindex_displays(mut displays: Vec<CaptureDisplay>) -> Vec<CaptureDisplay> {
+    displays.sort_by_key(|display| (display.x, display.y, display.index));
+    for (index, display) in displays.iter_mut().enumerate() {
+        display.index = index as i32;
+    }
+    displays
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn select_capture_display(displays: &[CaptureDisplay], display: i32) -> Option<CaptureDisplay> {
+    let target = display.max(0);
+    displays
+        .iter()
+        .find(|info| info.index == target)
+        .cloned()
+        .or_else(|| displays.first().cloned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn display(index: i32, x: i32, y: i32, width: i32, height: i32, name: &str) -> CaptureDisplay {
+        CaptureDisplay {
+            index,
+            x,
+            y,
+            width,
+            height,
+            name: name.to_owned(),
+        }
+    }
+
+    #[test]
+    fn linux_style_display_order_is_stable_and_reindexed() {
+        let displays = sort_and_reindex_displays(vec![
+            display(7, 1920, 0, 1280, 720, "HDMI-1"),
+            display(2, 0, 0, 1920, 1080, "DP-1"),
+            display(9, 0, 1080, 1024, 768, "VGA-1"),
+        ]);
+
+        assert_eq!(displays[0].name, "DP-1");
+        assert_eq!(displays[0].index, 0);
+        assert_eq!(displays[1].name, "VGA-1");
+        assert_eq!(displays[1].index, 1);
+        assert_eq!(displays[2].name, "HDMI-1");
+        assert_eq!(displays[2].index, 2);
+    }
+
+    #[test]
+    fn display_selection_falls_back_to_first_display() {
+        let displays = vec![
+            display(0, 0, 0, 1920, 1080, "DP-1"),
+            display(1, 1920, 0, 1280, 720, "HDMI-1"),
+        ];
+
+        assert_eq!(select_capture_display(&displays, 1).unwrap().name, "HDMI-1");
+        assert_eq!(select_capture_display(&displays, 9).unwrap().name, "DP-1");
+        assert_eq!(select_capture_display(&displays, -1).unwrap().name, "DP-1");
+    }
+}
+
 #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
 mod win {
     use std::{cell::RefCell, mem::size_of};
@@ -473,15 +536,6 @@ mod win {
         }
     }
 
-    fn display_info(display: i32) -> Option<CaptureDisplay> {
-        let displays = display_infos();
-        displays
-            .iter()
-            .find(|info| info.index == display.max(0))
-            .cloned()
-            .or_else(|| displays.first().cloned())
-    }
-
     unsafe fn dxgi_display_infos() -> Option<Vec<CaptureDisplay>> {
         let mut device = None;
         let mut context = None;
@@ -855,14 +909,7 @@ pub fn capture_screen_into(pixels: &mut Vec<u8>) -> Option<(u32, u32)> {
 
     #[cfg(target_os = "linux")]
     {
-        // Fast path: MIT-SHM shared-memory capture (no X11 socket copy).
-        if let Some(size) = linux_x11_shm::capture_into(pixels) {
-            return Some(size);
-        }
-        // Fallback: standard x11rb GetImage (socket copy) + grim on Wayland.
-        let (width, height, data) = linux_x11::capture()?;
-        *pixels = data;
-        return Some((width, height));
+        return capture_display_into(0, pixels);
     }
 
     #[cfg(target_os = "macos")]
@@ -882,8 +929,24 @@ pub fn capture_display_into(display: i32, pixels: &mut Vec<u8>) -> Option<(u32, 
     #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
     return win::capture_display_into(display, pixels);
 
-    let _ = display;
-    capture_screen_into(pixels)
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(size) = linux_x11_shm::capture_display_into(display, pixels) {
+            return Some(size);
+        }
+        let (width, height, data) = linux_x11::capture_display(display)?;
+        *pixels = data;
+        return Some((width, height));
+    }
+
+    #[cfg(not(any(
+        all(target_os = "windows", feature = "live-vp9-mf"),
+        target_os = "linux"
+    )))]
+    {
+        let _ = display;
+        capture_screen_into(pixels)
+    }
 }
 
 /// Return the primary display size without a full capture.
@@ -919,6 +982,13 @@ pub fn display_infos() -> Vec<CaptureDisplay> {
     #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
     return win::display_infos();
 
+    #[cfg(target_os = "linux")]
+    return linux_x11::display_infos();
+
+    #[cfg(not(any(
+        all(target_os = "windows", feature = "live-vp9-mf"),
+        target_os = "linux"
+    )))]
     screen_size()
         .map(|(width, height)| {
             vec![CaptureDisplay {
@@ -941,9 +1011,14 @@ mod linux_x11 {
         sync::OnceLock,
     };
 
+    use super::{select_capture_display, sort_and_reindex_displays, CaptureDisplay};
+
     use x11rb::{
         connection::Connection,
-        protocol::xproto::{ConnectionExt, ImageFormat},
+        protocol::{
+            randr::{self, ConnectionExt as RandrExt},
+            xproto::{ConnectionExt as XprotoExt, ImageFormat},
+        },
         rust_connection::RustConnection,
     };
 
@@ -954,70 +1029,112 @@ mod linux_x11 {
     struct X11Capture {
         conn: RustConnection,
         root: u32,
-        width: u16,
-        height: u16,
+        display: CaptureDisplay,
     }
 
     impl X11Capture {
-        fn connect() -> Option<Self> {
+        fn connect(display: i32) -> Option<Self> {
             let (conn, screen_num) = x11rb::connect(None).ok()?;
             let screen = &conn.setup().roots[screen_num];
-            if screen.width_in_pixels == 0 || screen.height_in_pixels == 0 {
+            let selected = select_display_from_conn(&conn, screen.root, display)
+                .or_else(|| root_display_from_screen(screen))?;
+            if selected.width <= 0 || selected.height <= 0 {
                 return None;
             }
             Some(Self {
                 root: screen.root,
-                width: screen.width_in_pixels,
-                height: screen.height_in_pixels,
+                display: selected,
                 conn,
             })
         }
 
         fn capture(&self) -> Option<(u32, u32, Vec<u8>)> {
+            let (x, y, width, height) = x11_region(&self.display)?;
             let reply = self
                 .conn
                 .get_image(
                     ImageFormat::Z_PIXMAP,
                     self.root,
-                    0,
-                    0,
-                    self.width,
-                    self.height,
+                    x,
+                    y,
+                    width,
+                    height,
                     u32::MAX,
                 )
                 .ok()?
                 .reply()
                 .ok()?;
 
-            bgra_from_ximage(self.width as u32, self.height as u32, reply.data)
+            bgra_from_ximage(width as u32, height as u32, reply.data)
+        }
+
+        fn matches(&self, display: &CaptureDisplay) -> bool {
+            self.display.index == display.index
+                && self.display.x == display.x
+                && self.display.y == display.y
+                && self.display.width == display.width
+                && self.display.height == display.height
         }
     }
 
-    pub fn capture() -> Option<(u32, u32, Vec<u8>)> {
-        if let Some(frame) = capture_x11_cached() {
+    pub fn capture_display(display: i32) -> Option<(u32, u32, Vec<u8>)> {
+        if let Some(frame) = capture_x11_cached(display) {
             return Some(frame);
         }
         capture_grim_ppm()
     }
 
     pub fn screen_size() -> Option<(u32, u32)> {
-        if let Some(size) = X11_CAPTURE.with(|cell| {
-            if cell.borrow().is_none() {
-                *cell.borrow_mut() = X11Capture::connect();
-            }
-            cell.borrow()
-                .as_ref()
-                .map(|x11| (x11.width as u32, x11.height as u32))
+        if let Some(size) = select_display(0).and_then(|display| {
+            Some((
+                u32::try_from(display.width).ok()?,
+                u32::try_from(display.height).ok()?,
+            ))
         }) {
             return Some(size);
         }
         capture_grim_ppm().map(|(w, h, _)| (w, h))
     }
 
-    fn capture_x11_cached() -> Option<(u32, u32, Vec<u8>)> {
+    pub fn display_infos() -> Vec<CaptureDisplay> {
+        if let Some(displays) = randr_display_infos().filter(|displays| !displays.is_empty()) {
+            return displays;
+        }
+        if let Some(display) = root_display() {
+            return vec![display];
+        }
+        capture_grim_ppm()
+            .map(|(width, height, _)| {
+                vec![CaptureDisplay {
+                    index: 0,
+                    x: 0,
+                    y: 0,
+                    width: width as i32,
+                    height: height as i32,
+                    name: "Display 1".to_owned(),
+                }]
+            })
+            .unwrap_or_default()
+    }
+
+    pub(super) fn select_display(display: i32) -> Option<CaptureDisplay> {
+        let displays = display_infos();
+        select_capture_display(&displays, display)
+    }
+
+    fn capture_x11_cached(display: i32) -> Option<(u32, u32, Vec<u8>)> {
         X11_CAPTURE.with(|cell| {
+            let selected = select_display(display)?;
             if cell.borrow().is_none() {
-                *cell.borrow_mut() = X11Capture::connect();
+                *cell.borrow_mut() = X11Capture::connect(selected.index);
+            }
+            let recreate = cell
+                .borrow()
+                .as_ref()
+                .map(|capture| !capture.matches(&selected))
+                .unwrap_or(true);
+            if recreate {
+                *cell.borrow_mut() = X11Capture::connect(selected.index);
             }
             let frame = cell.borrow().as_ref().and_then(X11Capture::capture);
             if frame.is_none() {
@@ -1025,6 +1142,128 @@ mod linux_x11 {
             }
             frame
         })
+    }
+
+    fn randr_display_infos() -> Option<Vec<CaptureDisplay>> {
+        if std::env::var_os("DISPLAY").is_none() {
+            return None;
+        }
+        let (conn, screen_num) = x11rb::connect(None).ok()?;
+        let screen = &conn.setup().roots[screen_num];
+        let root = screen.root;
+        let reply = conn.randr_get_monitors(root, true).ok()?.reply().ok()?;
+        let mut displays = reply
+            .monitors
+            .iter()
+            .filter(|monitor| monitor.width > 0 && monitor.height > 0)
+            .enumerate()
+            .map(|(index, monitor)| CaptureDisplay {
+                index: index as i32,
+                x: monitor.x as i32,
+                y: monitor.y as i32,
+                width: monitor.width as i32,
+                height: monitor.height as i32,
+                name: monitor_name(&conn, monitor, index),
+            })
+            .collect::<Vec<_>>();
+        if displays.is_empty() {
+            return None;
+        }
+        Some(sort_and_reindex_displays(displays))
+    }
+
+    fn select_display_from_conn(
+        conn: &RustConnection,
+        root: u32,
+        display: i32,
+    ) -> Option<CaptureDisplay> {
+        let reply = conn.randr_get_monitors(root, true).ok()?.reply().ok()?;
+        let mut displays = reply
+            .monitors
+            .iter()
+            .filter(|monitor| monitor.width > 0 && monitor.height > 0)
+            .enumerate()
+            .map(|(index, monitor)| CaptureDisplay {
+                index: index as i32,
+                x: monitor.x as i32,
+                y: monitor.y as i32,
+                width: monitor.width as i32,
+                height: monitor.height as i32,
+                name: monitor_name(conn, monitor, index),
+            })
+            .collect::<Vec<_>>();
+        let displays = sort_and_reindex_displays(displays);
+        select_capture_display(&displays, display)
+    }
+
+    fn monitor_name(
+        conn: &RustConnection,
+        monitor: &randr::MonitorInfo,
+        fallback_index: usize,
+    ) -> String {
+        if monitor.name != 0 {
+            if let Ok(cookie) = conn.get_atom_name(monitor.name) {
+                if let Ok(reply) = cookie.reply() {
+                    let name = String::from_utf8_lossy(&reply.name).trim().to_owned();
+                    if !name.is_empty() {
+                        return name;
+                    }
+                }
+            }
+        }
+        for output in &monitor.outputs {
+            if *output == 0 {
+                continue;
+            }
+            if let Ok(cookie) = conn.randr_get_output_info(*output, 0) {
+                if let Ok(reply) = cookie.reply() {
+                    let name = String::from_utf8_lossy(&reply.name).trim().to_owned();
+                    if !name.is_empty() {
+                        return name;
+                    }
+                }
+            }
+        }
+        if monitor.primary {
+            format!("Primary display {}", fallback_index + 1)
+        } else {
+            format!("Display {}", fallback_index + 1)
+        }
+    }
+
+    fn root_display() -> Option<CaptureDisplay> {
+        let (conn, screen_num) = x11rb::connect(None).ok()?;
+        let screen = &conn.setup().roots[screen_num];
+        root_display_from_screen(screen)
+    }
+
+    fn root_display_from_screen(
+        screen: &x11rb::protocol::xproto::Screen,
+    ) -> Option<CaptureDisplay> {
+        if screen.width_in_pixels == 0 || screen.height_in_pixels == 0 {
+            None
+        } else {
+            Some(CaptureDisplay {
+                index: 0,
+                x: 0,
+                y: 0,
+                width: screen.width_in_pixels as i32,
+                height: screen.height_in_pixels as i32,
+                name: "Display 1".to_owned(),
+            })
+        }
+    }
+
+    fn x11_region(display: &CaptureDisplay) -> Option<(i16, i16, u16, u16)> {
+        let x = i16::try_from(display.x).ok()?;
+        let y = i16::try_from(display.y).ok()?;
+        let width = u16::try_from(display.width).ok()?;
+        let height = u16::try_from(display.height).ok()?;
+        if width == 0 || height == 0 {
+            None
+        } else {
+            Some((x, y, width, height))
+        }
     }
 
     fn bgra_from_ximage(width: u32, height: u32, mut data: Vec<u8>) -> Option<(u32, u32, Vec<u8>)> {
@@ -1142,6 +1381,8 @@ mod linux_x11 {
 mod linux_x11_shm {
     use std::cell::RefCell;
 
+    use super::{linux_x11, CaptureDisplay};
+
     use x11rb::{
         connection::Connection,
         protocol::{
@@ -1154,6 +1395,7 @@ mod linux_x11_shm {
     struct ShmCapture {
         conn: RustConnection,
         root: xproto::Window,
+        display: CaptureDisplay,
         width: u16,
         height: u16,
         seg: shm::Seg,
@@ -1163,7 +1405,7 @@ mod linux_x11_shm {
     }
 
     impl ShmCapture {
-        fn connect() -> Option<Self> {
+        fn connect(display: i32) -> Option<Self> {
             // Only attempt on X11 sessions.
             if std::env::var_os("DISPLAY").is_none() {
                 return None;
@@ -1171,8 +1413,9 @@ mod linux_x11_shm {
 
             let (conn, screen_num) = x11rb::connect(None).ok()?;
             let screen = &conn.setup().roots[screen_num];
-            let width = screen.width_in_pixels;
-            let height = screen.height_in_pixels;
+            let selected = linux_x11::select_display(display)?;
+            let width = u16::try_from(selected.width).ok()?;
+            let height = u16::try_from(selected.height).ok()?;
             let root = screen.root;
             if width == 0 || height == 0 {
                 return None;
@@ -1212,6 +1455,7 @@ mod linux_x11_shm {
             Some(Self {
                 conn,
                 root,
+                display: selected,
                 width,
                 height,
                 seg,
@@ -1225,13 +1469,14 @@ mod linux_x11_shm {
         fn capture_into(&self, out: &mut Vec<u8>) -> Option<(u32, u32)> {
             let w = self.width as u32;
             let h = self.height as u32;
+            let (x, y) = self.origin()?;
 
             // Ask the server to fill our shared-memory segment.
             self.conn
                 .shm_get_image(
                     self.root,
-                    0,
-                    0,
+                    x,
+                    y,
                     self.width,
                     self.height,
                     !0u32, // plane_mask = all planes
@@ -1265,8 +1510,19 @@ mod linux_x11_shm {
         }
 
         /// True when the screen dimensions still match what we were created for.
-        fn matches(&self, w: u16, h: u16) -> bool {
-            self.width == w && self.height == h
+        fn matches(&self, display: &CaptureDisplay) -> bool {
+            self.display.index == display.index
+                && self.display.x == display.x
+                && self.display.y == display.y
+                && self.display.width == display.width
+                && self.display.height == display.height
+        }
+
+        fn origin(&self) -> Option<(i16, i16)> {
+            Some((
+                i16::try_from(self.display.x).ok()?,
+                i16::try_from(self.display.y).ok()?,
+            ))
         }
     }
 
@@ -1285,20 +1541,22 @@ mod linux_x11_shm {
 
     /// Try to capture via MIT-SHM.  Returns `None` if the extension is not
     /// available or if any system call fails.
-    pub fn capture_into(out: &mut Vec<u8>) -> Option<(u32, u32)> {
+    pub fn capture_display_into(display: i32, out: &mut Vec<u8>) -> Option<(u32, u32)> {
         SHM.with(|cell| {
+            let selected = linux_x11::select_display(display)?;
             // Lazily initialise on first call.
             if cell.borrow().is_none() {
-                *cell.borrow_mut() = ShmCapture::connect();
+                *cell.borrow_mut() = ShmCapture::connect(selected.index);
             }
 
             // Detect resolution change and recreate.
-            let needs_recreate = cell.borrow().as_ref().map_or(false, |cap| {
-                let (cur_w, cur_h) = current_screen_size().unwrap_or((0, 0));
-                !cap.matches(cur_w as u16, cur_h as u16)
-            });
+            let needs_recreate = cell
+                .borrow()
+                .as_ref()
+                .map(|cap| !cap.matches(&selected))
+                .unwrap_or(true);
             if needs_recreate {
-                *cell.borrow_mut() = ShmCapture::connect();
+                *cell.borrow_mut() = ShmCapture::connect(selected.index);
             }
 
             let result = cell.borrow().as_ref().and_then(|cap| cap.capture_into(out));
@@ -1308,14 +1566,6 @@ mod linux_x11_shm {
                 *cell.borrow_mut() = None;
             }
             result
-        })
-    }
-
-    fn current_screen_size() -> Option<(u32, u32)> {
-        SHM.with(|cell| {
-            cell.borrow()
-                .as_ref()
-                .map(|cap| (cap.width as u32, cap.height as u32))
         })
     }
 }

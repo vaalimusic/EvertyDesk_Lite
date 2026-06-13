@@ -100,13 +100,13 @@ impl AudioConfig {
 /// Блокирует до установки `stop=true`.
 /// На не-Windows платформах — no-op.
 pub fn run_audio_capture(socket: Arc<UdpSocket>, peer_addr: SocketAddr, stop: Arc<AtomicBool>) {
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", feature = "evrt-wasapi"))]
     {
         if let Err(e) = run_audio_capture_windows(socket, peer_addr, stop) {
             eprintln!("[evrt-audio] захват завершился: {e}");
         }
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(all(target_os = "windows", feature = "evrt-wasapi")))]
     {
         let _ = (socket, peer_addr);
         while !stop.load(Ordering::Relaxed) {
@@ -115,7 +115,7 @@ pub fn run_audio_capture(socket: Arc<UdpSocket>, peer_addr: SocketAddr, stop: Ar
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "evrt-wasapi"))]
 fn run_audio_capture_windows(
     socket: Arc<UdpSocket>,
     peer_addr: SocketAddr,
@@ -241,9 +241,9 @@ pub struct AudioPlayer {
     queue: VecDeque<Vec<u8>>,
     front_offset: usize,
     buffering: bool,
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", feature = "evrt-wasapi"))]
     inner: Option<WasapiPlayer>,
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(all(target_os = "windows", feature = "evrt-wasapi")))]
     _unused: (),
 }
 
@@ -254,16 +254,16 @@ impl AudioPlayer {
             queue: VecDeque::new(),
             front_offset: 0,
             buffering: true,
-            #[cfg(target_os = "windows")]
+            #[cfg(all(target_os = "windows", feature = "evrt-wasapi"))]
             inner: None,
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(not(all(target_os = "windows", feature = "evrt-wasapi")))]
             _unused: (),
         }
     }
 
     /// Инициализировать с заданным форматом.
     pub fn init(&mut self, cfg: &AudioConfig) {
-        #[cfg(target_os = "windows")]
+        #[cfg(all(target_os = "windows", feature = "evrt-wasapi"))]
         {
             if self.cfg.as_ref() == Some(cfg) && self.inner.is_some() {
                 return;
@@ -283,7 +283,7 @@ impl AudioPlayer {
                 Err(e) => eprintln!("[evrt-audio] WASAPI playback init failed: {e}"),
             }
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(all(target_os = "windows", feature = "evrt-wasapi")))]
         {
             let _ = cfg;
             eprintln!("[evrt-audio] аудио воспроизведение не поддерживается на этой платформе");
@@ -292,7 +292,7 @@ impl AudioPlayer {
 
     /// Воспроизвести PCM-фрейм.
     pub fn play(&mut self, pcm: &[u8]) {
-        #[cfg(target_os = "windows")]
+        #[cfg(all(target_os = "windows", feature = "evrt-wasapi"))]
         {
             if pcm.is_empty() {
                 return;
@@ -303,16 +303,16 @@ impl AudioPlayer {
             self.enqueue_pcm(pcm);
             self.pump();
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(all(target_os = "windows", feature = "evrt-wasapi")))]
         let _ = pcm;
     }
 
     pub fn tick(&mut self) {
-        #[cfg(target_os = "windows")]
+        #[cfg(all(target_os = "windows", feature = "evrt-wasapi"))]
         self.pump();
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", feature = "evrt-wasapi"))]
     fn enqueue_pcm(&mut self, pcm: &[u8]) {
         self.queue.push_back(pcm.to_vec());
         while self.queued_ms() > AUDIO_MAX_BUFFER_MS && self.queue.len() > 1 {
@@ -322,7 +322,7 @@ impl AudioPlayer {
         }
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", feature = "evrt-wasapi"))]
     fn pump(&mut self) {
         if self.buffering && self.queued_ms() < AUDIO_PREBUFFER_MS {
             return;
@@ -395,7 +395,7 @@ fn pcm_duration_ms(cfg: &AudioConfig, bytes: usize) -> u32 {
     ((frames as u64).saturating_mul(1000) / u64::from(cfg.sample_rate.max(1))) as u32
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "evrt-wasapi"))]
 struct WasapiPlayer {
     client: windows::Win32::Media::Audio::IAudioClient,
     render_client: windows::Win32::Media::Audio::IAudioRenderClient,
@@ -403,7 +403,7 @@ struct WasapiPlayer {
     buffer_frames: u32,
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "evrt-wasapi"))]
 impl WasapiPlayer {
     fn new(cfg: &AudioConfig) -> Result<Self, String> {
         use windows::Win32::{
@@ -506,7 +506,7 @@ impl WasapiPlayer {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "evrt-wasapi"))]
 impl Drop for WasapiPlayer {
     fn drop(&mut self) {
         unsafe {
@@ -533,6 +533,8 @@ impl crate::evrt::EvrtPacket {
 // Аудио-фреймы маленькие (≤1920 байт), обычно умещаются в один пакет.
 // Используем упрощённый reassembler без сложной логики keyframe.
 
+const MAX_AUDIO_PACKET_COUNT: u16 = 8;
+
 /// Сборщик аудио-фреймов из UDP-пакетов.
 pub struct AudioReassembler {
     frames: std::collections::HashMap<u32, AudioAssembly>,
@@ -555,7 +557,12 @@ impl AudioReassembler {
 
     /// Принять пакет. Возвращает `Some(pcm)` когда фрейм собран.
     pub fn on_packet(&mut self, pkt: &evrt::EvrtPacket) -> Option<Vec<u8>> {
-        if pkt.packet_count == 0 || pkt.packet_index >= pkt.packet_count {
+        if pkt.packet_type != evrt::TYPE_AUDIO_FRAME
+            || pkt.packet_count == 0
+            || pkt.packet_count > MAX_AUDIO_PACKET_COUNT
+            || pkt.packet_index >= pkt.packet_count
+            || pkt.payload.len() > evrt::MAX_PAYLOAD_SIZE
+        {
             return None;
         }
         // Дропаем старые
@@ -585,6 +592,7 @@ impl AudioReassembler {
             });
 
         if entry.count != pkt.packet_count {
+            self.frames.remove(&pkt.frame_id);
             return None;
         }
         let idx = pkt.packet_index as usize;
@@ -691,6 +699,74 @@ mod tests {
         let parsed = evrt::parse(&pkts[0], pkts[0].len()).unwrap();
         let result = re.on_packet(&parsed).unwrap();
         assert_eq!(result, pcm);
+    }
+
+    #[test]
+    fn audio_reassembler_rejects_non_audio_packet() {
+        let mut re = AudioReassembler::new();
+        let pkt = evrt::EvrtPacket {
+            packet_type: evrt::TYPE_VIDEO_FRAME,
+            flags: 0,
+            frame_id: 1,
+            packet_index: 0,
+            packet_count: 1,
+            presentation_time_us: 0,
+            payload: vec![1],
+        };
+
+        assert!(re.on_packet(&pkt).is_none());
+    }
+
+    #[test]
+    fn audio_reassembler_rejects_excessive_packet_count() {
+        let mut re = AudioReassembler::new();
+        let pkt = evrt::EvrtPacket {
+            packet_type: evrt::TYPE_AUDIO_FRAME,
+            flags: 0,
+            frame_id: 1,
+            packet_index: 0,
+            packet_count: MAX_AUDIO_PACKET_COUNT + 1,
+            presentation_time_us: 0,
+            payload: vec![1],
+        };
+
+        assert!(re.on_packet(&pkt).is_none());
+    }
+
+    #[test]
+    fn audio_reassembler_drops_conflicting_packet_count() {
+        let mut re = AudioReassembler::new();
+        let first = evrt::EvrtPacket {
+            packet_type: evrt::TYPE_AUDIO_FRAME,
+            flags: 0,
+            frame_id: 1,
+            packet_index: 0,
+            packet_count: 2,
+            presentation_time_us: 0,
+            payload: vec![1],
+        };
+        let conflict = evrt::EvrtPacket {
+            packet_type: evrt::TYPE_AUDIO_FRAME,
+            flags: 0,
+            frame_id: 1,
+            packet_index: 1,
+            packet_count: 3,
+            presentation_time_us: 0,
+            payload: vec![2],
+        };
+        let valid = evrt::EvrtPacket {
+            packet_type: evrt::TYPE_AUDIO_FRAME,
+            flags: 0,
+            frame_id: 1,
+            packet_index: 0,
+            packet_count: 1,
+            presentation_time_us: 0,
+            payload: vec![3],
+        };
+
+        assert!(re.on_packet(&first).is_none());
+        assert!(re.on_packet(&conflict).is_none());
+        assert_eq!(re.on_packet(&valid), Some(vec![3]));
     }
 
     #[test]

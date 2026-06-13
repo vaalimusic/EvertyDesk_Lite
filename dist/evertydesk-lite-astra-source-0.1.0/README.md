@@ -222,6 +222,15 @@ build manually, use the same shape:
 cargo build --release --no-default-features --features desktop-gui,live-h264,live-vpx-system
 ```
 
+On Astra Linux, auto GUI startup prefers the CPU framebuffer path to avoid
+broken GLX/WGPU stacks in VMs. Renderer policy can be overridden with:
+
+```bash
+EVERTYDESK_RENDERER=software ./target/release/evertydesk-lite
+EVERTYDESK_LINUX_GL_AUTO=1 ./target/release/evertydesk-lite
+EVERTYDESK_LINUX_AUTO_WGPU=1 ./target/release/evertydesk-lite
+```
+
 The long-term target is a simple package flow for:
 
 - Windows;
@@ -233,6 +242,8 @@ The long-term target is a simple package flow for:
 
 - [AI terminal setup](docs/terminal-llm.md)
 - [Video codecs and NVENC](docs/video-codecs.md)
+- [UI design rules](docs/ui-design-rules.md)
+- [Stream stability rules](docs/stream-stability-rules.md)
 
 ## Roadmap
 

@@ -545,38 +545,6 @@ fn draw_line_icon(p: &egui::Painter, rect: egui::Rect, icon: &str, color: egui::
     }
 }
 
-/// Залить скруглённый прямоугольник вертикальным градиентом `top` → `bottom`.
-/// Сначала рисуем скруглённый фон (bottom), затем градиентный меш с отступом
-/// на радиус — так острые углы меша остаются внутри скруглённой формы.
-pub(crate) fn gradient_rect(
-    painter: &egui::Painter,
-    rect: egui::Rect,
-    top: egui::Color32,
-    bottom: egui::Color32,
-    corner: f32,
-) {
-    use egui::epaint::{Mesh, Vertex};
-    // Скруглённый фон — закрывает углы мягко.
-    painter.rect_filled(rect, egui::CornerRadius::same(corner as u8), bottom);
-    // Градиентный меш внутри (отступ на радиус, чтобы не задеть углы).
-    let inner = rect.shrink(corner * 0.5);
-    let t_in = lerp_color(top, bottom, (corner * 0.5) / rect.height().max(1.0));
-    let mut mesh = Mesh::default();
-    let tl = Vertex { pos: inner.left_top(),     uv: egui::epaint::WHITE_UV, color: t_in };
-    let tr = Vertex { pos: inner.right_top(),    uv: egui::epaint::WHITE_UV, color: t_in };
-    let br = Vertex { pos: inner.right_bottom(), uv: egui::epaint::WHITE_UV, color: bottom };
-    let bl = Vertex { pos: inner.left_bottom(),  uv: egui::epaint::WHITE_UV, color: bottom };
-    mesh.vertices.extend([tl, tr, br, bl]);
-    mesh.indices.extend([0, 1, 2, 0, 2, 3]);
-    painter.add(egui::Shape::mesh(mesh));
-}
-
-fn lerp_color(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
-    let t = t.clamp(0.0, 1.0);
-    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
-    egui::Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
-}
-
 /// Кликабельный чип (для недавних ID). Возвращает Response.
 pub(crate) fn recent_chip(ui: &mut egui::Ui, label: &str) -> egui::Response {
     let pad_x = 12.0;
@@ -599,7 +567,12 @@ pub(crate) fn recent_chip(ui: &mut egui::Ui, label: &str) -> egui::Response {
     };
     let p = ui.painter();
     p.rect_filled(rect, egui::CornerRadius::same(15), fill);
-    p.rect_stroke(rect, egui::CornerRadius::same(15), stroke, egui::StrokeKind::Inside);
+    p.rect_stroke(
+        rect,
+        egui::CornerRadius::same(15),
+        stroke,
+        egui::StrokeKind::Inside,
+    );
     p.galley(
         egui::pos2(rect.left() + pad_x, rect.center().y - galley.size().y / 2.0),
         galley,
@@ -654,22 +627,4 @@ pub(crate) fn info_metric(ui: &mut egui::Ui, label: &str, value: &str, color: eg
         );
         ui.label(egui::RichText::new(value).size(17.0).strong().color(color));
     });
-}
-
-pub(crate) fn secondary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    let width = ui.available_width().min(156.0);
-    ui.add(
-        egui::Button::new(
-            egui::RichText::new(text)
-                .size(13.0)
-                .color(egui::Color32::from_rgb(0x20, 0x24, 0x2D)),
-        )
-        .min_size(egui::vec2(width, 40.0))
-        .fill(egui::Color32::from_rgb(0xFF, 0xFF, 0xFF))
-        .stroke(egui::Stroke::new(
-            1.0,
-            egui::Color32::from_rgb(0xE3, 0xE6, 0xEC),
-        ))
-        .corner_radius(egui::CornerRadius::same(10)),
-    )
 }

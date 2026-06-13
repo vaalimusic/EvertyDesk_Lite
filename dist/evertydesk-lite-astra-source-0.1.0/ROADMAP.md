@@ -199,6 +199,23 @@ $env:EVERTYDESK_ENABLE_AV1_MF="1"
 - Connected EVRT `ReceiverFeedback` / `AdaptiveRelief` to the live encoder
   bitrate path through a shared integer scale, so client pressure now lowers
   target bitrate instead of only producing logs.
+- Added host-stream recovery pressure rules: TCP keyframes get a short delivery
+  grace period, dropped video frames request the next keyframe, and congested
+  queues reduce bitrate pressure instead of silently corrupting inter-frame
+  prediction.
+- Tuned Linux/software H.264 quality policy for desktop text: 1080p captures
+  stay native, larger captures scale only to 1080p-class frames, and software
+  streams get a bitrate floor for readable fonts.
+- Completed the text clipboard path for desktop sessions: local paste sends a
+  RustDesk-compatible `Clipboard` message, incoming text clipboard writes into
+  the local system clipboard, and both client and host honor
+  `security.allow_clipboard`.
+- Cleaned the main desktop connect card: removed the separate remote-ID check
+  action, removed the extra hero logo plate, tightened spacing, and added
+  project UI/stream stability rules under `docs/`.
+- Added Linux X11/RandR per-monitor capture: `display_infos()` now reports
+  active monitor rectangles and `capture_display_into(display)` captures the
+  selected monitor instead of the whole root desktop.
 
 ## Remaining Work
 
@@ -217,6 +234,8 @@ Priority: high.
   size, FPS, bitrate, dropped frames, and fallback reason.
 - Keep AV1 disabled by default until the MF AV1 decoder survives long sessions.
 - Build an isolated AV1/H.265 decoder test harness with captured packets.
+- Add decoder-side "waiting for keyframe" UI state and request-IDR feedback
+  when the client detects a broken or missing reference chain.
 
 ### 2. True Hardware Paths
 
@@ -256,6 +275,8 @@ Priority: high.
 
 - Make codec preference negotiation more conservative by default.
 - Add explicit "codec failed, downgrade" session event.
+- Add explicit "stream corrupt, request keyframe" and "queue pressure" session
+  events.
 - Remember failed codec/backend per session.
 - Avoid advertising codecs that are only probed but not soak-tested.
 - Add UI-visible codec state:

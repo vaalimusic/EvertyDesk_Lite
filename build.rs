@@ -56,10 +56,14 @@ fn find_nv_codec_sdk() -> Option<PathBuf> {
 
 /// Рекурсивно (до `depth` уровней) ищет папки `Video_Codec_SDK_*`.
 fn collect_sdk_candidates(dir: &PathBuf, out: &mut Vec<PathBuf>, depth: u32) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
         if name.starts_with("Video_Codec_SDK_") && is_nv_codec_sdk(&path) {
             out.push(path.clone());
         } else if depth > 1 && path.is_dir()

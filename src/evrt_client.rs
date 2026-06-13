@@ -174,6 +174,7 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
     let packets_received = Arc::new(AtomicU64::new(0));
     let frames_assembled = Arc::new(AtomicU64::new(0));
     let reassembly_drops = Arc::new(AtomicU64::new(0));
+    let assembly_delay_ms = Arc::new(AtomicI32::new(-1));
     let configured_bitrate = Arc::new(AtomicU64::new(session_cfg.bitrate as u64));
 
     // ── Очередь кадров ────────────────────────────────────────────────────────
@@ -217,6 +218,7 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
     let recv_packets = packets_received.clone();
     let recv_assembled = frames_assembled.clone();
     let recv_reassembly_drops = reassembly_drops.clone();
+    let recv_assembly_delay = assembly_delay_ms.clone();
     let recv_bitrate = configured_bitrate.clone();
 
     // WASAPI playback lives inside the receive thread: COM objects stay
@@ -252,9 +254,10 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
                             }
                             evrt::TYPE_VIDEO_FRAME => {
                                 let drops_before = reassembler.dropped_frames();
-                                if let Some((bytes, key, _delay_ms, pts)) =
+                                if let Some((bytes, key, delay_ms, pts)) =
                                     reassembler.on_packet(&pkt)
                                 {
+                                    recv_assembly_delay.store(delay_ms, Ordering::Relaxed);
                                     recv_assembled.fetch_add(1, Ordering::Relaxed);
                                     recv_queue.enqueue(bytes, key, pts);
                                 }
@@ -365,6 +368,7 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
 
         // Собираем метрики
         let arr_delta = arrival_delta_ms.load(Ordering::Relaxed);
+        let assembly_delay = assembly_delay_ms.load(Ordering::Relaxed);
         let dec_delta = decode_delta_ms.load(Ordering::Relaxed);
         let queue_stats = queue.stats();
         let queued = queue_stats.queued_units as u32;
@@ -394,7 +398,7 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
             backlog_frames: queued,
             queue_drops: drops,
             decode_fps: fps_decoded,
-            assembly_delay_ms: 0,
+            assembly_delay_ms: assembly_delay,
             arrival_delta_ms: arr_delta,
             decode_delta_ms: dec_delta,
             present_delta_ms: -1,
@@ -409,6 +413,7 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
         let _ = events.send(SessionEvent::EvrtMetrics {
             pressure: pressure.as_str().to_owned(),
             arrival_delta_ms: arr_delta,
+            assembly_delay_ms: assembly_delay,
             decode_delta_ms: dec_delta,
             jitter_ms,
             bitrate_mbps: configured_bitrate.load(Ordering::Relaxed) as f32 / 1_000_000.0,
@@ -620,9 +625,7 @@ fn compute_pressure(
     // must not create receiver pressure by itself.
     let arrival_strained = arrival_delta_ms >= high_ms && (backlog > 0 || new_drops > 0);
 
-    let crit = decode_delta_ms >= crit_ms
-        || backlog >= backlog_crit
-        || new_drops >= 3;
+    let crit = decode_delta_ms >= crit_ms || backlog >= backlog_crit || new_drops >= 3;
 
     let high = crit
         || arrival_strained

@@ -142,7 +142,12 @@ fn collect_events(
     let mut seq = 0u64;
     while !stop.load(Ordering::Relaxed) {
         match ev_rx.recv_timeout(std::time::Duration::from_millis(250)) {
-            Ok(SessionEvent::Frame { width, height, rgba, .. }) => {
+            Ok(SessionEvent::Frame {
+                width,
+                height,
+                rgba,
+                ..
+            }) => {
                 seq += 1;
                 if let Ok(mut g) = remote_size.lock() {
                     *g = (width as u32, height as u32);
@@ -205,7 +210,9 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativePollFrame(
         Some(s) => s,
         None => return 0,
     };
-    let Ok(f) = session.latest.lock() else { return 0 };
+    let Ok(f) = session.latest.lock() else {
+        return 0;
+    };
     if f.seq == 0 || f.rgba.is_empty() {
         return 0;
     }
@@ -239,8 +246,12 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeFrameSize(
     _class: JClass,
     handle: jlong,
 ) -> jlong {
-    let Some(session) = session_ref(handle) else { return 0 };
-    let Ok(f) = session.latest.lock() else { return 0 };
+    let Some(session) = session_ref(handle) else {
+        return 0;
+    };
+    let Ok(f) = session.latest.lock() else {
+        return 0;
+    };
     if f.seq == 0 {
         return 0;
     }
@@ -261,7 +272,9 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeTouch(
     y: jint,
     action: jint,
 ) {
-    let Some(session) = session_ref(handle) else { return };
+    let Some(session) = session_ref(handle) else {
+        return;
+    };
     let cmd = match action {
         0 => SessionCommand::MouseDown { x, y },
         1 => SessionCommand::MouseMove { x, y },
@@ -281,7 +294,9 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeRightClick(
     x: jint,
     y: jint,
 ) {
-    let Some(session) = session_ref(handle) else { return };
+    let Some(session) = session_ref(handle) else {
+        return;
+    };
     let _ = session.cmd_tx.send(SessionCommand::MouseMove { x, y });
     let _ = session.cmd_tx.send(SessionCommand::MouseRightDown { x, y });
     let _ = session.cmd_tx.send(SessionCommand::MouseRightUp { x, y });
@@ -295,12 +310,16 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeKeyText(
     handle: jlong,
     text: JString,
 ) {
-    let Some(session) = session_ref(handle) else { return };
+    let Some(session) = session_ref(handle) else {
+        return;
+    };
     let s: String = match env.get_string(&text) {
         Ok(v) => v.into(),
         Err(_) => return,
     };
-    let _ = session.cmd_tx.send(crate::transport::SessionCommand::KeyText(s));
+    let _ = session
+        .cmd_tx
+        .send(crate::transport::SessionCommand::KeyText(s));
 }
 
 /// Управляющая клавиша по числовому коду ControlKey.
@@ -312,11 +331,15 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeKeyControl(
     handle: jlong,
     code: jint,
 ) {
-    let Some(session) = session_ref(handle) else { return };
+    let Some(session) = session_ref(handle) else {
+        return;
+    };
     use crate::rustdesk_proto::ControlKey;
     let key = ControlKey::try_from(code).unwrap_or(ControlKey::Unknown);
     if key != ControlKey::Unknown {
-        let _ = session.cmd_tx.send(crate::transport::SessionCommand::KeyControl(key));
+        let _ = session
+            .cmd_tx
+            .send(crate::transport::SessionCommand::KeyControl(key));
     }
 }
 
@@ -328,7 +351,9 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeKeyCtrl(
     handle: jlong,
     ch: JString,
 ) {
-    let Some(session) = session_ref(handle) else { return };
+    let Some(session) = session_ref(handle) else {
+        return;
+    };
     let s: String = match env.get_string(&ch) {
         Ok(v) => v.into(),
         Err(_) => return,
@@ -352,8 +377,12 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeScroll(
     _y: jint,
     delta_y: jint,
 ) {
-    let Some(session) = session_ref(handle) else { return };
-    let _ = session.cmd_tx.send(SessionCommand::MouseWheel { x, y: delta_y });
+    let Some(session) = session_ref(handle) else {
+        return;
+    };
+    let _ = session
+        .cmd_tx
+        .send(SessionCommand::MouseWheel { x, y: delta_y });
 }
 
 // ─── status / connected ──────────────────────────────────────────────────────

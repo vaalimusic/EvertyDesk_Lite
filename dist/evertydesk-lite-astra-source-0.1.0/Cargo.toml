@@ -76,7 +76,7 @@ log = "0.4"
 [target.'cfg(target_os = "linux")'.dependencies]
 font8x8 = "0.3"
 minifb = { version = "0.28", default-features = false, features = ["x11"] }
-x11rb = { version = "0.13", features = ["xtest", "shm"] }
+x11rb = { version = "0.13", features = ["xtest", "shm", "randr"] }
 
 [target.'cfg(windows)'.dependencies]
 font8x8 = "0.3"

@@ -37,6 +37,7 @@ struct LatestFrame {
 struct AndroidSession {
     cmd_tx: Sender<SessionCommand>,
     latest: Arc<Mutex<LatestFrame>>,
+    remote_size: Arc<Mutex<(u32, u32)>>,
     stop: Arc<AtomicBool>,
     /// Текстовый статус (прогресс/ошибка) для UI.
     status: Arc<Mutex<String>>,
@@ -65,6 +66,51 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeStart(
     relay_server: JString,
     public_key: JString,
 ) -> jlong {
+    start_android_session(
+        &mut env,
+        id,
+        password,
+        api_url,
+        id_server,
+        relay_server,
+        public_key,
+        false,
+    )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeStartTouchpad(
+    mut env: JNIEnv,
+    _class: JClass,
+    id: JString,
+    password: JString,
+    api_url: JString,
+    id_server: JString,
+    relay_server: JString,
+    public_key: JString,
+) -> jlong {
+    start_android_session(
+        &mut env,
+        id,
+        password,
+        api_url,
+        id_server,
+        relay_server,
+        public_key,
+        true,
+    )
+}
+
+fn start_android_session(
+    env: &mut JNIEnv,
+    id: JString,
+    password: JString,
+    api_url: JString,
+    id_server: JString,
+    relay_server: JString,
+    public_key: JString,
+    control_only: bool,
+) -> jlong {
     // Инициализируем android_logger один раз
     init_android_logger();
 
@@ -77,20 +123,23 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeStart(
         Err(_) => String::new(),
     };
 
-    jni_log(&format!("nativeStart id={remote_id}"));
+    jni_log(&format!(
+        "nativeStart id={remote_id} control_only={control_only}"
+    ));
 
     let config = AppConfig::load_or_create();
     let server = ServerConfig {
-        api_url: jstring_or(&mut env, &api_url, config.server.api_url.clone()),
-        id_server: jstring_or(&mut env, &id_server, config.server.id_server.clone()),
-        relay_server: jstring_or(&mut env, &relay_server, config.server.relay_server.clone()),
-        public_key: jstring_or(&mut env, &public_key, config.server.public_key.clone()),
+        api_url: jstring_or(env, &api_url, config.server.api_url.clone()),
+        id_server: jstring_or(env, &id_server, config.server.id_server.clone()),
+        relay_server: jstring_or(env, &relay_server, config.server.relay_server.clone()),
+        public_key: jstring_or(env, &public_key, config.server.public_key.clone()),
     };
     let request = ConnectionRequest {
         remote_id,
         password,
         server,
         display: config.display.clone(),
+        control_only,
     };
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>();
@@ -124,6 +173,7 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeStart(
     let session = Box::new(AndroidSession {
         cmd_tx,
         latest,
+        remote_size,
         stop,
         status,
         connected,
@@ -142,7 +192,12 @@ fn collect_events(
     let mut seq = 0u64;
     while !stop.load(Ordering::Relaxed) {
         match ev_rx.recv_timeout(std::time::Duration::from_millis(250)) {
-            Ok(SessionEvent::Frame { width, height, rgba, .. }) => {
+            Ok(SessionEvent::Frame {
+                width,
+                height,
+                rgba,
+                ..
+            }) => {
                 seq += 1;
                 if let Ok(mut g) = remote_size.lock() {
                     *g = (width as u32, height as u32);
@@ -158,6 +213,16 @@ fn collect_events(
                 connected.store(true, Ordering::Relaxed);
                 if let Ok(mut s) = status.lock() {
                     *s = format!("Подключено: {info}");
+                }
+            }
+            Ok(SessionEvent::Displays(displays)) => {
+                if let Some(display) = displays
+                    .iter()
+                    .find(|display| display.width > 0 && display.height > 0)
+                {
+                    if let Ok(mut g) = remote_size.lock() {
+                        *g = (display.width as u32, display.height as u32);
+                    }
                 }
             }
             Ok(SessionEvent::Progress(pct, msg)) => {
@@ -205,7 +270,9 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativePollFrame(
         Some(s) => s,
         None => return 0,
     };
-    let Ok(f) = session.latest.lock() else { return 0 };
+    let Ok(f) = session.latest.lock() else {
+        return 0;
+    };
     if f.seq == 0 || f.rgba.is_empty() {
         return 0;
     }
@@ -239,12 +306,34 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeFrameSize(
     _class: JClass,
     handle: jlong,
 ) -> jlong {
-    let Some(session) = session_ref(handle) else { return 0 };
-    let Ok(f) = session.latest.lock() else { return 0 };
+    let Some(session) = session_ref(handle) else {
+        return 0;
+    };
+    let Ok(f) = session.latest.lock() else {
+        return 0;
+    };
     if f.seq == 0 {
         return 0;
     }
     ((f.width as i64) << 32) | (f.height as i64)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeRemoteSize(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jlong {
+    let Some(session) = session_ref(handle) else {
+        return 0;
+    };
+    let Ok((w, h)) = session.remote_size.lock().map(|g| *g) else {
+        return 0;
+    };
+    if w == 0 || h == 0 {
+        return 0;
+    }
+    ((w as i64) << 32) | (h as i64)
 }
 
 // ─── touch → mouse ───────────────────────────────────────────────────────────
@@ -261,7 +350,9 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeTouch(
     y: jint,
     action: jint,
 ) {
-    let Some(session) = session_ref(handle) else { return };
+    let Some(session) = session_ref(handle) else {
+        return;
+    };
     let cmd = match action {
         0 => SessionCommand::MouseDown { x, y },
         1 => SessionCommand::MouseMove { x, y },
@@ -281,7 +372,9 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeRightClick(
     x: jint,
     y: jint,
 ) {
-    let Some(session) = session_ref(handle) else { return };
+    let Some(session) = session_ref(handle) else {
+        return;
+    };
     let _ = session.cmd_tx.send(SessionCommand::MouseMove { x, y });
     let _ = session.cmd_tx.send(SessionCommand::MouseRightDown { x, y });
     let _ = session.cmd_tx.send(SessionCommand::MouseRightUp { x, y });
@@ -295,12 +388,16 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeKeyText(
     handle: jlong,
     text: JString,
 ) {
-    let Some(session) = session_ref(handle) else { return };
+    let Some(session) = session_ref(handle) else {
+        return;
+    };
     let s: String = match env.get_string(&text) {
         Ok(v) => v.into(),
         Err(_) => return,
     };
-    let _ = session.cmd_tx.send(crate::transport::SessionCommand::KeyText(s));
+    let _ = session
+        .cmd_tx
+        .send(crate::transport::SessionCommand::KeyText(s));
 }
 
 /// Управляющая клавиша по числовому коду ControlKey.
@@ -312,11 +409,15 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeKeyControl(
     handle: jlong,
     code: jint,
 ) {
-    let Some(session) = session_ref(handle) else { return };
+    let Some(session) = session_ref(handle) else {
+        return;
+    };
     use crate::rustdesk_proto::ControlKey;
     let key = ControlKey::try_from(code).unwrap_or(ControlKey::Unknown);
     if key != ControlKey::Unknown {
-        let _ = session.cmd_tx.send(crate::transport::SessionCommand::KeyControl(key));
+        let _ = session
+            .cmd_tx
+            .send(crate::transport::SessionCommand::KeyControl(key));
     }
 }
 
@@ -328,7 +429,9 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeKeyCtrl(
     handle: jlong,
     ch: JString,
 ) {
-    let Some(session) = session_ref(handle) else { return };
+    let Some(session) = session_ref(handle) else {
+        return;
+    };
     let s: String = match env.get_string(&ch) {
         Ok(v) => v.into(),
         Err(_) => return,
@@ -352,8 +455,12 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeScroll(
     _y: jint,
     delta_y: jint,
 ) {
-    let Some(session) = session_ref(handle) else { return };
-    let _ = session.cmd_tx.send(SessionCommand::MouseWheel { x, y: delta_y });
+    let Some(session) = session_ref(handle) else {
+        return;
+    };
+    let _ = session
+        .cmd_tx
+        .send(SessionCommand::MouseWheel { x, y: delta_y });
 }
 
 // ─── status / connected ──────────────────────────────────────────────────────

@@ -37,6 +37,7 @@ class MainActivity : Activity() {
     private val client = NativeClient()
     private lateinit var root: FrameLayout
     private var remoteView: RemoteView? = null
+    private var touchpadView: TouchpadView? = null
     private val handler = Handler(Looper.getMainLooper())
 
     private val brandBg    = Color.rgb(0xF5, 0xF7, 0xF4)
@@ -134,6 +135,19 @@ class MainActivity : Activity() {
         }
         col.addView(connectBtn, LinearLayout.LayoutParams(MATCH_PARENT, dp(52)))
         col.addView(vSpace(dp(12)))
+        col.addView(makeSecondaryButton("Тачпад без картинки") {
+            val id = idInput.text.toString().filter { it.isDigit() }
+            if (id.isEmpty()) {
+                statusLabel.text = "Введите ID партнёра"
+                statusLabel.setTextColor(Color.rgb(0xE3, 0x4B, 0x2F))
+                return@makeSecondaryButton
+            }
+            prefs.edit().putString(PREF_LAST_ID, id).apply()
+            statusLabel.text = "Подключение тачпада..."
+            statusLabel.setTextColor(textSoft)
+            connect(id, pwInput.text.toString(), statusLabel, touchpadOnly = true)
+        }, LinearLayout.LayoutParams(MATCH_PARENT, dp(48)))
+        col.addView(vSpace(dp(12)))
         col.addView(statusLabel, matchWrap())
 
         val recent = loadRecentSessions()
@@ -175,11 +189,21 @@ class MainActivity : Activity() {
                 }, matchWrap())
             }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
 
-            addView(makeSecondaryButton("Открыть") {
-                idInput.setText(remoteId)
-                idInput.setSelection(idInput.text.length)
-                connect(remoteId, pwInput.text.toString(), statusLabel)
-            }, LinearLayout.LayoutParams(dp(104), dp(42)))
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                addView(makeSecondaryButton("Экран") {
+                    idInput.setText(remoteId)
+                    idInput.setSelection(idInput.text.length)
+                    connect(remoteId, pwInput.text.toString(), statusLabel)
+                }, LinearLayout.LayoutParams(dp(92), dp(42)).also {
+                    it.setMargins(0, 0, dp(6), 0)
+                })
+                addView(makeSecondaryButton("Тач") {
+                    idInput.setText(remoteId)
+                    idInput.setSelection(idInput.text.length)
+                    connect(remoteId, pwInput.text.toString(), statusLabel, touchpadOnly = true)
+                }, LinearLayout.LayoutParams(dp(82), dp(42)))
+            }, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
         }
 
     // ── Адресная книга ───────────────────────────────────────────────────────
@@ -329,11 +353,23 @@ class MainActivity : Activity() {
             }
 
             addView(vSpace(dp(10)))
-            addView(makePrimaryButton("Подключиться") {
-                prefs.edit().putString(PREF_LAST_ID, contact.remoteId).apply()
-                val status = TextView(this@MainActivity)
-                connect(contact.remoteId, "", status)
-            }, LinearLayout.LayoutParams(MATCH_PARENT, dp(44)))
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                addView(makePrimaryButton("Экран") {
+                    prefs.edit().putString(PREF_LAST_ID, contact.remoteId).apply()
+                    val status = TextView(this@MainActivity)
+                    connect(contact.remoteId, "", status)
+                }, LinearLayout.LayoutParams(0, dp(44), 1f).also {
+                    it.setMargins(0, 0, dp(6), 0)
+                })
+                addView(makeSecondaryButton("Тачпад") {
+                    prefs.edit().putString(PREF_LAST_ID, contact.remoteId).apply()
+                    val status = TextView(this@MainActivity)
+                    connect(contact.remoteId, "", status, touchpadOnly = true)
+                }, LinearLayout.LayoutParams(0, dp(44), 1f).also {
+                    it.setMargins(dp(6), 0, 0, 0)
+                })
+            }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         }
 
     // ── Настройки ────────────────────────────────────────────────────────────
@@ -459,20 +495,35 @@ class MainActivity : Activity() {
     }
 
     // ── Подключение ───────────────────────────────────────────────────────────
-    private fun connect(id: String, password: String, statusLabel: TextView) {
-        if (!client.start(id, password, apiUrl(), idServer(), relayServer(), publicKey())) {
+    private fun connect(
+        id: String,
+        password: String,
+        statusLabel: TextView,
+        touchpadOnly: Boolean = false,
+    ) {
+        val started = if (touchpadOnly) {
+            client.startTouchpad(id, password, apiUrl(), idServer(), relayServer(), publicKey())
+        } else {
+            client.start(id, password, apiUrl(), idServer(), relayServer(), publicKey())
+        }
+        if (!started) {
             statusLabel.text = "Не удалось запустить сессию"
             statusLabel.setTextColor(Color.rgb(0xE3, 0x4B, 0x2F))
             return
         }
         rememberRecentSession(id)
-        showRemoteScreen()
+        if (touchpadOnly) {
+            showTouchpadScreen()
+        } else {
+            showRemoteScreen()
+        }
     }
 
     // ── Удалённый экран ───────────────────────────────────────────────────────
     private fun showRemoteScreen() {
         root.removeAllViews()
         kbVisible = false
+        touchpadView = null
 
         val rv = RemoteView(this, client).apply {
             layoutParams = FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)
@@ -569,6 +620,89 @@ class MainActivity : Activity() {
         handler.post(statusTick)
     }
 
+    private fun showTouchpadScreen() {
+        root.removeAllViews()
+        kbVisible = false
+        remoteView = null
+
+        val tv = TouchpadView(this, client).apply {
+            layoutParams = FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)
+        }
+        touchpadView = tv
+        root.addView(tv)
+
+        val proxy = buildKeyProxy()
+        keyProxy = proxy
+        root.addView(proxy, FrameLayout.LayoutParams(1, 1).also {
+            it.gravity = Gravity.TOP or Gravity.START
+        })
+
+        val specRow = buildSpecialKeysRow()
+        kbPanel = specRow
+
+        val overlay = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.argb(0xAA, 0, 0, 0))
+            textSize = 11f
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+        }
+        root.addView(
+            overlay,
+            FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.START),
+        )
+
+        val toolbar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(toolbarBg)
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(6), dp(6), dp(6), dp(6))
+        }
+
+        val rcBtn = makeToolBtn("ПКМ", Color.rgb(0x44, 0x44, 0x55))
+        rcBtn.setOnClickListener { tv.rightClickAtCursor() }
+
+        val kbBtn = makeToolBtn("Клав.", Color.rgb(0x22, 0x44, 0x55))
+        kbBtn.setOnClickListener { toggleKeyboard() }
+
+        val centerBtn = makeToolBtn("Центр", Color.rgb(0x22, 0x44, 0x33))
+        centerBtn.setOnClickListener { tv.centerCursor() }
+
+        val discBtn = makeToolBtn("Выход", Color.rgb(0x66, 0x22, 0x22))
+        discBtn.setOnClickListener { disconnect() }
+
+        toolbar.addView(rcBtn, LinearLayout.LayoutParams(0, dp(40), 1f).also {
+            it.setMargins(dp(3), 0, dp(3), 0)
+        })
+        toolbar.addView(kbBtn, LinearLayout.LayoutParams(0, dp(40), 1f).also {
+            it.setMargins(dp(3), 0, dp(3), 0)
+        })
+        toolbar.addView(centerBtn, LinearLayout.LayoutParams(0, dp(40), 1f).also {
+            it.setMargins(dp(3), 0, dp(3), 0)
+        })
+        toolbar.addView(discBtn, LinearLayout.LayoutParams(0, dp(40), 1f).also {
+            it.setMargins(dp(3), 0, dp(3), 0)
+        })
+
+        val bottomBar = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        bottomBar.addView(specRow, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        bottomBar.addView(toolbar, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        root.addView(
+            bottomBar,
+            FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.BOTTOM),
+        )
+
+        val statusTick = object : Runnable {
+            override fun run() {
+                tv.refreshRemoteSize()
+                overlay.text = if (client.isConnected()) "● ${client.status()}" else client.status()
+                handler.postDelayed(this, 500)
+            }
+        }
+        handler.post(statusTick)
+    }
+
     private fun disconnect() {
         remoteView?.stopRendering()
         client.stop()
@@ -576,11 +710,13 @@ class MainActivity : Activity() {
         rightClickPending = false
         rightClickBtn = null
         remoteView = null
+        touchpadView = null
         showConnectScreen()
     }
 
     override fun onDestroy() {
         remoteView?.stopRendering()
+        touchpadView = null
         client.stop()
         super.onDestroy()
     }

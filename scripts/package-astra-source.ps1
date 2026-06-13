@@ -127,6 +127,17 @@ If GLX/OpenGL is unstable in the VM, use the CPU UI path:
 EVERTYDESK_RENDERER=software ./target/release/evertydesk-lite
 ```
 
+On Astra, auto startup prefers the CPU framebuffer UI first. Override only for
+diagnostics:
+
+```bash
+# Force normal GL auto attempts before CPU fallback.
+EVERTYDESK_LINUX_GL_AUTO=1 ./target/release/evertydesk-lite
+
+# Allow WGPU as an extra auto candidate.
+EVERTYDESK_LINUX_AUTO_WGPU=1 ./target/release/evertydesk-lite
+```
+
 Install for the current user:
 
 ```bash

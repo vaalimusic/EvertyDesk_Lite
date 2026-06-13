@@ -406,6 +406,7 @@ impl FrameQueueHandle {
 use crate::evrt::EvrtPacket;
 
 const REASSEMBLY_REORDER_WINDOW_FRAMES: u32 = 4;
+const REASSEMBLY_MAX_BUFFERED_BYTES: usize = 24 * 1024 * 1024;
 
 /// Один незавершённый кадр в процессе сборки.
 struct FrameAssembly {
@@ -415,6 +416,7 @@ struct FrameAssembly {
     presentation_time_us: u64,
     parts: Vec<Option<Vec<u8>>>,
     received: u16,
+    buffered_bytes: usize,
     first_packet_at: Instant,
 }
 
@@ -427,18 +429,28 @@ impl FrameAssembly {
             presentation_time_us: pts,
             parts: vec![None; packet_count as usize],
             received: 0,
+            buffered_bytes: 0,
             first_packet_at: Instant::now(),
         }
     }
 
-    fn set(&mut self, index: u16, payload: Vec<u8>) -> bool {
+    fn has_part(&self, index: u16) -> bool {
+        self.parts
+            .get(index as usize)
+            .map(|part| part.is_some())
+            .unwrap_or(true)
+    }
+
+    fn set(&mut self, index: u16, payload: Vec<u8>) -> Option<usize> {
         let idx = index as usize;
         if idx >= self.parts.len() || self.parts[idx].is_some() {
-            return false;
+            return None;
         }
+        let bytes = payload.len();
         self.parts[idx] = Some(payload);
         self.received += 1;
-        true
+        self.buffered_bytes = self.buffered_bytes.saturating_add(bytes);
+        Some(bytes)
     }
 
     fn is_complete(&self) -> bool {
@@ -446,7 +458,7 @@ impl FrameAssembly {
     }
 
     fn join(self) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(self.buffered_bytes);
         for part in self.parts {
             if let Some(p) = part {
                 out.extend_from_slice(&p);
@@ -462,6 +474,10 @@ impl FrameAssembly {
             .as_millis()
             .min(i32::MAX as u128) as i32
     }
+
+    fn buffered_bytes(&self) -> usize {
+        self.buffered_bytes
+    }
 }
 
 /// Сборщик кадров из одного канала (base или enhancement).
@@ -473,6 +489,7 @@ pub struct ChannelReassembler {
     waiting_after_loss: bool,
     dropped_frames: u64,
     last_dropped_id: Option<u32>,
+    buffered_bytes: usize,
 }
 
 impl ChannelReassembler {
@@ -485,11 +502,13 @@ impl ChannelReassembler {
             waiting_after_loss: false,
             dropped_frames: 0,
             last_dropped_id: None,
+            buffered_bytes: 0,
         }
     }
 
     pub fn reset(&mut self) {
         self.frames.clear();
+        self.buffered_bytes = 0;
         self.latest_frame_id_seen = None;
         self.latest_completed_id = None;
         self.waiting_after_loss = false;
@@ -504,7 +523,10 @@ impl ChannelReassembler {
     /// Возвращает `Some((bytes, is_key, assembly_ms, pts))` когда кадр собран.
     pub fn on_packet(&mut self, pkt: &EvrtPacket) -> Option<(Vec<u8>, bool, i32, u64)> {
         // Базовые проверки
-        if pkt.packet_count == 0 || pkt.packet_index >= pkt.packet_count {
+        if pkt.packet_count == 0
+            || pkt.packet_index >= pkt.packet_count
+            || pkt.packet_count as usize > crate::evrt::MAX_FRAME_PACKET_COUNT
+        {
             self.mark_frame_dropped(pkt.frame_id);
             return None;
         }
@@ -559,7 +581,7 @@ impl ChannelReassembler {
         }
 
         // Собираем кадр
-        let assembly = self.frames.entry(pkt.frame_id).or_insert_with(|| {
+        self.frames.entry(pkt.frame_id).or_insert_with(|| {
             FrameAssembly::new(
                 pkt.frame_id,
                 pkt.packet_count,
@@ -568,11 +590,29 @@ impl ChannelReassembler {
             )
         });
 
+        let assembly = self.frames.get(&pkt.frame_id).unwrap();
         if assembly.packet_count != pkt.packet_count {
+            self.drop_frame(pkt.frame_id);
+            if !pkt.is_key_frame() {
+                self.waiting_after_loss = true;
+            }
             return None; // несовместимые пакеты
         }
-        if !assembly.set(pkt.packet_index, pkt.payload.clone()) {
+        if assembly.has_part(pkt.packet_index) {
             return None; // дубль
+        }
+        if !self.reserve_buffer(pkt.payload.len(), pkt.frame_id, pkt.is_key_frame()) {
+            return None;
+        }
+
+        let assembly = match self.frames.get_mut(&pkt.frame_id) {
+            Some(assembly) => assembly,
+            None => return None,
+        };
+        if let Some(bytes) = assembly.set(pkt.packet_index, pkt.payload.clone()) {
+            self.buffered_bytes = self.buffered_bytes.saturating_add(bytes);
+        } else {
+            return None; // РґСѓР±Р»СЊ
         }
         if !assembly.is_complete() {
             return None;
@@ -580,6 +620,9 @@ impl ChannelReassembler {
 
         // Кадр собран
         let assembly = self.frames.remove(&pkt.frame_id).unwrap();
+        self.buffered_bytes = self
+            .buffered_bytes
+            .saturating_sub(assembly.buffered_bytes());
         self.latest_completed_id = Some(assembly.frame_id);
         let delay_ms = assembly.assembly_delay_ms();
         let pts = assembly.presentation_time_us;
@@ -619,6 +662,18 @@ impl ChannelReassembler {
         }
     }
 
+    fn drop_frame(&mut self, frame_id: u32) -> bool {
+        if let Some(assembly) = self.frames.remove(&frame_id) {
+            self.buffered_bytes = self
+                .buffered_bytes
+                .saturating_sub(assembly.buffered_bytes());
+            self.mark_frame_dropped(frame_id);
+            true
+        } else {
+            false
+        }
+    }
+
     fn drop_older_than(&mut self, frame_id: u32) -> usize {
         let dropped = self
             .frames
@@ -627,12 +682,54 @@ impl ChannelReassembler {
             .filter(|id| *id < frame_id)
             .collect::<Vec<_>>();
         for id in &dropped {
-            self.mark_frame_dropped(*id);
-        }
-        for id in &dropped {
-            self.frames.remove(id);
+            self.drop_frame(*id);
         }
         dropped.len()
+    }
+
+    fn drop_oldest_except(&mut self, keep_frame_id: u32) -> bool {
+        let Some(oldest) = self
+            .frames
+            .keys()
+            .copied()
+            .filter(|id| *id != keep_frame_id)
+            .min()
+        else {
+            return false;
+        };
+        self.drop_frame(oldest)
+    }
+
+    fn reserve_buffer(&mut self, bytes: usize, frame_id: u32, is_key_frame: bool) -> bool {
+        if bytes > REASSEMBLY_MAX_BUFFERED_BYTES {
+            self.drop_frame(frame_id);
+            if !is_key_frame {
+                self.waiting_after_loss = true;
+            }
+            return false;
+        }
+
+        let mut dropped_any = false;
+        while self.buffered_bytes.saturating_add(bytes) > REASSEMBLY_MAX_BUFFERED_BYTES {
+            if self.drop_oldest_except(frame_id) {
+                dropped_any = true;
+            } else {
+                self.drop_frame(frame_id);
+                if !is_key_frame {
+                    self.waiting_after_loss = true;
+                }
+                return false;
+            }
+        }
+
+        if dropped_any && !is_key_frame {
+            self.drop_frame(frame_id);
+            self.mark_frame_dropped(frame_id);
+            self.waiting_after_loss = true;
+            return false;
+        }
+
+        true
     }
 }
 
@@ -1000,13 +1097,12 @@ mod tests {
         assert!(ch.on_packet(&first).is_none());
 
         for frame_id in 2..=6 {
-            let dependent =
-                crate::evrt::packetize_video_frame(
-                    frame_id,
-                    frame_id as u64 * 1000,
-                    false,
-                    &vec![2u8; 3000],
-                );
+            let dependent = crate::evrt::packetize_video_frame(
+                frame_id,
+                frame_id as u64 * 1000,
+                false,
+                &vec![2u8; 3000],
+            );
             let packet = crate::evrt::parse(&dependent[0], dependent[0].len()).unwrap();
             assert!(ch.on_packet(&packet).is_none());
         }
@@ -1019,6 +1115,81 @@ mod tests {
             recovered = ch.on_packet(&packet).or(recovered);
         }
         assert!(recovered.is_some());
+    }
+
+    #[test]
+    fn reassembler_rejects_excessive_packet_count_without_allocating() {
+        let mut ch = ChannelReassembler::new();
+        let pkt = crate::evrt::EvrtPacket {
+            packet_type: crate::evrt::TYPE_VIDEO_FRAME,
+            flags: crate::evrt::FLAG_KEY_FRAME,
+            frame_id: 1,
+            packet_index: 0,
+            packet_count: (crate::evrt::MAX_FRAME_PACKET_COUNT as u16) + 1,
+            presentation_time_us: 1000,
+            payload: vec![1],
+        };
+
+        assert!(ch.on_packet(&pkt).is_none());
+        assert_eq!(ch.dropped_frames(), 1);
+    }
+
+    #[test]
+    fn reassembler_drops_frame_on_packet_count_conflict() {
+        let mut ch = ChannelReassembler::new();
+        let first = crate::evrt::EvrtPacket {
+            packet_type: crate::evrt::TYPE_VIDEO_FRAME,
+            flags: 0,
+            frame_id: 1,
+            packet_index: 0,
+            packet_count: 2,
+            presentation_time_us: 1000,
+            payload: vec![1],
+        };
+        let conflict = crate::evrt::EvrtPacket {
+            packet_type: crate::evrt::TYPE_VIDEO_FRAME,
+            flags: 0,
+            frame_id: 1,
+            packet_index: 1,
+            packet_count: 3,
+            presentation_time_us: 1000,
+            payload: vec![2],
+        };
+
+        assert!(ch.on_packet(&first).is_none());
+        assert!(ch.on_packet(&conflict).is_none());
+        assert_eq!(ch.dropped_frames(), 1);
+
+        let keyframe = crate::evrt::packetize_video_frame(2, 2000, true, &[3]);
+        let parsed = crate::evrt::parse(&keyframe[0], keyframe[0].len()).unwrap();
+        assert!(ch.on_packet(&parsed).is_some());
+    }
+
+    #[test]
+    fn reassembler_releases_buffer_budget_after_complete_frame() {
+        let mut ch = ChannelReassembler::new();
+        let payload = vec![7u8; 3000];
+        let packets = crate::evrt::packetize_video_frame(1, 1000, true, &payload);
+
+        let mut recovered = None;
+        for raw in &packets {
+            let packet = crate::evrt::parse(raw, raw.len()).unwrap();
+            recovered = ch.on_packet(&packet).or(recovered);
+        }
+
+        assert!(recovered.is_some());
+        assert_eq!(ch.buffered_bytes, 0);
+    }
+
+    #[test]
+    fn reassembler_rejects_payload_over_buffer_budget() {
+        let mut ch = ChannelReassembler::new();
+        ch.frames
+            .insert(1, FrameAssembly::new(1, 1, false, 1000));
+
+        assert!(!ch.reserve_buffer(REASSEMBLY_MAX_BUFFERED_BYTES + 1, 1, false));
+        assert_eq!(ch.dropped_frames(), 1);
+        assert!(ch.frames.is_empty());
     }
 
     #[test]

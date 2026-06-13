@@ -278,6 +278,7 @@ unsafe fn px(bgra: &[u8], base: usize) -> (i32, i32, i32) {
 ///
 /// `y_stride` and `uv_stride` are the row strides in bytes (may be > width).
 /// Output `rgba` must be pre-allocated to `width * height * 4` bytes.
+#[allow(dead_code)]
 pub fn nv12_to_rgba(
     rgba: &mut Vec<u8>,
     width: usize,

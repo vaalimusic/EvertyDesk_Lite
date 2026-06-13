@@ -58,10 +58,10 @@ use crate::{
     crypto::{self, StreamCipher},
     rustdesk_proto::{
         decode_message, decode_peer_message, encode_message, encode_peer_message, login_response,
-        misc, peer_message, rendezvous_message, video_frame, DisplayInfo, EncodedVideoFrame,
-        EncodedVideoFrames, Hash, IdPk, ImageQuality, LoginResponse, Misc, PeerInfo, PeerMessage,
-        PreferCodec, RegisterPeer, RegisterPk, RelayResponse, RendezvousMessage, RequestRelay,
-        ShellMessage, ShellMessageKind, SignedId, SupportedDecoding,
+        misc, peer_message, rendezvous_message, DisplayInfo, Hash, IdPk, ImageQuality,
+        LoginResponse, Misc, PeerInfo, PeerMessage, PreferCodec, RegisterPeer, RegisterPk,
+        RelayResponse, RendezvousMessage, RequestRelay, ShellMessage, ShellMessageKind, SignedId,
+        SupportedDecoding,
     },
     settings::{AppConfig, CodecPreference, EncoderPreference},
     transport::{connect_tcp, encode_frame_len, read_framed, send_framed},
@@ -1338,6 +1338,7 @@ fn relay_session_inner(
                 &mut shell,
                 &shared_target_fps,
                 &shared_quality_milli,
+                config.security.allow_clipboard,
             ),
             Ok(None) => {}
             Err(ref e) if is_timeout(e) => {}
@@ -1508,176 +1509,6 @@ struct FrameFingerprint {
     tile_hashes: Vec<u64>,
 }
 
-pub struct FrameSkipStats {
-    pub sent: u64,
-    pub skipped_static: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum VideoEncoderBackend {
-    MediaFoundation,
-    VideoToolbox,
-    Nvenc,
-    OpenH264,
-}
-
-impl VideoEncoderBackend {
-    fn label(self) -> &'static str {
-        match self {
-            Self::MediaFoundation => "Media Foundation",
-            Self::VideoToolbox => "VideoToolbox",
-            Self::Nvenc => "NVENC",
-            Self::OpenH264 => "OpenH264",
-        }
-    }
-}
-
-#[derive(Default)]
-#[allow(dead_code)] // orphaned: telemetry от старого video_loop
-struct VideoEncodeTelemetry {
-    planned_backend: String,
-    active_backend: Option<VideoEncoderBackend>,
-    active_codec: Option<crate::nvenc::NvencCodec>,
-    width: u32,
-    height: u32,
-    sent_packets: u64,
-    sent_bytes: u64,
-    keyframes: u64,
-    empty_outputs: u64,
-    fallback_count: u64,
-    last_fallback_reason: Option<String>,
-    timing_samples: u64,
-    capture_ms_total: u64,
-    capture_ms_max: u64,
-    change_ms_total: u64,
-    change_ms_max: u64,
-    encode_ms_total: u64,
-    encode_ms_max: u64,
-    send_ms_total: u64,
-    send_ms_max: u64,
-}
-
-impl VideoEncodeTelemetry {
-    fn new(planned_backend: String) -> Self {
-        Self {
-            planned_backend,
-            ..Default::default()
-        }
-    }
-
-    fn mark_sent(&mut self, packet: &EncodedPacket, width: u32, height: u32) {
-        self.active_backend = Some(packet.backend);
-        self.active_codec = Some(packet.codec);
-        self.width = width;
-        self.height = height;
-        self.sent_packets = self.sent_packets.saturating_add(1);
-        self.sent_bytes = self.sent_bytes.saturating_add(packet.bytes.len() as u64);
-        if packet.key {
-            self.keyframes = self.keyframes.saturating_add(1);
-        }
-    }
-
-    fn mark_capture_ms(&mut self, ms: u64) {
-        self.timing_samples = self.timing_samples.saturating_add(1);
-        self.capture_ms_total = self.capture_ms_total.saturating_add(ms);
-        self.capture_ms_max = self.capture_ms_max.max(ms);
-    }
-
-    fn mark_change_ms(&mut self, ms: u64) {
-        self.change_ms_total = self.change_ms_total.saturating_add(ms);
-        self.change_ms_max = self.change_ms_max.max(ms);
-    }
-
-    fn mark_encode_ms(&mut self, ms: u64) {
-        self.encode_ms_total = self.encode_ms_total.saturating_add(ms);
-        self.encode_ms_max = self.encode_ms_max.max(ms);
-    }
-
-    fn mark_send_ms(&mut self, ms: u64) {
-        self.send_ms_total = self.send_ms_total.saturating_add(ms);
-        self.send_ms_max = self.send_ms_max.max(ms);
-    }
-
-    fn mark_empty(&mut self, backend: VideoEncoderBackend, codec: crate::nvenc::NvencCodec) {
-        self.active_backend = Some(backend);
-        self.active_codec = Some(codec);
-        self.empty_outputs = self.empty_outputs.saturating_add(1);
-    }
-
-    fn mark_fallback(
-        &mut self,
-        backend: VideoEncoderBackend,
-        codec: crate::nvenc::NvencCodec,
-        reason: String,
-    ) {
-        self.active_backend = Some(backend);
-        self.active_codec = Some(codec);
-        self.fallback_count = self.fallback_count.saturating_add(1);
-        self.last_fallback_reason = Some(reason);
-    }
-
-    fn reset_interval(&mut self) -> VideoEncodeInterval {
-        let interval = VideoEncodeInterval {
-            active_backend: self.active_backend,
-            active_codec: self.active_codec,
-            width: self.width,
-            height: self.height,
-            sent_packets: self.sent_packets,
-            sent_bytes: self.sent_bytes,
-            keyframes: self.keyframes,
-            empty_outputs: self.empty_outputs,
-            fallback_count: self.fallback_count,
-            last_fallback_reason: self.last_fallback_reason.clone(),
-            timing_samples: self.timing_samples,
-            capture_ms_total: self.capture_ms_total,
-            capture_ms_max: self.capture_ms_max,
-            change_ms_total: self.change_ms_total,
-            change_ms_max: self.change_ms_max,
-            encode_ms_total: self.encode_ms_total,
-            encode_ms_max: self.encode_ms_max,
-            send_ms_total: self.send_ms_total,
-            send_ms_max: self.send_ms_max,
-        };
-        self.sent_packets = 0;
-        self.sent_bytes = 0;
-        self.keyframes = 0;
-        self.empty_outputs = 0;
-        self.fallback_count = 0;
-        self.timing_samples = 0;
-        self.capture_ms_total = 0;
-        self.capture_ms_max = 0;
-        self.change_ms_total = 0;
-        self.change_ms_max = 0;
-        self.encode_ms_total = 0;
-        self.encode_ms_max = 0;
-        self.send_ms_total = 0;
-        self.send_ms_max = 0;
-        interval
-    }
-}
-
-struct VideoEncodeInterval {
-    active_backend: Option<VideoEncoderBackend>,
-    active_codec: Option<crate::nvenc::NvencCodec>,
-    width: u32,
-    height: u32,
-    sent_packets: u64,
-    sent_bytes: u64,
-    keyframes: u64,
-    empty_outputs: u64,
-    fallback_count: u64,
-    last_fallback_reason: Option<String>,
-    timing_samples: u64,
-    capture_ms_total: u64,
-    capture_ms_max: u64,
-    change_ms_total: u64,
-    change_ms_max: u64,
-    encode_ms_total: u64,
-    encode_ms_max: u64,
-    send_ms_total: u64,
-    send_ms_max: u64,
-}
-
 #[derive(Clone, Copy)]
 pub struct ClientVideoSupport {
     pub h264: bool,
@@ -1698,36 +1529,8 @@ impl Default for ClientVideoSupport {
 }
 
 pub struct EncodedPacket {
-    pub backend: VideoEncoderBackend,
-    pub codec: crate::nvenc::NvencCodec,
     pub bytes: Vec<u8>,
     pub key: bool,
-}
-
-impl EncodedPacket {
-    fn h264(packet: H264Packet) -> Self {
-        Self {
-            backend: VideoEncoderBackend::OpenH264,
-            codec: crate::nvenc::NvencCodec::H264,
-            bytes: packet.bytes,
-            key: packet.key,
-        }
-    }
-
-    fn into_video_union(self) -> video_frame::Union {
-        let frames = EncodedVideoFrames {
-            frames: vec![EncodedVideoFrame {
-                data: self.bytes,
-                key: self.key,
-                ..Default::default()
-            }],
-        };
-        match self.codec {
-            crate::nvenc::NvencCodec::H264 => video_frame::Union::H264s(frames),
-            crate::nvenc::NvencCodec::H265 => video_frame::Union::H265s(frames),
-            crate::nvenc::NvencCodec::Av1 => video_frame::Union::Av1s(frames),
-        }
-    }
 }
 
 impl FrameChangeDetector {
@@ -1788,16 +1591,6 @@ impl FrameChangeDetector {
         self.last_sent_at = Some(Instant::now());
         self.consecutive_static_skips = 0;
         self.sent_since_log = self.sent_since_log.saturating_add(1);
-    }
-
-    pub fn take_stats(&mut self) -> FrameSkipStats {
-        let stats = FrameSkipStats {
-            sent: self.sent_since_log,
-            skipped_static: self.skipped_static_since_log,
-        };
-        self.sent_since_log = 0;
-        self.skipped_static_since_log = 0;
-        stats
     }
 
     fn frame_changed(&self, current: &FrameFingerprint) -> bool {
@@ -2155,8 +1948,6 @@ fn encode_mf_frame(
     };
     encoder.encode_bgra(bgra, force_key).map(|packet| {
         packet.map(|p| EncodedPacket {
-            backend: VideoEncoderBackend::MediaFoundation,
-            codec: p.codec,
             bytes: p.bytes,
             key: p.key,
         })
@@ -2207,8 +1998,6 @@ fn encode_videotoolbox_frame(
     };
     encoder.encode_bgra(bgra, force_key).map(|packet| {
         packet.map(|p| EncodedPacket {
-            backend: VideoEncoderBackend::VideoToolbox,
-            codec: p.codec,
             bytes: p.bytes,
             key: p.key,
         })
@@ -2254,8 +2043,6 @@ fn encode_nvenc_frame(
     };
     encoder.encode_bgra(bgra, force_key).map(|packet| {
         packet.map(|p| EncodedPacket {
-            backend: VideoEncoderBackend::Nvenc,
-            codec: p.codec,
             bytes: p.bytes,
             key: p.key,
         })
@@ -2528,6 +2315,7 @@ fn handle_client_input_pipeline(
     shell: &mut Option<ShellRuntime>,
     target_fps: &AtomicU32,
     quality_milli: &AtomicU32,
+    allow_clipboard: bool,
 ) {
     use crate::video_pipeline::PipelineCmd;
     match msg.union {
@@ -2626,8 +2414,42 @@ fn handle_client_input_pipeline(
             // Shell output идёт через peer_msg_tx → pipeline → TCP relay → клиент
             handle_shell_message(shell_msg, peer_msg_tx, shell);
         }
+        Some(peer_message::Union::Clipboard(clipboard)) => {
+            if !allow_clipboard {
+                host_log(
+                    events,
+                    "Host clipboard ignored: disabled by security policy".to_owned(),
+                );
+                return;
+            }
+
+            match crate::transport::clipboard_text_from_message(clipboard) {
+                Ok(Some(text)) => {
+                    let chars = text.chars().count();
+                    match write_host_clipboard_text(&text) {
+                        Ok(()) => {
+                            host_log(events, format!("Host clipboard updated: {chars} chars"))
+                        }
+                        Err(err) => host_log(events, format!("Host clipboard write failed: {err}")),
+                    }
+                }
+                Ok(None) => host_log(
+                    events,
+                    "Host clipboard ignored: unsupported format".to_owned(),
+                ),
+                Err(err) => host_log(events, format!("Host clipboard decode failed: {err}")),
+            }
+        }
         _ => {}
     }
+}
+
+fn write_host_clipboard_text(text: &str) -> Result<(), String> {
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|err| format!("Clipboard init failed: {err}"))?;
+    clipboard
+        .set_text(text.to_owned())
+        .map_err(|err| format!("Clipboard text write failed: {err}"))
 }
 
 fn mouse_event_should_log(ev: &crate::rustdesk_proto::MouseEvent) -> bool {
@@ -2650,7 +2472,10 @@ fn mouse_event_summary(ev: &crate::rustdesk_proto::MouseEvent) -> String {
         16 => "forward",
         _ => "none",
     };
-    format!("mouse {kind} button={button} x={} y={} mask={}", ev.x, ev.y, ev.mask)
+    format!(
+        "mouse {kind} button={button} x={} y={} mask={}",
+        ev.x, ev.y, ev.mask
+    )
 }
 
 fn key_event_summary(ev: &crate::rustdesk_proto::KeyEvent) -> String {
@@ -4298,29 +4123,6 @@ pub fn h264_target_bitrate_bps_pub(w: u32, h: u32, fps: u32, quality_milli: u32)
     h264_target_bitrate_bps(w, h, fps, quality_milli)
 }
 
-/// Публичная обёртка choose_mf_encoder_codec — нужна для `evrt_session.rs`.
-pub fn choose_mf_encoder_codec_pub(
-    enc: crate::settings::EncoderPreference,
-    codec: crate::settings::CodecPreference,
-    client: ClientVideoSupport,
-) -> Option<crate::nvenc::NvencCodec> {
-    choose_mf_encoder_codec(enc, codec, client)
-}
-
-/// Публичная обёртка encode_mf_frame — нужна для `evrt_session.rs`.
-pub fn encode_mf_frame_pub(
-    encoder: &mut Option<crate::mf_encode::MfVideoEncoder>,
-    codec: crate::nvenc::NvencCodec,
-    width: u32,
-    height: u32,
-    fps: u32,
-    bitrate: u32,
-    bgra: &[u8],
-    force_key: bool,
-) -> Result<Option<EncodedPacket>, String> {
-    encode_mf_frame(encoder, codec, width, height, fps, bitrate, bgra, force_key)
-}
-
 /// Публичная обёртка release_stuck_input — нужна для `evrt_session.rs`.
 pub fn release_stuck_input_pub() {
     release_stuck_input();
@@ -4330,9 +4132,15 @@ pub fn release_stuck_input_pub() {
 /// Позволяет понять, свежий ли хост запущен, без штампов сборки.
 /// Возвращает "HH:MM" локального времени сборки или "?" если недоступно.
 pub fn binary_build_stamp() -> String {
-    let Ok(exe) = std::env::current_exe() else { return "?".into() };
-    let Ok(meta) = std::fs::metadata(&exe) else { return "?".into() };
-    let Ok(mtime) = meta.modified() else { return "?".into() };
+    let Ok(exe) = std::env::current_exe() else {
+        return "?".into();
+    };
+    let Ok(meta) = std::fs::metadata(&exe) else {
+        return "?".into();
+    };
+    let Ok(mtime) = meta.modified() else {
+        return "?".into();
+    };
     let unix = mtime
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -4387,8 +4195,6 @@ pub struct MultiEncoder {
     /// Какой бэкенд реально выдал последний кадр (для диагностики).
     /// Меняется на первом успехе — видно MF это, OpenH264 или PNG.
     active_backend: &'static str,
-    /// Логировать активный бэкенд один раз.
-    backend_logged: bool,
     /// Причина почему MF отключился (для диагностики «почему софт вместо железа»).
     mf_error: Option<String>,
 }
@@ -4422,7 +4228,6 @@ impl MultiEncoder {
             #[cfg(feature = "live-h264")]
             yuv: YuvFrame::default(),
             active_backend: "none",
-            backend_logged: false,
             mf_error: None,
         }
     }

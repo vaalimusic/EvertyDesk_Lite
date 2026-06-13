@@ -68,6 +68,7 @@ enum TcpItem {
 
 // ─── Pipeline commands ────────────────────────────────────────────────────────
 
+#[allow(dead_code)] // Reserved for client-side IDR requests and EVRT lifecycle wiring.
 pub enum PipelineCmd {
     Stop,
     SetFps(u32),
@@ -728,15 +729,22 @@ fn encode_loop(
 
     let mut frame_id: u32 = 0;
     let mut last_idr: Instant = Instant::now();
+    let mut force_recovery_key = true;
     let mut next_frame_due: Instant = Instant::now();
-    const IDR_MIN: Duration = Duration::from_secs(2);
+    const IDR_MIN: Duration = Duration::from_millis(1_200);
     const SPIN: Duration = Duration::from_micros(1_500);
 
     while !stop.load(Ordering::Relaxed) {
         if software_profile_active {
             let current = target_fps.load(Ordering::Relaxed);
-            if current > 15 {
-                target_fps.store(15, Ordering::Relaxed);
+            let software_fps = software_encoder_target_fps(current);
+            if current != software_fps {
+                target_fps.store(software_fps, Ordering::Relaxed);
+            }
+            let current_quality = quality_ms.load(Ordering::Relaxed);
+            let software_quality = software_encoder_quality_milli(current_quality);
+            if current_quality != software_quality {
+                quality_ms.store(software_quality, Ordering::Relaxed);
             }
         }
         let fps = target_fps.load(Ordering::Relaxed).clamp(5, 60);
@@ -759,7 +767,8 @@ fn encode_loop(
         }
 
         // IDR по таймеру/запросу
-        let periodic_key = idr_rx.try_recv().is_ok() || last_idr.elapsed() > IDR_MIN;
+        let periodic_key =
+            force_recovery_key || idr_rx.try_recv().is_ok() || last_idr.elapsed() > IDR_MIN;
 
         // Захват
         let cap_started = Instant::now();
@@ -770,6 +779,24 @@ fn encode_loop(
             continue;
         };
         tele.mark_capture(cap_started.elapsed());
+        let expected_bgra_len = (cap_w as usize)
+            .saturating_mul(cap_h as usize)
+            .saturating_mul(4);
+        if cap_w == 0 || cap_h == 0 || bgra_raw.len() != expected_bgra_len {
+            log(
+                &events,
+                format!(
+                    "Capture returned invalid frame geometry: {}x{}, bgra={} expected={}",
+                    cap_w,
+                    cap_h,
+                    bgra_raw.len(),
+                    expected_bgra_len
+                ),
+            );
+            force_recovery_key = true;
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        }
 
         // FSR: апскейл происходит in-place в буфере адаптера.
         // Передаём срез напрямую в кодировщик — без лишнего .to_owned()
@@ -803,7 +830,17 @@ fn encode_loop(
             continue;
         }
 
-        let want_idr = decision.force_key || periodic_key;
+        let mut want_idr = decision.force_key || periodic_key;
+
+        if software_profile_active {
+            let next_downscale = software_encoder_downscale_target(enc_w, enc_h);
+            if downscale_to != next_downscale {
+                downscale_to = next_downscale;
+                downscale_buf.clear();
+                want_idr = true;
+                force_recovery_key = true;
+            }
+        }
 
         // ★ Применяем даунскейл если включён (софт-энкодер на высоком разрешении).
         let (enc_w, enc_h, bgra) = if let Some((dw, dh)) = downscale_to {
@@ -831,7 +868,12 @@ fn encode_loop(
             eff_bps = eff_bps.min(RELAY_MAX_BPS);
         }
         if software_profile_active {
-            eff_bps = eff_bps.min(2_000_000);
+            let cap_bps = software_encoder_bitrate_cap_bps(enc_w, enc_h, evrt_on);
+            if software_text_quality_needs_floor(decision.roi, enc_w, enc_h, want_idr) {
+                eff_bps =
+                    eff_bps.max(software_encoder_bitrate_floor_bps(enc_w, enc_h).min(cap_bps));
+            }
+            eff_bps = eff_bps.min(cap_bps);
         }
 
         // ── Кодирование через единый каскад ───────────────────────────────────
@@ -966,31 +1008,32 @@ fn encode_loop(
             if is_software {
                 software_profile_active = true;
 
-                let software_fps = target_fps.load(Ordering::Relaxed).min(15).max(5);
+                let software_fps = software_encoder_target_fps(target_fps.load(Ordering::Relaxed));
                 if software_fps < fps {
                     target_fps.store(software_fps, Ordering::Relaxed);
                     next_frame_due = Instant::now();
                 }
-                let software_quality = quality_ms.load(Ordering::Relaxed).min(800).max(1);
+                let software_quality =
+                    software_encoder_quality_milli(quality_ms.load(Ordering::Relaxed));
                 quality_ms.store(software_quality, Ordering::Relaxed);
 
-                let (dw, dh) = if enc_h > 720 || enc_w > 1280 {
-                    let scale_w = 1280.0_f32 / enc_w as f32;
-                    let scale_h = 720.0_f32 / enc_h as f32;
-                    let scale = scale_w.min(scale_h).min(1.0);
-                    let dw = ((enc_w as f32 * scale) as u32 & !1).max(2);
-                    let dh = ((enc_h as f32 * scale) as u32 & !1).max(2);
-                    downscale_to = Some((dw, dh));
-                    (dw, dh)
-                } else {
-                    (enc_w, enc_h)
-                };
+                downscale_to = software_encoder_downscale_target(enc_w, enc_h);
+                let (dw, dh) = downscale_to.unwrap_or((enc_w, enc_h));
+                let cap_bps = software_encoder_bitrate_cap_bps(dw, dh, evrt_on);
+                let floor_bps = software_encoder_bitrate_floor_bps(dw, dh).min(cap_bps);
 
                 log(
                     &events,
                     format!(
-                        "Software encoder profile: {}x{} -> {}x{} @ {}fps, bitrate <= 2Mbps",
-                        enc_w, enc_h, dw, dh, software_fps,
+                        "Software encoder profile: {}x{} -> {}x{} @ {}fps, quality={}, bitrate {}-{} kbps, priority=text",
+                        enc_w,
+                        enc_h,
+                        dw,
+                        dh,
+                        software_fps,
+                        software_quality,
+                        floor_bps / 1_000,
+                        cap_bps / 1_000,
                     ),
                 );
             }
@@ -1046,22 +1089,37 @@ fn encode_loop(
             // EVRT primary: все кадры → EVRT, IDR → TCP для синхронизации
             match evrt_tx.try_send(frame.clone()) {
                 Ok(()) => {}
-                Err(mpsc::TrySendError::Full(_)) => {} // клиент не успевает
+                Err(mpsc::TrySendError::Full(_)) => {
+                    force_recovery_key = true;
+                    apply_tcp_backpressure(&bitrate_scale_milli);
+                }
                 Err(mpsc::TrySendError::Disconnected(_)) => break,
             }
             if is_idr {
-                match tcp_tx.try_send(TcpItem::Video(frame)) {
-                    Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
-                    Err(mpsc::TrySendError::Disconnected(_)) => break,
+                match send_tcp_video_frame(&tcp_tx, &stop, frame) {
+                    TcpVideoSend::Sent => force_recovery_key = false,
+                    TcpVideoSend::Dropped => {
+                        force_recovery_key = true;
+                        apply_tcp_backpressure(&bitrate_scale_milli);
+                    }
+                    TcpVideoSend::Disconnected => break,
                 }
             }
         } else {
             // TCP relay is bounded and latency-sensitive. Drop video when the
             // sender is backed up so control messages and shutdown can still
             // make progress; the next captured frame will be fresher anyway.
-            match tcp_tx.try_send(TcpItem::Video(frame)) {
-                Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
-                Err(mpsc::TrySendError::Disconnected(_)) => break,
+            match send_tcp_video_frame(&tcp_tx, &stop, frame) {
+                TcpVideoSend::Sent => {
+                    if is_idr {
+                        force_recovery_key = false;
+                    }
+                }
+                TcpVideoSend::Dropped => {
+                    force_recovery_key = true;
+                    apply_tcp_backpressure(&bitrate_scale_milli);
+                }
+                TcpVideoSend::Disconnected => break,
             }
         }
     }
@@ -1128,6 +1186,12 @@ fn make_tcp_video_frame(frame: &EncodedFrame) -> crate::rustdesk_proto::PeerMess
     use crate::rustdesk_proto::{
         peer_message, video_frame, EncodedVideoFrame, EncodedVideoFrames, PeerMessage, VideoFrame,
     };
+    debug_assert!(
+        frame.width > 0 && frame.height > 0,
+        "encoded frame has invalid geometry: {}x{}",
+        frame.width,
+        frame.height
+    );
     let encoded = EncodedVideoFrame {
         data: (*frame.bytes).clone(),
         key: frame.is_idr,
@@ -1149,6 +1213,51 @@ fn make_tcp_video_frame(frame: &EncodedFrame) -> crate::rustdesk_proto::PeerMess
 }
 
 // ─── EVRT UDP Sender loop ─────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TcpVideoSend {
+    Sent,
+    Dropped,
+    Disconnected,
+}
+
+fn send_tcp_video_frame(
+    tcp_tx: &SyncSender<TcpItem>,
+    stop: &Arc<AtomicBool>,
+    frame: EncodedFrame,
+) -> TcpVideoSend {
+    if !frame.is_idr {
+        return match tcp_tx.try_send(TcpItem::Video(frame)) {
+            Ok(()) => TcpVideoSend::Sent,
+            Err(mpsc::TrySendError::Full(_)) => TcpVideoSend::Dropped,
+            Err(mpsc::TrySendError::Disconnected(_)) => TcpVideoSend::Disconnected,
+        };
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(120);
+    let mut item = TcpItem::Video(frame);
+    loop {
+        match tcp_tx.try_send(item) {
+            Ok(()) => return TcpVideoSend::Sent,
+            Err(mpsc::TrySendError::Full(returned)) => {
+                if stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                    return TcpVideoSend::Dropped;
+                }
+                item = returned;
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => return TcpVideoSend::Disconnected,
+        }
+    }
+}
+
+fn apply_tcp_backpressure(bitrate_scale_milli: &AtomicU32) {
+    let current = bitrate_scale_milli.load(Ordering::Relaxed);
+    let reduced = (current.saturating_mul(85) / 100).max(MIN_BITRATE_SCALE_MILLI);
+    if reduced < current {
+        bitrate_scale_milli.store(reduced, Ordering::Relaxed);
+    }
+}
 
 fn evrt_send_loop(
     stop: Arc<AtomicBool>,
@@ -1398,6 +1507,93 @@ fn maybe_emit_telemetry(
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
+// Software fallback policy: keep 1080p text native, reduce FPS first, and
+// downscale only frames that are larger than a 1080p-class desktop.
+const SOFTWARE_ENCODER_MAX_FPS: u32 = 15;
+const SOFTWARE_ENCODER_MIN_QUALITY_MILLI: u32 = 1_000;
+const SOFTWARE_ENCODER_MAX_QUALITY_MILLI: u32 = 1_800;
+const SOFTWARE_NATIVE_MAX_W: u32 = 1920;
+const SOFTWARE_NATIVE_MAX_H: u32 = 1080;
+const SOFTWARE_NATIVE_MAX_PIXELS: u64 = 1920 * 1080;
+
+fn software_encoder_target_fps(fps: u32) -> u32 {
+    fps.clamp(5, SOFTWARE_ENCODER_MAX_FPS)
+}
+
+fn software_encoder_quality_milli(quality_milli: u32) -> u32 {
+    quality_milli.clamp(
+        SOFTWARE_ENCODER_MIN_QUALITY_MILLI,
+        SOFTWARE_ENCODER_MAX_QUALITY_MILLI,
+    )
+}
+
+fn software_encoder_downscale_target(width: u32, height: u32) -> Option<(u32, u32)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    let pixels = u64::from(width) * u64::from(height);
+    if width <= SOFTWARE_NATIVE_MAX_W
+        && height <= SOFTWARE_NATIVE_MAX_H
+        && pixels <= SOFTWARE_NATIVE_MAX_PIXELS
+    {
+        return None;
+    }
+
+    let (dw, dh) = scale_even_to_fit(width, height, SOFTWARE_NATIVE_MAX_W, SOFTWARE_NATIVE_MAX_H);
+    (dw != width || dh != height).then_some((dw, dh))
+}
+
+fn scale_even_to_fit(width: u32, height: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    if width == 0 || height == 0 || max_w == 0 || max_h == 0 {
+        return (width, height);
+    }
+
+    let scale_w = max_w as f32 / width as f32;
+    let scale_h = max_h as f32 / height as f32;
+    let scale = scale_w.min(scale_h).min(1.0);
+    let dw = ((width as f32 * scale) as u32 & !1).max(2);
+    let dh = ((height as f32 * scale) as u32 & !1).max(2);
+    (dw, dh)
+}
+
+fn software_encoder_bitrate_cap_bps(width: u32, height: u32, evrt_on: bool) -> u32 {
+    let pixels = u64::from(width) * u64::from(height);
+    let relay_cap = if pixels >= 1_900_000 {
+        4_500_000
+    } else if pixels >= 800_000 {
+        3_000_000
+    } else {
+        2_000_000
+    };
+
+    if evrt_on {
+        (relay_cap + 2_000_000).min(8_000_000)
+    } else {
+        relay_cap
+    }
+}
+
+fn software_encoder_bitrate_floor_bps(width: u32, height: u32) -> u32 {
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels >= 1_900_000 {
+        3_200_000
+    } else if pixels >= 800_000 {
+        2_000_000
+    } else {
+        1_000_000
+    }
+}
+
+fn software_text_quality_needs_floor(
+    roi: crate::evrt::RoiRect,
+    width: u32,
+    height: u32,
+    want_idr: bool,
+) -> bool {
+    want_idr || roi.dirty_area_milli(width, height) >= 80
+}
+
 /// Даунскейл BGRA-кадра в `dst` методом усреднения блоков (box filter).
 /// Быстрый, без зависимостей. Для софт-энкодера на высоком разрешении.
 fn downscale_bgra(src: &[u8], src_w: u32, src_h: u32, dst: &mut Vec<u8>, dst_w: u32, dst_h: u32) {
@@ -1489,6 +1685,32 @@ mod downscale_tests {
         let mut dst = Vec::new();
         downscale_bgra(&[], 0, 0, &mut dst, 2, 2);
         assert_eq!(dst.len(), 2 * 2 * 4); // resized но нули
+    }
+    #[test]
+    fn software_profile_keeps_full_hd_native_for_text() {
+        assert_eq!(software_encoder_downscale_target(1920, 1080), None);
+    }
+
+    #[test]
+    fn software_profile_scales_4k_to_full_hd_class() {
+        assert_eq!(
+            software_encoder_downscale_target(3840, 2160),
+            Some((1920, 1080))
+        );
+    }
+
+    #[test]
+    fn software_profile_preserves_ultrawide_aspect_ratio() {
+        assert_eq!(
+            software_encoder_downscale_target(2560, 1080),
+            Some((1920, 810))
+        );
+    }
+
+    #[test]
+    fn software_profile_has_readable_full_hd_bitrate_floor() {
+        assert!(software_encoder_bitrate_floor_bps(1920, 1080) >= 3_000_000);
+        assert!(software_encoder_bitrate_cap_bps(1920, 1080, false) >= 4_000_000);
     }
 }
 
@@ -1614,6 +1836,18 @@ mod tests {
             h: 0,
         };
         assert_eq!(adapt_bitrate(base, roi, 1920, 1080, true, 880), 7_500_000);
+    }
+
+    #[test]
+    fn tcp_backpressure_reduces_bitrate_scale() {
+        let scale = AtomicU32::new(1_000);
+        apply_tcp_backpressure(&scale);
+        assert_eq!(scale.load(Ordering::Relaxed), 850);
+
+        for _ in 0..20 {
+            apply_tcp_backpressure(&scale);
+        }
+        assert_eq!(scale.load(Ordering::Relaxed), MIN_BITRATE_SCALE_MILLI);
     }
 
     #[test]

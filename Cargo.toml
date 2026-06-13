@@ -11,12 +11,15 @@ path = "src/lib.rs"
 crate-type = ["lib", "cdylib"]
 
 [features]
-default = ["live-h264", "live-vp9-mf", "live-nvenc-sdk", "desktop-gui"]
+default = ["live-h264", "live-vp9-mf", "live-nvenc-sdk", "desktop-gui", "evrt-wasapi"]
 # Desktop GUI: eframe + arboard. Excluded from Android builds.
 desktop-gui = ["dep:eframe", "dep:arboard"]
 # Android клиент: собирается как cdylib с JNI-мостом, без desktop GUI.
 android-client = ["dep:jni"]
 live-h264  = ["dep:openh264"]
+# EVRT audio capture/playback through WASAPI. Kept separate from EVRT core so
+# protocol/reassembly tests can run without the Windows media stack.
+evrt-wasapi = ["dep:windows"]
 # FSR: параллельная обработка строк через rayon (быстрее на многоядерных CPU)
 # Подключи rayon в [dependencies] и включи фичу: cargo build --features fsr-parallel
 fsr-parallel = []
@@ -76,7 +79,7 @@ log = "0.4"
 [target.'cfg(target_os = "linux")'.dependencies]
 font8x8 = "0.3"
 minifb = { version = "0.28", default-features = false, features = ["x11"] }
-x11rb = { version = "0.13", features = ["xtest", "shm"] }
+x11rb = { version = "0.13", features = ["xtest", "shm", "randr"] }
 
 [target.'cfg(windows)'.dependencies]
 font8x8 = "0.3"

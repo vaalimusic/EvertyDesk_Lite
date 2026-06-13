@@ -15,9 +15,28 @@ class NativeClient {
         return handle != 0L
     }
 
+    fun startTouchpad(
+        id: String,
+        password: String,
+        apiUrl: String,
+        idServer: String,
+        relayServer: String,
+        publicKey: String,
+    ): Boolean {
+        handle = nativeStartTouchpad(id, password, apiUrl, idServer, relayServer, publicKey)
+        return handle != 0L
+    }
+
     fun frameSize(): Pair<Int, Int>? {
         if (handle == 0L) return null
         val packed = nativeFrameSize(handle)
+        if (packed == 0L) return null
+        return Pair((packed ushr 32).toInt(), (packed and 0xFFFFFFFFL).toInt())
+    }
+
+    fun remoteSize(): Pair<Int, Int>? {
+        if (handle == 0L) return null
+        val packed = nativeRemoteSize(handle)
         if (packed == 0L) return null
         return Pair((packed ushr 32).toInt(), (packed and 0xFFFFFFFFL).toInt())
     }
@@ -78,7 +97,16 @@ class NativeClient {
         relayServer: String,
         publicKey: String,
     ): Long
+    private external fun nativeStartTouchpad(
+        id: String,
+        password: String,
+        apiUrl: String,
+        idServer: String,
+        relayServer: String,
+        publicKey: String,
+    ): Long
     private external fun nativeFrameSize(handle: Long): Long
+    private external fun nativeRemoteSize(handle: Long): Long
     private external fun nativePollFrame(handle: Long, out: IntArray): Long
     private external fun nativeTouch(handle: Long, x: Int, y: Int, action: Int)
     private external fun nativeRightClick(handle: Long, x: Int, y: Int)
