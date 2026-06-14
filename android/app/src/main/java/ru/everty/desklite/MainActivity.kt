@@ -70,6 +70,11 @@ class MainActivity : Activity() {
     private val PREF_DEVICE_UUID = "device_uuid"
     private val PREF_LOCAL_ID = "local_id"
     private val PREF_RECENT_SESSIONS = "recent_sessions"
+    private val PREF_AB_LOCAL_CONTACTS = "address_book_local_contacts"
+    private val PREF_SAVED_PASSWORDS = "saved_passwords"  // JSON {id: password}
+
+    // ID текущего удалённого хоста — используется для уведомления хоста через агент
+    private var currentRemoteId = ""
 
     private val defaultApiUrl = "https://desk.everty.ru"
     private val defaultIdServer = "edesk.server1.everty.ru"
@@ -97,7 +102,6 @@ class MainActivity : Activity() {
         val idInput = makeInput("ID партнёра", false).apply {
             inputType = InputType.TYPE_CLASS_NUMBER
             textSize = 18f
-            // Восстанавливаем последний ID
             prefs.getString(PREF_LAST_ID, "")?.takeIf { it.isNotEmpty() }?.let {
                 setText(it)
                 setSelection(it.length)
@@ -109,6 +113,41 @@ class MainActivity : Activity() {
 
         val pwInput = makeInput("Пароль (необязательно)", true)
         col.addView(pwInput, matchWrap())
+
+        // Строка-подсказка под полем пароля: показывает что пароль сохранён + кнопка очистки
+        val pwSavedHint = TextView(this).apply {
+            textSize = 12f
+            setTextColor(textSoft)
+            visibility = View.GONE
+        }
+        col.addView(pwSavedHint, matchWrap())
+
+        fun refreshPwHint() {
+            val id = idInput.text.toString().filter { it.isDigit() }
+            val saved = if (id.isNotEmpty()) savedPassword(id) else ""
+            if (saved.isNotEmpty() && pwInput.text.isNullOrEmpty()) {
+                pwInput.setText(saved)
+            }
+            if (saved.isNotEmpty()) {
+                pwSavedHint.text = "🔑 Пароль сохранён  ·  Нажмите чтобы очистить"
+                pwSavedHint.visibility = View.VISIBLE
+                pwSavedHint.setOnClickListener {
+                    val rid = idInput.text.toString().filter { it.isDigit() }
+                    savePassword(rid, "")
+                    pwInput.setText("")
+                    pwSavedHint.visibility = View.GONE
+                }
+            } else {
+                pwSavedHint.visibility = View.GONE
+            }
+        }
+        // Заполняем сразу при открытии и при смене ID
+        refreshPwHint()
+        idInput.addTextChangedListener(object : TextWatcher {
+            override fun afterTextChanged(s: Editable?) = refreshPwHint()
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+        })
 
         col.addView(vSpace(dp(24)))
 
@@ -211,16 +250,23 @@ class MainActivity : Activity() {
         val col = showAppScreen(
             active = "contacts",
             title = "Адресная книга",
-            subtitle = "Авторизация и контакты EvertyDesk",
+            subtitle = "Устройства для быстрого подключения",
         )
 
+        // ── Кнопка добавления ────────────────────────────────────────────────
+        col.addView(makePrimaryButton("+ Добавить устройство") {
+            showAddDeviceDialog { showContactsScreen() }
+        }, LinearLayout.LayoutParams(MATCH_PARENT, dp(48)))
+        col.addView(vSpace(dp(18)))
+
+        // ── Синхронизация с сервером ─────────────────────────────────────────
         val account = prefs.getString(PREF_AB_ACCOUNT, "").orEmpty()
         val token = prefs.getString(PREF_AB_TOKEN, "").orEmpty()
         val guid = prefs.getString(PREF_AB_GUID, "").orEmpty()
         val signedIn = token.isNotBlank() && guid.isNotBlank()
 
         val statusLabel = TextView(this).apply {
-            text = if (signedIn) "Вход выполнен: $account" else "Войдите в аккаунт адресной книги"
+            text = if (signedIn) "Синхронизировано: $account" else "Войдите для загрузки облачных контактов"
             setTextColor(textSoft)
             textSize = 13f
             gravity = Gravity.CENTER
@@ -233,6 +279,8 @@ class MainActivity : Activity() {
             }
             val passwordInput = makeInput("Пароль или токен", true)
 
+            col.addView(sectionHeader("Синхронизация с EvertyDesk"))
+            col.addView(vSpace(dp(8)))
             col.addView(accountInput, matchWrap())
             col.addView(vSpace(dp(10)))
             col.addView(passwordInput, matchWrap())
@@ -272,19 +320,171 @@ class MainActivity : Activity() {
         col.addView(statusLabel, matchWrap())
         col.addView(vSpace(dp(18)))
 
-        val contacts = loadContacts()
-        if (contacts.isEmpty()) {
-            col.addView(TextView(this).apply {
-                text = if (signedIn) "Контактов пока нет. Нажмите «Обновить»." else "После входа здесь появятся устройства из адресной книги."
-                setTextColor(textSoft)
-                textSize = 14f
-                gravity = Gravity.CENTER
-            }, matchWrap())
-        } else {
-            contacts.forEach { contact ->
+        // ── Локальные устройства ─────────────────────────────────────────────
+        val localContacts = loadLocalContacts()
+        if (localContacts.isNotEmpty()) {
+            col.addView(sectionHeader("Мои устройства"))
+            col.addView(vSpace(dp(8)))
+            localContacts.forEach { contact ->
+                col.addView(contactCard(contact, onDelete = {
+                    val updated = loadLocalContacts().filter { it.remoteId != contact.remoteId }
+                    saveLocalContacts(updated)
+                    showContactsScreen()
+                }))
+                col.addView(vSpace(dp(10)))
+            }
+            col.addView(vSpace(dp(8)))
+        }
+
+        // ── Серверные контакты ───────────────────────────────────────────────
+        val serverContacts = loadContacts()
+        if (serverContacts.isNotEmpty()) {
+            col.addView(sectionHeader("Адресная книга"))
+            col.addView(vSpace(dp(8)))
+            serverContacts.forEach { contact ->
                 col.addView(contactCard(contact))
                 col.addView(vSpace(dp(10)))
             }
+        }
+
+        if (localContacts.isEmpty() && serverContacts.isEmpty()) {
+            col.addView(TextView(this).apply {
+                text = "Нажмите «+ Добавить устройство» чтобы сохранить ID для быстрого подключения."
+                setTextColor(textSoft)
+                textSize = 14f
+                gravity = Gravity.CENTER
+                setLineSpacing(0f, 1.2f)
+            }, matchWrap())
+        }
+    }
+
+    /** Диалог добавления устройства — оверлей поверх root. */
+    private fun showAddDeviceDialog(onSaved: () -> Unit) {
+        val overlay = FrameLayout(this).apply {
+            setBackgroundColor(Color.argb(0xBB, 0, 0, 0))
+            isClickable = true
+            isFocusable = true
+        }
+
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = roundedBg(cardBg, 22)
+            setPadding(dp(20), dp(20), dp(20), dp(20))
+        }
+
+        val nameInput = makeInput("Имя устройства (необязательно)", false)
+        val idInput = makeInput("ID устройства *", false).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+        val noteInput = makeInput("Заметка (необязательно)", false)
+
+        val errorLabel = TextView(this).apply {
+            text = " "
+            setTextColor(Color.rgb(0xE3, 0x4B, 0x2F))
+            textSize = 12f
+            gravity = Gravity.CENTER
+        }
+
+        card.addView(TextView(this).apply {
+            text = "Добавить устройство"
+            setTextColor(textMain)
+            textSize = 18f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+        }, matchWrap())
+        card.addView(vSpace(dp(4)))
+        card.addView(TextView(this).apply {
+            text = "Введите ID партнёра для быстрого доступа"
+            setTextColor(textSoft)
+            textSize = 12f
+            gravity = Gravity.CENTER
+        }, matchWrap())
+        card.addView(vSpace(dp(16)))
+        card.addView(idInput, matchWrap())
+        card.addView(vSpace(dp(10)))
+        card.addView(nameInput, matchWrap())
+        card.addView(vSpace(dp(10)))
+        card.addView(noteInput, matchWrap())
+        card.addView(vSpace(dp(4)))
+        card.addView(errorLabel, matchWrap())
+        card.addView(vSpace(dp(12)))
+
+        fun dismiss() {
+            root.removeView(overlay)
+        }
+
+        val btnRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        btnRow.addView(makeSecondaryButton("Отмена") {
+            dismiss()
+        }, LinearLayout.LayoutParams(0, dp(48), 1f).also { it.setMargins(0, 0, dp(6), 0) })
+        btnRow.addView(makePrimaryButton("Сохранить") {
+            val id = idInput.text.toString().filter { it.isDigit() }
+            if (id.isBlank()) {
+                errorLabel.text = "Введите ID устройства"
+                return@makePrimaryButton
+            }
+            val existing = loadLocalContacts()
+            if (existing.any { it.remoteId == id }) {
+                errorLabel.text = "Устройство с ID $id уже добавлено"
+                return@makePrimaryButton
+            }
+            val name = nameInput.text.toString().trim()
+            val note = noteInput.text.toString().trim()
+            saveLocalContacts(existing + AddressBookContact(
+                name = name, remoteId = id, note = note, os = "", online = false
+            ))
+            dismiss()
+            onSaved()
+        }, LinearLayout.LayoutParams(0, dp(48), 1f).also { it.setMargins(dp(6), 0, 0, 0) })
+        card.addView(btnRow, matchWrap())
+
+        val lp = FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.CENTER).apply {
+            val m = dp(24)
+            setMargins(m, m, m, m)
+        }
+        overlay.addView(card, lp)
+        // Клик вне карточки = закрыть
+        overlay.setOnClickListener { dismiss() }
+        card.setOnClickListener { /* перехватить, не закрывать */ }
+
+        root.addView(overlay, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+        // Фокус сразу на поле ID
+        idInput.requestFocus()
+    }
+
+    // ── Сохранённые пароли ────────────────────────────────────────────────────
+
+    private fun savedPassword(id: String): String {
+        val json = prefs.getString(PREF_SAVED_PASSWORDS, "{}") ?: "{}"
+        return try { JSONObject(json).optString(id, "") } catch (_: Exception) { "" }
+    }
+
+    private fun savePassword(id: String, password: String) {
+        val json = prefs.getString(PREF_SAVED_PASSWORDS, "{}") ?: "{}"
+        val obj = try { JSONObject(json) } catch (_: Exception) { JSONObject() }
+        if (password.isBlank()) obj.remove(id) else obj.put(id, password)
+        prefs.edit().putString(PREF_SAVED_PASSWORDS, obj.toString()).apply()
+    }
+
+    // ── Уведомление хоста о подключении ──────────────────────────────────────
+
+    /** Сообщает бэкенду что Android подключился к хосту — хост получит баннер через агент. */
+    private fun notifySessionConnected(hostRdId: String) {
+        if (hostRdId.isEmpty()) return
+        val url = "${apiUrl()}/admin/agent/session-event"
+        thread {
+            try {
+                val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+                conn.requestMethod = "POST"
+                conn.setRequestProperty("Content-Type", "application/json")
+                conn.connectTimeout = 6_000
+                conn.readTimeout = 6_000
+                conn.doOutput = true
+                conn.outputStream.bufferedWriter().use {
+                    it.write("{\"host_rustdesk_id\":\"$hostRdId\",\"event\":\"connected\"}")
+                }
+                conn.disconnect()
+            } catch (_: Exception) {}
         }
     }
 
@@ -324,17 +524,33 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun contactCard(contact: AddressBookContact): LinearLayout =
+    private fun contactCard(contact: AddressBookContact, onDelete: (() -> Unit)? = null): LinearLayout =
         LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = roundedBg(cardBg, 18, lineSoft)
             setPadding(dp(14), dp(12), dp(14), dp(12))
 
-            addView(TextView(this@MainActivity).apply {
-                text = contact.name.ifBlank { "Без имени" }
-                setTextColor(textMain)
-                textSize = 17f
-                typeface = Typeface.DEFAULT_BOLD
+            // Шапка: имя + крестик удаления (если локальный контакт)
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                addView(TextView(this@MainActivity).apply {
+                    text = contact.name.ifBlank { "ID ${contact.remoteId}" }
+                    setTextColor(textMain)
+                    textSize = 17f
+                    typeface = Typeface.DEFAULT_BOLD
+                }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+                if (onDelete != null) {
+                    addView(Button(this@MainActivity).apply {
+                        text = "✕"
+                        setTextColor(Color.rgb(0xCC, 0x44, 0x33))
+                        background = roundedBg(Color.rgb(0xFF, 0xF0, 0xEE), 10)
+                        textSize = 13f
+                        isAllCaps = false
+                        setPadding(dp(8), 0, dp(8), 0)
+                        setOnClickListener { onDelete() }
+                    }, LinearLayout.LayoutParams(dp(36), dp(36)))
+                }
             }, matchWrap())
 
             addView(TextView(this@MainActivity).apply {
@@ -358,14 +574,14 @@ class MainActivity : Activity() {
                 addView(makePrimaryButton("Экран") {
                     prefs.edit().putString(PREF_LAST_ID, contact.remoteId).apply()
                     val status = TextView(this@MainActivity)
-                    connect(contact.remoteId, "", status)
+                    connect(contact.remoteId, savedPassword(contact.remoteId), status)
                 }, LinearLayout.LayoutParams(0, dp(44), 1f).also {
                     it.setMargins(0, 0, dp(6), 0)
                 })
                 addView(makeSecondaryButton("Тачпад") {
                     prefs.edit().putString(PREF_LAST_ID, contact.remoteId).apply()
                     val status = TextView(this@MainActivity)
-                    connect(contact.remoteId, "", status, touchpadOnly = true)
+                    connect(contact.remoteId, savedPassword(contact.remoteId), status, touchpadOnly = true)
                 }, LinearLayout.LayoutParams(0, dp(44), 1f).also {
                     it.setMargins(dp(6), 0, 0, 0)
                 })
@@ -512,6 +728,8 @@ class MainActivity : Activity() {
             return
         }
         rememberRecentSession(id)
+        if (password.isNotEmpty()) savePassword(id, password)
+        currentRemoteId = id
         if (touchpadOnly) {
             showTouchpadScreen()
         } else {
@@ -612,8 +830,14 @@ class MainActivity : Activity() {
         rv.startRendering()
 
         val statusTick = object : Runnable {
+            var hostNotified = false
             override fun run() {
-                overlay.text = if (client.isConnected()) "● ${client.status()}" else client.status()
+                val connected = client.isConnected()
+                overlay.text = if (connected) "● ${client.status()}" else client.status()
+                if (connected && !hostNotified) {
+                    hostNotified = true
+                    notifySessionConnected(currentRemoteId)
+                }
                 handler.postDelayed(this, 500)
             }
         }
@@ -694,9 +918,15 @@ class MainActivity : Activity() {
         )
 
         val statusTick = object : Runnable {
+            var hostNotified = false
             override fun run() {
                 tv.refreshRemoteSize()
-                overlay.text = if (client.isConnected()) "● ${client.status()}" else client.status()
+                val connected = client.isConnected()
+                overlay.text = if (connected) "● ${client.status()}" else client.status()
+                if (connected && !hostNotified) {
+                    hostNotified = true
+                    notifySessionConnected(currentRemoteId)
+                }
                 handler.postDelayed(this, 500)
             }
         }
@@ -711,7 +941,21 @@ class MainActivity : Activity() {
         rightClickBtn = null
         remoteView = null
         touchpadView = null
-        showConnectScreen()
+
+        // Ждём ~700ms пока поток старой сессии обработает Close и закроет TCP-сокет к relay.
+        // Без паузы повторное подключение приходит пока старый сокет жив — relay/хост отклоняют.
+        root.removeAllViews()
+        root.setBackgroundColor(brandBg)
+        root.addView(
+            TextView(this).apply {
+                text = "Завершение сеанса…"
+                setTextColor(textSoft)
+                textSize = 17f
+                gravity = Gravity.CENTER
+            },
+            FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT, Gravity.CENTER),
+        )
+        handler.postDelayed({ showConnectScreen() }, 700)
     }
 
     override fun onDestroy() {
@@ -960,6 +1204,40 @@ class MainActivity : Activity() {
                 )
             }
         }
+
+    private fun loadLocalContacts(): List<AddressBookContact> {
+        val raw = prefs.getString(PREF_AB_LOCAL_CONTACTS, "").orEmpty()
+        if (raw.isBlank()) return emptyList()
+        return try {
+            val array = JSONArray(raw)
+            val list = mutableListOf<AddressBookContact>()
+            for (i in 0 until array.length()) {
+                val item = array.optJSONObject(i) ?: continue
+                val remoteId = item.optString("remote_id").filter { it.isDigit() }
+                if (remoteId.isBlank()) continue
+                list += AddressBookContact(
+                    name = item.optString("name"),
+                    remoteId = remoteId,
+                    note = item.optString("note"),
+                    os = "",
+                    online = false,
+                )
+            }
+            list
+        } catch (_: Throwable) { emptyList() }
+    }
+
+    private fun saveLocalContacts(contacts: List<AddressBookContact>) {
+        val array = JSONArray().also { a ->
+            contacts.forEach { c ->
+                a.put(JSONObject()
+                    .put("name", c.name)
+                    .put("remote_id", c.remoteId)
+                    .put("note", c.note))
+            }
+        }
+        prefs.edit().putString(PREF_AB_LOCAL_CONTACTS, array.toString()).apply()
+    }
 
     private fun loadContacts(): List<AddressBookContact> {
         val raw = prefs.getString(PREF_AB_CONTACTS, "").orEmpty()

@@ -104,6 +104,7 @@ pub struct PipelineConfig {
     /// RecvCipher остаётся в relay_session_inner для расшифровки управляющих сообщений.
     pub send_cipher: Option<crate::crypto::SendCipher>,
     pub evrt_socket: Option<Arc<UdpSocket>>,
+    pub evrt_token: Option<String>,
     pub cmd_rx: Receiver<PipelineCmd>,
     pub peer_msg_rx: Receiver<crate::rustdesk_proto::PeerMessage>,
 }
@@ -121,6 +122,7 @@ pub fn run(cfg: PipelineConfig) {
         relay_stream,
         send_cipher,
         evrt_socket,
+        evrt_token,
         cmd_rx,
         peer_msg_rx,
     } = cfg;
@@ -233,6 +235,7 @@ pub fn run(cfg: PipelineConfig) {
                     bitrate_scale_u,
                     idr_u,
                     pid_u,
+                    evrt_token,
                 );
             })
             .expect("spawn evrt-sender");
@@ -376,24 +379,15 @@ pub fn run(cfg: PipelineConfig) {
     for service in video_services.values() {
         service.stop.store(true, Ordering::Relaxed);
     }
-    let join_events = events.clone();
-    let join_peer = peer_id.clone();
-    thread::Builder::new()
-        .name("pipeline-joiner".into())
-        .spawn(move || {
-            for (_, service) in video_services {
-                let _ = service.handle.join();
-            }
-            for handle in worker_handles {
-                let _ = handle.join();
-            }
-            log(
-                &join_events,
-                format!("Pipeline workers joined for {join_peer}"),
-            );
-        })
-        .ok();
-
+    // Join workers inline so run() only returns after capture threads are fully
+    // stopped. The previous detach approach left DXGI capture running across
+    // sessions, causing hangs on reconnect and leaked threads that blocked process exit.
+    for (_, service) in video_services {
+        let _ = service.handle.join();
+    }
+    for handle in worker_handles {
+        let _ = handle.join();
+    }
     log(&events, format!("Pipeline для {peer_id} завершён"));
 }
 
@@ -961,7 +955,16 @@ fn encode_loop(
                     },
                 )),
             };
-            let _ = tcp_tx.send(TcpItem::Peer(tele_msg));
+            // Never block here during shutdown: the TCP sender may be draining
+            // its write timeout (up to 2s) which, combined with other overheads,
+            // can push past the 3-second pipeline-join deadline in host.rs.
+            // During normal operation stop=false, so we use blocking send to
+            // guarantee delivery. Once stop is set we're about to exit anyway.
+            if stop.load(Ordering::Relaxed) {
+                let _ = tcp_tx.try_send(TcpItem::Peer(tele_msg));
+            } else {
+                let _ = tcp_tx.send(TcpItem::Peer(tele_msg));
+            }
             // ★ ПИШЕМ свою диагностику в файл — видно хост напрямую, без клиента.
             write_host_diag(
                 &info,
@@ -1271,6 +1274,7 @@ fn evrt_send_loop(
     bitrate_scale_milli: Arc<AtomicU32>,
     idr_request_tx: Sender<()>,
     peer_id: String,
+    evrt_token: Option<String>,
 ) {
     log(&events, "EVRT UDP sender: ожидание punch…".into());
 
@@ -1290,7 +1294,17 @@ fn evrt_send_loop(
             log(&events, "EVRT UDP sender stopped".into());
             return;
         }
-        if let Ok((_, src)) = socket.recv_from(&mut buf) {
+        if let Ok((len, src)) = socket.recv_from(&mut buf) {
+            if evrt_token.is_some() {
+                let token_ok = crate::evrt::parse_authenticated(&buf, len, evrt_token.as_deref()).is_some_and(|pkt| {
+                    pkt.packet_type == crate::evrt::TYPE_CONTROL
+                        && crate::evrt::control_token_matches(&pkt.payload, evrt_token.as_deref())
+                        && crate::evrt::parse_control(&pkt.payload).is_some()
+                });
+                if !token_ok {
+                    continue;
+                }
+            }
             log(&events, format!("EVRT: punch от {src}"));
             if let Ok(mut g) = evrt_active.lock() {
                 *g = Some(src);
@@ -1302,6 +1316,7 @@ fn evrt_send_loop(
     // Запускаем EVRT сессию, передаём frame_rx из pipeline
     let params = crate::evrt_session::EvrtSessionParams {
         peer_addr,
+        session_token: evrt_token,
         socket: socket.clone(),
         config: config.clone(),
         peer_id: peer_id.clone(),

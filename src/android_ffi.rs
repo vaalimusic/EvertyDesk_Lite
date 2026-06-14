@@ -21,7 +21,9 @@ use jni::sys::{jboolean, jint, jintArray, jlong};
 use jni::JNIEnv;
 
 use crate::settings::{AppConfig, ServerConfig};
-use crate::transport::{ConnectionRequest, SessionCommand, SessionEvent, TransportClient};
+use crate::transport::{
+    ConnectionRequest, RemoteDisplay, SessionCommand, SessionEvent, TransportClient,
+};
 
 /// Последний полученный кадр (RGBA).
 #[derive(Default)]
@@ -33,11 +35,25 @@ struct LatestFrame {
     seq: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct RemoteBounds {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+impl RemoteBounds {
+    fn is_empty(self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+}
+
 /// Состояние одной сессии. Указатель отдаётся в Kotlin как jlong-handle.
 struct AndroidSession {
     cmd_tx: Sender<SessionCommand>,
     latest: Arc<Mutex<LatestFrame>>,
-    remote_size: Arc<Mutex<(u32, u32)>>,
+    remote_bounds: Arc<Mutex<RemoteBounds>>,
     stop: Arc<AtomicBool>,
     /// Текстовый статус (прогресс/ошибка) для UI.
     status: Arc<Mutex<String>>,
@@ -148,7 +164,7 @@ fn start_android_session(
     let latest = Arc::new(Mutex::new(LatestFrame::default()));
     let status = Arc::new(Mutex::new("Подключение…".to_owned()));
     let connected = Arc::new(AtomicBool::new(false));
-    let remote_size = Arc::new(Mutex::new((0u32, 0u32)));
+    let remote_bounds = Arc::new(Mutex::new(RemoteBounds::default()));
     let stop = Arc::new(AtomicBool::new(false));
 
     // Поток сессии
@@ -163,17 +179,17 @@ fn start_android_session(
         let latest = latest.clone();
         let status = status.clone();
         let connected = connected.clone();
-        let remote_size = remote_size.clone();
+        let remote_bounds = remote_bounds.clone();
         let stop = stop.clone();
         thread::spawn(move || {
-            collect_events(ev_rx, latest, status, connected, remote_size, stop);
+            collect_events(ev_rx, latest, status, connected, remote_bounds, stop);
         });
     }
 
     let session = Box::new(AndroidSession {
         cmd_tx,
         latest,
-        remote_size,
+        remote_bounds,
         stop,
         status,
         connected,
@@ -186,10 +202,11 @@ fn collect_events(
     latest: Arc<Mutex<LatestFrame>>,
     status: Arc<Mutex<String>>,
     connected: Arc<AtomicBool>,
-    remote_size: Arc<Mutex<(u32, u32)>>,
+    remote_bounds: Arc<Mutex<RemoteBounds>>,
     stop: Arc<AtomicBool>,
 ) {
     let mut seq = 0u64;
+    let mut has_display_bounds = false;
     while !stop.load(Ordering::Relaxed) {
         match ev_rx.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(SessionEvent::Frame {
@@ -199,8 +216,15 @@ fn collect_events(
                 ..
             }) => {
                 seq += 1;
-                if let Ok(mut g) = remote_size.lock() {
-                    *g = (width as u32, height as u32);
+                if !has_display_bounds {
+                    if let Ok(mut g) = remote_bounds.lock() {
+                        *g = RemoteBounds {
+                            x: 0,
+                            y: 0,
+                            width: width as u32,
+                            height: height as u32,
+                        };
+                    }
                 }
                 if let Ok(mut f) = latest.lock() {
                     f.width = width as u32;
@@ -216,12 +240,10 @@ fn collect_events(
                 }
             }
             Ok(SessionEvent::Displays(displays)) => {
-                if let Some(display) = displays
-                    .iter()
-                    .find(|display| display.width > 0 && display.height > 0)
-                {
-                    if let Ok(mut g) = remote_size.lock() {
-                        *g = (display.width as u32, display.height as u32);
+                if let Some(bounds) = remote_bounds_from_displays(&displays) {
+                    if let Ok(mut g) = remote_bounds.lock() {
+                        *g = bounds;
+                        has_display_bounds = true;
                     }
                 }
             }
@@ -270,19 +292,34 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativePollFrame(
         Some(s) => s,
         None => return 0,
     };
-    let Ok(f) = session.latest.lock() else {
-        return 0;
+
+    // Снимаем снапшот кадра под коротким локом, сразу освобождаем мьютекс.
+    // Это не блокирует collect_events пока идёт конвертация + JNI копия.
+    let (w, h, rgba) = {
+        let Ok(f) = session.latest.lock() else { return 0; };
+        if f.seq == 0 || f.rgba.is_empty() { return 0; }
+        (f.width as usize, f.height as usize, f.rgba.clone())
     };
-    if f.seq == 0 || f.rgba.is_empty() {
+
+    let px_count = w * h;
+    if px_count == 0 { return 0; }
+
+    let arr = unsafe { jni::objects::JIntArray::from_raw(out) };
+
+    // Проверяем длину выходного массива ДО записи — защита от гонки когда
+    // разрешение изменилось между nativeFrameSize() и nativePollFrame().
+    let arr_len = match env.get_array_length(&arr) {
+        Ok(l) => l as usize,
+        Err(_) => { let _ = env.exception_clear(); return 0; }
+    };
+    if arr_len < px_count {
+        // Kotlin переаллоцирует на следующем тике по новому frameSize().
         return 0;
     }
-    let w = f.width as usize;
-    let h = f.height as usize;
-    let px_count = w * h;
 
     // Конвертируем RGBA(u8) → ARGB(i32) для Android Bitmap.Config.ARGB_8888.
     let mut argb = vec![0i32; px_count];
-    for (i, chunk) in f.rgba.chunks_exact(4).take(px_count).enumerate() {
+    for (i, chunk) in rgba.chunks_exact(4).take(px_count).enumerate() {
         let r = chunk[0] as i32;
         let g = chunk[1] as i32;
         let b = chunk[2] as i32;
@@ -290,9 +327,8 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativePollFrame(
         argb[i] = (a << 24) | (r << 16) | (g << 8) | b;
     }
 
-    // out — jintArray; копируем
-    let arr = unsafe { jni::objects::JIntArray::from_raw(out) };
     if env.set_int_array_region(&arr, 0, &argb).is_err() {
+        let _ = env.exception_clear();
         return 0;
     }
     ((w as i64) << 32) | (h as i64)
@@ -327,13 +363,28 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeRemoteSize(
     let Some(session) = session_ref(handle) else {
         return 0;
     };
-    let Ok((w, h)) = session.remote_size.lock().map(|g| *g) else {
+    let Ok(bounds) = session.remote_bounds.lock().map(|g| *g) else {
         return 0;
     };
-    if w == 0 || h == 0 {
+    if bounds.is_empty() {
         return 0;
     }
-    ((w as i64) << 32) | (h as i64)
+    ((bounds.width as i64) << 32) | (bounds.height as i64)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeRemoteOrigin(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jlong {
+    let Some(session) = session_ref(handle) else {
+        return 0;
+    };
+    let Ok(bounds) = session.remote_bounds.lock().map(|g| *g) else {
+        return 0;
+    };
+    pack_i32_pair(bounds.x, bounds.y)
 }
 
 // ─── touch → mouse ───────────────────────────────────────────────────────────
@@ -516,12 +567,51 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeStop(
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 /// Безопасная ссылка на сессию по handle (без передачи владения).
+fn remote_bounds_from_displays(displays: &[RemoteDisplay]) -> Option<RemoteBounds> {
+    let mut any = false;
+    let mut min_x = i64::MAX;
+    let mut min_y = i64::MAX;
+    let mut max_x = i64::MIN;
+    let mut max_y = i64::MIN;
+
+    for display in displays {
+        if display.width <= 0 || display.height <= 0 {
+            continue;
+        }
+
+        any = true;
+        let x0 = i64::from(display.x);
+        let y0 = i64::from(display.y);
+        let x1 = x0 + i64::from(display.width);
+        let y1 = y0 + i64::from(display.height);
+        min_x = min_x.min(x0);
+        min_y = min_y.min(y0);
+        max_x = max_x.max(x1);
+        max_y = max_y.max(y1);
+    }
+
+    if !any || max_x <= min_x || max_y <= min_y {
+        return None;
+    }
+
+    Some(RemoteBounds {
+        x: i32::try_from(min_x).ok()?,
+        y: i32::try_from(min_y).ok()?,
+        width: u32::try_from(max_x - min_x).ok()?,
+        height: u32::try_from(max_y - min_y).ok()?,
+    })
+}
+
 fn session_ref<'a>(handle: jlong) -> Option<&'a AndroidSession> {
     if handle == 0 {
         None
     } else {
         Some(unsafe { &*(handle as *const AndroidSession) })
     }
+}
+
+fn pack_i32_pair(x: i32, y: i32) -> jlong {
+    ((i64::from(x)) << 32) | (i64::from(y) & 0xFFFF_FFFF)
 }
 
 fn init_android_logger() {

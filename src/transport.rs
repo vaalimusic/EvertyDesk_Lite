@@ -362,8 +362,15 @@ impl TransportClient {
         request: ConnectionRequest,
         mut progress: impl FnMut(u8, String),
     ) -> Result<ConnectionState, String> {
-        let (_relay_stream, peer_stage, _displays, _evrt_addr, _evrt_base, _early_evrt_candidates) =
-            establish_session(request.clone(), &mut progress)?;
+        let (
+            _relay_stream,
+            peer_stage,
+            _displays,
+            _evrt_addr,
+            _evrt_base,
+            _early_evrt_candidates,
+            _evrt_token,
+        ) = establish_session(request.clone(), &mut progress)?;
 
         progress(99, format!("Login stage: {peer_stage}"));
         Ok(ConnectionState::RelayReady {
@@ -396,6 +403,7 @@ impl TransportClient {
             evrt_host_addr,
             evrt_host_base,
             early_evrt_candidates,
+            mut evrt_token,
         ) = match establish_session(request.clone(), &mut emit_progress) {
             Ok(session) => session,
             Err(err) => {
@@ -428,13 +436,19 @@ impl TransportClient {
         // IP из PunchHoleResponse.socket_addr, порт из Misc{EvrtUdpPort}.
         // Порт может прийти в handshake (evrt_host_addr) ИЛИ позже в session loop
         // (evrt_host_base + late Misc). Флаг не даёт запустить дважды.
+        // Единый stop-сигнал для всех EVRT-потоков этой сессии.
+        // nativeStop / TCP-ошибка устанавливают его в true, чтобы потоки не
+        // продолжали слать UDP хосту и не мешали новому подключению.
+        let evrt_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         let mut evrt_started = false;
         if !control_only {
             if let Some(host_addr) = evrt_host_addr {
             evrt_started = true;
             let evrt_events = events.clone();
-            let evrt_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let evrt_stop_clone = evrt_stop.clone();
             let evrt_ull = display_config.target_fps >= 60;
+            let evrt_token_for_thread = evrt_token.clone();
 
             eprintln!("[evrt-client] прямой UDP → {host_addr}");
 
@@ -444,8 +458,9 @@ impl TransportClient {
                     crate::evrt_client::try_evrt_before_relay(
                         &udp,
                         host_addr,
+                        evrt_token_for_thread.clone(),
                         &evrt_events,
-                        evrt_stop,
+                        evrt_stop_clone,
                         evrt_ull,
                     );
                 }
@@ -456,6 +471,8 @@ impl TransportClient {
             evrt_started = true;
             let evrt_events = events.clone();
             let evrt_ull = display_config.target_fps >= 60;
+            let evrt_token_for_thread = evrt_token.clone();
+            let evrt_stop_clone = evrt_stop.clone();
             eprintln!(
                 "[evrt-client] ранние EVRT кандидаты: {:?}",
                 early_evrt_candidates
@@ -463,8 +480,10 @@ impl TransportClient {
             thread::spawn(move || {
                 crate::evrt_client::try_evrt_candidates(
                     early_evrt_candidates,
+                    evrt_token_for_thread.clone(),
                     &evrt_events,
                     evrt_ull,
+                    evrt_stop_clone,
                 );
             });
         }
@@ -987,6 +1006,7 @@ impl TransportClient {
                     }
                     SessionCommand::Close => {
                         flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
+                        evrt_stop.store(true, std::sync::atomic::Ordering::Relaxed);
                         let _ = events.send(SessionEvent::Closed);
                         return;
                     }
@@ -1020,6 +1040,7 @@ impl TransportClient {
                             control_only,
                             &mut evrt_port_seen,
                             &mut evrt_candidates,
+                            &mut evrt_token,
                         );
                         // ★ EVRT (после LoginResponse). Собираем кандидаты:
                         //   1) список EvrtEndpoints (LAN+VPN) — основной путь
@@ -1036,16 +1057,20 @@ impl TransportClient {
                                 evrt_started = true;
                                 let evrt_events = events.clone();
                                 let evrt_ull = initial_video_fps >= 60;
+                                let evrt_token_for_thread = evrt_token.clone();
                                 eprintln!(
                                     "[evrt-client] пробуем {} кандидат(ов): {:?}",
                                     candidates.len(),
                                     candidates,
                                 );
+                                let evrt_stop_clone = evrt_stop.clone();
                                 thread::spawn(move || {
                                     crate::evrt_client::try_evrt_candidates(
                                         candidates,
+                                        evrt_token_for_thread.clone(),
                                         &evrt_events,
                                         evrt_ull,
+                                        evrt_stop_clone,
                                     );
                                 });
                             }
@@ -1068,6 +1093,7 @@ impl TransportClient {
                 }
                 Err(err) => {
                     eprintln!("[session] READ ERROR: {err}");
+                    evrt_stop.store(true, std::sync::atomic::Ordering::Relaxed);
                     let _ = events.send(SessionEvent::Failed(err));
                     return;
                 }
@@ -1384,6 +1410,7 @@ fn establish_session(
         Option<std::net::SocketAddr>, // готовый EVRT addr (если порт в handshake)
         Option<std::net::SocketAddr>, // базовый host UDP IP (для позднего порта)
         Vec<std::net::SocketAddr>,    // EVRT endpoints, если пришли до session loop
+        Option<String>,
     ),
     String,
 > {
@@ -1564,6 +1591,7 @@ fn establish_session(
                 displays,
                 evrt_port_from_misc,
                 early_evrt_candidates,
+                evrt_token,
             )) => {
                 let evrt_host_addr = evrt_port_from_misc.map(|port| {
                     let mut addr = peer_addr;
@@ -1577,6 +1605,7 @@ fn establish_session(
                     evrt_host_addr,
                     Some(peer_addr),
                     early_evrt_candidates,
+                    evrt_token,
                 ));
             }
             Err(err) => {
@@ -1682,7 +1711,13 @@ fn establish_session(
             control_only,
             progress,
         ) {
-            Ok((peer_stage, displays, evrt_port_from_misc, early_evrt_candidates)) => {
+            Ok((
+                peer_stage,
+                displays,
+                evrt_port_from_misc,
+                early_evrt_candidates,
+                evrt_token,
+            )) => {
                 progress(
                     98,
                     format!(
@@ -1707,6 +1742,7 @@ fn establish_session(
                     evrt_host_addr,
                     host_udp_base,
                     early_evrt_candidates,
+                    evrt_token,
                 ));
             }
             Err(err) => last_err = err,
@@ -2011,6 +2047,7 @@ fn open_direct_tcp_session(
         Vec<RemoteDisplay>,
         Option<u16>,
         Vec<SocketAddr>,
+        Option<String>,
     ),
     String,
 > {
@@ -2054,8 +2091,15 @@ fn open_direct_tcp_session(
         control_only,
         progress,
     )
-    .map(|(peer_stage, displays, evrt_port, evrt_candidates)| {
-        (stream, peer_stage, displays, evrt_port, evrt_candidates)
+    .map(|(peer_stage, displays, evrt_port, evrt_candidates, evrt_token)| {
+        (
+            stream,
+            peer_stage,
+            displays,
+            evrt_port,
+            evrt_candidates,
+            evrt_token,
+        )
     })
 }
 
@@ -2094,7 +2138,16 @@ fn read_initial_peer_stage(
     bootstrap_wait_secs: u64,
     control_only: bool,
     progress: &mut impl FnMut(u8, String),
-) -> Result<(String, Vec<RemoteDisplay>, Option<u16>, Vec<SocketAddr>), String> {
+) -> Result<
+    (
+        String,
+        Vec<RemoteDisplay>,
+        Option<u16>,
+        Vec<SocketAddr>,
+        Option<String>,
+    ),
+    String,
+> {
     relay
         .set_read_timeout(Some(Duration::from_millis(RELAY_HANDSHAKE_POLL_MS)))
         .map_err(|err| format!("Failed to set relay read timeout: {err}"))?;
@@ -2103,6 +2156,7 @@ fn read_initial_peer_stage(
     let wait_remote_accept = password.is_empty();
     let mut evrt_port: Option<u16> = None;
     let mut evrt_candidates: Vec<SocketAddr> = Vec::new();
+    let mut evrt_token: Option<String> = None;
     let started = Instant::now();
     let bootstrap_deadline = started + Duration::from_secs(bootstrap_wait_secs);
     let auth_deadline = started + Duration::from_secs(RELAY_AUTH_WAIT_SECS);
@@ -2216,6 +2270,7 @@ fn read_initial_peer_stage(
                     displays,
                     evrt_port,
                     evrt_candidates,
+                    evrt_token,
                 ));
             }
             Some(peer_message::Union::PeerInfo(info)) => {
@@ -2239,6 +2294,7 @@ fn read_initial_peer_stage(
                     displays,
                     evrt_port,
                     evrt_candidates,
+                    evrt_token,
                 ));
             }
             Some(peer_message::Union::PublicKey(_)) => {}
@@ -2255,6 +2311,10 @@ fn read_initial_peer_stage(
                         }
                     }
                     Some(misc::Union::EvrtEndpoints(list)) => {
+                        if let Some(token) = parse_evrt_token(&list) {
+                            evrt_token = Some(token);
+                            eprintln!("[evrt-client] ранний EVRT session token получен");
+                        }
                         let parsed = parse_evrt_endpoints(&list);
                         if !parsed.is_empty() {
                             eprintln!("[evrt-client] ранние EvrtEndpoints: [{list}]");
@@ -2286,6 +2346,7 @@ fn read_initial_peer_stage(
                     Vec::new(),
                     evrt_port,
                     evrt_candidates,
+                    evrt_token,
                 ));
             }
             Some(peer_message::Union::LoginRequest(_)) => {
@@ -2701,6 +2762,21 @@ fn parse_evrt_endpoints(list: &str) -> Vec<SocketAddr> {
     out
 }
 
+fn parse_evrt_token(list: &str) -> Option<String> {
+    for part in list.split(',') {
+        let part = part.trim();
+        let token = part
+            .strip_prefix("token=")
+            .or_else(|| part.strip_prefix("sessionToken="));
+        if let Some(token) = token {
+            if crate::evrt::valid_session_token(token) {
+                return Some(token.to_owned());
+            }
+        }
+    }
+    None
+}
+
 fn handle_session_message(
     message: PeerMessage,
     relay: &mut TcpStream,
@@ -2713,6 +2789,7 @@ fn handle_session_message(
     control_only: bool,
     evrt_port_out: &mut Option<u16>,
     evrt_candidates_out: &mut Vec<std::net::SocketAddr>,
+    evrt_token_out: &mut Option<String>,
 ) -> Option<FrameSource> {
     match message.union {
         Some(peer_message::Union::ScreenshotResponse(response)) => {
@@ -3035,6 +3112,10 @@ fn handle_session_message(
                 Some(misc::Union::EvrtEndpoints(list)) => {
                     // ★ Новый путь: список IP:порт кандидатов (LAN+VPN). mini-ICE.
                     eprintln!("[session] ★ EvrtEndpoints получены: [{list}]");
+                    if let Some(token) = parse_evrt_token(list) {
+                        *evrt_token_out = Some(token);
+                        eprintln!("[session] EVRT session token received");
+                    }
                     for addr in parse_evrt_endpoints(list) {
                         if !evrt_candidates_out.contains(&addr) {
                             evrt_candidates_out.push(addr);
@@ -4553,6 +4634,28 @@ mod tests {
             split_host_port("edesk.server1.everty.ru", 21117),
             ("edesk.server1.everty.ru".to_owned(), 21117)
         );
+    }
+
+    #[test]
+    fn evrt_endpoint_parser_ignores_session_token_part() {
+        let endpoints = parse_evrt_endpoints(
+            "192.168.1.10:40000,token=0123456789abcdef0123456789abcdef,10.0.0.2:40000",
+        );
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints[0].to_string(), "192.168.1.10:40000");
+        assert_eq!(endpoints[1].to_string(), "10.0.0.2:40000");
+    }
+
+    #[test]
+    fn evrt_token_parser_extracts_valid_hex_token() {
+        assert_eq!(
+            parse_evrt_token(
+                "192.168.1.10:40000,token=0123456789abcdef0123456789abcdef"
+            )
+            .as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert!(parse_evrt_token("192.168.1.10:40000,token=short").is_none());
     }
 
     #[test]

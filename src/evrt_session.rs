@@ -54,6 +54,7 @@ const PACER_BURST_PACKETS: u8 = 4;
 pub struct EvrtSessionParams {
     /// Адрес клиента (после punch-hole).
     pub peer_addr: SocketAddr,
+    pub session_token: Option<String>,
     /// UDP сокет (тот же что зарегистрирован на hbbs).
     pub socket: Arc<UdpSocket>,
     /// Конфиг приложения (для SessionConfig).
@@ -81,6 +82,7 @@ pub struct EvrtSessionParams {
 pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
     let EvrtSessionParams {
         peer_addr,
+        session_token,
         socket,
         config,
         peer_id,
@@ -131,7 +133,8 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
     };
 
     // SessionConfig ×2 против потери первого UDP
-    let cfg_pkt = evrt::build_session_config(&session_cfg.to_json());
+    let cfg_pkt =
+        evrt::build_session_config_authenticated(&session_cfg.to_json(), session_token.as_deref());
     send_udp(&socket, &cfg_pkt, peer_addr)?;
     thread::sleep(Duration::from_millis(5));
     send_udp(&socket, &cfg_pkt, peer_addr)?;
@@ -163,9 +166,17 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
             return Err(format!("client {peer_addr} did not respond"));
         }
         match socket.recv_from(&mut buf) {
-            Ok((_, src)) if src == peer_addr => {
-                evrt_log(&events, "EVRT: client confirmed".into());
-                break;
+            Ok((len, src)) if src == peer_addr => {
+                let confirmed = evrt::parse_authenticated(&buf, len, session_token.as_deref()).is_some_and(|pkt| {
+                    pkt.packet_type == evrt::TYPE_CONTROL
+                        && evrt::control_token_matches(&pkt.payload, session_token.as_deref())
+                        && evrt::parse_control(&pkt.payload).is_some()
+                });
+                if confirmed {
+                    evrt_log(&events, "EVRT: client confirmed".into());
+                    break;
+                }
+                send_udp(&socket, &cfg_pkt, peer_addr)?; // retry
             }
             Ok(_) | Err(_) => {
                 send_udp(&socket, &cfg_pkt, peer_addr)?; // retry
@@ -182,6 +193,7 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
         let recv_sock = socket.clone();
         let recv_stop = stop.clone();
         let recv_events = events.clone();
+        let recv_session_token = session_token.clone();
 
         thread::spawn(move || {
             let mut buf = vec![0u8; evrt::MAX_PACKET_SIZE + 64];
@@ -194,8 +206,18 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
                 match recv_sock.recv_from(&mut buf) {
                     Ok((len, src)) if src == peer_addr => {
                         last_pkt = Instant::now();
-                        if let Some(pkt) = evrt::parse(&buf, len) {
+                        if let Some(pkt) = evrt::parse_authenticated(
+                            &buf,
+                            len,
+                            recv_session_token.as_deref(),
+                        ) {
                             if pkt.packet_type == evrt::TYPE_CONTROL {
+                                if !evrt::control_token_matches(
+                                    &pkt.payload,
+                                    recv_session_token.as_deref(),
+                                ) {
+                                    continue;
+                                }
                                 match evrt::parse_control(&pkt.payload) {
                                     Some(ControlMessage::RequestKeyFrame) => {
                                         let _ = kf_tx.send(());
@@ -226,8 +248,14 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
     {
         let audio_sock = socket.clone();
         let audio_stop = stop.clone();
+        let audio_session_token = session_token.clone();
         thread::spawn(move || {
-            crate::evrt_audio::run_audio_capture(audio_sock, peer_addr, audio_stop);
+            crate::evrt_audio::run_audio_capture(
+                audio_sock,
+                peer_addr,
+                audio_stop,
+                audio_session_token,
+            );
         });
     }
 
@@ -294,7 +322,10 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
             };
             let _ = send_udp(
                 &socket,
-                &evrt::build_session_config(&upd.to_json()),
+                &evrt::build_session_config_authenticated(
+                    &upd.to_json(),
+                    session_token.as_deref(),
+                ),
                 peer_addr,
             );
             last_keepalive = Instant::now();
@@ -316,7 +347,8 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
             waiting_for_idr = false;
             // CodecConfig (SPS/PPS) перед IDR
             if let Some(ref sps_pps) = frame.sps_pps {
-                let config_packet = evrt::build_codec_config(sps_pps);
+                let config_packet =
+                    evrt::build_codec_config_authenticated(sps_pps, session_token.as_deref());
                 let _ = send_udp(&socket, &config_packet, peer_addr);
                 thread::sleep(Duration::from_millis(1));
                 let _ = send_udp(&socket, &config_packet, peer_addr);
@@ -328,7 +360,7 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
             frame_id: frame.frame_id,
             ..frame.roi
         };
-        let roi_pkt = evrt::build_roi_metadata(roi);
+        let roi_pkt = evrt::build_roi_metadata_authenticated(roi, session_token.as_deref());
         if !roi_pkt.is_empty() {
             let _ = send_udp(&socket, &roi_pkt, peer_addr);
         }
@@ -339,7 +371,13 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
         sample_hns = sample_hns.wrapping_add(hns_per_frame(cur_fps));
 
         // ── Пакетизация и отправка ────────────────────────────────────────────
-        let pkts = evrt::packetize_video_frame(frame.frame_id, pts_us, frame.is_idr, &frame.bytes);
+        let pkts = evrt::packetize_video_frame_authenticated(
+            frame.frame_id,
+            pts_us,
+            frame.is_idr,
+            &frame.bytes,
+            session_token.as_deref(),
+        );
         for pkt in &pkts {
             if pacer.send(&socket, pkt, peer_addr, pacing_bps).is_err() {
                 stop.store(true, Ordering::Relaxed);

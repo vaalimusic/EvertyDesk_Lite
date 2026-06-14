@@ -99,16 +99,21 @@ impl AudioConfig {
 ///
 /// Блокирует до установки `stop=true`.
 /// На не-Windows платформах — no-op.
-pub fn run_audio_capture(socket: Arc<UdpSocket>, peer_addr: SocketAddr, stop: Arc<AtomicBool>) {
+pub fn run_audio_capture(
+    socket: Arc<UdpSocket>,
+    peer_addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    session_token: Option<String>,
+) {
     #[cfg(all(target_os = "windows", feature = "evrt-wasapi"))]
     {
-        if let Err(e) = run_audio_capture_windows(socket, peer_addr, stop) {
+        if let Err(e) = run_audio_capture_windows(socket, peer_addr, stop, session_token) {
             eprintln!("[evrt-audio] захват завершился: {e}");
         }
     }
     #[cfg(not(all(target_os = "windows", feature = "evrt-wasapi")))]
     {
-        let _ = (socket, peer_addr);
+        let _ = (socket, peer_addr, session_token);
         while !stop.load(Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(100));
         }
@@ -120,6 +125,7 @@ fn run_audio_capture_windows(
     socket: Arc<UdpSocket>,
     peer_addr: SocketAddr,
     stop: Arc<AtomicBool>,
+    session_token: Option<String>,
 ) -> Result<(), String> {
     use windows::Win32::{
         Media::Audio::{
@@ -174,7 +180,11 @@ fn run_audio_capture_windows(
             .map_err(|e| format!("IAudioClient::Initialize: {e}"))?;
 
         // ── Отправить AudioConfig клиенту ─────────────────────────────────────
-        let cfg_pkt = evrt::build_single(evrt::TYPE_AUDIO_CONFIG, &cfg.to_json());
+        let cfg_pkt = evrt::build_single_authenticated(
+            evrt::TYPE_AUDIO_CONFIG,
+            &cfg.to_json(),
+            session_token.as_deref(),
+        );
         let _ = socket.send_to(&cfg_pkt, peer_addr);
 
         let capture_client: IAudioCaptureClient = client
@@ -218,7 +228,12 @@ fn run_audio_capture_windows(
             // Пакетизируем и отправляем
             frame_id = frame_id.wrapping_add(1);
             let pts_us = pts_hns / 10;
-            let pkts = evrt::packetize_audio_frame(frame_id, pts_us, pcm_slice);
+            let pkts = evrt::packetize_audio_frame_authenticated(
+                frame_id,
+                pts_us,
+                pcm_slice,
+                session_token.as_deref(),
+            );
             for pkt in &pkts {
                 let _ = socket.send_to(pkt, peer_addr);
             }

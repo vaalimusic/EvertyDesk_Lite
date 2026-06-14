@@ -38,6 +38,7 @@
 // интерфейс для будущего использования (enhancement layer, audio config, jitter API).
 #![allow(dead_code)]
 
+use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ─── константы ────────────────────────────────────────────────────────────────
@@ -47,8 +48,11 @@ pub const VERSION: u8 = 3;
 pub const HEADER_SIZE: usize = 24;
 pub const MAX_PACKET_SIZE: usize = 1200;
 pub const MAX_PAYLOAD_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE;
+pub const AUTH_TAG_SIZE: usize = 16;
+pub const MAX_AUTH_PAYLOAD_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE - AUTH_TAG_SIZE;
 pub const MAX_FRAME_PACKET_COUNT: usize = 16 * 1024;
 pub const MAX_FRAME_PAYLOAD_SIZE: usize = MAX_PAYLOAD_SIZE * MAX_FRAME_PACKET_COUNT;
+pub const MAX_AUTH_FRAME_PAYLOAD_SIZE: usize = MAX_AUTH_PAYLOAD_SIZE * MAX_FRAME_PACKET_COUNT;
 
 // ─── типы пакетов ─────────────────────────────────────────────────────────────
 
@@ -131,6 +135,22 @@ pub fn parse(buf: &[u8], len: usize) -> Option<EvrtPacket> {
     })
 }
 
+pub fn parse_authenticated(buf: &[u8], len: usize, session_token: Option<&str>) -> Option<EvrtPacket> {
+    let Some(token) = session_token.filter(|token| valid_session_token(token)) else {
+        return parse(buf, len);
+    };
+    if len < HEADER_SIZE + AUTH_TAG_SIZE || len > MAX_PACKET_SIZE || len > buf.len() {
+        return None;
+    }
+    let body_len = len.checked_sub(AUTH_TAG_SIZE)?;
+    let body = &buf[..body_len];
+    let tag = &buf[body_len..len];
+    if !auth_tag_matches(token, body, tag) {
+        return None;
+    }
+    parse(body, body_len)
+}
+
 // ─── построитель пакетов ──────────────────────────────────────────────────────
 
 /// Построить один пакет с заданными полями.
@@ -156,6 +176,44 @@ pub fn build_packet(
     pkt
 }
 
+pub fn build_packet_authenticated(
+    packet_type: u8,
+    flags: u16,
+    frame_id: u32,
+    packet_index: u16,
+    packet_count: u16,
+    presentation_time_us: u64,
+    payload: &[u8],
+    session_token: Option<&str>,
+) -> Vec<u8> {
+    let Some(token) = session_token.filter(|token| valid_session_token(token)) else {
+        return build_packet(
+            packet_type,
+            flags,
+            frame_id,
+            packet_index,
+            packet_count,
+            presentation_time_us,
+            payload,
+        );
+    };
+    if payload.len() > MAX_AUTH_PAYLOAD_SIZE {
+        return Vec::new();
+    }
+    let mut pkt = build_packet(
+        packet_type,
+        flags,
+        frame_id,
+        packet_index,
+        packet_count,
+        presentation_time_us,
+        payload,
+    );
+    let tag = auth_tag(token, &pkt);
+    pkt.extend_from_slice(&tag);
+    pkt
+}
+
 /// Пакетизировать видеокадр в список UDP-датаграмм.
 /// Каждая датаграмма ≤ MAX_PACKET_SIZE байт.
 pub fn packetize_video_frame(
@@ -171,6 +229,24 @@ pub fn packetize_video_frame(
         frame_id,
         presentation_time_us,
         payload,
+    )
+}
+
+pub fn packetize_video_frame_authenticated(
+    frame_id: u32,
+    presentation_time_us: u64,
+    is_key_frame: bool,
+    payload: &[u8],
+    session_token: Option<&str>,
+) -> Vec<Vec<u8>> {
+    let flags = if is_key_frame { FLAG_KEY_FRAME } else { 0 };
+    packetize_authenticated(
+        TYPE_VIDEO_FRAME,
+        flags,
+        frame_id,
+        presentation_time_us,
+        payload,
+        session_token,
     )
 }
 
@@ -258,6 +334,20 @@ pub fn build_roi_metadata(roi: RoiRect) -> Vec<u8> {
     }
 }
 
+pub fn build_roi_metadata_authenticated(roi: RoiRect, session_token: Option<&str>) -> Vec<u8> {
+    let json = roi.to_json();
+    let max_payload = if session_token.is_some_and(valid_session_token) {
+        MAX_AUTH_PAYLOAD_SIZE
+    } else {
+        MAX_PAYLOAD_SIZE
+    };
+    if json.len() <= max_payload {
+        build_single_authenticated(TYPE_ROI_METADATA, &json, session_token)
+    } else {
+        Vec::new()
+    }
+}
+
 /// Пакетизировать аудио-фрейм (PCM данные).
 /// Аудио-фреймы маленькие и обычно умещаются в один пакет.
 pub fn packetize_audio_frame(
@@ -266,6 +356,22 @@ pub fn packetize_audio_frame(
     payload: &[u8],
 ) -> Vec<Vec<u8>> {
     packetize(TYPE_AUDIO_FRAME, 0, frame_id, presentation_time_us, payload)
+}
+
+pub fn packetize_audio_frame_authenticated(
+    frame_id: u32,
+    presentation_time_us: u64,
+    payload: &[u8],
+    session_token: Option<&str>,
+) -> Vec<Vec<u8>> {
+    packetize_authenticated(
+        TYPE_AUDIO_FRAME,
+        0,
+        frame_id,
+        presentation_time_us,
+        payload,
+        session_token,
+    )
 }
 
 /// Построить одиночный пакет для конфигурации/управления.
@@ -279,12 +385,39 @@ pub fn build_single(packet_type: u8, payload: &[u8]) -> Vec<u8> {
     build_packet(packet_type, 0, 0, 0, 1, 0, payload)
 }
 
+pub fn build_single_authenticated(
+    packet_type: u8,
+    payload: &[u8],
+    session_token: Option<&str>,
+) -> Vec<u8> {
+    let max_payload = if session_token.is_some_and(valid_session_token) {
+        MAX_AUTH_PAYLOAD_SIZE
+    } else {
+        MAX_PAYLOAD_SIZE
+    };
+    assert!(
+        payload.len() <= max_payload,
+        "single-packet payload too large: {} > {}",
+        payload.len(),
+        max_payload
+    );
+    build_packet_authenticated(packet_type, 0, 0, 0, 1, 0, payload, session_token)
+}
+
 pub fn build_session_config(payload: &[u8]) -> Vec<u8> {
     build_single(TYPE_SESSION_CONFIG, payload)
 }
 
+pub fn build_session_config_authenticated(payload: &[u8], session_token: Option<&str>) -> Vec<u8> {
+    build_single_authenticated(TYPE_SESSION_CONFIG, payload, session_token)
+}
+
 pub fn build_codec_config(payload: &[u8]) -> Vec<u8> {
     build_single(TYPE_CODEC_CONFIG, payload)
+}
+
+pub fn build_codec_config_authenticated(payload: &[u8], session_token: Option<&str>) -> Vec<u8> {
+    build_single_authenticated(TYPE_CODEC_CONFIG, payload, session_token)
 }
 
 pub fn build_control(payload: &[u8]) -> Vec<u8> {
@@ -300,17 +433,55 @@ fn packetize(
     presentation_time_us: u64,
     payload: &[u8],
 ) -> Vec<Vec<u8>> {
+    packetize_with_limit(packet_type, flags, frame_id, presentation_time_us, payload, MAX_PAYLOAD_SIZE, None)
+}
+
+fn packetize_authenticated(
+    packet_type: u8,
+    flags: u16,
+    frame_id: u32,
+    presentation_time_us: u64,
+    payload: &[u8],
+    session_token: Option<&str>,
+) -> Vec<Vec<u8>> {
+    if session_token.is_some_and(valid_session_token) {
+        packetize_with_limit(
+            packet_type,
+            flags,
+            frame_id,
+            presentation_time_us,
+            payload,
+            MAX_AUTH_PAYLOAD_SIZE,
+            session_token,
+        )
+    } else {
+        packetize(packet_type, flags, frame_id, presentation_time_us, payload)
+    }
+}
+
+fn packetize_with_limit(
+    packet_type: u8,
+    flags: u16,
+    frame_id: u32,
+    presentation_time_us: u64,
+    payload: &[u8],
+    max_payload_size: usize,
+    session_token: Option<&str>,
+) -> Vec<Vec<u8>> {
     if payload.is_empty() {
         return Vec::new();
     }
-    let packet_count = payload.len().div_ceil(MAX_PAYLOAD_SIZE);
+    if max_payload_size == 0 {
+        return Vec::new();
+    }
+    let packet_count = payload.len().div_ceil(max_payload_size);
     if packet_count > MAX_FRAME_PACKET_COUNT {
         return Vec::new();
     }
     let mut packets = Vec::with_capacity(packet_count);
 
-    for (i, chunk) in payload.chunks(MAX_PAYLOAD_SIZE).enumerate() {
-        packets.push(build_packet(
+    for (i, chunk) in payload.chunks(max_payload_size).enumerate() {
+        packets.push(build_packet_authenticated(
             packet_type,
             flags,
             frame_id,
@@ -318,9 +489,57 @@ fn packetize(
             packet_count as u16,
             presentation_time_us,
             chunk,
+            session_token,
         ));
     }
     packets
+}
+
+fn auth_tag(session_token: &str, packet_body: &[u8]) -> [u8; AUTH_TAG_SIZE] {
+    let mac = hmac_sha256(session_token.as_bytes(), packet_body);
+    let mut tag = [0u8; AUTH_TAG_SIZE];
+    tag.copy_from_slice(&mac[..AUTH_TAG_SIZE]);
+    tag
+}
+
+fn auth_tag_matches(session_token: &str, packet_body: &[u8], tag: &[u8]) -> bool {
+    if tag.len() != AUTH_TAG_SIZE {
+        return false;
+    }
+    let expected = auth_tag(session_token, packet_body);
+    let mut diff = 0u8;
+    for (a, b) in expected.iter().zip(tag.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut key_block = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        let digest = Sha256::digest(key);
+        key_block[..32].copy_from_slice(&digest);
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for i in 0..BLOCK {
+        ipad[i] ^= key_block[i];
+        opad[i] ^= key_block[i];
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(msg);
+    let inner_hash = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner_hash);
+    outer.finalize().into()
 }
 
 /// Текущее время в микросекундах (монотонно относительно process start).
@@ -334,9 +553,39 @@ pub fn now_us() -> u64 {
 // ─── управляющие пакеты ───────────────────────────────────────────────────────
 
 /// Построить пакет `request_key_frame`.
+pub const SESSION_TOKEN_HEX_LEN: usize = 32;
+
+pub fn valid_session_token(token: &str) -> bool {
+    token.len() == SESSION_TOKEN_HEX_LEN && token.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn session_token_json(token: Option<&str>) -> String {
+    match token {
+        Some(token) if valid_session_token(token) => {
+            format!(r#","sessionToken":"{token}""#)
+        }
+        _ => String::new(),
+    }
+}
+
 pub fn build_request_key_frame() -> Vec<u8> {
-    let payload = br#"{"kind":"request_key_frame"}"#;
-    build_control(payload)
+    build_request_key_frame_with_token(None)
+}
+
+pub fn build_request_key_frame_with_token(session_token: Option<&str>) -> Vec<u8> {
+    let json = format!(
+        r#"{{"kind":"request_key_frame"{}}}"#,
+        session_token_json(session_token)
+    );
+    build_control(json.as_bytes())
+}
+
+pub fn build_request_key_frame_authenticated(session_token: Option<&str>) -> Vec<u8> {
+    let json = format!(
+        r#"{{"kind":"request_key_frame"{}}}"#,
+        session_token_json(session_token)
+    );
+    build_single_authenticated(TYPE_CONTROL, json.as_bytes(), session_token)
 }
 
 /// Feedback от получателя к отправителю.
@@ -382,8 +631,15 @@ impl Pressure {
 
 /// Сериализовать feedback в JSON-байты для `TYPE_CONTROL` пакета.
 pub fn build_receiver_feedback(fb: &ReceiverFeedback) -> Vec<u8> {
+    build_receiver_feedback_with_token(fb, None)
+}
+
+pub fn build_receiver_feedback_with_token(
+    fb: &ReceiverFeedback,
+    session_token: Option<&str>,
+) -> Vec<u8> {
     let json = format!(
-        r#"{{"kind":"receiver_feedback","pressure":"{}","backlogFrames":{},"queueDrops":{},"decodeFps":{},"assemblyDelayMs":{},"arrivalDeltaMs":{},"decodeDeltaMs":{},"presentDeltaMs":{},"pulseEstimateMs":{},"inputEstimateMs":{}}}"#,
+        r#"{{"kind":"receiver_feedback","pressure":"{}","backlogFrames":{},"queueDrops":{},"decodeFps":{},"assemblyDelayMs":{},"arrivalDeltaMs":{},"decodeDeltaMs":{},"presentDeltaMs":{},"pulseEstimateMs":{},"inputEstimateMs":{}{}}}"#,
         fb.pressure.as_str(),
         fb.backlog_frames,
         fb.queue_drops,
@@ -394,13 +650,51 @@ pub fn build_receiver_feedback(fb: &ReceiverFeedback) -> Vec<u8> {
         fb.present_delta_ms,
         fb.pulse_estimate_ms,
         fb.input_estimate_ms,
+        session_token_json(session_token),
     );
     // Может не войти в MAX_PAYLOAD_SIZE при очень больших числах — обрезать безопасно не нужно,
     // JSON всегда < 300 байт.
     build_control(json.as_bytes())
 }
 
+pub fn build_receiver_feedback_authenticated(
+    fb: &ReceiverFeedback,
+    session_token: Option<&str>,
+) -> Vec<u8> {
+    let json = format!(
+        r#"{{"kind":"receiver_feedback","pressure":"{}","backlogFrames":{},"queueDrops":{},"decodeFps":{},"assemblyDelayMs":{},"arrivalDeltaMs":{},"decodeDeltaMs":{},"presentDeltaMs":{},"pulseEstimateMs":{},"inputEstimateMs":{}{}}}"#,
+        fb.pressure.as_str(),
+        fb.backlog_frames,
+        fb.queue_drops,
+        fb.decode_fps,
+        fb.assembly_delay_ms,
+        fb.arrival_delta_ms,
+        fb.decode_delta_ms,
+        fb.present_delta_ms,
+        fb.pulse_estimate_ms,
+        fb.input_estimate_ms,
+        session_token_json(session_token),
+    );
+    build_single_authenticated(TYPE_CONTROL, json.as_bytes(), session_token)
+}
+
 /// Разобрать входящий control-пакет.
+pub fn control_session_token(payload: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(payload).ok()?;
+    let token = json_str_field(s, "sessionToken").or_else(|| json_str_field(s, "token"))?;
+    valid_session_token(&token).then_some(token)
+}
+
+pub fn control_token_matches(payload: &[u8], expected: Option<&str>) -> bool {
+    match expected {
+        Some(expected) if valid_session_token(expected) => {
+            control_session_token(payload).as_deref() == Some(expected)
+        }
+        Some(_) => false,
+        None => true,
+    }
+}
+
 pub fn parse_control(payload: &[u8]) -> Option<ControlMessage> {
     // Минимальный ручной парсер без зависимости от serde_json.
     let s = std::str::from_utf8(payload).ok()?;
@@ -627,6 +921,38 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_packet_roundtrip_strips_tag() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let pkt = build_packet_authenticated(TYPE_VIDEO_FRAME, FLAG_KEY_FRAME, 7, 0, 1, 42, b"abc", Some(token));
+        assert_eq!(pkt.len(), HEADER_SIZE + 3 + AUTH_TAG_SIZE);
+        let parsed = parse_authenticated(&pkt, pkt.len(), Some(token)).unwrap();
+        assert_eq!(parsed.packet_type, TYPE_VIDEO_FRAME);
+        assert_eq!(parsed.frame_id, 7);
+        assert_eq!(parsed.payload, b"abc");
+        assert!(parsed.is_key_frame());
+    }
+
+    #[test]
+    fn authenticated_packet_rejects_tamper() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let mut pkt = build_packet_authenticated(TYPE_VIDEO_FRAME, 0, 7, 0, 1, 42, b"abc", Some(token));
+        pkt[HEADER_SIZE] ^= 0x01;
+        assert!(parse_authenticated(&pkt, pkt.len(), Some(token)).is_none());
+        assert!(parse_authenticated(&pkt, pkt.len(), Some("ffffffffffffffffffffffffffffffff")).is_none());
+    }
+
+    #[test]
+    fn authenticated_packetizer_keeps_mtu_safe_datagrams() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let payload = vec![1u8; MAX_AUTH_PAYLOAD_SIZE + 1];
+        let packets = packetize_video_frame_authenticated(1, 0, true, &payload, Some(token));
+        assert_eq!(packets.len(), 2);
+        assert!(packets.iter().all(|pkt| pkt.len() <= MAX_PACKET_SIZE));
+        let first = parse_authenticated(&packets[0], packets[0].len(), Some(token)).unwrap();
+        assert_eq!(first.payload.len(), MAX_AUTH_PAYLOAD_SIZE);
+    }
+
+    #[test]
     fn feedback_roundtrip() {
         let fb = ReceiverFeedback {
             pressure: Pressure::Critical,
@@ -662,6 +988,53 @@ mod tests {
         let parsed = parse(&pkt, pkt.len()).unwrap();
         let ctrl = parse_control(&parsed.payload).unwrap();
         assert!(matches!(ctrl, ControlMessage::RequestKeyFrame));
+    }
+
+    #[test]
+    fn request_key_frame_carries_session_token() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let pkt = build_request_key_frame_with_token(Some(token));
+        let parsed = parse(&pkt, pkt.len()).unwrap();
+        assert_eq!(control_session_token(&parsed.payload).as_deref(), Some(token));
+        assert!(control_token_matches(&parsed.payload, Some(token)));
+        assert!(!control_token_matches(
+            &parsed.payload,
+            Some("ffffffffffffffffffffffffffffffff")
+        ));
+    }
+
+    #[test]
+    fn authenticated_control_roundtrip() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let pkt = build_request_key_frame_authenticated(Some(token));
+        let parsed = parse_authenticated(&pkt, pkt.len(), Some(token)).unwrap();
+        assert_eq!(parsed.packet_type, TYPE_CONTROL);
+        assert_eq!(control_session_token(&parsed.payload).as_deref(), Some(token));
+        assert!(matches!(
+            parse_control(&parsed.payload),
+            Some(ControlMessage::RequestKeyFrame)
+        ));
+    }
+
+    #[test]
+    fn receiver_feedback_carries_session_token() {
+        let token = "abcdef0123456789abcdef0123456789";
+        let fb = ReceiverFeedback {
+            pressure: Pressure::High,
+            backlog_frames: 1,
+            ..ReceiverFeedback::default()
+        };
+        let pkt = build_receiver_feedback_with_token(&fb, Some(token));
+        let parsed = parse(&pkt, pkt.len()).unwrap();
+        assert_eq!(control_session_token(&parsed.payload).as_deref(), Some(token));
+        let ctrl = parse_control(&parsed.payload).unwrap();
+        match ctrl {
+            ControlMessage::ReceiverFeedback(parsed_fb) => {
+                assert_eq!(parsed_fb.pressure, Pressure::High);
+                assert_eq!(parsed_fb.backlog_frames, 1);
+            }
+            _ => panic!("wrong kind"),
+        }
     }
 
     #[test]

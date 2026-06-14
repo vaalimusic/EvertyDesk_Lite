@@ -1223,15 +1223,19 @@ fn relay_session_inner(
     // Если UDP не поднялся за 2 сек — клиент остаётся на TCP relay.
     let evrt_socket = try_open_evrt_socket(config, events);
     let mut evrt_announce: Option<(String, u16)> = None;
+    let mut evrt_token: Option<String> = None;
 
     if let Some((ref _sock, evrt_port)) = evrt_socket {
+        let token = new_evrt_session_token();
         // ★ Перечисляем ВСЕ локальные IP (LAN + VPN) как кандидаты — mini-ICE.
         //   Это решает мультихоминг: через VPN клиент достучится по VPN-IP хоста.
         let endpoints = crate::netif::candidate_endpoints(evrt_port);
-        evrt_announce = Some((endpoints.clone(), evrt_port));
+        let endpoints_with_token = append_evrt_session_token(&endpoints, &token);
+        evrt_token = Some(token);
+        evrt_announce = Some((endpoints_with_token.clone(), evrt_port));
 
-        if !endpoints.is_empty() {
-            let misc = evrt_endpoints_message(&endpoints);
+        if !endpoints_with_token.is_empty() {
+            let misc = evrt_endpoints_message(&endpoints_with_token);
             match send_peer_enc(&mut relay, &mut cipher, &misc) {
                 Ok(()) => host_log(
                     events,
@@ -1301,6 +1305,7 @@ fn relay_session_inner(
         relay_stream: write_stream,
         send_cipher,
         evrt_socket: evrt_socket.map(|(s, _)| s),
+        evrt_token,
         cmd_rx,
         peer_msg_rx,
     };
@@ -1364,7 +1369,7 @@ fn relay_session_inner(
             let _ = pipeline_handle.join();
             let _ = done_tx.send(());
         });
-        match done_rx.recv_timeout(Duration::from_secs(3)) {
+        match done_rx.recv_timeout(Duration::from_secs(8)) {
             Ok(()) => host_log(events, format!("Pipeline join complete for {peer_id}")),
             Err(_) => {
                 host_log(events, format!("Pipeline join timeout for {peer_id}"));
@@ -2691,9 +2696,13 @@ fn inject_mouse(ev: crate::rustdesk_proto::MouseEvent) {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
         MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
-        MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP,
+        MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+        MOUSEEVENTF_XUP,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
+    };
 
     // XBUTTON1 = 0x0001 (back), XBUTTON2 = 0x0002 (forward) — for mouseData.
     const XBUTTON1: i32 = 0x0001;
@@ -2716,8 +2725,10 @@ fn inject_mouse(ev: crate::rustdesk_proto::MouseEvent) {
     let button = ev.mask >> 3;
 
     unsafe {
-        let sw = GetSystemMetrics(SM_CXSCREEN).max(1) as i32;
-        let sh = GetSystemMetrics(SM_CYSCREEN).max(1) as i32;
+        let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1);
+        let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1);
 
         // ── Wheel: ev.x / ev.y carry scroll deltas, not coordinates ──────────
         if evt_type == EVT_WHEEL {
@@ -2734,11 +2745,15 @@ fn inject_mouse(ev: crate::rustdesk_proto::MouseEvent) {
         // Only reposition the cursor for move events, or for down/up that carry
         // real coordinates. Some clients send button events with (0,0) — moving
         // there first made every click jump to the top-left corner.
-        let abs_x = (ev.x * 65535 / sw).clamp(0, 65535);
-        let abs_y = (ev.y * 65535 / sh).clamp(0, 65535);
+        let max_rel_x = i64::from(vw.saturating_sub(1));
+        let max_rel_y = i64::from(vh.saturating_sub(1));
+        let rel_x = (i64::from(ev.x) - i64::from(vx)).clamp(0, max_rel_x);
+        let rel_y = (i64::from(ev.y) - i64::from(vy)).clamp(0, max_rel_y);
+        let abs_x = (rel_x * 65535 / max_rel_x.max(1)).clamp(0, 65535) as i32;
+        let abs_y = (rel_y * 65535 / max_rel_y.max(1)).clamp(0, 65535) as i32;
         let do_move = evt_type == EVT_MOVE || ev.x != 0 || ev.y != 0;
         let mut flags = if do_move {
-            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
         } else {
             windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS::default()
         };
@@ -3985,6 +4000,18 @@ fn tcp_probe(host: &str, port: u16, local_id: &str, events: &Sender<HostEvent>) 
 }
 
 /// Send a PeerMessage over the relay, encrypting it if the secure channel is up.
+fn new_evrt_session_token() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+fn append_evrt_session_token(endpoints: &str, token: &str) -> String {
+    if endpoints.trim().is_empty() {
+        format!("token={token}")
+    } else {
+        format!("{endpoints},token={token}")
+    }
+}
+
 fn evrt_endpoints_message(endpoints: &str) -> PeerMessage {
     PeerMessage {
         union: Some(peer_message::Union::Misc(Misc {

@@ -63,6 +63,7 @@ pub struct EvrtClientParams {
     pub stop: Arc<AtomicBool>,
     /// Ultra-low-latency режим (feedback каждые 70мс вместо 150мс).
     pub ultra_low_latency: bool,
+    pub session_token: Option<String>,
 }
 
 /// Результат попытки EVRT-подключения.
@@ -83,6 +84,7 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
         events,
         stop,
         ultra_low_latency,
+        session_token,
     } = params;
 
     evrt_log(&events, format!("EVRT client: punching to {host_addr}"));
@@ -103,7 +105,7 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
     }
 
     // Отправляем RequestKeyFrame — хост по нему определяет что клиент живой
-    let kf_pkt = evrt::build_request_key_frame();
+    let kf_pkt = evrt::build_request_key_frame_authenticated(session_token.as_deref());
     let _ = socket.send_to(&kf_pkt, host_addr);
 
     // ── Ожидаем SessionConfig от хоста ───────────────────────────────────────
@@ -117,7 +119,9 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
     while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
         match socket.recv_from(&mut buf) {
             Ok((len, src)) if src == host_addr => {
-                if let Some(pkt) = evrt::parse(&buf, len) {
+                if let Some(pkt) =
+                    evrt::parse_authenticated(&buf, len, session_token.as_deref())
+                {
                     if pkt.packet_type == evrt::TYPE_SESSION_CONFIG {
                         if let Some(cfg) = SessionConfig::from_json(&pkt.payload) {
                             evrt_log(
@@ -220,6 +224,7 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
     let recv_reassembly_drops = reassembly_drops.clone();
     let recv_assembly_delay = assembly_delay_ms.clone();
     let recv_bitrate = configured_bitrate.clone();
+    let recv_session_token = session_token.clone();
 
     // WASAPI playback lives inside the receive thread: COM objects stay
     // on the same thread where they are created and used.
@@ -246,7 +251,9 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
                     }
                     last_pkt_at = Instant::now();
 
-                    if let Some(pkt) = evrt::parse(&buf, len) {
+                    if let Some(pkt) =
+                        evrt::parse_authenticated(&buf, len, recv_session_token.as_deref())
+                    {
                         recv_packets.fetch_add(1, Ordering::Relaxed);
                         match pkt.packet_type {
                             evrt::TYPE_CODEC_CONFIG => {
@@ -267,8 +274,12 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
                                     && last_loss_keyframe_request.elapsed()
                                         >= Duration::from_millis(250)
                                 {
-                                    let _ = recv_socket
-                                        .send_to(&evrt::build_request_key_frame(), host_addr);
+                                    let _ = recv_socket.send_to(
+                                        &evrt::build_request_key_frame_authenticated(
+                                            recv_session_token.as_deref(),
+                                        ),
+                                        host_addr,
+                                    );
                                     recv_queue.wait_for_keyframe();
                                     last_loss_keyframe_request = Instant::now();
                                 }
@@ -406,7 +417,7 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
             input_estimate_ms: -1,
         };
 
-        let pkt = evrt::build_receiver_feedback(&fb);
+        let pkt = evrt::build_receiver_feedback_authenticated(&fb, session_token.as_deref());
         let _ = socket.send_to(&pkt, host_addr);
 
         // ★ Метрики → UI (каждый тик feedback loop)
@@ -426,7 +437,7 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
 
         // Если critical + задержка растёт → запрос keyframe
         if pressure == Pressure::Critical && queued > 0 {
-            let kf = evrt::build_request_key_frame();
+            let kf = evrt::build_request_key_frame_authenticated(session_token.as_deref());
             let _ = socket.send_to(&kf, host_addr);
             queue.wait_for_keyframe();
         }
@@ -660,6 +671,7 @@ fn evrt_log(events: &Sender<SessionEvent>, msg: String) {
 pub fn try_evrt_before_relay(
     local_udp: &Arc<UdpSocket>,
     host_addr: SocketAddr,
+    session_token: Option<String>,
     events: &Sender<SessionEvent>,
     stop: Arc<AtomicBool>,
     ultra_low_lat: bool,
@@ -670,6 +682,7 @@ pub fn try_evrt_before_relay(
         events: events.clone(),
         stop,
         ultra_low_latency: ultra_low_lat,
+        session_token,
     };
 
     match run_evrt_client(params) {
@@ -696,10 +709,15 @@ pub fn try_evrt_before_relay(
 /// Каждый кандидат пробуется со своим свежим UDP-сокетом.
 pub fn try_evrt_candidates(
     candidates: Vec<SocketAddr>,
+    session_token: Option<String>,
     events: &Sender<SessionEvent>,
     ultra_low_lat: bool,
+    stop: Arc<AtomicBool>,
 ) -> bool {
     for (i, addr) in candidates.iter().enumerate() {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         evrt_log(
             events,
             format!(
@@ -712,7 +730,6 @@ pub fn try_evrt_candidates(
             continue;
         };
         let udp = Arc::new(udp);
-        let stop = Arc::new(AtomicBool::new(false));
 
         // Быстрая проба: короткий таймаут на каждый кандидат, чтобы не висеть.
         // run_evrt_client сам делает CONNECT_TIMEOUT(4с); для перебора это ок,
@@ -721,8 +738,9 @@ pub fn try_evrt_candidates(
             socket: udp,
             host_addr: *addr,
             events: events.clone(),
-            stop,
+            stop: stop.clone(),
             ultra_low_latency: ultra_low_lat,
+            session_token: session_token.clone(),
         }) {
             EvrtConnectResult::Ok => {
                 // Сессия завершилась нормально (была установлена)

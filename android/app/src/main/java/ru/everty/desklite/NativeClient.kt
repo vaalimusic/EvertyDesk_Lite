@@ -1,6 +1,13 @@
 package ru.everty.desklite
 
 class NativeClient {
+    data class RemoteGeometry(
+        val x: Int,
+        val y: Int,
+        val width: Int,
+        val height: Int,
+    )
+
     private var handle: Long = 0
 
     fun start(
@@ -39,6 +46,19 @@ class NativeClient {
         val packed = nativeRemoteSize(handle)
         if (packed == 0L) return null
         return Pair((packed ushr 32).toInt(), (packed and 0xFFFFFFFFL).toInt())
+    }
+
+    fun remoteGeometry(): RemoteGeometry? {
+        if (handle == 0L) return null
+        val packedSize = nativeRemoteSize(handle)
+        if (packedSize == 0L) return null
+        val packedOrigin = nativeRemoteOrigin(handle)
+        return RemoteGeometry(
+            x = (packedOrigin shr 32).toInt(),
+            y = packedOrigin.toInt(),
+            width = (packedSize ushr 32).toInt(),
+            height = (packedSize and 0xFFFFFFFFL).toInt(),
+        )
     }
 
     fun pollFrame(out: IntArray): Pair<Int, Int>? {
@@ -107,6 +127,7 @@ class NativeClient {
     ): Long
     private external fun nativeFrameSize(handle: Long): Long
     private external fun nativeRemoteSize(handle: Long): Long
+    private external fun nativeRemoteOrigin(handle: Long): Long
     private external fun nativePollFrame(handle: Long, out: IntArray): Long
     private external fun nativeTouch(handle: Long, x: Int, y: Int, action: Int)
     private external fun nativeRightClick(handle: Long, x: Int, y: Int)

@@ -2115,6 +2115,41 @@ impl EvertyDeskApp {
             self.incoming_approval_window(ctx);
         }
 
+        // Floating connection badge — visible on every tab when host session is active.
+        if let HostState::Accepting(ref peer_id) = self.host_state.clone() {
+            egui::Window::new("__active_session_badge")
+                .title_bar(false)
+                .resizable(false)
+                .movable(false)
+                .collapsible(false)
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0))
+                .frame(
+                    egui::Frame::NONE
+                        .fill(egui::Color32::from_rgb(18, 95, 170))
+                        .corner_radius(egui::CornerRadius::same(10))
+                        .inner_margin(egui::Margin::symmetric(14, 10)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("📡").size(20.0));
+                        ui.add_space(6.0);
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new("К вам подключены")
+                                    .size(11.0)
+                                    .color(egui::Color32::from_rgb(140, 190, 255)),
+                            );
+                            ui.label(
+                                egui::RichText::new(peer_id.as_str())
+                                    .size(14.0)
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            );
+                        });
+                    });
+                });
+        }
+
         let screen_rect = ctx.content_rect();
         ctx.layer_painter(egui::LayerId::background()).rect_filled(
             screen_rect,
