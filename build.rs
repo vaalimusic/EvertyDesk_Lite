@@ -1,6 +1,8 @@
 use std::{env, path::PathBuf};
 
 fn main() {
+    embed_windows_icon();
+
     println!("cargo:rerun-if-env-changed=EVERTYDESK_NV_CODEC_SDK");
     println!("cargo:rerun-if-env-changed=NV_CODEC_SDK");
     println!("cargo:rerun-if-env-changed=NVIDIA_VIDEO_CODEC_SDK");
@@ -29,6 +31,21 @@ fn main() {
         if target_os == "windows" {
             compile_nvenc_windows_shim(&sdk);
         }
+    }
+}
+
+fn embed_windows_icon() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    println!("cargo:rerun-if-changed=edesk_lite.ico");
+    let mut res = winres::WindowsResource::new();
+    res.set_icon("edesk_lite.ico");
+    res.set("ProductName", "EvertyDesk Lite");
+    res.set("FileDescription", "EvertyDesk Lite — удалённый доступ");
+    res.set("LegalCopyright", "Copyright 2026 Everty");
+    if let Err(e) = res.compile() {
+        eprintln!("winres: {e}");
     }
 }
 
