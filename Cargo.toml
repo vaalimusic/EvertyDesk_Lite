@@ -42,7 +42,7 @@ live-nvenc-sdk = []
 cc = "1"
 
 [target.'cfg(windows)'.build-dependencies]
-winres = "0.1"
+embed-resource = "2"
 
 [dependencies]
 arboard = { version = "3.6", optional = true }

@@ -1,0 +1,31 @@
+// Windows resource file for EvertyDesk Lite
+IDI_ICON1 ICON "edesk_lite.ico"
+
+1 VERSIONINFO
+FILEVERSION 0,2,0,0
+PRODUCTVERSION 0,2,0,0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "Everty\0"
+            VALUE "FileDescription",  "EvertyDesk Lite\0"
+            VALUE "FileVersion",      "0.2.0\0"
+            VALUE "InternalName",     "evertydesk-lite\0"
+            VALUE "LegalCopyright",   "Copyright 2026 Everty\0"
+            VALUE "OriginalFilename", "evertydesk-lite.exe\0"
+            VALUE "ProductName",      "EvertyDesk Lite\0"
+            VALUE "ProductVersion",   "0.2.0\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

@@ -39,14 +39,8 @@ fn embed_windows_icon() {
         return;
     }
     println!("cargo:rerun-if-changed=edesk_lite.ico");
-    let mut res = winres::WindowsResource::new();
-    res.set_icon("edesk_lite.ico");
-    res.set("ProductName", "EvertyDesk Lite");
-    res.set("FileDescription", "EvertyDesk Lite — удалённый доступ");
-    res.set("LegalCopyright", "Copyright 2026 Everty");
-    if let Err(e) = res.compile() {
-        eprintln!("winres: {e}");
-    }
+    println!("cargo:rerun-if-changed=edesk_lite.rc");
+    embed_resource::compile("edesk_lite.rc", embed_resource::NONE);
 }
 
 fn find_nv_codec_sdk() -> Option<PathBuf> {
