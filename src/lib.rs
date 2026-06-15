@@ -29,7 +29,12 @@ pub mod transport;
 pub mod video;
 pub mod video_pipeline;
 pub mod videotoolbox;
+pub mod vm_bridge;
 pub mod vp9_mf;
+
+// Agentless VM-доступ через гипервизор (Hyper-V) — только Windows-хост.
+#[cfg(windows)]
+pub mod hyperv;
 
 #[cfg(feature = "live-vpx-system")]
 pub mod vpx_system;

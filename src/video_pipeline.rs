@@ -694,7 +694,10 @@ fn encode_loop(
                     next_capture_due += frame_interval;
 
                     let capture_started = Instant::now();
-                    let captured = crate::capture::capture_display_into(display, &mut buf);
+                    // Agentless VM-доступ: если клиент прикреплён к VM, кодируем
+                    // кадр консоли VM вместо физического экрана хоста.
+                    let captured = crate::vm_bridge::active_frame(&mut buf)
+                        .or_else(|| crate::capture::capture_display_into(display, &mut buf));
                     let capture_us = capture_started
                         .elapsed()
                         .as_micros()

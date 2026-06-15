@@ -156,6 +156,10 @@ pub enum SessionEvent {
         reassembly_drops: u64,
         queue_drops: u64,
     },
+    /// Agentless VM: список VM от хоста (JSON `[{"id","name","state","connectable"}]`).
+    VmList(String),
+    /// Agentless VM: статус VM-сессии от хоста.
+    VmStatus(String),
 }
 
 #[derive(Clone, Debug)]
@@ -237,6 +241,10 @@ pub enum SessionCommand {
     ShellStart,
     ShellInput(String),
     ShellStop,
+    /// Agentless VM: запросить у хоста список VM на гипервизоре.
+    ListVms,
+    /// Agentless VM: прикрепиться к VM по id (пустая строка = отсоединиться).
+    AttachVm(String),
     Close,
 }
 
@@ -1003,6 +1011,27 @@ impl TransportClient {
                     SessionCommand::ShellStop => {
                         flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
                         let _ = send_shell_message(&mut relay, ShellMessageKind::Stop, "");
+                    }
+                    SessionCommand::ListVms => {
+                        flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
+                        let msg = PeerMessage {
+                            union: Some(peer_message::Union::Misc(Misc {
+                                union: Some(misc::Union::VmListRequest(true)),
+                            })),
+                        };
+                        let _ = send_framed(&mut relay, &encode_peer_message(&msg));
+                    }
+                    SessionCommand::AttachVm(vm_id) => {
+                        flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
+                        let msg = PeerMessage {
+                            union: Some(peer_message::Union::Misc(Misc {
+                                union: Some(misc::Union::VmAttach(vm_id)),
+                            })),
+                        };
+                        let _ = send_framed(&mut relay, &encode_peer_message(&msg));
+                        // Свежее видео после переключения источника (VM ↔ экран).
+                        live_video_seen = false;
+                        last_decoder_recovery = Some(Instant::now());
                     }
                     SessionCommand::Close => {
                         flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
@@ -3126,6 +3155,14 @@ fn handle_session_message(
                     // ★ Телеметрия хоста — пробрасываем в --diagnose отчёт.
                     eprintln!("[session] ★ Хост-энкодер: {info}");
                     let _ = events.send(SessionEvent::Info(format!("★ Хост-энкодер: {info}")));
+                }
+                Some(misc::Union::VmList(json)) => {
+                    eprintln!("[session] VM list received");
+                    let _ = events.send(SessionEvent::VmList(json.clone()));
+                }
+                Some(misc::Union::VmStatus(status)) => {
+                    eprintln!("[session] VM status: {status}");
+                    let _ = events.send(SessionEvent::VmStatus(status.clone()));
                 }
                 other => {
                     eprintln!(

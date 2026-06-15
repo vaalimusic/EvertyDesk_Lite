@@ -34,6 +34,7 @@ fn main() {
     }
 }
 
+#[cfg(windows)]
 fn embed_windows_icon() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
@@ -42,6 +43,11 @@ fn embed_windows_icon() {
     println!("cargo:rerun-if-changed=edesk_lite.rc");
     embed_resource::compile("edesk_lite.rc", embed_resource::NONE);
 }
+
+// На не-Windows хостах build-dependency `embed-resource` недоступна
+// (объявлена в `[target.'cfg(windows)'.build-dependencies]`), поэтому no-op.
+#[cfg(not(windows))]
+fn embed_windows_icon() {}
 
 fn find_nv_codec_sdk() -> Option<PathBuf> {
     for key in [

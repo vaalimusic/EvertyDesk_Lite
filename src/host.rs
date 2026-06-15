@@ -2365,14 +2365,39 @@ fn handle_client_input_pipeline(
     use crate::video_pipeline::PipelineCmd;
     match msg.union {
         Some(peer_message::Union::MouseEvent(ev)) => {
+            // Agentless VM: если прикреплены к VM — ввод уходит в VM, не в ОС хоста.
+            if crate::vm_bridge::route_mouse(&ev) {
+                return;
+            }
             if mouse_event_should_log(&ev) {
                 host_log(events, format!("Host input: {}", mouse_event_summary(&ev)));
             }
             inject_mouse(ev);
         }
         Some(peer_message::Union::KeyEvent(ev)) => {
+            if crate::vm_bridge::route_key(&ev) {
+                return;
+            }
             host_log(events, format!("Host input: {}", key_event_summary(&ev)));
             inject_key(ev);
+        }
+        Some(peer_message::Union::Misc(Misc {
+            union: Some(misc::Union::VmListRequest(_)),
+        })) => {
+            let json = crate::vm_bridge::list_json();
+            host_log(events, "Host VM: список VM запрошен клиентом".to_owned());
+            let _ = peer_msg_tx.send(vm_misc_message(misc::Union::VmList(json)));
+        }
+        Some(peer_message::Union::Misc(Misc {
+            union: Some(misc::Union::VmAttach(vm_id)),
+        })) => {
+            let status = match crate::vm_bridge::attach(&vm_id) {
+                Ok(s) => s,
+                Err(e) => format!("Ошибка VM: {e}"),
+            };
+            host_log(events, format!("Host VM: attach '{vm_id}' → {status}"));
+            let _ = cmd_tx.send(PipelineCmd::RefreshDisplay(0));
+            let _ = peer_msg_tx.send(vm_misc_message(misc::Union::VmStatus(status)));
         }
         Some(peer_message::Union::Misc(Misc {
             union: Some(misc::Union::Option(option)),
@@ -4049,6 +4074,12 @@ fn append_evrt_session_token(endpoints: &str, token: &str) -> String {
         format!("token={token}")
     } else {
         format!("{endpoints},token={token}")
+    }
+}
+
+fn vm_misc_message(union: misc::Union) -> PeerMessage {
+    PeerMessage {
+        union: Some(peer_message::Union::Misc(Misc { union: Some(union) })),
     }
 }
 

@@ -32,6 +32,7 @@ mod ui;
 mod video;
 mod video_pipeline;
 mod videotoolbox;
+mod vm_bridge;
 mod vp9_mf;
 #[cfg(feature = "live-vpx-system")]
 mod vpx_system;
@@ -76,6 +77,46 @@ enum AppMode {
     History,
     Contacts,
     Settings,
+}
+
+/// VM на удалённом хосте-гипервизоре (получена через agentless control-plane).
+#[derive(Clone, Debug)]
+struct RemoteVmEntry {
+    id: String,
+    name: String,
+    state: String,
+    connectable: bool,
+}
+
+/// Распарсить JSON-список VM от хоста: `[{"id","name","state","connectable"}]`.
+fn parse_remote_vms(json: &str) -> Vec<RemoteVmEntry> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(arr) = value.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|row| {
+            Some(RemoteVmEntry {
+                id: row.get("id")?.as_str()?.to_owned(),
+                name: row
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("VM")
+                    .to_owned(),
+                state: row
+                    .get("state")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+                connectable: row
+                    .get("connectable")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            })
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -995,6 +1036,16 @@ struct EvertyDeskApp {
     #[cfg(windows)]
     hyperv_console_vm: Option<usize>,
 
+    // ── Remote agentless VM (через подключённый хост-гипервизор) ───────────────
+    /// Список VM, полученный от удалённого хоста (киллер-фича).
+    remote_vms: Vec<RemoteVmEntry>,
+    /// id VM, к которой сейчас прикреплён удалённый сеанс (пусто = экран хоста).
+    remote_attached_vm: String,
+    /// Статус удалённой VM-сессии (от хоста).
+    remote_vm_status: String,
+    /// Открыта ли панель VM в окне удалённого сеанса.
+    remote_vm_panel_open: bool,
+
     // ── Settings window ───────────────────────────────────────────────────────
     /// Whether the settings panel is visible.
     show_settings: bool,
@@ -1240,6 +1291,10 @@ impl EvertyDeskApp {
             hyperv_status: String::new(),
             #[cfg(windows)]
             hyperv_console_vm: None,
+            remote_vms: Vec::new(),
+            remote_attached_vm: String::new(),
+            remote_vm_status: String::new(),
+            remote_vm_panel_open: false,
             show_settings: false,
             settings_draft: None,
             settings_custom_server: crate::settings::ServerConfig {
@@ -1753,6 +1808,14 @@ impl EvertyDeskApp {
                 self.evrt_reassembly_drops = reassembly_drops;
                 self.evrt_queue_drops = queue_drops;
             }
+            SessionEvent::VmList(json) => {
+                self.remote_vms = parse_remote_vms(&json);
+                self.log(format!("Хост VM: получено {} машин", self.remote_vms.len()));
+            }
+            SessionEvent::VmStatus(status) => {
+                self.log(format!("Хост VM: {status}"));
+                self.remote_vm_status = status;
+            }
             SessionEvent::Failed(err) => {
                 self.busy = false;
                 self.connected = false;
@@ -2156,6 +2219,9 @@ impl EvertyDeskApp {
         if self.connected && self.shell_window_open {
             self.shell_window(ctx);
         }
+        if self.connected && self.remote_vm_panel_open {
+            self.remote_vm_window(ctx);
+        }
         if self.host_pending_peer.is_some() {
             self.incoming_approval_window(ctx);
         }
@@ -2235,6 +2301,8 @@ impl EvertyDeskApp {
                 AppMode::Host => self.host_ui(ui),
                 #[cfg(windows)]
                 AppMode::HyperV => self.hyperv_ui(ui),
+                #[cfg(not(windows))]
+                AppMode::HyperV => self.hyperv_unavailable_ui(ui),
                 AppMode::History => self.history_ui(ui),
                 AppMode::Contacts => self.contacts_ui(ui),
                 AppMode::Settings => self.settings_ui(ui),
@@ -3135,6 +3203,18 @@ impl EvertyDeskApp {
     }
 
     // ── Hyper-V UI ────────────────────────────────────────────────────────────
+
+    #[cfg(not(windows))]
+    fn hyperv_unavailable_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading(egui::RichText::new("Hyper-V VMs").size(20.0).strong());
+        ui.add_space(12.0);
+        ui.label("Локальный доступ к Hyper-V доступен только на Windows-хосте.");
+        ui.add_space(6.0);
+        ui.label(
+            "Подключитесь к удалённому Windows-хосту-гипервизору — список его VM \
+             появится в окне сеанса (кнопка «VM хоста»).",
+        );
+    }
 
     #[cfg(windows)]
     fn hyperv_ui(&mut self, ui: &mut egui::Ui) {
@@ -4156,8 +4236,131 @@ impl EvertyDeskApp {
                 ),
                 |ui| self.remote_video_profile_menu_ui(ui),
             );
+            if remote_icon_toggle(
+                ui,
+                "VM",
+                self.remote_vm_panel_open,
+                "Виртуальные машины на хосте (agentless)",
+            )
+            .clicked()
+            {
+                self.remote_vm_panel_open = !self.remote_vm_panel_open;
+                if self.remote_vm_panel_open {
+                    self.send_command(SessionCommand::ListVms);
+                }
+            }
+
             ui.menu_button("⋯", |ui| self.remote_more_menu_ui(ui));
         });
+    }
+
+    /// Панель agentless-VM: список VM удалённого хоста-гипервизора и
+    /// подключение к ним без агента в гостевой ОС.
+    fn remote_vm_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.remote_vm_panel_open;
+        egui::Window::new("🖧  Виртуальные машины хоста")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("↻ Обновить список").clicked() {
+                        self.send_command(SessionCommand::ListVms);
+                    }
+                    if !self.remote_attached_vm.is_empty()
+                        && ui.button("⏏ Вернуться к экрану хоста").clicked()
+                    {
+                        self.remote_attached_vm.clear();
+                        self.send_command(SessionCommand::AttachVm(String::new()));
+                    }
+                });
+
+                if !self.remote_vm_status.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(&self.remote_vm_status)
+                            .size(12.0)
+                            .color(egui::Color32::from_rgb(0x9A, 0xC9, 0xB8)),
+                    );
+                }
+                ui.separator();
+
+                if self.remote_vms.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(
+                        "Список пуст. Нажмите «Обновить». Доступно, если удалённый \
+                         хост — Windows с ролью Hyper-V.",
+                    );
+                    return;
+                }
+
+                let vms = self.remote_vms.clone();
+                let attached = self.remote_attached_vm.clone();
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .show(ui, |ui| {
+                        for vm in &vms {
+                            let is_attached = vm.id == attached;
+                            let dot = if vm.connectable {
+                                egui::Color32::from_rgb(0x22, 0xC5, 0x5E)
+                            } else {
+                                egui::Color32::from_rgb(0x9A, 0x9A, 0x9A)
+                            };
+                            egui::Frame::NONE
+                                .fill(if is_attached {
+                                    egui::Color32::from_rgb(0x1C, 0x33, 0x2A)
+                                } else {
+                                    egui::Color32::from_rgb(0x16, 0x24, 0x36)
+                                })
+                                .corner_radius(egui::CornerRadius::same(8))
+                                .inner_margin(egui::Margin::same(10))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.colored_label(dot, "●");
+                                        ui.vertical(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(&vm.name).strong().size(14.0),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(&vm.state)
+                                                    .size(11.0)
+                                                    .color(egui::Color32::GRAY),
+                                            );
+                                        });
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if is_attached {
+                                                    ui.label(
+                                                        egui::RichText::new("● подключено")
+                                                            .size(11.0)
+                                                            .color(egui::Color32::from_rgb(
+                                                                0x22, 0xC5, 0x5E,
+                                                            )),
+                                                    );
+                                                } else if ui
+                                                    .add_enabled(
+                                                        vm.connectable,
+                                                        egui::Button::new("Подключиться"),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.remote_attached_vm = vm.id.clone();
+                                                    self.remote_vm_status =
+                                                        format!("Подключение к «{}»…", vm.name);
+                                                    self.send_command(SessionCommand::AttachVm(
+                                                        vm.id.clone(),
+                                                    ));
+                                                }
+                                            },
+                                        );
+                                    });
+                                });
+                            ui.add_space(6.0);
+                        }
+                    });
+            });
+        self.remote_vm_panel_open = open;
     }
 
     #[allow(deprecated)]
