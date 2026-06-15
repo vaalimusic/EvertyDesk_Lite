@@ -7,11 +7,13 @@ import android.graphics.Paint
 import android.graphics.RectF
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.GestureDetector
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
+import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.roundToInt
 
@@ -21,7 +23,9 @@ import kotlin.math.roundToInt
  *  • 1 палец tap           → левый клик (click feedback)
  *  • 1 палец long press    → drag-select (зажать ЛКМ + двигать для выделения текста)
  *  • 2 пальца tap < 500ms  → правый клик (Mac-style, click feedback)
- *  • 2 пальца drag         → вертикальный скролл
+ *  • 2 пальца drag         → вертикальный скролл (с axis-lock)
+ *
+ * Shake-to-find: быстрое движение пальцем → курсор временно увеличивается (как macOS).
  */
 class TouchpadView(context: Context, private val client: NativeClient) : View(context) {
 
@@ -34,7 +38,7 @@ class TouchpadView(context: Context, private val client: NativeClient) : View(co
         color = Color.rgb(18, 201, 114)
     }
     private val cursorDragPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.rgb(0xFF, 0x99, 0x33)  // оранжевый в drag-режиме
+        color = Color.rgb(0xFF, 0x99, 0x33)
     }
     private val cursorStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
@@ -88,8 +92,18 @@ class TouchpadView(context: Context, private val client: NativeClient) : View(co
     private var downX = 0f
     private var downY = 0f
     private var longPressFired = false
-    private var dragSelectMode = false   // ЛКМ зажата, движение = выделение текста
+    private var dragSelectMode = false
     private var sensitivity = 1.35f
+
+    // Sub-pixel accumulator — prevents jitter from roundToInt discarding fractions
+    private var moveAccumX = 0f
+    private var moveAccumY = 0f
+
+    // ── Shake-to-find cursor (like macOS) ─────────────────────────────────────
+    // Fast movement temporarily enlarges the cursor so it's easy to locate.
+    private var cursorScale = 1f
+    private var lastMoveMs = 0L
+    private val resetCursorScaleRunnable = Runnable { cursorScale = 1f; invalidate() }
 
     // ── 2-пальца ─────────────────────────────────────────────────────────────
     private var twoFinger = false
@@ -100,17 +114,31 @@ class TouchpadView(context: Context, private val client: NativeClient) : View(co
     private var twoFingerDownMidX = 0f
     private var twoFingerDownMidY = 0f
     private var twoFingerMoved = false
+
+    // Scroll accumulators + axis-lock (prevents diagonal drift)
+    private var scrollAccumX = 0f
     private var scrollAccumY = 0f
     private val scrollStepPx = 28f * density
+    private var scrollAxisLocked = false
+    private var scrollIsVertical = true
+    private val AXIS_LOCK_THRESHOLD = 14f * density  // lock axis after 14dp total movement
+
+    // ── Scroll direction ──────────────────────────────────────────────────────
+    // naturalScroll=true  (Mac default): swipe down → content follows finger → page scrolls down
+    // naturalScroll=false (traditional): swipe down → page scrolls up (like a scroll wheel)
+    private var naturalScroll = true
 
     companion object {
         private const val TWO_FINGER_TAP_MS = 500L
-        private const val TWO_FINGER_TAP_SLOP = 80f    // px; дрейф при тапе на телефоне
-        private const val TWO_FINGER_COOLDOWN = 500L   // cooldown long press после 2-пальц. жеста
+        private const val TWO_FINGER_TAP_SLOP = 80f
+        private const val TWO_FINGER_COOLDOWN = 500L
+        private const val SHAKE_SPEED_PX_PER_SEC = 2200f  // touch px/s threshold
+        private const val SHAKE_SCALE = 3.5f
+        private const val SHAKE_HOLD_MS = 700L
     }
 
     // ── Click feedback ────────────────────────────────────────────────────────
-    private var clickFeedback = 0f   // 1.0 = только нажали, плавно до 0
+    private var clickFeedback = 0f
     private var clickIsRight = false
 
     private val clickFadeRunnable = object : Runnable {
@@ -140,10 +168,9 @@ class TouchpadView(context: Context, private val client: NativeClient) : View(co
             override fun onLongPress(e: MotionEvent) {
                 if (twoFinger) return
                 if (System.currentTimeMillis() - twoFingerEndTime < TWO_FINGER_COOLDOWN) return
-                // Long press = drag-select: зажимаем ЛКМ, двигаем — выделяем текст
                 longPressFired = true
                 dragSelectMode = true
-                client.touch(cursorX, cursorY, 0)  // mouse DOWN
+                client.touch(cursorX, cursorY, 0)
                 triggerClick(false)
                 invalidate()
             }
@@ -183,6 +210,10 @@ class TouchpadView(context: Context, private val client: NativeClient) : View(co
         sensitivity = value.coerceIn(0.6f, 2.4f)
     }
 
+    fun setNaturalScroll(enabled: Boolean) {
+        naturalScroll = enabled
+    }
+
     // ── Draw ──────────────────────────────────────────────────────────────────
 
     override fun onDraw(canvas: Canvas) {
@@ -214,7 +245,7 @@ class TouchpadView(context: Context, private val client: NativeClient) : View(co
 
         // Click feedback: расширяющееся кольцо с затуханием
         if (clickFeedback > 0f) {
-            val progress = 1f - clickFeedback          // 0=только нажали → 1=угасает
+            val progress = 1f - clickFeedback
             val radius = (14f + progress * 32f) * density
             val alpha = (clickFeedback * 220).toInt()
             val base = if (clickIsRight) Color.rgb(0xCC, 0x55, 0x22) else Color.rgb(0x12, 0xC9, 0x72)
@@ -222,10 +253,12 @@ class TouchpadView(context: Context, private val client: NativeClient) : View(co
             canvas.drawCircle(vcx, vcy, radius, clickRingPaint)
         }
 
-        // Курсор: зелёный обычно, оранжевый в drag-режиме
+        // Курсор — размер растёт при быстром движении (shake-to-find)
+        val baseR = 11f * density * cursorScale
+        val strokeR = 16f * density * cursorScale
         val fill = if (dragSelectMode) cursorDragPaint else cursorNormalPaint
-        canvas.drawCircle(vcx, vcy, 11f * density, fill)
-        canvas.drawCircle(vcx, vcy, 16f * density, cursorStrokePaint)
+        canvas.drawCircle(vcx, vcy, baseR, fill)
+        canvas.drawCircle(vcx, vcy, strokeR, cursorStrokePaint)
 
         // Бейдж "DRAG" над курсором
         if (dragSelectMode) {
@@ -261,11 +294,12 @@ class TouchpadView(context: Context, private val client: NativeClient) : View(co
                 twoFinger = false
                 downX = event.x; downY = event.y
                 prevX = event.x; prevY = event.y
+                moveAccumX = 0f; moveAccumY = 0f
+                lastMoveMs = SystemClock.elapsedRealtime()
             }
 
             MotionEvent.ACTION_POINTER_DOWN -> {
                 if (event.pointerCount == 2) {
-                    // Если были в drag-режиме — отпустить кнопку
                     if (dragSelectMode) {
                         client.touch(cursorX, cursorY, 2)
                         dragSelectMode = false
@@ -278,39 +312,17 @@ class TouchpadView(context: Context, private val client: NativeClient) : View(co
                     twoFingerDownTime = System.currentTimeMillis()
                     twoFingerDownMidX = midX; twoFingerDownMidY = midY
                     twoFingerMoved = false
-                    scrollAccumY = 0f
+                    scrollAccumX = 0f; scrollAccumY = 0f
+                    scrollAxisLocked = false
+                    scrollIsVertical = true
                 }
             }
 
             MotionEvent.ACTION_MOVE -> {
                 if (twoFinger && event.pointerCount >= 2) {
-                    val midX = (event.getX(0) + event.getX(1)) / 2f
-                    val midY = (event.getY(0) + event.getY(1)) / 2f
-                    val dy = midY - prevMidY
-                    prevMidX = midX; prevMidY = midY
-
-                    // Проверяем смещение от начала жеста
-                    val drift = hypot(midX - twoFingerDownMidX, midY - twoFingerDownMidY)
-                    if (drift > TWO_FINGER_TAP_SLOP) twoFingerMoved = true
-
-                    // Скролл с аккумулятором
-                    scrollAccumY += dy
-                    val steps = (scrollAccumY / scrollStepPx).toInt()
-                    if (steps != 0) {
-                        scrollAccumY -= steps * scrollStepPx
-                        client.scroll(cursorX, cursorY, -steps)
-                    }
+                    handleTwoFingerMove(event)
                 } else if (!twoFinger) {
-                    val dx = ((event.x - prevX) * sensitivity).roundToInt()
-                    val dy = ((event.y - prevY) * sensitivity).roundToInt()
-                    prevX = event.x; prevY = event.y
-                    if (dx != 0 || dy != 0) {
-                        cursorX = clampX(cursorX + dx)
-                        cursorY = clampY(cursorY + dy)
-                        // В drag-select: action=1 (move) — хост помнит зажатую кнопку
-                        client.touch(cursorX, cursorY, 1)
-                        invalidate()
-                    }
+                    handleOneFingerMove(event)
                 }
             }
 
@@ -320,18 +332,18 @@ class TouchpadView(context: Context, private val client: NativeClient) : View(co
                     val elapsed = twoFingerEndTime - twoFingerDownTime
 
                     if (!twoFingerMoved && elapsed < TWO_FINGER_TAP_MS) {
-                        // 2-пальцевый тап → правый клик
                         client.rightClick(cursorX, cursorY)
                         triggerClick(true)
-                        longPressFired = true  // не пустить левый клик в ACTION_UP
+                        longPressFired = true
                     }
 
-                    // Реинициализируем 1-пальц. трекинг с оставшегося пальца
                     val ri = if (event.actionIndex == 0) 1 else 0
                     prevX = event.getX(ri); prevY = event.getY(ri)
                     downX = prevX; downY = prevY
+                    moveAccumX = 0f; moveAccumY = 0f
+                    lastMoveMs = SystemClock.elapsedRealtime()
                     twoFinger = false
-                    scrollAccumY = 0f
+                    scrollAccumX = 0f; scrollAccumY = 0f
                     invalidate()
                 }
             }
@@ -339,7 +351,6 @@ class TouchpadView(context: Context, private val client: NativeClient) : View(co
             MotionEvent.ACTION_UP -> {
                 when {
                     dragSelectMode -> {
-                        // Отпускаем зажатую ЛКМ — текст выделен
                         client.touch(cursorX, cursorY, 2)
                         dragSelectMode = false
                     }
@@ -365,11 +376,85 @@ class TouchpadView(context: Context, private val client: NativeClient) : View(co
                 twoFinger = false
                 longPressFired = false
                 twoFingerEndTime = System.currentTimeMillis()
-                scrollAccumY = 0f
+                scrollAccumX = 0f; scrollAccumY = 0f
                 invalidate()
             }
         }
         return true
+    }
+
+    // ── 1-палец: движение с sub-pixel аккумулятором и shake-to-find ──────────
+
+    private fun handleOneFingerMove(event: MotionEvent) {
+        val rawDx = event.x - prevX
+        val rawDy = event.y - prevY
+
+        // Velocity for shake-to-find
+        val now = SystemClock.elapsedRealtime()
+        val dtMs = (now - lastMoveMs).coerceAtLeast(1).toFloat()
+        val speed = hypot(rawDx, rawDy) / dtMs * 1000f  // touch px/s
+        lastMoveMs = now
+        if (speed > SHAKE_SPEED_PX_PER_SEC) {
+            cursorScale = SHAKE_SCALE
+            handler.removeCallbacks(resetCursorScaleRunnable)
+            handler.postDelayed(resetCursorScaleRunnable, SHAKE_HOLD_MS)
+        }
+
+        // Sub-pixel accumulator — avoids jitter from rounding discarding fractions
+        moveAccumX += rawDx * sensitivity
+        moveAccumY += rawDy * sensitivity
+        prevX = event.x; prevY = event.y
+
+        val dx = moveAccumX.toInt()
+        val dy = moveAccumY.toInt()
+        moveAccumX -= dx
+        moveAccumY -= dy
+
+        if (dx != 0 || dy != 0) {
+            cursorX = clampX(cursorX + dx)
+            cursorY = clampY(cursorY + dy)
+            client.touch(cursorX, cursorY, 1)
+            invalidate()
+        }
+    }
+
+    // ── 2-пальца: скролл с axis-lock (нет диагонального дрейфа) ─────────────
+
+    private fun handleTwoFingerMove(event: MotionEvent) {
+        val midX = (event.getX(0) + event.getX(1)) / 2f
+        val midY = (event.getY(0) + event.getY(1)) / 2f
+        val dx = midX - prevMidX
+        val dy = midY - prevMidY
+        prevMidX = midX; prevMidY = midY
+
+        val drift = hypot(midX - twoFingerDownMidX, midY - twoFingerDownMidY)
+        if (drift > TWO_FINGER_TAP_SLOP) twoFingerMoved = true
+
+        scrollAccumX += dx
+        scrollAccumY += dy
+
+        // Lock scroll axis after enough movement to determine intent
+        if (!scrollAxisLocked) {
+            val totalMovement = abs(scrollAccumX) + abs(scrollAccumY)
+            if (totalMovement > AXIS_LOCK_THRESHOLD) {
+                scrollIsVertical = abs(scrollAccumY) >= abs(scrollAccumX)
+                scrollAxisLocked = true
+                // Discard off-axis accumulation
+                if (scrollIsVertical) scrollAccumX = 0f else scrollAccumY = 0f
+            }
+        }
+
+        if (scrollAxisLocked && scrollIsVertical) {
+            val steps = (scrollAccumY / scrollStepPx).toInt()
+            if (steps != 0) {
+                scrollAccumY -= steps * scrollStepPx
+                val delta = if (naturalScroll) -steps else steps
+                client.scroll(cursorX, cursorY, delta)
+            }
+        }
+
+        // Always redraw so cursor stays visible during scroll
+        invalidate()
     }
 
     private fun clampX(v: Int) = v.coerceIn(remoteLeft, remoteLeft + remoteW - 1)

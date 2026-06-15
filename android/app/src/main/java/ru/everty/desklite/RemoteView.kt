@@ -8,12 +8,14 @@ import android.graphics.Matrix
 import android.graphics.Paint
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.GestureDetector
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.ViewConfiguration
+import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
@@ -24,12 +26,16 @@ import kotlin.math.roundToInt
  *  • 1 палец move          → MouseMove (курсор без нажатия)
  *  • 1 палец tap           → левый клик
  *  • 1 палец long press    → правый клик (вибрация; fallback)
- *  • 2 пальца tap (< 300ms, < 24px) → правый клик (Mac-style)
- *  • 2 пальца drag (zoom=1) → вертикальный скролл
+ *  • 2 пальца tap (< 500ms, < 80px) → правый клик (Mac-style)
+ *  • 2 пальца drag (zoom=1) → вертикальный скролл (с axis-lock)
  *  • 2 пальца drag (zoom>1) → пан картинки
  *  • 2 пальца pinch        → зум (ScaleGestureDetector)
+ *
+ * Shake-to-find: быстрое движение → курсор временно увеличивается (как macOS).
  */
 class RemoteView(context: Context, private val client: NativeClient) : View(context) {
+
+    private val density = resources.displayMetrics.density
 
     // ── кадр ─────────────────────────────────────────────────────────────────
     private var bitmap: Bitmap? = null
@@ -43,14 +49,13 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
     private val matrixInv = Matrix()
 
     private var baseFit = 1f
-    private var userZoom = 1f        // 1.0 = fit, макс 4.0
+    private var userZoom = 1f
     private var panX = 0f
     private var panY = 0f
 
-    // Порог: если палец не сдвинулся — тап, иначе drag
     private val tapSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
 
-    // ── виртуальный рабочий стол (все мониторы) ─────────────────────────────
+    // ── виртуальный рабочий стол ────────────────────────────────────────────
     private var geomX = 0
     private var geomY = 0
     private var geomW = 0
@@ -69,26 +74,47 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
     private var cursorVisible = false
     private val hideCursorRunnable = Runnable { cursorVisible = false; invalidate() }
 
+    // Sub-pixel accumulator for remote cursor — avoids integer truncation jitter
+    private var remoteAccumX = 0f
+    private var remoteAccumY = 0f
+
+    // ── Shake-to-find cursor (like macOS) ─────────────────────────────────────
+    private var cursorScale = 1f
+    private var lastMoveMs = 0L
+    private val resetCursorScaleRunnable = Runnable { cursorScale = 1f; invalidate() }
+
+    companion object {
+        private const val TWO_FINGER_TAP_MS = 500L
+        private const val TWO_FINGER_TAP_SLOP = 80f
+        private const val TWO_FINGER_COOLDOWN = 500L
+        private const val SCROLL_STEP_PX = 30f
+        private const val MIN_SCALE = 0.001f
+        private const val AXIS_LOCK_THRESHOLD_DP = 14f  // dp before locking scroll axis
+        private const val SHAKE_SPEED_PX_PER_SEC = 2200f
+        private const val SHAKE_SCALE = 3.5f
+        private const val SHAKE_HOLD_MS = 700L
+    }
+
     // ── двухпальцевый режим ──────────────────────────────────────────────────
     private var twoFingerMode = false
     private var prevMidX = 0f
     private var prevMidY = 0f
-
-    // Для детекции 2-пальцевого тапа (правый клик как на Mac)
     private var twoFingerDownTime = 0L
     private var twoFingerEndTime = 0L
     private var twoFingerDownMidX = 0f
     private var twoFingerDownMidY = 0f
     private var twoFingerMoved = false
-    private var scrollAccumY = 0f
 
-    companion object {
-        private const val TWO_FINGER_TAP_MS = 500L   // макс время для 2-пальц. тапа
-        private const val TWO_FINGER_TAP_SLOP = 80f  // макс смещение центра (px); дрейф пальцев ~20-60px
-        private const val TWO_FINGER_COOLDOWN = 500L  // cooldown после жеста для long press
-        private const val SCROLL_STEP_PX = 30f        // px смещения пальца на 1 шаг скролла
-        private const val MIN_SCALE = 0.001f          // защита от деления на ноль
-    }
+    // Scroll state + axis-lock
+    private var scrollAccumX = 0f
+    private var scrollAccumY = 0f
+    private var scrollAxisLocked = false
+    private var scrollIsVertical = true
+
+    // ── Scroll direction ──────────────────────────────────────────────────────
+    // naturalScroll=true  (Mac default): swipe down → content follows finger
+    // naturalScroll=false (traditional): swipe down → page scrolls up
+    private var naturalScroll = true
 
     // ── рендер-тик ──────────────────────────────────────────────────────────
     private val handler = Handler(Looper.getMainLooper())
@@ -96,7 +122,7 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
         override fun run() { pullFrame(); handler.postDelayed(this, 16) }
     }
 
-    // ── callback для режима «следующий тап = правый клик» из MainActivity ───
+    // ── callback для режима «следующий тап = правый клик» ───────────────────
     private var rightClickCallback: ((Int, Int) -> Boolean)? = null
     fun setRightClickCallback(cb: (Int, Int) -> Boolean) { rightClickCallback = cb }
 
@@ -104,7 +130,6 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
     private val gestureDetector = GestureDetector(context,
         object : GestureDetector.SimpleOnGestureListener() {
             override fun onLongPress(e: MotionEvent) {
-                // Игнорируем во время 2-пальц. жеста и 500 мс после него
                 if (twoFingerMode) return
                 if (System.currentTimeMillis() - twoFingerEndTime < TWO_FINGER_COOLDOWN) return
                 longPressFired = true
@@ -129,6 +154,10 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
     fun startRendering() { handler.post(refreshTick) }
     fun stopRendering()  { handler.removeCallbacks(refreshTick) }
 
+    fun setNaturalScroll(enabled: Boolean) {
+        naturalScroll = enabled
+    }
+
     private fun pullFrame() {
         val size = client.frameSize() ?: return
         val (w, h) = size
@@ -139,7 +168,6 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
             bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
             rebuildMatrix()
         }
-        // Обновляем границы виртуального рабочего стола
         client.remoteGeometry()?.let { g ->
             if (g.width > 0 && g.height > 0) {
                 geomX = g.x; geomY = g.y; geomW = g.width; geomH = g.height
@@ -191,15 +219,17 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
     }
 
     private fun drawCursor(canvas: Canvas, cx: Float, cy: Float) {
-        val arm = 14f; val gap = 5f
+        val arm = 14f * cursorScale
+        val gap = 5f * cursorScale
+        val dotR = 2.5f * cursorScale
         for (p in listOf(cursorStrokePaint, cursorFillPaint)) {
             canvas.drawLine(cx - arm, cy, cx - gap, cy, p)
             canvas.drawLine(cx + gap, cy, cx + arm, cy, p)
             canvas.drawLine(cx, cy - arm, cx, cy - gap, p)
             canvas.drawLine(cx, cy + gap, cx, cy + arm, p)
-            canvas.drawCircle(cx, cy, 4f, p)
+            canvas.drawCircle(cx, cy, 4f * cursorScale, p)
         }
-        canvas.drawCircle(cx, cy, 2.5f, cursorDotPaint)
+        canvas.drawCircle(cx, cy, dotR, cursorDotPaint)
     }
 
     // ── жесты ────────────────────────────────────────────────────────────────
@@ -214,7 +244,8 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
                 longPressFired = false
                 downViewX = event.x; downViewY = event.y
                 prevFingerX = event.x; prevFingerY = event.y
-                // Курсор остаётся где был — показываем в текущей позиции
+                remoteAccumX = 0f; remoteAccumY = 0f
+                lastMoveMs = SystemClock.elapsedRealtime()
                 val (cvx, cvy) = remoteToView(lastRemoteX, lastRemoteY)
                 showCursorAt(cvx, cvy)
             }
@@ -229,7 +260,9 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
                     twoFingerDownTime = System.currentTimeMillis()
                     twoFingerDownMidX = midX; twoFingerDownMidY = midY
                     twoFingerMoved = false
-                    scrollAccumY = 0f
+                    scrollAccumX = 0f; scrollAccumY = 0f
+                    scrollAxisLocked = false
+                    scrollIsVertical = true
                 }
             }
 
@@ -243,24 +276,23 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
 
             MotionEvent.ACTION_POINTER_UP -> {
                 if (twoFingerMode && event.pointerCount == 2) {
-                    // Переход 2→1 палец
                     twoFingerEndTime = System.currentTimeMillis()
                     val elapsed = twoFingerEndTime - twoFingerDownTime
 
                     if (!twoFingerMoved && elapsed < TWO_FINGER_TAP_MS) {
-                        // 2-пальцевый тап → правый клик (Mac trackpad)
                         performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
                         client.rightClick(lastRemoteX, lastRemoteY)
-                        longPressFired = true  // не допустить левый клик на ACTION_UP
+                        longPressFired = true
                     }
 
-                    // Переинициализируем 1-пальц. трекинг с оставшегося пальца
                     val ri = if (event.actionIndex == 0) 1 else 0
                     prevFingerX = event.getX(ri); prevFingerY = event.getY(ri)
                     downViewX = prevFingerX; downViewY = prevFingerY
+                    remoteAccumX = 0f; remoteAccumY = 0f
+                    lastMoveMs = SystemClock.elapsedRealtime()
 
                     twoFingerMode = false
-                    scrollAccumY = 0f
+                    scrollAccumX = 0f; scrollAccumY = 0f
                 }
             }
 
@@ -282,26 +314,47 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
                 twoFingerMode = false
                 longPressFired = false
                 twoFingerEndTime = System.currentTimeMillis()
-                scrollAccumY = 0f
+                scrollAccumX = 0f; scrollAccumY = 0f
             }
         }
         return true
     }
 
+    // ── 1-палец: sub-pixel аккумулятор + shake-to-find ───────────────────────
+
     private fun handleOneFingerMove(event: MotionEvent) {
         val totalScale = (baseFit * userZoom).coerceAtLeast(MIN_SCALE)
-        val dx = (event.x - prevFingerX) / totalScale
-        val dy = (event.y - prevFingerY) / totalScale
+
+        // Velocity for shake-to-find (measured in touch pixels/s, not remote)
+        val now = SystemClock.elapsedRealtime()
+        val dtMs = (now - lastMoveMs).coerceAtLeast(1).toFloat()
+        val touchDx = event.x - prevFingerX
+        val touchDy = event.y - prevFingerY
+        val speed = hypot(touchDx, touchDy) / dtMs * 1000f
+        lastMoveMs = now
+        if (speed > SHAKE_SPEED_PX_PER_SEC) {
+            cursorScale = SHAKE_SCALE
+            handler.removeCallbacks(resetCursorScaleRunnable)
+            handler.postDelayed(resetCursorScaleRunnable, SHAKE_HOLD_MS)
+        }
+
+        // Sub-pixel accumulator: collect fractional remote pixels across frames
+        remoteAccumX += touchDx / totalScale
+        remoteAccumY += touchDy / totalScale
         prevFingerX = event.x; prevFingerY = event.y
 
-        // Зажимаем в границах всего virtual desktop; fallback на размер кадра
+        val dx = remoteAccumX.toInt()
+        val dy = remoteAccumY.toInt()
+        remoteAccumX -= dx
+        remoteAccumY -= dy
+
         val clampX0 = if (geomW > 0) geomX else 0
         val clampX1 = if (geomW > 0) geomX + geomW - 1 else (frameW - 1).coerceAtLeast(0)
         val clampY0 = if (geomH > 0) geomY else 0
         val clampY1 = if (geomH > 0) geomY + geomH - 1 else (frameH - 1).coerceAtLeast(0)
 
-        val newRx = (lastRemoteX + dx).toInt().coerceIn(clampX0, clampX1)
-        val newRy = (lastRemoteY + dy).toInt().coerceIn(clampY0, clampY1)
+        val newRx = (lastRemoteX + dx).coerceIn(clampX0, clampX1)
+        val newRy = (lastRemoteY + dy).coerceIn(clampY0, clampY1)
 
         if (newRx != lastRemoteX || newRy != lastRemoteY) {
             lastRemoteX = newRx; lastRemoteY = newRy
@@ -312,33 +365,47 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
         showCursorAt(cvx, cvy)
     }
 
+    // ── 2-пальца: скролл с axis-lock или пан ─────────────────────────────────
+
     private fun handleTwoFingerMove(event: MotionEvent) {
         val midX = (event.getX(0) + event.getX(1)) / 2f
         val midY = (event.getY(0) + event.getY(1)) / 2f
         val dx = midX - prevMidX
         val dy = midY - prevMidY
 
-        // Обновляем флаг движения для детекции тапа
         val totalDrift = hypot(midX - twoFingerDownMidX, midY - twoFingerDownMidY)
         if (totalDrift > TWO_FINGER_TAP_SLOP) twoFingerMoved = true
 
         if (userZoom > 1f) {
-            // Зумлено: двигаем картинку (пан)
             if (dx != 0f || dy != 0f) applyPan(dx, dy)
         } else {
-            // Без зума: скроллим удалённый контент
-            if (dy != 0f) {
-                scrollAccumY += dy
+            scrollAccumX += dx
+            scrollAccumY += dy
+
+            // Lock to dominant axis to eliminate diagonal scroll drift
+            if (!scrollAxisLocked) {
+                val totalMovement = abs(scrollAccumX) + abs(scrollAccumY)
+                if (totalMovement > AXIS_LOCK_THRESHOLD_DP * density) {
+                    scrollIsVertical = abs(scrollAccumY) >= abs(scrollAccumX)
+                    scrollAxisLocked = true
+                    if (scrollIsVertical) scrollAccumX = 0f else scrollAccumY = 0f
+                }
+            }
+
+            if (scrollAxisLocked && scrollIsVertical) {
                 val steps = (scrollAccumY / SCROLL_STEP_PX).toInt()
                 if (steps != 0) {
                     scrollAccumY -= steps * SCROLL_STEP_PX
-                    client.scroll(lastRemoteX, lastRemoteY, -steps)
+                    val delta = if (naturalScroll) -steps else steps
+                    client.scroll(lastRemoteX, lastRemoteY, delta)
                 }
             }
+
+            // Keep cursor visible while scrolling
+            showCursorAt(cursorViewX.coerceAtLeast(0f), cursorViewY.coerceAtLeast(0f))
         }
 
         prevMidX = midX; prevMidY = midY
-        // Зум обрабатывает ScaleGestureDetector — ручной span не нужен
     }
 
     // ── зум / пан helpers ────────────────────────────────────────────────────
@@ -391,7 +458,7 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
     }
 
     private fun followCursor() {
-        val margin = 48f * resources.displayMetrics.density
+        val margin = 48f * density
         val (cvx, cvy) = remoteToView(lastRemoteX, lastRemoteY)
         var changed = false
         if (cvx < margin) { panX += margin - cvx; changed = true }

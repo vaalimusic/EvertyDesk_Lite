@@ -72,6 +72,7 @@ class MainActivity : Activity() {
     private val PREF_RECENT_SESSIONS = "recent_sessions"
     private val PREF_AB_LOCAL_CONTACTS = "address_book_local_contacts"
     private val PREF_SAVED_PASSWORDS = "saved_passwords"  // JSON {id: password}
+    private val PREF_NATURAL_SCROLL = "natural_scroll"    // true = Mac natural (default)
 
     // ID текущего удалённого хоста — используется для уведомления хоста через агент
     private var currentRemoteId = ""
@@ -679,6 +680,45 @@ class MainActivity : Activity() {
         }, LinearLayout.LayoutParams(MATCH_PARENT, dp(46)))
         col.addView(vSpace(dp(12)))
         col.addView(statusLabel, matchWrap())
+
+        // ── Тачпад ────────────────────────────────────────────────────────────
+        col.addView(vSpace(dp(24)))
+        col.addView(sectionHeader("Тачпад"))
+        col.addView(vSpace(dp(12)))
+
+        val naturalScrollRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = roundedBg(cardBg, 18, lineSoft)
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+        }
+        val naturalScrollSwitch = android.widget.Switch(this).apply {
+            isChecked = prefs.getBoolean(PREF_NATURAL_SCROLL, true)
+        }
+        val naturalScrollLabel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        naturalScrollLabel.addView(TextView(this).apply {
+            text = "Естественная прокрутка"
+            setTextColor(textMain)
+            textSize = 15f
+        })
+        naturalScrollLabel.addView(TextView(this).apply {
+            text = "Как на Mac: свайп вниз → страница идёт вниз"
+            setTextColor(textSoft)
+            textSize = 12f
+        })
+        naturalScrollRow.addView(naturalScrollLabel,
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        naturalScrollRow.addView(naturalScrollSwitch)
+        naturalScrollSwitch.setOnCheckedChangeListener { _, isChecked ->
+            prefs.edit().putBoolean(PREF_NATURAL_SCROLL, isChecked).apply()
+            remoteView?.setNaturalScroll(isChecked)
+            touchpadView?.setNaturalScroll(isChecked)
+        }
+        col.addView(naturalScrollRow, matchWrap())
+        col.addView(vSpace(dp(8)))
+        col.addView(label("Отключите, если скролл ощущается перевёрнутым на вашем хосте"), matchWrap())
     }
 
     // ── О нас / контакты ─────────────────────────────────────────────────────
@@ -745,6 +785,7 @@ class MainActivity : Activity() {
 
         val rv = RemoteView(this, client).apply {
             layoutParams = FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)
+            setNaturalScroll(prefs.getBoolean(PREF_NATURAL_SCROLL, true))
         }
         remoteView = rv
         root.addView(rv)
@@ -851,6 +892,7 @@ class MainActivity : Activity() {
 
         val tv = TouchpadView(this, client).apply {
             layoutParams = FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)
+            setNaturalScroll(prefs.getBoolean(PREF_NATURAL_SCROLL, true))
         }
         touchpadView = tv
         root.addView(tv)
