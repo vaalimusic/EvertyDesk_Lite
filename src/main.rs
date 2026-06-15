@@ -3587,7 +3587,7 @@ impl EvertyDeskApp {
 
         // Toolbar
         ui.horizontal(|ui| {
-            let refresh_label = if self.hyperv_loading { "⟳  Загрузка..." } else { "⟳  Обновить" };
+            let refresh_label = if self.hyperv_loading { "Загрузка..." } else { "Обновить" };
             if ui
                 .add_enabled(!self.hyperv_loading, egui::Button::new(refresh_label))
                 .clicked()
@@ -3605,7 +3605,7 @@ impl EvertyDeskApp {
                 ui.label(egui::RichText::new(age).small().color(crate::theme::palette().text_muted));
             }
             let any_session = self.hyperv_session.is_some() || self.vbox_session.is_some() || self.hyperv_rdp_session.is_some();
-            if any_session && ui.button("✕  Отключиться").clicked() {
+            if any_session && ui.button("Отключиться").clicked() {
                 if let Some(s) = self.hyperv_session.take() { s.stop(); }
                 if let Some(s) = self.vbox_session.take() { s.stop(); }
                 if let Some(s) = self.hyperv_rdp_session.take() { s.stop(); }
@@ -3776,7 +3776,7 @@ impl EvertyDeskApp {
                                             let vm_path = vm.wmi_path.clone();
                                             match vm.state {
                                                 hyperv::VmState::Off | hyperv::VmState::Saved => {
-                                                    if ui.small_button("▶ Старт")
+                                                    if ui.small_button("Старт")
                                                         .on_hover_text("Запустить VM")
                                                         .clicked()
                                                     {
@@ -3784,13 +3784,13 @@ impl EvertyDeskApp {
                                                     }
                                                 }
                                                 hyperv::VmState::Running | hyperv::VmState::Paused => {
-                                                    if ui.small_button("⏹ Стоп")
+                                                    if ui.small_button("Стоп")
                                                         .on_hover_text("Выключить VM (жёстко)")
                                                         .clicked()
                                                     {
                                                         hyperv::request_power_action(&vm_path, hyperv::VmPowerAction::Stop);
                                                     }
-                                                    if ui.small_button("↺ Ребут")
+                                                    if ui.small_button("Ребут")
                                                         .on_hover_text("Перезапустить VM")
                                                         .clicked()
                                                     {
@@ -3806,7 +3806,7 @@ impl EvertyDeskApp {
                                         {
                                             let vm_id = vm.id.clone();
                                             let vm_name = vm.name.clone();
-                                            if ui.small_button("🖥 VMConnect")
+                                            if ui.small_button("VMConnect")
                                                 .on_hover_text("Открыть нативную консоль Hyper-V (vmconnect.exe) — полная клавиатура, буфер обмена")
                                                 .clicked()
                                             {
@@ -3820,7 +3820,7 @@ impl EvertyDeskApp {
                                             && vm.state.is_connectable()
                                         {
                                             let vm_id = vm.id.clone();
-                                            if ui.small_button("🖱 Консоль (RDP)")
+                                            if ui.small_button("Консоль (RDP)")
                                                 .on_hover_text("Подключиться через RDP over VMBus — 30–60 FPS, полный ввод (Integration Services активны)")
                                                 .clicked()
                                             {
@@ -3846,10 +3846,15 @@ impl EvertyDeskApp {
                                             } else {
                                                 "Предпросмотр"
                                             };
-                                            let mut btn = ui.small_button(btn_label);
-                                            if let Some(tip) = btn_tooltip {
-                                                btn = btn.on_disabled_hover_text(tip);
-                                            }
+                                            let disabled_tip = btn_tooltip.unwrap_or_else(|| {
+                                                if !vm.state.is_connectable() {
+                                                    "VM выключена — запустите её чтобы увидеть экран"
+                                                } else {
+                                                    "Недоступно"
+                                                }
+                                            });
+                                            let btn = ui.small_button(btn_label)
+                                                .on_disabled_hover_text(disabled_tip);
                                             if btn.clicked() {
                                                 let vm_clone = self.hyperv_vms[i].clone();
                                                 if let Some(s) = self.hyperv_session.take() { s.stop(); }
@@ -4221,7 +4226,9 @@ impl EvertyDeskApp {
             .as_ref()
             .map(|s| s.at.elapsed() > Duration::from_secs(10))
             .unwrap_or(true);
-        if stale && self.dashboard_load_rx.is_none() {
+        // Обновляем дашборд только если провайдеры зарегистрированы и данные устарели.
+        // Пропускаем если список VM ещё загружается — нет смысла дублировать скан.
+        if stale && self.dashboard_load_rx.is_none() && !self.hyperv_loading {
             self.start_dashboard_rebuild();
         }
         let Some(snapshot) = &self.dashboard_snapshot else { return; };
