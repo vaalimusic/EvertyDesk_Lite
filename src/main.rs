@@ -4330,8 +4330,27 @@ impl EvertyDeskApp {
                 let attached = self.remote_attached_vm.clone();
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 7.0;
-                    for vm in &vms {
-                        self.remote_vm_row(ui, vm, vm.id == attached);
+                    // Группируем по провайдеру: Hyper-V, затем VirtualBox.
+                    for (prefix, title, color) in [
+                        ("hyperv:", "HYPER-V", egui::Color32::from_rgb(0x3B, 0x9E, 0xE8)),
+                        ("vbox:", "VIRTUALBOX", egui::Color32::from_rgb(0xE8, 0x8A, 0x2E)),
+                    ] {
+                        let group: Vec<&RemoteVmEntry> =
+                            vms.iter().filter(|v| v.id.starts_with(prefix)).collect();
+                        if group.is_empty() {
+                            continue;
+                        }
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(format!("{title}  ({})", group.len()))
+                                .size(11.0)
+                                .strong()
+                                .color(color),
+                        );
+                        ui.add_space(2.0);
+                        for vm in group {
+                            self.remote_vm_row(ui, vm, vm.id == attached);
+                        }
                     }
                 });
             });
