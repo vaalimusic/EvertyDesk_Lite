@@ -658,17 +658,8 @@ pub fn get_capability_graph(vm_id: &str) -> String {
             return crate::capability_engine::evaluate(vm).to_json();
         }
         // VM не найдена — Unknown
-        crate::capability_engine::VmCapabilityGraph {
-            vm_id: vm_id.to_owned(),
-            preview: crate::capability_engine::Capability::unknown("VM_NOT_FOUND"),
-            keyboard_rescue: crate::capability_engine::Capability::unknown("VM_NOT_FOUND"),
-            rdp_relay: crate::capability_engine::Capability::unknown("VM_NOT_FOUND"),
-            enhanced_session: crate::capability_engine::Capability::unknown("VM_NOT_FOUND"),
-            hv_socket: crate::capability_engine::Capability::experimental("HVSOCKET_EXPERIMENTAL_DISABLED"),
-            clipboard: crate::capability_engine::Capability::unknown("VM_NOT_FOUND"),
-            recommended_mode: crate::capability_engine::SessionMode::Offline,
-            constraints: vec!["VM not found in local inventory".to_owned()],
-        }.to_json()
+        crate::capability_engine::VmCapabilityGraph::unsupported_stub(vm_id, "VM_NOT_FOUND")
+            .to_json()
     }
     #[cfg(not(windows))]
     crate::capability_engine::evaluate_stub(vm_id).to_json()

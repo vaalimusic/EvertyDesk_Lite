@@ -9,6 +9,13 @@
 // =============================================================================
 
 // ── Core-модули (нужны клиентскому пути transport → evrt_client → декод) ──────
+pub mod capability_engine;
+pub mod libvirt_provider;
+pub mod proxmox_provider;
+pub mod provider_api;
+pub mod session_backend;
+pub mod smart_connect;
+pub mod vmware_provider;
 pub mod capture;
 pub mod colorconv;
 pub mod crypto;

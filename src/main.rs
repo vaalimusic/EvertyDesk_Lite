@@ -4,6 +4,13 @@
 )]
 
 mod address_book;
+mod capability_engine;
+mod libvirt_provider;
+mod proxmox_provider;
+mod provider_api;
+mod session_backend;
+mod smart_connect;
+mod vmware_provider;
 mod capture;
 mod colorconv;
 mod crypto;
@@ -89,6 +96,10 @@ struct RemoteVmEntry {
     name: String,
     state: String,
     connectable: bool,
+    /// Capability graph received from host (None until requested).
+    capability_graph: Option<capability_engine::VmCapabilityGraph>,
+    /// Raw checkpoints JSON from last list operation.
+    checkpoints_json: Option<String>,
 }
 
 /// Метка+цвет чипа провайдера по префиксу id ("hyperv:" / "vbox:").
@@ -126,6 +137,8 @@ fn parse_remote_vms(json: &str) -> Vec<RemoteVmEntry> {
                     .get("connectable")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
+                capability_graph: None,
+                checkpoints_json: None,
             })
         })
         .collect()
@@ -1085,6 +1098,23 @@ struct EvertyDeskApp {
     /// Открыта ли панель VM в окне удалённого сеанса.
     remote_vm_panel_open: bool,
 
+    // ── Universal Provider Registry ───────────────────────────────────────────
+    /// Runtime registry of all connected hypervisor providers.
+    /// Hyper-V (local) + FakeProviders registered at startup for multi-provider demo.
+    provider_registry: std::sync::Arc<provider_api::ProviderRegistry>,
+
+    // ── Remote VM control panels ──────────────────────────────────────────────
+    /// VM id для которой открыта панель управления (power / checkpoint / rescue).
+    remote_ctrl_vm_id: String,
+    /// Открыта ли панель power operations.
+    remote_power_panel_open: bool,
+    /// Открыта ли панель checkpoints.
+    remote_checkpoint_panel_open: bool,
+    /// Открыта ли панель rescue input.
+    remote_rescue_panel_open: bool,
+    /// Буфер ввода текста для TypeText в BasicRescue.
+    remote_rescue_text: String,
+
     // ── Settings window ───────────────────────────────────────────────────────
     /// Whether the settings panel is visible.
     show_settings: bool,
@@ -1354,6 +1384,21 @@ impl EvertyDeskApp {
             remote_attached_vm: String::new(),
             remote_vm_status: String::new(),
             remote_vm_panel_open: false,
+            provider_registry: {
+                use std::sync::Arc;
+                use provider_api::{FakeProvider, ProviderRegistry};
+                let reg = Arc::new(ProviderRegistry::new());
+                // Register FakeProviders to prove multi-provider architecture (§48 §65–68)
+                reg.register(Arc::new(FakeProvider::fake_vmware("fake-vmware-01")));
+                reg.register(Arc::new(FakeProvider::fake_proxmox("fake-proxmox-01")));
+                // HyperV local provider registered only on Windows at runtime
+                reg
+            },
+            remote_ctrl_vm_id: String::new(),
+            remote_power_panel_open: false,
+            remote_checkpoint_panel_open: false,
+            remote_rescue_panel_open: false,
+            remote_rescue_text: String::new(),
             show_settings: false,
             settings_draft: None,
             settings_custom_server: crate::settings::ServerConfig {
@@ -1874,6 +1919,59 @@ impl EvertyDeskApp {
             SessionEvent::VmStatus(status) => {
                 self.log(format!("Хост VM: {status}"));
                 self.remote_vm_status = status;
+            }
+            SessionEvent::VmPowerResult(json) => {
+                // {"vm_id":"…","action":"…","ok":true/false,"error":"…"}
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+                    let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+                    let action = v.get("action").and_then(|x| x.as_str()).unwrap_or("?");
+                    let err = v.get("error").and_then(|x| x.as_str()).unwrap_or("");
+                    if ok {
+                        self.log(format!("Power action '{action}' — OK"));
+                    } else {
+                        self.log(format!("Power action '{action}' — ERROR: {err}"));
+                    }
+                }
+            }
+            SessionEvent::VmCapabilities(json) => {
+                // Обновляем capability graph в записи remote_vms
+                if let Some(graph) = capability_engine::VmCapabilityGraph::from_json(&json) {
+                    let vm_id = graph.vm_id.clone();
+                    for vm in &mut self.remote_vms {
+                        if vm.id == vm_id {
+                            vm.capability_graph = Some(graph.clone());
+                            break;
+                        }
+                    }
+                    self.log(format!("Capability graph: {} — {}", vm_id, graph.recommended_mode.label()));
+                }
+            }
+            SessionEvent::VmCheckpoints(json) => {
+                // {"vm_id":"…","op":"list","ok":true,"checkpoints":[…]}
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+                    let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+                    let op = v.get("op").and_then(|x| x.as_str()).unwrap_or("?");
+                    let vm_id = v.get("vm_id").and_then(|x| x.as_str()).unwrap_or("?");
+                    if ok {
+                        let count = v.get("checkpoints")
+                            .and_then(|x| x.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0);
+                        self.log(format!("Checkpoint '{op}' for {vm_id}: {count} checkpoints"));
+                        // Обновить checkpoint list в remote_vms
+                        if op == "list" {
+                            for vm in &mut self.remote_vms {
+                                if vm.id == vm_id {
+                                    vm.checkpoints_json = Some(json.clone());
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        let err = v.get("error").and_then(|x| x.as_str()).unwrap_or("unknown");
+                        self.log(format!("Checkpoint '{op}' error: {err}"));
+                    }
+                }
             }
             SessionEvent::Failed(err) => {
                 self.busy = false;
@@ -3287,6 +3385,7 @@ impl EvertyDeskApp {
             .spawn();
     }
 
+    #[cfg(windows)]
     fn hyperv_start_load(&mut self) {
         if self.hyperv_loading || self.hyperv_load_rx.is_some() {
             return;
@@ -3304,12 +3403,28 @@ impl EvertyDeskApp {
     fn hyperv_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading(
             egui::RichText::new(
-                self.text("Виртуальные машины (Hyper-V)", "Virtual Machines (Hyper-V)"),
+                self.text(
+                    "Universal Hypervisor Access Fabric",
+                    "Universal Hypervisor Access Fabric",
+                ),
             )
             .size(20.0)
             .strong(),
         );
-        ui.add_space(12.0);
+        ui.add_space(4.0);
+        // ── Universal Provider Dashboard ──────────────────────────────────────
+        self.universal_provider_dashboard_ui(ui);
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new(
+                self.text("Локальный гипервизор (WMI)", "Local Hypervisor (WMI)"),
+            )
+            .size(16.0)
+            .strong(),
+        );
+        ui.add_space(8.0);
 
         // Toolbar
         ui.horizontal(|ui| {
@@ -3857,6 +3972,174 @@ impl EvertyDeskApp {
         }
     }
 
+    /// Universal Provider Dashboard — shows all registered providers and their VMs.
+    /// ADR-001: UI reads CapabilityGraph, not provider-specific fields.
+    /// §51 plan: multi-provider dashboard.
+    #[cfg(windows)]
+    fn universal_provider_dashboard_ui(&mut self, ui: &mut egui::Ui) {
+        let providers = self.provider_registry.all();
+        if providers.is_empty() {
+            ui.label(
+                egui::RichText::new("Нет зарегистрированных провайдеров")
+                    .color(egui::Color32::GRAY)
+                    .size(12.0),
+            );
+            return;
+        }
+
+        let total = providers.len();
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!("Провайдеры: {total}"))
+                    .size(12.0)
+                    .color(egui::Color32::from_rgb(0xA7, 0xB4, 0xC2)),
+            );
+            // Count total VMs across all providers
+            let total_vms: usize = providers.iter().map(|p| {
+                p.list_hosts().ok()
+                    .map(|hosts| hosts.iter().map(|h| p.list_vms(&h.host_id).ok().map(|v| v.len()).unwrap_or(0)).sum::<usize>())
+                    .unwrap_or(0)
+            }).sum();
+            if total_vms > 0 {
+                ui.label(
+                    egui::RichText::new(format!("| VM: {total_vms}"))
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(0xA7, 0xB4, 0xC2)),
+                );
+            }
+        });
+        ui.add_space(6.0);
+
+        for provider in &providers {
+            let ptype = provider.provider_type();
+            let pid = provider.provider_id().to_owned();
+            let (prov_color, prov_label) = match &ptype {
+                provider_api::ProviderType::HyperV => {
+                    (egui::Color32::from_rgb(0x3B, 0x9E, 0xE8), "HYPER-V")
+                }
+                provider_api::ProviderType::VMware => {
+                    (egui::Color32::from_rgb(0x60, 0xA8, 0xE0), "VMWARE")
+                }
+                provider_api::ProviderType::Proxmox => {
+                    (egui::Color32::from_rgb(0xE5, 0x7E, 0x25), "PROXMOX")
+                }
+                provider_api::ProviderType::Libvirt => {
+                    (egui::Color32::from_rgb(0x58, 0xD6, 0x8D), "LIBVIRT")
+                }
+                _ => (egui::Color32::from_rgb(0x90, 0x90, 0x90), "PROVIDER"),
+            };
+
+            egui::Frame::NONE
+                .fill(egui::Color32::from_rgb(0x12, 0x1E, 0x2C))
+                .corner_radius(egui::CornerRadius::same(6))
+                .inner_margin(egui::Margin::same(8))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        egui::Frame::NONE
+                            .fill(prov_color.gamma_multiply(0.22))
+                            .corner_radius(egui::CornerRadius::same(4))
+                            .inner_margin(egui::Margin::symmetric(5, 2))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(prov_label)
+                                        .size(10.0)
+                                        .strong()
+                                        .color(prov_color),
+                                );
+                            });
+                        ui.label(
+                            egui::RichText::new(&pid)
+                                .size(12.0)
+                                .color(egui::Color32::from_rgb(0xE0, 0xE8, 0xF4)),
+                        );
+                        // Status badge
+                        let reachable = provider.list_hosts().is_ok();
+                        let (status_dot, status_text) = if reachable {
+                            (egui::Color32::from_rgb(0x22, 0xC5, 0x5E), "Healthy")
+                        } else {
+                            (egui::Color32::from_rgb(0xFF, 0x60, 0x00), "Unavailable")
+                        };
+                        ui.colored_label(status_dot, format!("● {status_text}"));
+                    });
+
+                    // VM list from this provider
+                    let hosts = provider.list_hosts().unwrap_or_default();
+                    let mut vm_count = 0usize;
+                    for host in &hosts {
+                        let vms = provider.list_vms(&host.host_id).unwrap_or_default();
+                        vm_count += vms.len();
+                        for vm in &vms {
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                // Power state dot
+                                let (dot_color, state_label) = match vm.power_state {
+                                    provider_api::PowerState::Running =>
+                                        (egui::Color32::from_rgb(0x22, 0xC5, 0x5E), "Running"),
+                                    provider_api::PowerState::Stopped =>
+                                        (egui::Color32::from_rgb(0x80, 0x80, 0x80), "Stopped"),
+                                    provider_api::PowerState::Paused =>
+                                        (egui::Color32::from_rgb(0xFF, 0xBF, 0x00), "Paused"),
+                                    _ =>
+                                        (egui::Color32::from_rgb(0x60, 0x60, 0x60), "Unknown"),
+                                };
+                                ui.colored_label(dot_color, "●");
+                                ui.label(
+                                    egui::RichText::new(&vm.name)
+                                        .size(12.0)
+                                        .color(egui::Color32::from_rgb(0xF2, 0xF6, 0xFA)),
+                                );
+                                ui.label(
+                                    egui::RichText::new(state_label)
+                                        .size(10.5)
+                                        .color(egui::Color32::GRAY),
+                                );
+                                // Show recommended mode from capabilities
+                                if let Ok(graph) = provider.get_capabilities(&vm.vm_id) {
+                                    let (r, g, b) = graph.recommended_mode.badge_rgb();
+                                    let badge_color = egui::Color32::from_rgb(r, g, b);
+                                    egui::Frame::NONE
+                                        .fill(badge_color.gamma_multiply(0.20))
+                                        .corner_radius(egui::CornerRadius::same(3))
+                                        .inner_margin(egui::Margin::symmetric(4, 1))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    graph.recommended_mode.label(),
+                                                )
+                                                .size(9.5)
+                                                .color(badge_color),
+                                            );
+                                        });
+                                }
+                                if let Some(ip) = vm.primary_ip() {
+                                    ui.label(
+                                        egui::RichText::new(ip)
+                                            .size(10.0)
+                                            .color(egui::Color32::from_rgb(0x80, 0xC0, 0xFF)),
+                                    );
+                                }
+                            });
+                        }
+                    }
+                    if vm_count == 0 && hosts.is_empty() {
+                        ui.label(
+                            egui::RichText::new("Инвентарь недоступен")
+                                .size(11.0)
+                                .color(egui::Color32::GRAY),
+                        );
+                    } else if vm_count == 0 {
+                        ui.label(
+                            egui::RichText::new("VM не обнаружены")
+                                .size(11.0)
+                                .color(egui::Color32::GRAY),
+                        );
+                    }
+                });
+            ui.add_space(4.0);
+        }
+    }
+
     #[cfg(windows)]
     fn poll_hyperv_session(&mut self, ctx: &egui::Context) {
         // Collect async VM list
@@ -3867,6 +4150,13 @@ impl EvertyDeskApp {
                 self.hyperv_checked = true;
                 self.hyperv_load_rx = None;
                 self.hyperv_last_refresh = Some(std::time::Instant::now());
+                // Register local HyperV provider in the universal ProviderRegistry
+                // (done here so it's only registered when WMI confirmed to work)
+                {
+                    use std::sync::Arc;
+                    let hv = Arc::new(hyperv::HyperVProvider::new());
+                    self.provider_registry.register(hv);
+                }
                 ctx.request_repaint();
             }
         }
@@ -4899,6 +5189,20 @@ impl EvertyDeskApp {
         } else {
             egui::Color32::from_rgb(0x9A, 0x9A, 0x9A)
         };
+        let vm_id = vm.id.clone();
+        let vm_name = vm.name.clone();
+        let is_ctrl_open = self.remote_ctrl_vm_id == vm_id
+            && (self.remote_power_panel_open
+                || self.remote_checkpoint_panel_open
+                || self.remote_rescue_panel_open);
+        let cap_mode_label = vm
+            .capability_graph
+            .as_ref()
+            .map(|g| g.recommended_mode.label().to_owned());
+        let cap_mode_rgb = vm
+            .capability_graph
+            .as_ref()
+            .map(|g| g.recommended_mode.badge_rgb());
         egui::Frame::NONE
             .fill(if is_attached {
                 egui::Color32::from_rgb(0x1C, 0x33, 0x2A)
@@ -4909,12 +5213,12 @@ impl EvertyDeskApp {
             .inner_margin(egui::Margin::same(11))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
+                // ── Top row: dot + name/state + action buttons ────────────────
                 ui.horizontal(|ui| {
                     ui.colored_label(dot, "●");
                     ui.add_space(2.0);
                     ui.vertical(|ui| {
-                        // Имя без суффикса «· VirtualBox» (его покажем чипом).
-                        let name = vm.name.split(" · ").next().unwrap_or(&vm.name);
+                        let name = vm_name.split(" · ").next().unwrap_or(&vm_name);
                         ui.label(
                             egui::RichText::new(name)
                                 .strong()
@@ -4940,6 +5244,22 @@ impl EvertyDeskApp {
                                     .size(11.0)
                                     .color(egui::Color32::from_rgb(0xA7, 0xB4, 0xC2)),
                             );
+                            // ── Capability mode badge ─────────────────────────
+                            if let (Some(label), Some((r, g, b))) = (&cap_mode_label, cap_mode_rgb) {
+                                let badge_color = egui::Color32::from_rgb(r, g, b);
+                                egui::Frame::NONE
+                                    .fill(badge_color.gamma_multiply(0.22))
+                                    .corner_radius(egui::CornerRadius::same(4))
+                                    .inner_margin(egui::Margin::symmetric(5, 1))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new(label.as_str())
+                                                .size(9.5)
+                                                .strong()
+                                                .color(badge_color),
+                                        );
+                                    });
+                            }
                         });
                     });
                     ui.with_layout(
@@ -4955,13 +5275,266 @@ impl EvertyDeskApp {
                                 .add_enabled(vm.connectable, egui::Button::new("Подключиться"))
                                 .clicked()
                             {
-                                self.remote_attached_vm = vm.id.clone();
-                                self.remote_vm_status = format!("Подключение к «{}»…", vm.name);
-                                self.send_command(SessionCommand::AttachVm(vm.id.clone()));
+                                self.remote_attached_vm = vm_id.clone();
+                                self.remote_vm_status = format!("Подключение к «{vm_name}»…");
+                                self.send_command(SessionCommand::AttachVm(vm_id.clone()));
+                            }
+                            // ── Capability / Analyse button ───────────────────
+                            if ui
+                                .add(egui::Button::new("🔍").small())
+                                .on_hover_text("Запросить capability graph")
+                                .clicked()
+                            {
+                                self.send_command(SessionCommand::VmCapabilityRequest(vm_id.clone()));
                             }
                         },
                     );
                 });
+
+                // ── Power + Control buttons row ───────────────────────────────
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    // Power: Start
+                    if ui
+                        .add(egui::Button::new("▶").small())
+                        .on_hover_text("Запустить VM")
+                        .clicked()
+                    {
+                        let payload = serde_json::json!({
+                            "vm_id": vm_id,
+                            "action": "start"
+                        })
+                        .to_string();
+                        self.send_command(SessionCommand::VmPowerOp(payload));
+                    }
+                    // Power: Stop (hard)
+                    if ui
+                        .add(egui::Button::new("⏹").small())
+                        .on_hover_text("Выключить VM (hard stop)")
+                        .clicked()
+                    {
+                        let payload = serde_json::json!({
+                            "vm_id": vm_id,
+                            "action": "stop"
+                        })
+                        .to_string();
+                        self.send_command(SessionCommand::VmPowerOp(payload));
+                    }
+                    // Power: Shutdown (guest)
+                    if ui
+                        .add(egui::Button::new("⏻").small())
+                        .on_hover_text("Завершить работу (guest shutdown)")
+                        .clicked()
+                    {
+                        let payload = serde_json::json!({
+                            "vm_id": vm_id,
+                            "action": "shutdown"
+                        })
+                        .to_string();
+                        self.send_command(SessionCommand::VmPowerOp(payload));
+                    }
+                    // Power: Restart
+                    if ui
+                        .add(egui::Button::new("⟳").small())
+                        .on_hover_text("Перезапустить VM")
+                        .clicked()
+                    {
+                        let payload = serde_json::json!({
+                            "vm_id": vm_id,
+                            "action": "restart"
+                        })
+                        .to_string();
+                        self.send_command(SessionCommand::VmPowerOp(payload));
+                    }
+                    // Power: Pause
+                    if ui
+                        .add(egui::Button::new("⏸").small())
+                        .on_hover_text("Пауза VM")
+                        .clicked()
+                    {
+                        let payload = serde_json::json!({
+                            "vm_id": vm_id,
+                            "action": "pause"
+                        })
+                        .to_string();
+                        self.send_command(SessionCommand::VmPowerOp(payload));
+                    }
+                    ui.separator();
+                    // Checkpoint toggle
+                    let chk_active = self.remote_ctrl_vm_id == vm_id
+                        && self.remote_checkpoint_panel_open;
+                    if ui
+                        .selectable_label(chk_active, "📷 Checkpoints")
+                        .clicked()
+                    {
+                        if self.remote_ctrl_vm_id == vm_id && self.remote_checkpoint_panel_open {
+                            self.remote_checkpoint_panel_open = false;
+                        } else {
+                            self.remote_ctrl_vm_id = vm_id.clone();
+                            self.remote_checkpoint_panel_open = true;
+                            self.remote_rescue_panel_open = false;
+                            // Request fresh list
+                            let payload = serde_json::json!({
+                                "vm_id": vm_id,
+                                "op": "list"
+                            })
+                            .to_string();
+                            self.send_command(SessionCommand::VmCheckpointOp(payload));
+                        }
+                    }
+                    // Rescue toggle
+                    let rescue_active = self.remote_ctrl_vm_id == vm_id
+                        && self.remote_rescue_panel_open;
+                    if ui.selectable_label(rescue_active, "🛟 Rescue").clicked() {
+                        if self.remote_ctrl_vm_id == vm_id && self.remote_rescue_panel_open {
+                            self.remote_rescue_panel_open = false;
+                        } else {
+                            self.remote_ctrl_vm_id = vm_id.clone();
+                            self.remote_rescue_panel_open = true;
+                            self.remote_checkpoint_panel_open = false;
+                        }
+                    }
+                });
+
+                // ── Checkpoint panel ──────────────────────────────────────────
+                if self.remote_ctrl_vm_id == vm_id && self.remote_checkpoint_panel_open {
+                    ui.add_space(6.0);
+                    egui::Frame::NONE
+                        .fill(egui::Color32::from_rgb(0x10, 0x1E, 0x30))
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .inner_margin(egui::Margin::same(8))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Контрольные точки").strong().size(12.0));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.button("➕ Создать").clicked() {
+                                        let payload = serde_json::json!({
+                                            "vm_id": vm_id, "op": "create"
+                                        })
+                                        .to_string();
+                                        self.send_command(SessionCommand::VmCheckpointOp(payload));
+                                        // Refresh list after a moment
+                                        let payload2 = serde_json::json!({
+                                            "vm_id": vm_id, "op": "list"
+                                        })
+                                        .to_string();
+                                        self.send_command(SessionCommand::VmCheckpointOp(payload2));
+                                    }
+                                });
+                            });
+                            ui.add_space(4.0);
+                            // Show checkpoints from cached JSON
+                            let checkpoints_json = vm.checkpoints_json.clone();
+                            if let Some(ref json_str) = checkpoints_json {
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                                    if let Some(arr) = v.get("checkpoints").and_then(|x| x.as_array()) {
+                                        if arr.is_empty() {
+                                            ui.label(egui::RichText::new("Нет контрольных точек").color(egui::Color32::GRAY).size(11.0));
+                                        }
+                                        for cp in arr {
+                                            let name = cp.get("name").and_then(|x| x.as_str()).unwrap_or("Без имени");
+                                            let path = cp.get("path").and_then(|x| x.as_str()).unwrap_or("");
+                                            let time = cp.get("created_time").and_then(|x| x.as_str()).unwrap_or("");
+                                            let ctype = cp.get("type").and_then(|x| x.as_str()).unwrap_or("");
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new(name).size(11.5).strong());
+                                                ui.label(egui::RichText::new(format!("[{ctype}] {time}")).size(10.0).color(egui::Color32::GRAY));
+                                                let path_str = path.to_owned();
+                                                let vm_id2 = vm_id.clone();
+                                                if ui.small_button("↩ Apply").clicked() {
+                                                    let payload = serde_json::json!({
+                                                        "vm_id": vm_id2, "op": "apply",
+                                                        "path": path_str
+                                                    })
+                                                    .to_string();
+                                                    self.send_command(SessionCommand::VmCheckpointOp(payload));
+                                                }
+                                                let path_str2 = path.to_owned();
+                                                let vm_id3 = vm_id.clone();
+                                                if ui.small_button("🗑 Delete").clicked() {
+                                                    let payload = serde_json::json!({
+                                                        "vm_id": vm_id3, "op": "delete",
+                                                        "path": path_str2
+                                                    })
+                                                    .to_string();
+                                                    self.send_command(SessionCommand::VmCheckpointOp(payload));
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
+                            } else {
+                                ui.label(egui::RichText::new("Загрузка…").color(egui::Color32::GRAY).size(11.0));
+                            }
+                        });
+                }
+
+                // ── Rescue input panel ────────────────────────────────────────
+                if self.remote_ctrl_vm_id == vm_id && self.remote_rescue_panel_open {
+                    ui.add_space(6.0);
+                    egui::Frame::NONE
+                        .fill(egui::Color32::from_rgb(0x20, 0x10, 0x10))
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .inner_margin(egui::Margin::same(8))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(egui::RichText::new("🛟 BasicRescue — ввод").strong().size(12.0));
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                // Ctrl+Alt+Del
+                                if ui
+                                    .add(
+                                        egui::Button::new("⌨ Ctrl+Alt+Del")
+                                            .fill(egui::Color32::from_rgb(0x8B, 0x00, 0x00)),
+                                    )
+                                    .on_hover_text("Отправить Ctrl+Alt+Del в VM")
+                                    .clicked()
+                                {
+                                    let payload = serde_json::json!({
+                                        "vm_id": vm_id,
+                                        "input_type": "ctrl_alt_del",
+                                        "text": ""
+                                    })
+                                    .to_string();
+                                    self.send_command(SessionCommand::VmRescueInput(payload));
+                                }
+                            });
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.label("Ввод текста:");
+                            });
+                            ui.horizontal(|ui| {
+                                let text_edit = egui::TextEdit::singleline(&mut self.remote_rescue_text)
+                                    .hint_text("Введите текст для отправки в VM…")
+                                    .desired_width(ui.available_width() - 80.0);
+                                let resp = ui.add(text_edit);
+                                let send_text = resp.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                if send_text
+                                    || ui
+                                        .add_enabled(
+                                            !self.remote_rescue_text.is_empty(),
+                                            egui::Button::new("▶ Send"),
+                                        )
+                                        .clicked()
+                                {
+                                    let text = std::mem::take(&mut self.remote_rescue_text);
+                                    if !text.is_empty() {
+                                        let payload = serde_json::json!({
+                                            "vm_id": vm_id,
+                                            "input_type": "type_text",
+                                            "text": text
+                                        })
+                                        .to_string();
+                                        self.send_command(SessionCommand::VmRescueInput(payload));
+                                    }
+                                }
+                            });
+                        });
+                }
+
+                let _ = is_ctrl_open;
             });
     }
 

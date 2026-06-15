@@ -1446,3 +1446,311 @@ impl HyperVSession {
         let _ = self.cmd_tx.try_send(HyperVCmd::Stop);
     }
 }
+
+// ── HyperVProvider — VirtualizationProvider wrapper ──────────────────────────
+//
+// Wraps the existing hyperv.rs functions as a VirtualizationProvider so that
+// Broker / ProviderRegistry can treat Hyper-V the same as VMware or Proxmox.
+// ADR-001: Core works with Provider API, not hypervisor-specific APIs.
+// §47.4–47.5: Wrap existing code, do not rewrite from scratch.
+
+/// Provider ID used when registering in ProviderRegistry.
+pub const HYPERV_PROVIDER_ID: &str = "local-hyperv";
+
+pub struct HyperVProvider {
+    provider_id: String,
+}
+
+impl HyperVProvider {
+    pub fn new() -> Self {
+        Self {
+            provider_id: HYPERV_PROVIDER_ID.to_owned(),
+        }
+    }
+    pub fn with_id(id: &str) -> Self {
+        Self { provider_id: id.to_owned() }
+    }
+
+    /// Convert hyperv::VmInfo to universal provider_api::VmInfo.
+    fn to_universal_vm(vm: &VmInfo) -> crate::provider_api::VmInfo {
+        use crate::provider_api::{PowerState, ProviderType, ToolsStatus, VmInfo as UVmInfo};
+        let power_state = match vm.state {
+            VmState::Running => PowerState::Running,
+            VmState::Off => PowerState::Stopped,
+            VmState::Paused => PowerState::Paused,
+            VmState::Saved => PowerState::Saved,
+            VmState::Other(_) => PowerState::Unknown,
+        };
+        let provider_type = match vm.provider {
+            VmProvider::HyperV => ProviderType::HyperV,
+            VmProvider::VMware => ProviderType::VMware,
+            VmProvider::VirtualBox => ProviderType::Custom("VirtualBox".to_owned()),
+        };
+        let tools_status = if matches!(vm.console_mode, ConsoleMode::EnhancedSession) {
+            ToolsStatus::Running
+        } else if matches!(vm.provider, VmProvider::HyperV) {
+            ToolsStatus::Unknown
+        } else {
+            ToolsStatus::NotApplicable
+        };
+        let enhanced_state = match vm.console_mode {
+            ConsoleMode::EnhancedSession => "available",
+            ConsoleMode::ThumbnailOnly => "unavailable",
+            ConsoleMode::Other => "not_applicable",
+        };
+        UVmInfo {
+            vm_id: format!("hyperv:{}", vm.id),
+            provider_native_id: vm.id.clone(),
+            name: vm.name.clone(),
+            provider_type,
+            host_id: "local".to_owned(),
+            cluster: None,
+            power_state,
+            guest_ips: vec![],
+            tools_status,
+            tags: vec![],
+            provider_metadata: serde_json::json!({
+                "hyperv": {
+                    "wmi_path": vm.wmi_path,
+                    "console_mode": vm.console_mode.label(),
+                    "enhanced_session_state": enhanced_state,
+                }
+            }),
+        }
+    }
+
+    /// Convert universal SnapshotInfo from a CheckpointInfo.
+    fn checkpoint_to_snapshot(
+        cp: &CheckpointInfo,
+        vm_id: &str,
+    ) -> crate::provider_api::SnapshotInfo {
+        crate::provider_api::SnapshotInfo {
+            snapshot_id: format!("hyperv:{}", cp.instance_id),
+            provider_native_id: cp.instance_id.clone(),
+            vm_id: vm_id.to_owned(),
+            name: cp.name.clone(),
+            description: None,
+            created_at: cp.created_time.clone(),
+            is_current: false,
+            snapshot_type: cp.checkpoint_type.clone(),
+            provider_metadata: serde_json::json!({
+                "hyperv": { "wmi_path": cp.wmi_path }
+            }),
+        }
+    }
+}
+
+impl Default for HyperVProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl crate::provider_api::VirtualizationProvider for HyperVProvider {
+    fn provider_type(&self) -> crate::provider_api::ProviderType {
+        crate::provider_api::ProviderType::HyperV
+    }
+
+    fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    fn list_hosts(&self) -> crate::provider_api::ProviderResult<Vec<crate::provider_api::HostInfo>> {
+        use crate::provider_api::{HostInfo, ProviderType};
+        // For local Hyper-V we return a single host entry for the local machine.
+        let hostname = std::env::var("COMPUTERNAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .unwrap_or_else(|_| "localhost".to_owned());
+        Ok(vec![HostInfo {
+            host_id: "local".to_owned(),
+            hostname,
+            provider_type: ProviderType::HyperV,
+            cluster: None,
+            os_version: None,
+            provider_metadata: serde_json::json!({
+                "hyperv": { "wmi_namespace": "root\\\\virtualization\\\\v2" }
+            }),
+        }])
+    }
+
+    fn list_vms(
+        &self,
+        _host_id: &str,
+    ) -> crate::provider_api::ProviderResult<Vec<crate::provider_api::VmInfo>> {
+        let vms = list_vms();
+        Ok(vms
+            .iter()
+            .filter(|v| matches!(v.provider, VmProvider::HyperV))
+            .map(Self::to_universal_vm)
+            .collect())
+    }
+
+    fn get_vm(&self, vm_id: &str) -> crate::provider_api::ProviderResult<crate::provider_api::VmInfo> {
+        let real_id = vm_id.strip_prefix("hyperv:").unwrap_or(vm_id);
+        let vms = list_vms();
+        vms.iter()
+            .find(|v| v.id == real_id)
+            .map(Self::to_universal_vm)
+            .ok_or_else(|| crate::provider_api::ProviderError::VmNotFound(vm_id.to_owned()))
+    }
+
+    fn get_capabilities(
+        &self,
+        vm_id: &str,
+    ) -> crate::provider_api::ProviderResult<crate::capability_engine::VmCapabilityGraph> {
+        let real_id = vm_id.strip_prefix("hyperv:").unwrap_or(vm_id);
+        let vms = list_vms();
+        let vm = vms
+            .iter()
+            .find(|v| v.id == real_id)
+            .ok_or_else(|| crate::provider_api::ProviderError::VmNotFound(vm_id.to_owned()))?;
+        Ok(crate::capability_engine::evaluate(vm))
+    }
+
+    fn power_action(
+        &self,
+        vm_id: &str,
+        action: &str,
+    ) -> crate::provider_api::ProviderResult<()> {
+        let real_id = vm_id.strip_prefix("hyperv:").unwrap_or(vm_id);
+        let action_enum = VmPowerAction::from_str(action)
+            .ok_or_else(|| crate::provider_api::ProviderError::NotSupported(
+                format!("Unknown power action: {action}"),
+            ))?;
+        let vm_path = format!(
+            "Msvm_ComputerSystem.CreationClassName=\"Msvm_ComputerSystem\",Name=\"{real_id}\""
+        );
+        request_power_action(&vm_path, action_enum);
+        Ok(())
+    }
+
+    fn list_snapshots(
+        &self,
+        vm_id: &str,
+    ) -> crate::provider_api::ProviderResult<Vec<crate::provider_api::SnapshotInfo>> {
+        let real_id = vm_id.strip_prefix("hyperv:").unwrap_or(vm_id);
+        let checkpoints = list_checkpoints(real_id);
+        Ok(checkpoints
+            .iter()
+            .map(|cp| Self::checkpoint_to_snapshot(cp, vm_id))
+            .collect())
+    }
+
+    fn create_snapshot(
+        &self,
+        vm_id: &str,
+        name: Option<&str>,
+    ) -> crate::provider_api::ProviderResult<crate::provider_api::SnapshotInfo> {
+        let real_id = vm_id.strip_prefix("hyperv:").unwrap_or(vm_id);
+        let vm_path = format!(
+            "Msvm_ComputerSystem.CreationClassName=\"Msvm_ComputerSystem\",Name=\"{real_id}\""
+        );
+        let snap_name = create_checkpoint(&vm_path, name)
+            .map_err(|e| crate::provider_api::ProviderError::NativeError {
+                provider: "hyperv".to_owned(),
+                code: "CREATE_CHECKPOINT_FAILED".to_owned(),
+                message: e,
+            })?;
+        Ok(crate::provider_api::SnapshotInfo {
+            snapshot_id: format!("hyperv:new:{snap_name}"),
+            provider_native_id: snap_name.clone(),
+            vm_id: vm_id.to_owned(),
+            name: snap_name,
+            description: None,
+            created_at: chrono_now_iso(),
+            is_current: false,
+            snapshot_type: "Standard".to_owned(),
+            provider_metadata: serde_json::Value::Null,
+        })
+    }
+
+    fn apply_snapshot(
+        &self,
+        _vm_id: &str,
+        snapshot_id: &str,
+    ) -> crate::provider_api::ProviderResult<()> {
+        // snapshot_id is the WMI path (stored in provider_native_id)
+        let wmi_path = snapshot_id.strip_prefix("hyperv:").unwrap_or(snapshot_id);
+        apply_checkpoint(wmi_path)
+            .map_err(|e| crate::provider_api::ProviderError::NativeError {
+                provider: "hyperv".to_owned(),
+                code: "APPLY_CHECKPOINT_FAILED".to_owned(),
+                message: e,
+            })
+    }
+
+    fn delete_snapshot(
+        &self,
+        _vm_id: &str,
+        snapshot_id: &str,
+    ) -> crate::provider_api::ProviderResult<()> {
+        let wmi_path = snapshot_id.strip_prefix("hyperv:").unwrap_or(snapshot_id);
+        delete_checkpoint(wmi_path)
+            .map_err(|e| crate::provider_api::ProviderError::NativeError {
+                provider: "hyperv".to_owned(),
+                code: "DELETE_CHECKPOINT_FAILED".to_owned(),
+                message: e,
+            })
+    }
+
+    fn get_preview_frame(
+        &self,
+        vm_id: &str,
+        width: u32,
+        height: u32,
+    ) -> crate::provider_api::ProviderResult<Vec<u8>> {
+        let real_id = vm_id.strip_prefix("hyperv:").unwrap_or(vm_id);
+        let vm_path = format!(
+            "Msvm_ComputerSystem.CreationClassName=\"Msvm_ComputerSystem\",Name=\"{real_id}\""
+        );
+        let rgba = capture_screen(real_id, &vm_path, width as u16, height as u16)
+            .map_err(|e| crate::provider_api::ProviderError::NativeError {
+                provider: "hyperv".to_owned(),
+                code: "PREVIEW_CAPTURE_FAILED".to_owned(),
+                message: e,
+            })?;
+        // Convert RGBA → BGRA as required by pipeline
+        let bgra: Vec<u8> = rgba
+            .chunks_exact(4)
+            .flat_map(|p| [p[2], p[1], p[0], p[3]])
+            .collect();
+        Ok(bgra)
+    }
+
+    fn manifest(&self) -> serde_json::Value {
+        serde_json::json!({
+            "provider_type": "hyperv",
+            "provider_id": self.provider_id,
+            "features": [
+                "inventory", "preview", "power_control", "checkpoints",
+                "keyboard_rescue", "rdp_relay", "enhanced_session_detection"
+            ],
+            "experimental": ["af_hyperv_socket"],
+            "wmi_namespace": "root\\virtualization\\v2"
+        })
+    }
+}
+
+/// Returns current time as ISO 8601 string (no external dependency).
+fn chrono_now_iso() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Format as yyyy-mm-ddTHH:MM:SSZ (UTC, simplified)
+    let s = secs;
+    let (y, mo, d, h, mi, sec) = {
+        let s2 = s % 60;
+        let mi2 = (s / 60) % 60;
+        let h2 = (s / 3600) % 24;
+        let days = s / 86400;
+        // Simplified Gregorian (good until ~2100)
+        let y2 = 1970 + days / 365;
+        let rem = days % 365;
+        let mo2 = rem / 30 + 1;
+        let d2 = rem % 30 + 1;
+        (y2, mo2, d2, h2, mi2, s2)
+    };
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{sec:02}Z")
+}
