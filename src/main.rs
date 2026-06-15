@@ -3579,33 +3579,6 @@ impl EvertyDeskApp {
             self.hyperv_start_load();
         }
 
-        // ── Provider dashboard (compact, above split) ─────────────────────────
-        self.universal_provider_dashboard_ui(ui);
-
-        // ── Loading / empty state ─────────────────────────────────────────────
-        if self.hyperv_loading && self.hyperv_vms.is_empty() {
-            ui.add_space(40.0);
-            ui.vertical_centered(|ui| {
-                ui.label(
-                    egui::RichText::new("Поиск гипервизоров (Hyper-V, VirtualBox, VMware)...")
-                        .size(14.0)
-                        .color(crate::theme::palette().text_muted),
-                );
-            });
-            ui.ctx().request_repaint_after(Duration::from_millis(300));
-            return;
-        }
-        if self.hyperv_checked && self.hyperv_vms.is_empty() {
-            ui.add_space(20.0);
-            ui.label(
-                egui::RichText::new(
-                    "Гипервизоры не обнаружены. Нажмите «Обновить» для повторного поиска.",
-                )
-                .color(crate::theme::palette().text_muted),
-            );
-            return;
-        }
-
         // ── Layout: SidePanel + console ───────────────────────────────────────
         const SIDEBAR_W: f32 = 276.0;
         let fullscreen = self.vm_console_fullscreen;
@@ -3724,6 +3697,24 @@ impl EvertyDeskApp {
                 ui.add_space(5.0);
                 ui.separator();
                 ui.add_space(2.0);
+
+                // Loading / empty states inside sidebar
+                if self.hyperv_loading && self.hyperv_vms.is_empty() {
+                    ui.add_space(16.0);
+                    ui.label(
+                        egui::RichText::new("Поиск гипервизоров...")
+                            .size(12.0)
+                            .color(crate::theme::palette().text_muted),
+                    );
+                    ui.ctx().request_repaint_after(Duration::from_millis(300));
+                } else if self.hyperv_checked && self.hyperv_vms.is_empty() {
+                    ui.add_space(16.0);
+                    ui.label(
+                        egui::RichText::new("Гипервизоры не найдены.\nНажмите R для повторного поиска.")
+                            .size(11.0)
+                            .color(crate::theme::palette().text_muted),
+                    );
+                }
 
                 // VM list (grouped by provider)
                 egui::ScrollArea::vertical()
