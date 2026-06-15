@@ -178,6 +178,55 @@ struct PlanSignature {
 ///
 /// Безопасно вызывать из panic hook — не паникует сам, все ошибки логируются stderr.
 /// `state` должен быть `Arc<Mutex<HotfixState>>`.
+/// Синхронная отправка краш-репорта — используй в panic hook.
+///
+/// Делает только POST /incidents с таймаутом 5 сек, не ждёт AI-анализа.
+/// Безопасно вызывать из panic hook — не паникует сам.
+pub fn submit_crash_sync(
+    crash_signature: String,
+    component: String,
+    error_code: String,
+    message: String,
+    stack_trace: String,
+    config: &HotfixConfig,
+    app_config: &AppConfig,
+) {
+    if !config.enabled || config.api_key.is_empty() {
+        return;
+    }
+    let fp = collect_fingerprint();
+    let payload = IncidentPayload {
+        schema_version: 1,
+        client_incident_id: uuid::Uuid::new_v4().to_string(),
+        device_id: app_config.ui.agent_machine_id.clone(),
+        incident_type: "crash".to_owned(),
+        severity: "error".to_owned(),
+        component,
+        error_code,
+        crash_signature,
+        app_version: env!("CARGO_PKG_VERSION").to_owned(),
+        os_family: fp.os_family,
+        distro: fp.distro,
+        gpu_vendor: fp.gpu_vendor,
+        driver_version: fp.driver_version,
+        renderer_backend: fp.renderer_backend,
+        evrt_transport: fp.evrt_transport,
+        provider_type: fp.provider_type,
+        detail: IncidentDetail { message, stack_trace },
+    };
+    let url = format!("{}/api/v1/incidents", app_config.server.api_url.trim_end_matches('/'));
+    // 5 секунд максимум — не блокируем процесс надолго при завершении.
+    match ureq::post(&url)
+        .timeout(Duration::from_secs(5))
+        .set("Authorization", &format!("Bearer {}", config.api_key))
+        .set("Content-Type", "application/json")
+        .send_json(serde_json::to_value(&payload).unwrap_or_default())
+    {
+        Ok(_) => eprintln!("[hotfix] crash submitted ok"),
+        Err(e) => eprintln!("[hotfix] crash submit failed: {e}"),
+    }
+}
+
 pub fn report(
     crash_signature: String,
     component: String,

@@ -195,8 +195,6 @@ fn tr(lang: UiLang, ru: &'static str, en: &'static str) -> &'static str {
 fn install_panic_logger() {
     // Load config once so the hotfix report has correct api_key / device_id.
     let hotfix_cfg = AppConfig::load_or_create();
-    let hotfix_state: Arc<Mutex<hotfix::HotfixState>> =
-        Arc::new(Mutex::new(hotfix::HotfixState::default()));
 
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -230,16 +228,16 @@ fn install_panic_logger() {
             let _ = writeln!(f, "{record}");
         }
 
-        // Отправляем краш-репорт в AI Hotfix Pipeline (в фоне).
-        hotfix::report(
+        // Синхронная отправка — блокируемся максимум 5 сек прямо здесь,
+        // чтобы успеть отправить POST до завершения процесса.
+        hotfix::submit_crash_sync(
             format!("{}:{}", location, &msg[..msg.len().min(120)]),
             "core".to_owned(),
             "PANIC".to_owned(),
             msg.clone(),
             format!("{backtrace}"),
-            hotfix_cfg.hotfix.clone(),
-            hotfix_cfg.clone(),
-            Arc::clone(&hotfix_state),
+            &hotfix_cfg.hotfix,
+            &hotfix_cfg,
         );
 
         prev(info);
