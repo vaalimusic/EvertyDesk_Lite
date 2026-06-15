@@ -38,6 +38,9 @@ struct Shared {
     status: String,
     /// Последняя заметка о вводе (ошибка инжекта мыши/клавы) — для диагностики.
     input_note: String,
+    /// Канал команд в HyperVSession (мышь/клавиатура без overhead нового WMI connect).
+    #[cfg(windows)]
+    hyperv_cmd_tx: Option<std::sync::mpsc::SyncSender<crate::hyperv::HyperVCmd>>,
 }
 
 impl Default for Shared {
@@ -52,6 +55,8 @@ impl Default for Shared {
             have_frame: false,
             status: String::new(),
             input_note: String::new(),
+            #[cfg(windows)]
+            hyperv_cmd_tx: None,
         }
     }
 }
@@ -383,10 +388,18 @@ fn attach_hyperv(_vm_id: &str) -> Result<String, String> {
 #[cfg(windows)]
 fn pump_loop(vm: hyperv::VmInfo, gen: u64) {
     let session = hyperv::HyperVSession::start(vm);
+    // Share the cmd channel so dispatch_mouse/dispatch_key can send input
+    // without creating a new WMI connection per event.
+    if let Ok(mut s) = state().lock() {
+        s.hyperv_cmd_tx = Some(session.cmd_tx.clone());
+    }
     loop {
         // Эпоха устарела (другой attach/detach) → гасим сессию и выходим.
         let current_gen = state().lock().map(|s| s.generation).unwrap_or(gen + 1);
         if current_gen != gen {
+            if let Ok(mut s) = state().lock() {
+                s.hyperv_cmd_tx = None;
+            }
             session.stop();
             return;
         }
@@ -425,33 +438,47 @@ const EVT_WHEEL: i32 = 3;
 
 #[cfg(windows)]
 fn dispatch_mouse(vm_id: &str, ev: &crate::rustdesk_proto::MouseEvent, w: u32, h: u32) {
+    let cmd_tx = state().lock().ok()
+        .and_then(|s| s.hyperv_cmd_tx.clone());
+    let Some(tx) = cmd_tx else {
+        note_input("мышь: сессия не готова");
+        return;
+    };
     let evt_type = ev.mask & 0x7;
     let button_bits = ev.mask >> 3;
-    let res = match evt_type {
+    match evt_type {
         EVT_MOVE | EVT_DOWN | EVT_UP => {
-            // Координаты экрана VM → 0–65535 (SetAbsolutePosition).
             let nx = norm(ev.x, w);
             let ny = norm(ev.y, h);
-            let mut r = hyperv::move_mouse(vm_id, nx, ny);
-            if r.is_ok() && (evt_type == EVT_DOWN || evt_type == EVT_UP) {
+            let _ = tx.try_send(hyperv::HyperVCmd::MoveMouse(nx, ny));
+            if evt_type == EVT_DOWN || evt_type == EVT_UP {
                 if let Some(btn) = vm_button(button_bits) {
-                    r = hyperv::click_mouse(vm_id, btn, evt_type == EVT_DOWN);
+                    let _ = tx.try_send(hyperv::HyperVCmd::ClickMouse(btn, evt_type == EVT_DOWN));
                 }
             }
-            r
+            note_input("мышь ок");
         }
-        EVT_WHEEL => Ok(()), // Hyper-V WMI не имеет прямого wheel API — пропускаем
-        _ => Ok(()),
-    };
-    match res {
-        Ok(()) => note_input("мышь ок"),
-        Err(e) => note_input(&format!("мышь: {e}")),
+        EVT_WHEEL => {} // Hyper-V WMI не имеет прямого wheel API
+        _ => {}
     }
+    let _ = vm_id; // resolved via session, not needed directly
 }
 
 #[cfg(windows)]
 fn dispatch_key(vm_id: &str, ev: &crate::rustdesk_proto::KeyEvent) {
     use crate::rustdesk_proto::key_event::Union;
+    let cmd_tx = state().lock().ok()
+        .and_then(|s| s.hyperv_cmd_tx.clone());
+    let Some(tx) = cmd_tx else {
+        note_input("клава: сессия не готова");
+        return;
+    };
+
+    // Send a key via the session channel — no WMI connect overhead
+    let send_press = |vk: u32| { let _ = tx.try_send(hyperv::HyperVCmd::PressKey(vk)); };
+    let send_release = |vk: u32| { let _ = tx.try_send(hyperv::HyperVCmd::ReleaseKey(vk)); };
+    let send_text = |t: String| { let _ = tx.try_send(hyperv::HyperVCmd::TypeText(t)); };
+
     // Модификаторы (Shift/Ctrl/Alt) — жмём перед, отпускаем после.
     let mods: Vec<u32> = ev
         .modifiers
@@ -465,40 +492,30 @@ fn dispatch_key(vm_id: &str, ev: &crate::rustdesk_proto::KeyEvent) {
                 let scan = control_key_scancode(*ck)
                     .ok_or_else(|| format!("нет scancode для ControlKey={ck}"))?;
                 if ev.press {
-                    for m in &mods {
-                        hyperv::press_key(vm_id, *m)?;
-                    }
-                    hyperv::press_key(vm_id, scan)?;
-                    hyperv::release_key(vm_id, scan)?;
-                    for m in mods.iter().rev() {
-                        hyperv::release_key(vm_id, *m)?;
-                    }
+                    mods.iter().for_each(|m| send_press(*m));
+                    send_press(scan);
+                    send_release(scan);
+                    mods.iter().rev().for_each(|m| send_release(*m));
                 } else if ev.down {
-                    hyperv::press_key(vm_id, scan)?;
+                    send_press(scan);
                 } else {
-                    hyperv::release_key(vm_id, scan)?;
+                    send_release(scan);
                 }
                 Ok(())
             }
             Some(Union::Unicode(ch)) => {
                 if (ev.press || ev.down) && *ch != 0 {
                     if let Some(c) = char::from_u32(*ch) {
-                        // С модификаторами (Ctrl+C и т.п.) TypeText не годится —
-                        // если есть мод-клавиши, шлём через scancode.
                         if !mods.is_empty() {
                             if let Some(scan) = ascii_scancode(c) {
-                                for m in &mods {
-                                    hyperv::press_key(vm_id, *m)?;
-                                }
-                                hyperv::press_key(vm_id, scan)?;
-                                hyperv::release_key(vm_id, scan)?;
-                                for m in mods.iter().rev() {
-                                    hyperv::release_key(vm_id, *m)?;
-                                }
+                                mods.iter().for_each(|m| send_press(*m));
+                                send_press(scan);
+                                send_release(scan);
+                                mods.iter().rev().for_each(|m| send_release(*m));
                                 return Ok(());
                             }
                         }
-                        hyperv::type_text(vm_id, &c.to_string())?;
+                        send_text(c.to_string());
                     }
                 }
                 Ok(())
@@ -507,6 +524,7 @@ fn dispatch_key(vm_id: &str, ev: &crate::rustdesk_proto::KeyEvent) {
         }
     })();
 
+    let _ = vm_id;
     match res {
         Ok(()) => note_input("клава ок"),
         Err(e) => note_input(&format!("клава: {e}")),

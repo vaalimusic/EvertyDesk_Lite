@@ -32,16 +32,63 @@ use windows::{
 const RPC_C_AUTHN_WINNT_VALUE: u32 = 10;
 const RPC_C_AUTHZ_NONE_VALUE: u32 = 0;
 
-// ── VM state ──────────────────────────────────────────────────────────────────
+// ── VM provider / state ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum VmProvider {
+    HyperV,
+    VirtualBox,
+    VMware,
+}
+
+impl VmProvider {
+    pub fn label(&self) -> &str {
+        match self {
+            Self::HyperV => "Hyper-V",
+            Self::VirtualBox => "VirtualBox",
+            Self::VMware => "VMware",
+        }
+    }
+    /// True if we can open an in-app console for this provider.
+    pub fn has_console(&self) -> bool {
+        matches!(self, Self::HyperV)
+    }
+}
+
+/// Console capability of a VM — determines which interactive modes are available.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConsoleMode {
+    /// Integration Services installed + Enhanced Session enabled → RDP over VMBus (best)
+    EnhancedSession,
+    /// No IS / Enhanced Session disabled → WMI thumbnail preview only (limited)
+    ThumbnailOnly,
+    /// Not a Hyper-V VM (VirtualBox, VMware, etc.)
+    Other,
+}
+
+impl ConsoleMode {
+    pub fn label(&self) -> &str {
+        match self {
+            Self::EnhancedSession => "Enhanced Session",
+            Self::ThumbnailOnly => "Превью только",
+            Self::Other => "",
+        }
+    }
+    pub fn supports_rdp(&self) -> bool {
+        matches!(self, Self::EnhancedSession)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct VmInfo {
     pub name: String,
-    /// GUID used as SystemName for keyboard/mouse WMI objects
+    /// GUID used as SystemName for keyboard/mouse WMI objects (Hyper-V) or VM path (others)
     pub id: String,
     /// Full WMI object path for method calls
     pub wmi_path: String,
     pub state: VmState,
+    pub provider: VmProvider,
+    pub console_mode: ConsoleMode,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -380,8 +427,9 @@ unsafe fn collect_rows(enumerator: IEnumWbemClassObject) -> Vec<HashMap<String, 
 /// Extract the class name from a WMI object path like
 /// `\\SERVER\ROOT\virtualization\v2:Msvm_VirtualSystemManagementService.Name="..."`
 fn obj_path_class(path: &str) -> &str {
-    // After the last colon, before the dot
-    let after_colon = path.rfind(':').map(|i| &path[i + 1..]).unwrap_or(path);
+    // WMI path: \\SERVER\namespace:ClassName.key="val"
+    // The namespace separator is the FIRST colon (not last — DeviceID can contain "Microsoft:GUID")
+    let after_colon = path.find(':').map(|i| &path[i + 1..]).unwrap_or(path);
     let before_dot = after_colon.find('.').map(|i| &after_colon[..i]).unwrap_or(after_colon);
     before_dot
 }
@@ -397,18 +445,179 @@ pub fn is_available() -> bool {
     Wmi::connect().is_some()
 }
 
+/// Discover VMs from all available hypervisors on this machine.
 pub fn list_vms() -> Vec<VmInfo> {
-    let mut vms = list_vms_com();
-    if vms.is_empty() {
-        vms = list_vms_powershell();
+    let mut all: Vec<VmInfo> = Vec::new();
+
+    // Hyper-V (WMI root\virtualization\v2)
+    let hv = {
+        let mut v = list_vms_com();
+        if v.is_empty() {
+            v = list_vms_powershell();
+        }
+        v
+    };
+    all.extend(hv);
+
+    // VirtualBox
+    all.extend(list_virtualbox_vms());
+
+    // VMware Workstation / Player
+    all.extend(list_vmware_vms());
+
+    all
+}
+
+fn list_virtualbox_vms() -> Vec<VmInfo> {
+    let Some(vboxmanage) = find_vboxmanage() else {
+        return Vec::new();
+    };
+    let Ok(all_out) = std::process::Command::new(&vboxmanage)
+        .args(["list", "vms"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let running_ids: std::collections::HashSet<String> = std::process::Command::new(&vboxmanage)
+        .args(["list", "runningvms"])
+        .output()
+        .map(|o| parse_vbox_list(&o.stdout).into_iter().map(|(_, id)| id).collect())
+        .unwrap_or_default();
+
+    parse_vbox_list(&all_out.stdout)
+        .into_iter()
+        .map(|(name, id)| {
+            let state = if running_ids.contains(&id) {
+                VmState::Running
+            } else {
+                VmState::Off
+            };
+            VmInfo {
+                name,
+                wmi_path: id.clone(),
+                id,
+                state,
+                provider: VmProvider::VirtualBox,
+                console_mode: ConsoleMode::Other,
+            }
+        })
+        .collect()
+}
+
+fn parse_vbox_list(output: &[u8]) -> Vec<(String, String)> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .filter_map(|line| {
+            // Format: "VM Name" {uuid}
+            let (name_part, id_part) = line.rsplit_once(' ')?;
+            let name = name_part.trim().trim_matches('"').to_owned();
+            let id = id_part
+                .trim()
+                .trim_matches(|c| c == '{' || c == '}')
+                .to_owned();
+            if id.is_empty() || name.is_empty() {
+                return None;
+            }
+            Some((name, id))
+        })
+        .collect()
+}
+
+fn find_vboxmanage() -> Option<String> {
+    if std::process::Command::new("VBoxManage")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        return Some("VBoxManage".to_owned());
     }
-    vms
+    for path in [
+        r"C:\Program Files\Oracle\VirtualBox\VBoxManage.exe",
+        r"C:\Program Files (x86)\Oracle\VirtualBox\VBoxManage.exe",
+    ] {
+        if std::path::Path::new(path).exists() {
+            return Some(path.to_owned());
+        }
+    }
+    None
+}
+
+fn list_vmware_vms() -> Vec<VmInfo> {
+    let Some(vmrun) = find_vmrun() else {
+        return Vec::new();
+    };
+    let Ok(out) = std::process::Command::new(&vmrun)
+        .arg("list")
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| line.trim_end().ends_with(".vmx"))
+        .map(|path| {
+            let path = path.trim().to_owned();
+            let name = std::path::Path::new(&path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&path)
+                .to_owned();
+            VmInfo {
+                name,
+                wmi_path: path.clone(),
+                id: path,
+                state: VmState::Running, // vmrun list only shows running VMs
+                provider: VmProvider::VMware,
+                console_mode: ConsoleMode::Other,
+            }
+        })
+        .collect()
+}
+
+fn find_vmrun() -> Option<String> {
+    if std::process::Command::new("vmrun")
+        .arg("list")
+        .output()
+        .is_ok()
+    {
+        return Some("vmrun".to_owned());
+    }
+    for path in [
+        r"C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe",
+        r"C:\Program Files\VMware\VMware Workstation\vmrun.exe",
+        r"C:\Program Files (x86)\VMware\VMware Player\vmrun.exe",
+    ] {
+        if std::path::Path::new(path).exists() {
+            return Some(path.to_owned());
+        }
+    }
+    None
+}
+
+/// Query Msvm_SummaryInformation for heartbeat status of all VMs.
+/// Heartbeat == 2 means Integration Services are running → RDP over VMBus available.
+fn query_heartbeat_map(wmi: &Wmi) -> HashMap<String, ConsoleMode> {
+    let rows = wmi.query("SELECT Name, Heartbeat FROM Msvm_SummaryInformation");
+    rows.into_iter()
+        .filter_map(|mut row| {
+            let name = row.remove("Name")?.as_str()?.to_owned();
+            let heartbeat = row.remove("Heartbeat").and_then(|v| v.as_u32()).unwrap_or(0);
+            // 2 = Ok (IS running), 6 = Error, 12 = NoContact, 0 = Unknown/not available
+            let mode = if heartbeat == 2 {
+                ConsoleMode::EnhancedSession
+            } else {
+                ConsoleMode::ThumbnailOnly
+            };
+            Some((name, mode))
+        })
+        .collect()
 }
 
 fn list_vms_com() -> Vec<VmInfo> {
     let Some(wmi) = Wmi::connect() else { return vec![] };
     // НЕ проецируем __PATH в SELECT: у virtualization-провайдера это может
     // вернуть 0 строк. read_all_properties дочитывает __PATH через obj.Get.
+    let console_modes = query_heartbeat_map(&wmi);
     let rows = wmi.query(
         "SELECT Name, ElementName, Caption, Description, EnabledState \
          FROM Msvm_ComputerSystem",
@@ -422,6 +631,7 @@ fn list_vms_com() -> Vec<VmInfo> {
             let wmi_path = take_non_empty_string(&mut row, "__PATH")
                 .or_else(|| take_non_empty_string(&mut row, "__RELPATH"))
                 .unwrap_or_else(|| vm_computer_system_path(&id));
+            let console_mode = console_modes.get(&id).cloned().unwrap_or(ConsoleMode::ThumbnailOnly);
             Some(VmInfo {
                 name: row.remove("ElementName")?.as_str()?.to_owned(),
                 id,
@@ -429,6 +639,8 @@ fn list_vms_com() -> Vec<VmInfo> {
                 state: VmState::from_u32(
                     row.remove("EnabledState").and_then(|v| v.as_u32()).unwrap_or(0),
                 ),
+                provider: VmProvider::HyperV,
+                console_mode,
             })
         })
         .collect()
@@ -501,6 +713,8 @@ fn parse_vm_json(text: &str) -> Vec<VmInfo> {
                 id: id.clone(),
                 wmi_path: vm_computer_system_path(&id),
                 state: VmState::from_u32(state),
+                provider: VmProvider::HyperV,
+                console_mode: ConsoleMode::ThumbnailOnly,
             })
         })
         .collect()
@@ -550,6 +764,37 @@ fn escape_wmi_key(value: &str) -> String {
 
 fn escape_wmi_value(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+/// WMI RequestedState values for Msvm_ComputerSystem.RequestStateChange.
+pub enum VmPowerAction {
+    /// Start (Enabled)
+    Start,
+    /// Hard power-off
+    Stop,
+    /// Reboot (not a direct WMI state — implemented as stop then start)
+    Restart,
+    /// Save state (hibernate)
+    Save,
+}
+
+/// Send a power action to a Hyper-V VM. Non-blocking — fires and forgets.
+pub fn request_power_action(vm_wmi_path: &str, action: VmPowerAction) {
+    let path = vm_wmi_path.to_owned();
+    std::thread::spawn(move || {
+        let Some(wmi) = Wmi::connect() else { return; };
+        match action {
+            VmPowerAction::Start  => { let _ = wmi.exec_method_result(&path, "RequestStateChange", &[("RequestedState", WmiVal::I32(2))]); }
+            VmPowerAction::Stop   => { let _ = wmi.exec_method_result(&path, "RequestStateChange", &[("RequestedState", WmiVal::I32(3))]); }
+            VmPowerAction::Save   => { let _ = wmi.exec_method_result(&path, "RequestStateChange", &[("RequestedState", WmiVal::I32(32770))]); }
+            VmPowerAction::Restart => {
+                // Stop then start — both async, give stop time to complete
+                let _ = wmi.exec_method_result(&path, "RequestStateChange", &[("RequestedState", WmiVal::I32(3))]);
+                std::thread::sleep(Duration::from_secs(3));
+                let _ = wmi.exec_method_result(&path, "RequestStateChange", &[("RequestedState", WmiVal::I32(2))]);
+            }
+        }
+    });
 }
 
 /// Returns raw RGB bytes (3 bytes/pixel, width × height). None if VM is off or on error.
@@ -678,7 +923,7 @@ fn current_setting_path(wmi: &Wmi, vm_id: &str, vm_wmi_path: &str) -> Option<Str
 /// Чётные размеры (требование энкодеров H264). Если уже меньше — без изменений.
 fn cap_resolution(w: u16, h: u16, max_w: u16, max_h: u16) -> (u16, u16) {
     if w == 0 || h == 0 {
-        return (1280, 720);
+        return (max_w, max_h);
     }
     if w <= max_w && h <= max_h {
         return (w & !1, h & !1);
@@ -726,7 +971,8 @@ fn kbd_exec(vm_id: &str, method: &str, scan_code: u32) -> Result<(), String> {
     let path = find_device_path(&wmi, "Msvm_Keyboard", vm_id)
         .ok_or_else(|| "Msvm_Keyboard не найден".to_owned())?;
     // VT_I4: провайдер виртуализации отвергает VT_UI4 (WBEM_E_TYPE_MISMATCH).
-    wmi.exec_method_result(&path, method, &[("scanCode", WmiVal::I32(scan_code as i32))])
+    // Msvm_Keyboard::PressKey/ReleaseKey parameter is named "keyCode" (NOT "scanCode")
+    wmi.exec_method_result(&path, method, &[("keyCode", WmiVal::I32(scan_code as i32))])
         .map(|_| ())
 }
 
@@ -757,13 +1003,70 @@ pub fn click_mouse(vm_id: &str, button: u32, press: bool) -> Result<(), String> 
 }
 
 fn find_device_path(wmi: &Wmi, class: &str, vm_id: &str) -> Option<String> {
-    let q = format!("SELECT * FROM {class} WHERE SystemName = '{vm_id}'");
-    wmi.query(&q)
-        .into_iter()
-        .next()?
-        .remove("__PATH")?
-        .as_str()
-        .map(|s| s.to_owned())
+    // Try WHERE first, then enumerate all and filter (some WMI providers ignore WHERE)
+    let candidates = [
+        format!("SELECT * FROM {class} WHERE SystemName = '{vm_id}'"),
+        format!("SELECT * FROM {class}"),
+    ];
+    for q in &candidates {
+        let rows = wmi.query(q);
+        for mut row in rows {
+            // Filter by SystemName when scanning all
+            if q.contains("SELECT * FROM") && !q.contains("WHERE") {
+                let sn = row.get("SystemName").and_then(|v| v.as_str().map(|s| s.to_owned()));
+                if sn.as_deref() != Some(vm_id) {
+                    continue;
+                }
+            }
+            // Prefer __PATH, fall back to __RELPATH, else build from DeviceID
+            if let Some(p) = row.get("__PATH").and_then(|v| v.as_str().map(|s| s.to_owned()))
+                .filter(|s| !s.is_empty())
+            {
+                return Some(p);
+            }
+            if let Some(p) = row.get("__RELPATH").and_then(|v| v.as_str().map(|s| s.to_owned()))
+                .filter(|s| !s.is_empty())
+            {
+                return Some(p);
+            }
+            // Build path manually from key properties
+            if let Some(dev_id) = row.get("DeviceID").and_then(|v| v.as_str().map(|s| s.to_owned())) {
+                let path = format!(
+                    "{class}.CreationClassName=\"{class}\",DeviceID=\"{}\",\
+                     SystemCreationClassName=\"Msvm_ComputerSystem\",SystemName=\"{vm_id}\"",
+                    dev_id.replace('"', "\"\"")
+                );
+                return Some(path);
+            }
+        }
+        // If WHERE-filtered query returned results, stop here regardless
+        if q.contains("WHERE") && !wmi.query(q).is_empty() {
+            break;
+        }
+    }
+    None
+}
+
+/// Pre-resolve keyboard/mouse WMI paths at session start (once per session).
+struct DevicePaths {
+    keyboard: Option<String>,
+    mouse: Option<String>,
+}
+
+impl DevicePaths {
+    fn resolve(vm_id: &str) -> (Self, Option<String>) {
+        let Some(wmi) = Wmi::connect() else {
+            return (Self { keyboard: None, mouse: None }, Some("WMI connect failed".into()));
+        };
+        let keyboard = find_device_path(&wmi, "Msvm_Keyboard", vm_id);
+        let mouse = find_device_path(&wmi, "Msvm_Mouse", vm_id);
+        let warn = if mouse.is_none() {
+            Some("Msvm_Mouse не найден — управление мышью недоступно".into())
+        } else {
+            None
+        };
+        (Self { keyboard, mouse }, warn)
+    }
 }
 
 // ── Background session ────────────────────────────────────────────────────────
@@ -772,6 +1075,7 @@ pub enum HyperVCmd {
     PressKey(u32),
     ReleaseKey(u32),
     TypeText(String),
+    CtrlAltDel,
     MoveMouse(u32, u32),
     ClickMouse(u32, bool),
     Stop,
@@ -799,41 +1103,126 @@ impl HyperVSession {
             .name(format!("hyperv-{}", vm.name))
             .spawn(move || {
                 let native = video_resolution(&vm.id).unwrap_or((1280, 720));
-                // Кап разрешения thumbnail: на хостах без аппаратного энкодера
-                // (OpenH264-SW) 1080p даёт encode_ms 200–2500 → <1 fps. Меньший
-                // thumbnail Hyper-V рендерит сам → софт-энкод тянет реалтайм.
-                let (width, height) = cap_resolution(native.0, native.1, 1280, 720);
+                let (width, height) = cap_resolution(native.0, native.1, 640, 480);
                 let _ = status_tx.try_send(format!(
                     "Hyper-V capture started: {}x{} (native {}x{})",
                     width, height, native.0, native.1
                 ));
+
+                // Cache device paths once — avoids WMI lookup on every keypress/mousemove
+                let (paths, warn) = DevicePaths::resolve(&vm.id);
+                if let Some(w) = warn {
+                    let _ = status_tx.try_send(w);
+                }
+                // Keep a persistent WMI connection for input operations
+                let wmi_input = Wmi::connect();
+
+                const FRAME_TARGET_MS: u64 = 50;
+                // Adaptive resolution: auto-reduce if WMI is too slow
+                let mut cur_w = width;
+                let mut cur_h = height;
+                // EMA of capture duration in ms (α=0.2)
+                let mut capture_ema_ms: f32 = 100.0;
+                let mut frame_count: u32 = 0;
+                let mut fps_window_start = std::time::Instant::now();
+
                 loop {
+                let t0 = std::time::Instant::now();
                 // Drain commands
                 loop {
                     match cmd_rx.try_recv() {
                         Ok(HyperVCmd::Stop) => return,
-                        Ok(HyperVCmd::PressKey(sc)) => { let _ = press_key(&vm.id, sc); }
-                        Ok(HyperVCmd::ReleaseKey(sc)) => { let _ = release_key(&vm.id, sc); }
-                        Ok(HyperVCmd::TypeText(t)) => { let _ = type_text(&vm.id, &t); }
-                        Ok(HyperVCmd::MoveMouse(x, y)) => { let _ = move_mouse(&vm.id, x, y); }
-                        Ok(HyperVCmd::ClickMouse(b, p)) => { let _ = click_mouse(&vm.id, b, p); }
+                        Ok(HyperVCmd::PressKey(sc)) => {
+                            if let (Some(wmi), Some(p)) = (&wmi_input, &paths.keyboard) {
+                                let _ = wmi.exec_method_result(p, "PressKey", &[("keyCode", WmiVal::I32(sc as i32))]);
+                                std::thread::sleep(Duration::from_millis(15));
+                            }
+                        }
+                        Ok(HyperVCmd::ReleaseKey(sc)) => {
+                            if let (Some(wmi), Some(p)) = (&wmi_input, &paths.keyboard) {
+                                let _ = wmi.exec_method_result(p, "ReleaseKey", &[("keyCode", WmiVal::I32(sc as i32))]);
+                                std::thread::sleep(Duration::from_millis(15));
+                            }
+                        }
+                        Ok(HyperVCmd::TypeText(t)) => {
+                            if let (Some(wmi), Some(p)) = (&wmi_input, &paths.keyboard) {
+                                let _ = wmi.exec_method_result(p, "TypeText", &[("asciiText", WmiVal::Str(t))]);
+                            }
+                        }
+                        Ok(HyperVCmd::CtrlAltDel) => {
+                            if let (Some(wmi), Some(p)) = (&wmi_input, &paths.keyboard) {
+                                let _ = wmi.exec_method_result(p, "TypeCtrlAltDel", &[]);
+                            }
+                        }
+                        Ok(HyperVCmd::MoveMouse(x, y)) => {
+                            if let (Some(wmi), Some(p)) = (&wmi_input, &paths.mouse) {
+                                let _ = wmi.exec_method_result(p, "SetAbsolutePosition", &[
+                                    ("horizontalPosition", WmiVal::I32(x as i32)),
+                                    ("verticalPosition",   WmiVal::I32(y as i32)),
+                                ]);
+                            }
+                        }
+                        Ok(HyperVCmd::ClickMouse(b, press)) => {
+                            if let (Some(wmi), Some(p)) = (&wmi_input, &paths.mouse) {
+                                let method = if press { "ClickButton" } else { "ReleaseButton" };
+                                let _ = wmi.exec_method_result(p, method, &[("buttonIndex", WmiVal::I32(b as i32))]);
+                            }
+                        }
                         Err(_) => break,
                     }
                 }
-                // Capture frame
-                match capture_screen(&vm.id, &vm.wmi_path, width, height) {
+                // Capture frame and measure WMI call duration
+                let cap_t0 = std::time::Instant::now();
+                match capture_screen(&vm.id, &vm.wmi_path, cur_w, cur_h) {
                     Ok(rgba) => {
+                        let cap_ms = cap_t0.elapsed().as_millis() as f32;
+                        // EMA update (α=0.25)
+                        capture_ema_ms = capture_ema_ms * 0.75 + cap_ms * 0.25;
+
+                        // #8 Adaptive resolution: if consistently slow, halve; if fast, try to restore
+                        if capture_ema_ms > 500.0 && cur_w > 320 {
+                            cur_w = (cur_w / 2).max(320);
+                            cur_h = (cur_h / 2).max(240);
+                            let _ = status_tx.try_send(format!(
+                                "WMI медленно ({:.0}ms) — снижаю разрешение до {}×{}", capture_ema_ms, cur_w, cur_h
+                            ));
+                            capture_ema_ms = 300.0; // reset estimate
+                        } else if capture_ema_ms < 200.0 && cur_w < width {
+                            // Recover resolution when WMI speeds up
+                            cur_w = (cur_w * 3 / 2).min(width);
+                            cur_h = (cur_h * 3 / 2).min(height);
+                        }
+
+                        // #1 FPS counter: report actual capture rate every 5s
+                        frame_count += 1;
+                        let fps_elapsed = fps_window_start.elapsed();
+                        if fps_elapsed >= Duration::from_secs(5) {
+                            let fps = frame_count as f32 / fps_elapsed.as_secs_f32();
+                            let has_mouse = paths.mouse.is_some();
+                            let mouse_str = if has_mouse { "мышь ✓" } else { "мышь ✗ (нет IS)" };
+                            let _ = status_tx.try_send(format!(
+                                "● VM активна | {:.1} fps | {}×{} | WMI {:.0}ms | {}",
+                                fps, cur_w, cur_h, capture_ema_ms, mouse_str
+                            ));
+                            frame_count = 0;
+                            fps_window_start = std::time::Instant::now();
+                        }
+
                         let _ = frame_tx.try_send(Frame {
                             rgba,
-                            width: width as u32,
-                            height: height as u32,
+                            width: cur_w as u32,
+                            height: cur_h as u32,
                         });
                     }
                     Err(err) => {
                         let _ = status_tx.try_send(err);
                     }
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                let elapsed = t0.elapsed();
+                let target = Duration::from_millis(FRAME_TARGET_MS);
+                if elapsed < target {
+                    std::thread::sleep(target - elapsed);
+                }
                 }
             })
             .expect("hyperv thread");
