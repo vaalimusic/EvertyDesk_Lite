@@ -164,7 +164,48 @@ fn tr(lang: UiLang, ru: &'static str, en: &'static str) -> &'static str {
     }
 }
 
+/// Глобальный логгер паник: пишет место + сообщение + бэктрейс в файл рядом
+/// с конфигом (evertydesk_panic.log) и в stderr. Сохраняет родной хук, чтобы
+/// стандартный вывод тоже остался. Помогает диагностировать «выкидывает» без
+/// отладочной сборки у пользователя.
+fn install_panic_logger() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<неизвестно>".to_owned());
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_owned()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<непечатаемая paника>".to_owned()
+        };
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed>")
+            .to_owned();
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let record = format!(
+            "\n===== PANIC =====\nthread: {thread}\nat: {location}\nmessage: {msg}\nbacktrace:\n{backtrace}\n=================\n"
+        );
+        eprintln!("{record}");
+        // Пишем рядом с конфигом, чтобы пользователь легко нашёл файл.
+        let path = settings::config_path()
+            .parent()
+            .map(|p| p.join("evertydesk_panic.log"))
+            .unwrap_or_else(|| std::path::PathBuf::from("evertydesk_panic.log"));
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(f, "{record}");
+        }
+        prev(info);
+    }));
+}
+
 fn main() -> eframe::Result<()> {
+    install_panic_logger();
     let cleanup = diagnostics::cleanup_default_artifacts();
     if cleanup.removed_total() > 0 || cleanup.errors > 0 {
         eprintln!(
@@ -1389,13 +1430,11 @@ impl EvertyDeskApp {
             remote_vm_panel_open: false,
             provider_registry: {
                 use std::sync::Arc;
-                use provider_api::{FakeProvider, ProviderRegistry};
-                let reg = Arc::new(ProviderRegistry::new());
-                // Register FakeProviders to prove multi-provider architecture (§48 §65–68)
-                reg.register(Arc::new(FakeProvider::fake_vmware("fake-vmware-01")));
-                reg.register(Arc::new(FakeProvider::fake_proxmox("fake-proxmox-01")));
-                // HyperV local provider registered only on Windows at runtime
-                reg
+                use provider_api::ProviderRegistry;
+                // Только реальные провайдеры. Hyper-V регистрируется в рантайме
+                // на Windows после успешного WMI-скана; VirtualBox — при наличии
+                // VBoxManage. Никаких фейковых демо-провайдеров в продакшене.
+                Arc::new(ProviderRegistry::new())
             },
             remote_ctrl_vm_id: String::new(),
             remote_power_panel_open: false,

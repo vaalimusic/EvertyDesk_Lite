@@ -484,77 +484,20 @@ pub fn list_vms() -> Vec<VmInfo> {
 }
 
 fn list_virtualbox_vms() -> Vec<VmInfo> {
-    let Some(vboxmanage) = find_vboxmanage() else {
-        return Vec::new();
-    };
-    let Ok(all_out) = std::process::Command::new(&vboxmanage)
-        .args(["list", "vms"])
-        .output()
-    else {
-        return Vec::new();
-    };
-    let running_ids: std::collections::HashSet<String> = std::process::Command::new(&vboxmanage)
-        .args(["list", "runningvms"])
-        .output()
-        .map(|o| parse_vbox_list(&o.stdout).into_iter().map(|(_, id)| id).collect())
-        .unwrap_or_default();
-
-    parse_vbox_list(&all_out.stdout)
+    // Используем НАДЁЖНУЮ реализацию из virtualbox.rs (таймауты + кэш пути),
+    // а не свой дубль с блокирующим Command::output(). Конвертируем VboxVm →
+    // hyperv::VmInfo, чтобы список VM был единым по провайдерам.
+    crate::virtualbox::list_vms()
         .into_iter()
-        .map(|(name, id)| {
-            let state = if running_ids.contains(&id) {
-                VmState::Running
-            } else {
-                VmState::Off
-            };
-            VmInfo {
-                name,
-                wmi_path: id.clone(),
-                id,
-                state,
-                provider: VmProvider::VirtualBox,
-                console_mode: ConsoleMode::Other,
-            }
+        .map(|v| VmInfo {
+            name: v.name,
+            wmi_path: v.id.clone(),
+            id: v.id,
+            state: if v.running { VmState::Running } else { VmState::Off },
+            provider: VmProvider::VirtualBox,
+            console_mode: ConsoleMode::Other,
         })
         .collect()
-}
-
-fn parse_vbox_list(output: &[u8]) -> Vec<(String, String)> {
-    String::from_utf8_lossy(output)
-        .lines()
-        .filter_map(|line| {
-            // Format: "VM Name" {uuid}
-            let (name_part, id_part) = line.rsplit_once(' ')?;
-            let name = name_part.trim().trim_matches('"').to_owned();
-            let id = id_part
-                .trim()
-                .trim_matches(|c| c == '{' || c == '}')
-                .to_owned();
-            if id.is_empty() || name.is_empty() {
-                return None;
-            }
-            Some((name, id))
-        })
-        .collect()
-}
-
-fn find_vboxmanage() -> Option<String> {
-    if std::process::Command::new("VBoxManage")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
-        return Some("VBoxManage".to_owned());
-    }
-    for path in [
-        r"C:\Program Files\Oracle\VirtualBox\VBoxManage.exe",
-        r"C:\Program Files (x86)\Oracle\VirtualBox\VBoxManage.exe",
-    ] {
-        if std::path::Path::new(path).exists() {
-            return Some(path.to_owned());
-        }
-    }
-    None
 }
 
 fn list_vmware_vms() -> Vec<VmInfo> {
