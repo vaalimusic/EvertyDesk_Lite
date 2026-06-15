@@ -390,6 +390,39 @@ impl Default for UiConfig {
     }
 }
 
+// ── AI Hotfix Pipeline configuration ─────────────────────────────────────────
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HotfixConfig {
+    /// Включить автоотправку краш-репортов в AI Hotfix Pipeline.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bearer-токен для аутентификации на /api/v1/incidents.
+    #[serde(default)]
+    pub api_key: String,
+    /// Base64-кодированный 32-байтный Ed25519 публичный ключ для проверки планов.
+    #[serde(default)]
+    pub signing_public_key: String,
+    /// Минимальный интервал между отправками одного и того же краша (секунды).
+    #[serde(default = "default_hotfix_rate_limit")]
+    pub rate_limit_secs: u64,
+}
+
+fn default_hotfix_rate_limit() -> u64 {
+    300
+}
+
+impl Default for HotfixConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: String::new(),
+            signing_public_key: String::new(),
+            rate_limit_secs: default_hotfix_rate_limit(),
+        }
+    }
+}
+
 // ── Root configuration ────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -405,6 +438,8 @@ pub struct AppConfig {
     pub llm: LlmConfig,
     #[serde(default)]
     pub ui: UiConfig,
+    #[serde(default)]
+    pub hotfix: HotfixConfig,
     /// Optional: bind the hbbs UDP socket to this specific local port.
     #[serde(default)]
     pub udp_bind_port: u16,
@@ -474,6 +509,7 @@ impl AppConfig {
             display: DisplayConfig::default(),
             llm: LlmConfig::default(),
             ui: UiConfig::default(),
+            hotfix: HotfixConfig::default(),
             udp_bind_port: 0,
             evrt_udp_port: 0,
             host_pk: Vec::new(),

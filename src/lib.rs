@@ -32,6 +32,7 @@ pub mod mf_video;
 pub mod netif;
 pub mod nvenc;
 pub mod rustdesk_proto;
+pub mod hotfix;
 pub mod settings;
 pub mod transport;
 pub mod video;
