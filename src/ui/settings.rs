@@ -488,11 +488,7 @@ fn network_section(
     settings_section(ui, tr(selected_lang, "Сеть", "Network"), |ui| {
         if is_custom {
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("★")
-                        .color(egui::Color32::from_rgb(0xF5, 0xA6, 0x23))
-                        .size(14.0),
-                );
+                status_dot(ui, egui::Color32::from_rgb(0xF5, 0xA6, 0x23));
                 ui.label(
                     egui::RichText::new(tr(
                         selected_lang,
@@ -543,11 +539,7 @@ fn network_section(
             }
         } else {
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("✓")
-                        .color(egui::Color32::from_rgb(0x12, 0xC9, 0x72))
-                        .size(14.0),
-                );
+                status_dot(ui, egui::Color32::from_rgb(0x12, 0xC9, 0x72));
                 ui.label(
                     egui::RichText::new(tr(
                         selected_lang,
@@ -562,8 +554,8 @@ fn network_section(
             ui.collapsing(
                 tr(
                     selected_lang,
-                    "▸ Использовать другой сервер",
-                    "▸ Use a different server",
+                    "Использовать другой сервер",
+                    "Use a different server",
                 ),
                 |ui| {
                     ui.add_space(4.0);
@@ -945,5 +937,15 @@ fn default_config_from(config: &AppConfig) -> AppConfig {
         host_pk: Vec::new(),
         host_sign_pk: config.host_sign_pk.clone(),
         host_sign_sk: config.host_sign_sk.clone(),
+    }
+}
+
+/// Small filled circle as a status indicator — avoids Unicode symbols that
+/// may not be present in the bundled font and render as tofu squares.
+fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
+    let size = egui::vec2(10.0, 10.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        ui.painter().circle_filled(rect.center(), 4.0, color);
     }
 }
