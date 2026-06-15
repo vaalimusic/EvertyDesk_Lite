@@ -19,7 +19,7 @@ impl EvertyDeskApp {
                     egui::RichText::new(self.text("Контакты", "Contacts"))
                         .size(26.0)
                         .strong()
-                        .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                        .color(crate::theme::palette().text),
                 );
                 ui.label(
                     egui::RichText::new(format!(
@@ -287,7 +287,7 @@ impl EvertyDeskApp {
                         })
                         .size(17.0)
                         .strong()
-                        .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                        .color(crate::theme::palette().text),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         status_dot(
@@ -534,7 +534,7 @@ impl EvertyDeskApp {
                             })
                             .size(18.0)
                             .strong()
-                            .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                            .color(crate::theme::palette().text),
                         );
                         ui.label(
                             egui::RichText::new(format_peer_id(&contact.remote_id))
@@ -803,7 +803,7 @@ fn draw_contact_tile(
                         })
                         .size(14.0)
                         .strong()
-                        .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                        .color(crate::theme::palette().text),
                     )
                     .truncate(),
                 );
@@ -956,7 +956,7 @@ fn compact_info_row(ui: &mut egui::Ui, label: &str, value: &str) {
             egui::Label::new(
                 egui::RichText::new(value)
                     .size(12.5)
-                    .color(egui::Color32::from_rgb(0x20, 0x24, 0x2D)),
+                    .color(crate::theme::palette().text),
             )
             .truncate(),
         );

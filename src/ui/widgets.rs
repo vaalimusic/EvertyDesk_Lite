@@ -32,7 +32,7 @@ pub(crate) fn settings_section(
                 egui::RichText::new(title)
                     .size(15.0)
                     .strong()
-                    .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                    .color(crate::theme::palette().text),
             );
             ui.add_space(10.0);
             add_contents(ui);
@@ -50,7 +50,7 @@ pub(crate) fn settings_text_row(ui: &mut egui::Ui, label: &str, value: &mut Stri
                 egui::Label::new(
                     egui::RichText::new(label)
                         .size(13.0)
-                        .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+                        .color(crate::theme::palette().text_weak),
                 )
                 .truncate(),
             );
@@ -66,7 +66,7 @@ pub(crate) fn settings_text_row(ui: &mut egui::Ui, label: &str, value: &mut Stri
         ui.label(
             egui::RichText::new(label)
                 .size(13.0)
-                .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+                .color(crate::theme::palette().text_weak),
         );
         ui.add_sized(
             egui::vec2(ui.available_width(), 34.0),
@@ -82,59 +82,87 @@ pub(crate) fn danger_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
         egui::Button::new(
             egui::RichText::new(text)
                 .size(13.0)
-                .color(egui::Color32::from_rgb(0xE5, 0x18, 0x2E)),
+                .color(crate::theme::palette().danger),
         )
         .min_size(egui::vec2(ui.available_width(), 40.0))
-        .fill(egui::Color32::from_rgb(0xFF, 0xFA, 0xFA))
+        .fill(crate::theme::tint(crate::theme::palette().danger, 0.10))
         .stroke(egui::Stroke::new(
             1.0,
-            egui::Color32::from_rgb(0xF4, 0xB8, 0xBE),
+            crate::theme::tint(crate::theme::palette().danger, 0.40),
         ))
         .corner_radius(egui::CornerRadius::same(10)),
     )
 }
 
 pub(crate) fn primary_connect_button(ui: &mut egui::Ui, text: &str, icon: &str) -> egui::Response {
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 46.0), egui::Sense::click());
-    let fill = if response.hovered() {
-        egui::Color32::from_rgb(0x0B, 0xB8, 0x68)
+    let t = crate::theme::palette();
+    // Резервируем чуть больше высоты, чем сама кнопка: сверху/снизу остаётся
+    // воздух, кнопка не «прилипает» к соседям, и снизу есть место под свечение.
+    const BTN_H: f32 = 46.0;
+    const PAD_V: f32 = 7.0; // вертикальный воздух
+    let full = egui::vec2(ui.available_width(), BTN_H + PAD_V * 2.0);
+    let (outer, response) = ui.allocate_exact_size(full, egui::Sense::click());
+    // Кнопка по центру зарезервированной области.
+    let rect = egui::Rect::from_center_size(outer.center(), egui::vec2(outer.width(), BTN_H));
+
+    let radius = egui::CornerRadius::same(crate::theme::radius::MD);
+    let fill = if response.is_pointer_button_down_on() {
+        t.accent_active
+    } else if response.hovered() {
+        t.accent_hover
     } else {
-        egui::Color32::from_rgb(0x12, 0xC9, 0x72)
+        t.accent
     };
-    ui.painter()
-        .rect_filled(rect, egui::CornerRadius::same(11), fill);
+
+    // Мягкое «свечение» под кнопкой — приподнятость без тяжёлой тени.
+    // Несколько полупрозрачных слоёв со смещением вниз и расширением.
+    if response.hovered() {
+        for i in 1..=3 {
+            let grow = i as f32 * 2.0;
+            let glow = rect.translate(egui::vec2(0.0, 3.0)).expand(grow);
+            ui.painter().rect_filled(
+                glow,
+                egui::CornerRadius::same(crate::theme::radius::MD + i as u8),
+                crate::theme::tint(t.accent, 0.05),
+            );
+        }
+    }
+
+    ui.painter().rect_filled(rect, radius, fill);
+    // Тонкий верхний блик + нижняя кромка темнее для объёма.
     ui.painter().rect_stroke(
         rect,
-        egui::CornerRadius::same(11),
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(0x0A, 0xA8, 0x5E)),
+        radius,
+        egui::Stroke::new(1.0, crate::theme::mix(fill, egui::Color32::BLACK, 0.12)),
         egui::StrokeKind::Inside,
     );
 
+    let fg = t.accent_fg;
     let icon_rect =
-        egui::Rect::from_min_size(rect.min + egui::vec2(18.0, 13.0), egui::vec2(20.0, 20.0));
-    draw_line_icon(ui.painter(), icon_rect, icon, egui::Color32::WHITE);
+        egui::Rect::from_min_size(rect.min + egui::vec2(18.0, (BTN_H - 20.0) / 2.0), egui::vec2(20.0, 20.0));
+    draw_line_icon(ui.painter(), icon_rect, icon, fg);
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         text,
         egui::FontId::proportional(16.0),
-        egui::Color32::WHITE,
+        fg,
     );
 
+    // Шеврон-стрелка справа.
     let x = rect.max.x - 24.0;
     let y = rect.center().y;
     ui.painter().line_segment(
         [egui::pos2(x - 7.0, y), egui::pos2(x + 4.0, y)],
-        egui::Stroke::new(1.8, egui::Color32::WHITE),
+        egui::Stroke::new(1.8, fg),
     );
     ui.painter().line_segment(
         [egui::pos2(x, y - 5.0), egui::pos2(x + 5.0, y)],
-        egui::Stroke::new(1.8, egui::Color32::WHITE),
+        egui::Stroke::new(1.8, fg),
     );
     ui.painter().line_segment(
         [egui::pos2(x + 5.0, y), egui::pos2(x, y + 5.0)],
-        egui::Stroke::new(1.8, egui::Color32::WHITE),
+        egui::Stroke::new(1.8, fg),
     );
     response
 }
@@ -148,14 +176,14 @@ pub(crate) fn mode_segment_button(
 ) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 38.0), egui::Sense::click());
     let fill = if active {
-        egui::Color32::from_rgb(0xEC, 0xF8, 0xF2)
+        crate::theme::accent_tint(&crate::theme::palette(), 0.16)
     } else if response.hovered() {
         crate::theme::palette().surface_raised
     } else {
         crate::theme::palette().surface
     };
     let stroke = if active {
-        egui::Stroke::new(1.2, egui::Color32::from_rgb(0x12, 0xC9, 0x72))
+        egui::Stroke::new(1.2, crate::theme::palette().accent)
     } else {
         egui::Stroke::new(1.0, crate::theme::palette().border)
     };
@@ -172,9 +200,9 @@ pub(crate) fn mode_segment_button(
         egui::vec2(18.0, 18.0),
     );
     let color = if active {
-        egui::Color32::from_rgb(0x0C, 0xA8, 0x60)
+        crate::theme::palette().accent
     } else {
-        egui::Color32::from_rgb(0x4E, 0x58, 0x68)
+        crate::theme::palette().text_weak
     };
     draw_line_icon(ui.painter(), icon_rect, icon, color);
     ui.painter().text(
@@ -183,9 +211,9 @@ pub(crate) fn mode_segment_button(
         text,
         egui::FontId::proportional(14.0),
         if active {
-            egui::Color32::from_rgb(0x12, 0x17, 0x20)
+            crate::theme::palette().text
         } else {
-            egui::Color32::from_rgb(0x4F, 0x58, 0x68)
+            crate::theme::palette().text_weak
         },
     );
     response
@@ -207,7 +235,7 @@ pub(crate) fn status_pill(ui: &mut egui::Ui, label: &str, dot: egui::Color32) {
             ui.label(
                 egui::RichText::new(label)
                     .size(14.0)
-                    .color(egui::Color32::from_rgb(0x20, 0x24, 0x2D)),
+                    .color(crate::theme::palette().text),
             );
         });
 }
@@ -307,7 +335,7 @@ pub(crate) fn icon_button(ui: &mut egui::Ui, icon: &str) -> egui::Response {
         ui.painter(),
         rect.shrink(10.0),
         icon,
-        egui::Color32::from_rgb(0x20, 0x24, 0x2D),
+        crate::theme::palette().text,
     );
     response
 }
@@ -328,7 +356,7 @@ pub(crate) fn language_button(ui: &mut egui::Ui, label: &str, active: bool) -> e
             egui::RichText::new(label)
                 .size(13.0)
                 .strong()
-                .color(egui::Color32::from_rgb(0x20, 0x24, 0x2D)),
+                .color(crate::theme::palette().text),
         )
         .min_size(egui::vec2(56.0, 34.0))
         .fill(fill)
@@ -539,17 +567,17 @@ pub(crate) fn recent_chip(ui: &mut egui::Ui, label: &str) -> egui::Response {
     let galley = ui.painter().layout_no_wrap(
         label.to_owned(),
         egui::FontId::proportional(13.0),
-        egui::Color32::from_rgb(0x20, 0x24, 0x2D),
+        crate::theme::palette().text,
     );
     let w = galley.size().x + pad_x * 2.0;
     let (rect, response) = ui.allocate_exact_size(egui::vec2(w, 30.0), egui::Sense::click());
     let fill = if response.hovered() {
-        egui::Color32::from_rgb(0xEC, 0xFD, 0xF3) // зеленоватый hover
+        crate::theme::accent_tint(&crate::theme::palette(), 0.16) // зеленоватый hover
     } else {
         crate::theme::palette().surface_raised
     };
     let stroke = if response.hovered() {
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(0x12, 0xC9, 0x72))
+        egui::Stroke::new(1.0, crate::theme::palette().accent)
     } else {
         egui::Stroke::new(1.0, crate::theme::palette().border)
     };

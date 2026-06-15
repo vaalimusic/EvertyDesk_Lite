@@ -1513,6 +1513,18 @@ impl HyperVSession {
                 let mut frame_count: u32 = 0;
                 let mut fps_window_start = std::time::Instant::now();
 
+                // ── Гистерезис разрешения ────────────────────────────────────
+                // Раньше разрешение качалось: снизили → меньше пикселей → ema
+                // упал < 200 → восстановили → ema вырос > 500 → снизили. Цикл.
+                //
+                // Решение: `ceiling_w` — потолок, выше которого НЕ поднимаемся.
+                // Когда WMI оказался медленным на каком-то уровне, запоминаем
+                // его как «плохой» и больше туда не возвращаемся. Плюс cooldown
+                // между повышениями, чтобы измерения успели устаканиться.
+                let mut ceiling_w: u16 = width; // максимально допустимая ширина
+                let mut upscale_cooldown: u32 = 0; // кадров до возможного повышения
+                const COOLDOWN_FRAMES: u32 = 60; // ~3 c при 20 fps
+
                 loop {
                     // Capture thread exits when stop_flag is set (by HyperVSession::stop).
                     if stop_flag_cap.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1527,18 +1539,35 @@ impl HyperVSession {
                             let cap_ms = cap_t0.elapsed().as_millis() as f32;
                             capture_ema_ms = capture_ema_ms * 0.75 + cap_ms * 0.25;
 
-                            // Adaptive resolution
-                            if capture_ema_ms > 500.0 && cur_w > 320 {
-                                cur_w = (cur_w / 2).max(320);
-                                cur_h = (cur_h / 2).max(240);
+                            if upscale_cooldown > 0 {
+                                upscale_cooldown -= 1;
+                            }
+
+                            // Снижение: WMI медленный → текущий уровень «плохой».
+                            // Запоминаем потолок чуть ниже текущего и снижаемся.
+                            if capture_ema_ms > 450.0 && cur_w > 320 {
+                                // Текущий уровень оказался медленным — не возвращаемся
+                                // к нему: потолок = на шаг ниже текущей ширины.
+                                ceiling_w = ceiling_w.min(cur_w.saturating_sub(1));
+                                cur_w = (cur_w * 2 / 3).max(320);
+                                cur_h = (cur_h * 2 / 3).max(240);
+                                upscale_cooldown = COOLDOWN_FRAMES;
                                 let _ = status_tx.try_send(format!(
-                                    "WMI медленно ({:.0}ms) — снижаю разрешение до {}×{}",
-                                    capture_ema_ms, cur_w, cur_h
+                                    "WMI медленно ({:.0}ms) — снижаю до {}×{} (потолок {})",
+                                    capture_ema_ms, cur_w, cur_h, ceiling_w
                                 ));
-                                capture_ema_ms = 300.0;
-                            } else if capture_ema_ms < 200.0 && cur_w < width {
-                                cur_w = (cur_w * 3 / 2).min(width);
-                                cur_h = (cur_h * 3 / 2).min(height);
+                                capture_ema_ms = 250.0;
+                            }
+                            // Повышение: только если WMI стабильно быстрый, есть
+                            // запас под потолком, и прошёл cooldown. Шаг мягкий.
+                            else if capture_ema_ms < 150.0
+                                && cur_w < ceiling_w
+                                && upscale_cooldown == 0
+                            {
+                                cur_w = (cur_w * 5 / 4).min(ceiling_w);
+                                cur_h = (cur_h * 5 / 4).min(height);
+                                upscale_cooldown = COOLDOWN_FRAMES;
+                                capture_ema_ms = 250.0; // сброс, чтобы переизмерить
                             }
 
                             // FPS counter every 5s

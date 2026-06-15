@@ -2880,7 +2880,7 @@ impl EvertyDeskApp {
                         self.text("Готов к подключению", "Ready to connect")
                     })
                     .size(16.0)
-                    .color(egui::Color32::from_rgb(0x20, 0x24, 0x2D)),
+                    .color(crate::theme::palette().text),
                 );
             });
         });
@@ -2941,7 +2941,7 @@ impl EvertyDeskApp {
         let cap_galley = ui.painter().layout_no_wrap(
             cap_label.to_owned(),
             egui::FontId::proportional(12.5),
-            egui::Color32::from_rgb(0xE8, 0xF5, 0xEF),
+            crate::theme::palette().accent_fg,
         );
         let cap_right = rect.right() - pad;
         let dot_x = cap_right - cap_galley.size().x - 13.0;
@@ -3108,6 +3108,7 @@ impl EvertyDeskApp {
                             self.connect();
                         }
 
+                        ui.add_space(theme::space::SM);
                         // ── Чипы недавних подключений (быстрый коннект) ───────
                         self.recent_chips(ui);
                     });
@@ -3528,7 +3529,7 @@ impl EvertyDeskApp {
                         _ => egui::Color32::from_rgb(0xFF, 0xA5, 0x00),
                     };
                     let row_fill = if is_active {
-                        egui::Color32::from_rgb(0xE8, 0xF0, 0xFE)
+                        crate::theme::accent_tint(&crate::theme::palette(), 0.16)
                     } else {
                         egui::Color32::TRANSPARENT
                     };
@@ -4360,7 +4361,7 @@ impl EvertyDeskApp {
                         "A remote user wants to connect without a password.",
                     ))
                     .size(15.0)
-                    .color(egui::Color32::from_rgb(0x20, 0x24, 0x2D)),
+                    .color(crate::theme::palette().text),
                 );
                 ui.add_space(10.0);
                 ui.label(
@@ -5590,7 +5591,7 @@ impl EvertyDeskApp {
                     ui,
                     Some(fps_dot),
                     &format!("{:.0} fps", self.display_fps),
-                    egui::Color32::from_rgb(0xE8, 0xEE, 0xF6),
+                    crate::theme::palette().surface_raised,
                 );
                 ui.add_space(6.0);
                 // Кодек
