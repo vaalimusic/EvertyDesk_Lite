@@ -588,10 +588,12 @@ pub fn capture_screen(vm_id: &str, vm_wmi_path: &str, width: u16, height: u16) -
         .exec_method_result(
             &svc_path,
             "GetVirtualSystemThumbnailImage",
+            // WidthPixels/HeightPixels — CIM uint16, но этот провайдер требует
+            // VARIANT VT_I4 (VT_UI2 → WBEM_E_TYPE_MISMATCH 0x80041005).
             &[
                 ("TargetSystem", WmiVal::Str(setting_path.clone())),
-                ("WidthPixels", WmiVal::U16(width)),
-                ("HeightPixels", WmiVal::U16(height)),
+                ("WidthPixels", WmiVal::I32(width as i32)),
+                ("HeightPixels", WmiVal::I32(height as i32)),
             ],
         )
         .map_err(|e| format!("GetThumbnail [{e}]; svc={svc_path}; target={setting_path}"))?;
@@ -720,7 +722,8 @@ pub fn type_text(vm_id: &str, text: &str) {
 fn kbd_exec(vm_id: &str, method: &str, scan_code: u32) {
     let Some(wmi) = Wmi::connect() else { return };
     let Some(path) = find_device_path(&wmi, "Msvm_Keyboard", vm_id) else { return };
-    let _ = wmi.exec_method(&path, method, &[("scanCode", WmiVal::U32(scan_code))]);
+    // VT_I4: провайдер виртуализации отвергает VT_UI4 (WBEM_E_TYPE_MISMATCH).
+    let _ = wmi.exec_method(&path, method, &[("scanCode", WmiVal::I32(scan_code as i32))]);
 }
 
 /// x, y in 0–65535 (normalized to VM display).
@@ -742,7 +745,7 @@ pub fn click_mouse(vm_id: &str, button: u32, press: bool) {
     let Some(wmi) = Wmi::connect() else { return };
     let Some(path) = find_device_path(&wmi, "Msvm_Mouse", vm_id) else { return };
     let method = if press { "ClickButton" } else { "ReleaseButton" };
-    let _ = wmi.exec_method(&path, method, &[("buttonIndex", WmiVal::U32(button))]);
+    let _ = wmi.exec_method(&path, method, &[("buttonIndex", WmiVal::I32(button as i32))]);
 }
 
 fn find_device_path(wmi: &Wmi, class: &str, vm_id: &str) -> Option<String> {
