@@ -214,12 +214,14 @@ impl WmiVal {
         }
     }
     fn as_u32(&self) -> Option<u32> {
-        if let Self::U32(v) = self {
-            Some(*v)
-        } else if let Self::U16(v) = self {
-            Some(*v as u32)
-        } else {
-            None
+        match self {
+            Self::U32(v) => Some(*v),
+            Self::U16(v) => Some(*v as u32),
+            // WMI часто отдаёт CIM uint16/uint32 (EnabledState, разрешение видео)
+            // как VARIANT VT_I4 → WmiVal::I32. Без этого state = Other(0),
+            // connectable = false, кнопка «Подключиться» неактивна.
+            Self::I32(v) => u32::try_from(*v).ok(),
+            _ => None,
         }
     }
     fn as_bytes(&self) -> Option<&[u8]> {
