@@ -538,6 +538,12 @@ fn dispatch_key(vm_id: &str, ev: &crate::rustdesk_proto::KeyEvent) {
                 // VK-код клавиши: ASCII-пунктуация/буквы, затем JCUKEN-кириллица.
                 let vk = ascii_scancode(c).or_else(|| cyrillic_to_vk(c));
 
+                // ДИАГНОСТИКА: показываем что реально пришло и что отправим.
+                note_input(&format!(
+                    "U+{:04X} '{}' press={} down={} mods={:?} shift={} vk={:?}",
+                    *ch, c, ev.press, ev.down, mods, needs_shift(c), vk
+                ));
+
                 match vk {
                     Some(vk_code) => {
                         const VK_SHIFT: u32 = 0x10;
