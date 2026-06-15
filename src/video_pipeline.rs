@@ -731,6 +731,12 @@ fn encode_loop(
     const IDR_MIN: Duration = Duration::from_millis(1_200);
     const SPIN: Duration = Duration::from_micros(1_500);
 
+    // VM-режим: отслеживаем frame_seq из vm_bridge.
+    // Когда WMI прислал новый кадр (seq изменился) — обходим change_detector
+    // и форсируем отправку. Это устраняет задержку 0–1200ms (IDR-таймер)
+    // при вводе текста в терминал, где dirty_area < порога change_detector.
+    let mut last_vm_seq: u64 = 0;
+
     while !stop.load(Ordering::Relaxed) {
         if software_profile_active {
             let current = target_fps.load(Ordering::Relaxed);
@@ -804,15 +810,37 @@ fn encode_loop(
             None => &bgra_raw,
         };
 
+        // ── VM-режим: bypass change_detector когда WMI прислал новый кадр ───
+        // WMI thumbnail обновляется медленно (~3fps). Обычный change_detector
+        // пропускает мелкие изменения текста (dirty_area < 8% порога) и не
+        // отправляет кадр до следующего IDR (до 1200ms). В терминале без GUI
+        // это делает ввод "невидимым" на 1-2 секунды после нажатия клавиши.
+        // Решение: если seq изменился — WMI дал НОВЫЙ кадр → отправляем сразу.
+        let vm_seq_changed = match crate::vm_bridge::vm_frame_seq() {
+            Some(seq) => {
+                if seq != last_vm_seq {
+                    last_vm_seq = seq;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => false,
+        };
+
         // ── Детекция изменений: пропускаем статичные кадры ────────────────────
         let change_started = Instant::now();
-        let decision = change_detector.decide(enc_w, enc_h, bgra, periodic_key);
+        let decision = change_detector.decide(enc_w, enc_h, bgra, periodic_key || vm_seq_changed);
         tele.mark_change(change_started.elapsed());
 
-        if !decision.send && allow_static_skip {
+        // В VM-режиме: если новый WMI-кадр — никогда не скипаем и не засыпаем.
+        let skip_allowed = allow_static_skip && !vm_seq_changed;
+
+        if !decision.send && skip_allowed {
             // Кадр не изменился — не кодируем, не шлём. Экономия трафика и CPU.
             tele.mark_skipped();
-            // Backoff при долгой статике — снижаем частоту опроса
+            // Backoff при долгой статике — снижаем частоту опроса.
+            // В VM-режиме backoff НЕ применяется (vm_seq_changed отключил skip_allowed).
             if let Some(delay) = change_detector.static_backoff_delay(fps) {
                 thread::sleep(delay);
             }

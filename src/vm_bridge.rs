@@ -35,6 +35,13 @@ struct Shared {
     /// Последний кадр VM в формате BGRA (как ждёт энкодер pipeline).
     bgra: Vec<u8>,
     have_frame: bool,
+    /// Монотонный счётчик кадров VM: инкрементируется каждый раз, когда WMI
+    /// прислал НОВЫЙ кадр. Video pipeline сравнивает с last_vm_seq и если
+    /// изменился — немедленно отправляет (обходит change_detector).
+    /// Решает проблему: символы в терминале занимают < 0.1% пикселей,
+    /// ниже порога dirty_area_milli=80 → раньше никогда не отправлялись
+    /// раньше IDR-таймера (1200ms).
+    frame_seq: u64,
     status: String,
     /// Последняя заметка о вводе (ошибка инжекта мыши/клавы) — для диагностики.
     input_note: String,
@@ -53,6 +60,7 @@ impl Default for Shared {
             height: 0,
             bgra: Vec::new(),
             have_frame: false,
+            frame_seq: 0,
             status: String::new(),
             input_note: String::new(),
             #[cfg(windows)]
@@ -164,6 +172,21 @@ pub fn active_frame(out: &mut Vec<u8>) -> Option<(u32, u32)> {
     Some((s.width, s.height))
 }
 
+/// Возвращает монотонный счётчик WMI-кадров VM.
+///
+/// Используется в video_pipeline для bypass change_detector:
+/// если seq изменился с момента последнего вызова — WMI прислал НОВЫЙ кадр
+/// → форсируем отправку, не ждём IDR-таймера (1200ms).
+///
+/// Возвращает `None` если VM не присоединена.
+pub fn vm_frame_seq() -> Option<u64> {
+    let s = state().lock().ok()?;
+    if s.attached_id.is_none() || !s.have_frame {
+        return None;
+    }
+    Some(s.frame_seq)
+}
+
 /// Роутинг мыши: если VM активна — отправляет в VM и возвращает `true`
 /// (хост НЕ инжектит событие в свою ОС).
 pub fn route_mouse(ev: &crate::rustdesk_proto::MouseEvent) -> bool {
@@ -257,6 +280,7 @@ fn begin_attach(provider: &str, id: &str, name: &str) -> Result<u64, String> {
 }
 
 /// Обновить кадр активной VM (если эпоха ещё актуальна).
+/// Инкрементирует frame_seq — video pipeline использует его для bypass change_detector.
 fn push_frame(gen: u64, w: u32, h: u32, bgra: Vec<u8>) {
     if let Ok(mut s) = state().lock() {
         if s.generation == gen {
@@ -264,6 +288,7 @@ fn push_frame(gen: u64, w: u32, h: u32, bgra: Vec<u8>) {
             s.height = h;
             s.bgra = bgra;
             s.have_frame = true;
+            s.frame_seq = s.frame_seq.wrapping_add(1);
         }
     }
 }
@@ -418,6 +443,7 @@ fn pump_loop(vm: hyperv::VmInfo, gen: u64) {
                     s.height = frame.height;
                     s.bgra = bgra;
                     s.have_frame = true;
+                    s.frame_seq = s.frame_seq.wrapping_add(1);
                 }
             }
         }
