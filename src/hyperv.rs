@@ -6,6 +6,11 @@
 
 use std::{collections::HashMap, mem::ManuallyDrop, sync::mpsc, time::Duration};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 use windows::{
     core::{BSTR, PCWSTR},
     Win32::{
@@ -504,10 +509,11 @@ fn list_vmware_vms() -> Vec<VmInfo> {
     let Some(vmrun) = find_vmrun() else {
         return Vec::new();
     };
-    let Ok(out) = std::process::Command::new(&vmrun)
-        .arg("list")
-        .output()
-    else {
+    let mut vm_cmd = std::process::Command::new(&vmrun);
+    vm_cmd.arg("list");
+    #[cfg(windows)]
+    vm_cmd.creation_flags(CREATE_NO_WINDOW);
+    let Ok(out) = vm_cmd.output() else {
         return Vec::new();
     };
     String::from_utf8_lossy(&out.stdout)
@@ -533,11 +539,11 @@ fn list_vmware_vms() -> Vec<VmInfo> {
 }
 
 fn find_vmrun() -> Option<String> {
-    if std::process::Command::new("vmrun")
-        .arg("list")
-        .output()
-        .is_ok()
-    {
+    let mut probe = std::process::Command::new("vmrun");
+    probe.arg("list");
+    #[cfg(windows)]
+    probe.creation_flags(CREATE_NO_WINDOW);
+    if probe.output().is_ok() {
         return Some("vmrun".to_owned());
     }
     for path in [
@@ -617,17 +623,18 @@ Get-CimInstance -Namespace root\virtualization\v2 -ClassName Msvm_ComputerSystem
   ConvertTo-Json -Depth 2
 "#;
 
-    let Ok(output) = std::process::Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script,
-        ])
-        .output()
-    else {
+    let mut ps_cmd = std::process::Command::new("powershell.exe");
+    ps_cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        script,
+    ]);
+    #[cfg(windows)]
+    ps_cmd.creation_flags(CREATE_NO_WINDOW);
+    let Ok(output) = ps_cmd.output() else {
         return Vec::new();
     };
 

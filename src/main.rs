@@ -1187,8 +1187,11 @@ struct EvertyDeskApp {
     /// Hyper-V (local) + FakeProviders registered at startup for multi-provider demo.
     provider_registry: std::sync::Arc<provider_api::ProviderRegistry>,
     /// Кэш снимка дашборда — чтобы не вызывать провайдеры (WMI/VBoxManage)
-    /// на каждом кадре. Пересобирается раз в несколько секунд.
+    /// на каждом кадре. Пересобирается раз в несколько секунд в фоновом потоке.
     dashboard_snapshot: Option<DashSnapshot>,
+    /// Канал от фонового rebuild дашборда — None когда rebuild не запущен.
+    #[cfg(windows)]
+    dashboard_load_rx: Option<mpsc::Receiver<DashSnapshot>>,
 
     // ── Remote VM control panels ──────────────────────────────────────────────
     /// VM id для которой открыта панель управления (power / checkpoint / rescue).
@@ -1485,6 +1488,8 @@ impl EvertyDeskApp {
                 Arc::new(ProviderRegistry::new())
             },
             dashboard_snapshot: None,
+            #[cfg(windows)]
+            dashboard_load_rx: None,
             remote_ctrl_vm_id: String::new(),
             remote_power_panel_open: false,
             remote_checkpoint_panel_open: false,
@@ -4151,60 +4156,73 @@ impl EvertyDeskApp {
     }
 
     /// Universal Provider Dashboard — shows all registered providers and their VMs.
-    /// ADR-001: UI reads CapabilityGraph, not provider-specific fields.
-    /// §51 plan: multi-provider dashboard.
+    /// Запустить фоновый rebuild дашборда. Вызовы провайдеров (WMI/VBoxManage)
+    /// происходят в отдельном потоке — UI не блокируется.
     #[cfg(windows)]
-    /// Пересобрать снимок дашборда (синхронные вызовы провайдеров). Дорого —
-    /// вызывается не чаще раза в несколько секунд из universal_provider_dashboard_ui.
-    fn rebuild_dashboard_snapshot(&mut self) {
-        let providers = self.provider_registry.all();
-        let mut out = Vec::with_capacity(providers.len());
-        let mut total_vms = 0usize;
-        for p in &providers {
-            let reachable = p.list_hosts().is_ok();
-            let hosts = p.list_hosts().unwrap_or_default();
-            let mut vms = Vec::new();
-            for host in &hosts {
-                for vm in p.list_vms(&host.host_id).unwrap_or_default() {
-                    total_vms += 1;
-                    // Сначала все заимствования vm, потом перемещение power_state.
-                    let badge = p.get_capabilities(&vm.vm_id).ok().map(|g| {
-                        (g.recommended_mode.label().to_owned(), g.recommended_mode.badge_rgb())
-                    });
-                    let ip = vm.primary_ip().map(|s| s.to_owned());
-                    let name = vm.name.clone();
-                    vms.push(DashVm {
-                        name,
-                        power_state: vm.power_state,
-                        badge,
-                        ip,
-                    });
-                }
-            }
-            out.push(DashProvider {
-                ptype: p.provider_type(),
-                pid: p.provider_id().to_owned(),
-                reachable,
-                vms,
-            });
+    fn start_dashboard_rebuild(&mut self) {
+        if self.dashboard_load_rx.is_some() {
+            return; // уже в процессе
         }
-        self.dashboard_snapshot = Some(DashSnapshot {
-            at: std::time::Instant::now(),
-            providers: out,
-            total_vms,
+        let registry = Arc::clone(&self.provider_registry);
+        let (tx, rx) = mpsc::channel();
+        self.dashboard_load_rx = Some(rx);
+        thread::spawn(move || {
+            let providers = registry.all();
+            let mut out = Vec::with_capacity(providers.len());
+            let mut total_vms = 0usize;
+            for p in &providers {
+                let reachable = p.list_hosts().is_ok();
+                let hosts = p.list_hosts().unwrap_or_default();
+                let mut vms = Vec::new();
+                for host in &hosts {
+                    for vm in p.list_vms(&host.host_id).unwrap_or_default() {
+                        total_vms += 1;
+                        let badge = p.get_capabilities(&vm.vm_id).ok().map(|g| {
+                            (g.recommended_mode.label().to_owned(), g.recommended_mode.badge_rgb())
+                        });
+                        let ip = vm.primary_ip().map(|s| s.to_owned());
+                        let name = vm.name.clone();
+                        vms.push(DashVm {
+                            name,
+                            power_state: vm.power_state,
+                            badge,
+                            ip,
+                        });
+                    }
+                }
+                out.push(DashProvider {
+                    ptype: p.provider_type(),
+                    pid: p.provider_id().to_owned(),
+                    reachable,
+                    vms,
+                });
+            }
+            let _ = tx.send(DashSnapshot {
+                at: std::time::Instant::now(),
+                providers: out,
+                total_vms,
+            });
         });
     }
 
     #[cfg(windows)]
     fn universal_provider_dashboard_ui(&mut self, ui: &mut egui::Ui) {
-        // Обновляем снимок не чаще раза в 5 секунд (а не каждый кадр).
+        // Собираем результат фонового rebuild если готов.
+        if let Some(rx) = &self.dashboard_load_rx {
+            if let Ok(snap) = rx.try_recv() {
+                self.dashboard_snapshot = Some(snap);
+                self.dashboard_load_rx = None;
+            }
+        }
+
+        // Запускаем фоновый rebuild если снимок устарел и rebuild не идёт.
         let stale = self
             .dashboard_snapshot
             .as_ref()
-            .map(|s| s.at.elapsed() > Duration::from_secs(5))
+            .map(|s| s.at.elapsed() > Duration::from_secs(10))
             .unwrap_or(true);
-        if stale {
-            self.rebuild_dashboard_snapshot();
+        if stale && self.dashboard_load_rx.is_none() {
+            self.start_dashboard_rebuild();
         }
         let Some(snapshot) = &self.dashboard_snapshot else { return; };
 

@@ -18,6 +18,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+/// CREATE_NO_WINDOW — подавляет мигание CMD-окна при запуске дочерних процессов.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 #[derive(Debug, Clone)]
 pub struct VboxVm {
     /// UUID машины (стабильный id для controlvm).
@@ -35,6 +42,8 @@ const VBOX_CMD_TIMEOUT: Duration = Duration::from_secs(6);
 /// Запустить команду с таймаутом. None при ошибке запуска ИЛИ при таймауте
 /// (процесс убивается). Никогда не блокирует дольше `timeout`.
 fn output_timeout(mut cmd: Command, timeout: Duration) -> Option<Output> {
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
