@@ -532,52 +532,40 @@ fn dispatch_key(vm_id: &str, ev: &crate::rustdesk_proto::KeyEvent) {
             Some(Union::Unicode(ch)) => {
                 if *ch == 0 { return Ok(()); }
                 let Some(c) = char::from_u32(*ch) else { return Ok(()); };
+                // Печатаемый символ обрабатываем только на нажатии — атомарно.
+                if !(ev.press || ev.down) { return Ok(()); }
 
-                // VK-код клавиши: сначала ASCII-пунктуация/буквы, потом JCUKEN-кириллица.
-                // TypeText больше НЕ используется для одиночных символов:
-                //   TypeText("с") → WMI делает VkKeyScanW на хосте → неожиданный
-                //   символ ('~') или ничего. PressKey/ReleaseKey даёт VM сырой VK-код
-                //   и VM сама декодирует по своей раскладке.
+                // VK-код клавиши: ASCII-пунктуация/буквы, затем JCUKEN-кириллица.
                 let vk = ascii_scancode(c).or_else(|| cyrillic_to_vk(c));
 
                 match vk {
                     Some(vk_code) => {
-                        // Различаем два режима отправки:
-                        //
-                        // ev.press=true — "атомарное" нажатие от клиента (press+release одним
-                        //   пакетом). Модификаторы из ev.modifiers нужно обработать явно здесь,
-                        //   потому что для такого события не будет отдельных ControlKey-событий.
-                        //
-                        // ev.down/up пара — реальные key-down / key-up. Модификаторы (Shift,
-                        //   Ctrl, Alt) уже обработаны их собственными ControlKey-событиями.
-                        //   Здесь мы их НЕ трогаем — иначе Shift нажимается дважды, а потом
-                        //   преждевременно отпускается на key-up символа, хотя оператор ещё
-                        //   держит Shift. Это была причина лишних заглавных букв.
-                        if ev.press {
-                            // Атомарное нажатие: жмём модификаторы + клавишу, потом отпускаем.
-                            mods.iter().for_each(|m| send_press(*m));
-                            send_press(vk_code);
-                            send_release(vk_code);
-                            mods.iter().rev().for_each(|m| send_release(*m));
-                        } else if ev.down {
-                            // Key-down: только саму клавишу — модификаторы уже нажаты.
-                            send_press(vk_code);
-                        } else {
-                            // Key-up: только саму клавишу — модификаторы отпустятся своими событиями.
-                            send_release(vk_code);
-                        }
+                        const VK_SHIFT: u32 = 0x10;
+
+                        // КРИТИЧНО: Shift НЕ берём из ev.modifiers и не полагаемся на
+                        // отдельные ControlKey(Shift)-события. Раньше Shift "залипал" в VM
+                        // (down приходил, up терялся) → всё печаталось заглавными, а реальный
+                        // Shift инвертировал в строчные. Теперь регистр определяем из САМОГО
+                        // символа и сами держим Shift ровно вокруг одного символа.
+                        let shift_needed = needs_shift(c);
+
+                        // Из внешних модификаторов оставляем только Ctrl/Alt/Meta
+                        // (для сочетаний Ctrl+C и т.п.), Shift игнорируем — он наш.
+                        let non_shift_mods: Vec<u32> =
+                            mods.iter().copied().filter(|&m| m != VK_SHIFT).collect();
+
+                        // Атомарно: [Ctrl/Alt][Shift] key↓ key↑ [Shift][Ctrl/Alt]
+                        non_shift_mods.iter().for_each(|m| send_press(*m));
+                        if shift_needed { send_press(VK_SHIFT); }
+                        send_press(vk_code);
+                        send_release(vk_code);
+                        if shift_needed { send_release(VK_SHIFT); }
+                        non_shift_mods.iter().rev().for_each(|m| send_release(*m));
                     }
                     None => {
-                        // Нет VK-маппинга (emoji, нестандартный Unicode и т.п.).
-                        // TypeText как last-resort только для ASCII-графики.
-                        if (ev.press || ev.down) && c.is_ascii_graphic() {
-                            if ev.press {
-                                mods.iter().for_each(|m| send_press(*m));
-                            }
+                        // Нет VK-маппинга (emoji и т.п.) — TypeText как last-resort для ASCII.
+                        if c.is_ascii_graphic() {
                             send_text(c.to_string());
-                            if ev.press {
-                                mods.iter().rev().for_each(|m| send_release(*m));
-                            }
                         }
                     }
                 }
@@ -635,6 +623,31 @@ fn control_key_scancode(ck: i32) -> Option<u32> {
         72 => 0x0D, // NumpadEnter→ VK_RETURN
         _ => return None,
     })
+}
+
+/// Нужен ли Shift чтобы получить данный символ на US-раскладке.
+///
+/// Регистр выводится из самого Unicode-символа, а не из внешних модификаторов —
+/// это устраняет проблему "залипшего Shift" (всё печаталось заглавными).
+///
+///   'A'..'Z'  → true   (заглавные буквы)
+///   'a'..'z'  → false
+///   '!@#$%^&*()_+{}:"~<>?|'  → true  (Shift-символы верхнего ряда/пунктуации)
+///   '1234567890-=[];'`,./\\' → false (базовые)
+///   Кириллица: регистр по c.is_uppercase()
+#[cfg(windows)]
+fn needs_shift(c: char) -> bool {
+    match c {
+        'A'..='Z' => true,
+        'a'..='z' => false,
+        '!' | '@' | '#' | '$' | '%' | '^' | '&' | '*' | '(' | ')'
+        | '_' | '+' | '{' | '}' | ':' | '"' | '~' | '<' | '>' | '?' | '|' => true,
+        '0'..='9' => false,
+        '-' | '=' | '[' | ']' | ';' | '\'' | '`' | ',' | '.' | '/' | '\\'
+        | ' ' | '\t' => false,
+        // Кириллица и прочее: по регистру самого символа.
+        _ => c.is_uppercase(),
+    }
 }
 
 /// Символ → Windows VK-код физической клавиши (US QWERTY раскладка).
