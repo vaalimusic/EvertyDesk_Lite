@@ -120,6 +120,39 @@ pub fn is_available() -> bool {
     vboxmanage().is_some()
 }
 
+/// Запустить VM в фоне (headless). Не блокирует UI.
+pub fn start_vm(uuid: &str) {
+    let uuid = uuid.to_owned();
+    thread::spawn(move || {
+        let Some(vbm) = vboxmanage() else { return; };
+        let mut cmd = Command::new(&vbm);
+        cmd.args(["startvm", &uuid, "--type", "headless"]);
+        let _ = output_timeout(cmd, Duration::from_secs(30));
+    });
+}
+
+/// Выключить VM (poweroff) в фоне.
+pub fn stop_vm(uuid: &str) {
+    let uuid = uuid.to_owned();
+    thread::spawn(move || {
+        let Some(vbm) = vboxmanage() else { return; };
+        let mut cmd = Command::new(&vbm);
+        cmd.args(["controlvm", &uuid, "poweroff"]);
+        let _ = output_timeout(cmd, Duration::from_secs(15));
+    });
+}
+
+/// Сброс (жёсткий ребут) VM в фоне.
+pub fn reset_vm(uuid: &str) {
+    let uuid = uuid.to_owned();
+    thread::spawn(move || {
+        let Some(vbm) = vboxmanage() else { return; };
+        let mut cmd = Command::new(&vbm);
+        cmd.args(["controlvm", &uuid, "reset"]);
+        let _ = output_timeout(cmd, Duration::from_secs(15));
+    });
+}
+
 /// Список VM VirtualBox с отметкой running.
 pub fn list_vms() -> Vec<VboxVm> {
     let Some(vbm) = vboxmanage() else {

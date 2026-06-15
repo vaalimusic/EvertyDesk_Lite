@@ -3404,7 +3404,7 @@ impl EvertyDeskApp {
             // Coloured status indicator
             let (r, g, b) = self.host_state.color();
             let dot_color = egui::Color32::from_rgb(r, g, b);
-            ui.colored_label(dot_color, "●");
+            paint_status_dot(ui, dot_color);
             ui.label(self.host_state.label());
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3694,7 +3694,7 @@ impl EvertyDeskApp {
                         .inner_margin(egui::Margin::symmetric(8, 6))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                ui.colored_label(state_color, "●");
+                                paint_status_dot(ui, state_color);
                                 ui.label(egui::RichText::new(&vm.name).strong());
                                 ui.label(
                                     egui::RichText::new(vm.state.label())
@@ -3795,6 +3795,34 @@ impl EvertyDeskApp {
                                                         .clicked()
                                                     {
                                                         hyperv::request_power_action(&vm_path, hyperv::VmPowerAction::Restart);
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        if matches!(vm.provider, hyperv::VmProvider::VirtualBox) {
+                                            let vm_uuid = vm.id.clone();
+                                            match vm.state {
+                                                hyperv::VmState::Off => {
+                                                    if ui.small_button("Старт")
+                                                        .on_hover_text("Запустить VM (headless)")
+                                                        .clicked()
+                                                    {
+                                                        virtualbox::start_vm(&vm_uuid);
+                                                    }
+                                                }
+                                                hyperv::VmState::Running => {
+                                                    if ui.small_button("Стоп")
+                                                        .on_hover_text("Выключить VM (poweroff)")
+                                                        .clicked()
+                                                    {
+                                                        virtualbox::stop_vm(&vm_uuid);
+                                                    }
+                                                    if ui.small_button("Ребут")
+                                                        .on_hover_text("Перезапустить VM (reset)")
+                                                        .clicked()
+                                                    {
+                                                        virtualbox::reset_vm(&vm_uuid);
                                                     }
                                                 }
                                                 _ => {}
@@ -3910,7 +3938,7 @@ impl EvertyDeskApp {
             return;
         }
 
-        if self.hyperv_session.is_none() {
+        if self.hyperv_session.is_none() && self.vbox_session.is_none() {
             return;
         }
         ui.separator();
@@ -3919,6 +3947,13 @@ impl EvertyDeskApp {
             if let Some(vm_idx) = self.hyperv_console_vm {
                 let vm_name = self.hyperv_vms.get(vm_idx).map(|v| v.name.as_str()).unwrap_or("VM");
                 ui.label(egui::RichText::new(format!("Консоль: {vm_name}")).size(13.0).strong());
+            }
+            if self.vbox_session.is_some() {
+                ui.label(
+                    egui::RichText::new("VirtualBox — захват экрана")
+                        .small()
+                        .color(crate::theme::palette().text_muted),
+                );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Only show shortcut buttons when a HyperV session is active
@@ -4018,6 +4053,11 @@ impl EvertyDeskApp {
                     session.send(hyperv::HyperVCmd::ReleaseKey(0x12));
                 }
             });
+        }
+        // VBox status line (только когда не hyperv_session)
+        if self.vbox_session.is_some() && !self.hyperv_status.is_empty() {
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new(&self.hyperv_status.clone()).small().color(crate::theme::palette().text_muted));
         }
         ui.add_space(4.0);
 
@@ -4298,7 +4338,8 @@ impl EvertyDeskApp {
                         } else {
                             (crate::theme::palette().danger, "Unavailable")
                         };
-                        ui.colored_label(status_dot, format!("● {status_text}"));
+                        paint_status_dot(ui, status_dot);
+                        ui.colored_label(status_dot, status_text);
                     });
 
                     for vm in &provider.vms {
@@ -4313,7 +4354,7 @@ impl EvertyDeskApp {
                                     (crate::theme::palette().warning, "Paused"),
                                 _ => (crate::theme::palette().text_weak, "Unknown"),
                             };
-                            ui.colored_label(dot_color, "●");
+                            paint_status_dot(ui, dot_color);
                             ui.label(
                                 egui::RichText::new(&vm.name)
                                     .size(12.0)
@@ -5436,7 +5477,7 @@ impl EvertyDeskApp {
                 ui.set_width(ui.available_width());
                 // ── Top row: dot + name/state + action buttons ────────────────
                 ui.horizontal(|ui| {
-                    ui.colored_label(dot, "●");
+                    paint_status_dot(ui, dot);
                     ui.add_space(2.0);
                     ui.vertical(|ui| {
                         let name = vm_name.split(" · ").next().unwrap_or(&vm_name);
@@ -5488,7 +5529,7 @@ impl EvertyDeskApp {
                         |ui| {
                             if is_attached {
                                 ui.label(
-                                    egui::RichText::new("● подключено")
+                                    egui::RichText::new("подключено")
                                         .size(11.0)
                                         .color(crate::theme::palette().success),
                                 );
@@ -7604,6 +7645,12 @@ fn run_service_command(action: &str) -> Result<String, String> {
     }
     #[allow(unreachable_code)]
     Err("Service control is not implemented for this OS".to_owned())
+}
+
+/// Рисует цветной круг-индикатор статуса (альтернатива "●" которого нет в NotoSans).
+fn paint_status_dot(ui: &mut egui::Ui, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 4.0, color);
 }
 
 /// A `label … value` row for the This Computer info block.
