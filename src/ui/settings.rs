@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use eframe::egui;
 
 use crate::settings::{
@@ -251,6 +252,10 @@ impl EvertyDeskApp {
             ui.add_space(8.0);
 
             llm_settings_section(ui, selected_lang, draft);
+
+            ui.add_space(8.0);
+
+            hotfix_settings_section(ui, selected_lang, draft);
 
             ui.add_space(8.0);
 
@@ -958,6 +963,132 @@ fn default_config_from(config: &AppConfig) -> AppConfig {
         host_sign_pk: config.host_sign_pk.clone(),
         host_sign_sk: config.host_sign_sk.clone(),
     }
+}
+
+fn hotfix_settings_section(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut AppConfig) {
+    settings_section(
+        ui,
+        tr(selected_lang, "AI Hotfix (авто-исправления)", "AI Hotfix (auto-fixes)"),
+        |ui| {
+            ui.label(
+                egui::RichText::new(tr(
+                    selected_lang,
+                    "Автоматически отправляет краш-отчёты на сервер EvertyDesk и применяет\n\
+                     рекомендованные AI-исправления настроек (FPS, энкодер и т.д.).",
+                    "Automatically reports crashes to the EvertyDesk server and applies\n\
+                     AI-recommended setting fixes (FPS, encoder, etc.).",
+                ))
+                .size(12.0)
+                .color(crate::theme::palette().text_weak),
+            );
+
+            ui.add_space(6.0);
+
+            ui.checkbox(
+                &mut draft.hotfix.enabled,
+                tr(
+                    selected_lang,
+                    "Включить AI Hotfix Pipeline",
+                    "Enable AI Hotfix Pipeline",
+                ),
+            );
+
+            if draft.hotfix.enabled {
+                ui.add_space(4.0);
+
+                settings_secret_row(
+                    ui,
+                    tr(selected_lang, "API ключ", "API key"),
+                    &mut draft.hotfix.api_key,
+                );
+
+                settings_text_row(
+                    ui,
+                    tr(
+                        selected_lang,
+                        "Публичный ключ подписи (Base64)",
+                        "Signing public key (Base64)",
+                    ),
+                    &mut draft.hotfix.signing_public_key,
+                );
+
+                ui.add_space(4.0);
+
+                // Проверка ключа — показываем статус
+                let key_status = if draft.hotfix.signing_public_key.trim().is_empty() {
+                    (
+                        tr(selected_lang, "Ключ подписи не задан — подпись не проверяется", "Signing key not set — signatures won't be verified"),
+                        crate::theme::palette().warn,
+                    )
+                } else {
+                    match base64::engine::general_purpose::STANDARD
+                        .decode(draft.hotfix.signing_public_key.trim())
+                    {
+                        Ok(b) if b.len() == 32 => (
+                            tr(selected_lang, "Ключ корректен (32 байта Ed25519)", "Key valid (32-byte Ed25519)"),
+                            crate::theme::palette().success,
+                        ),
+                        Ok(b) => (
+                            format!(
+                                "{} ({} {})",
+                                tr(selected_lang, "Неверная длина:", "Wrong length:"),
+                                b.len(),
+                                tr(selected_lang, "байт, ожидается 32", "bytes, expected 32")
+                            ),
+                            crate::theme::palette().error,
+                        ),
+                        Err(_) => (
+                            tr(selected_lang, "Ошибка декодирования Base64", "Base64 decode error"),
+                            crate::theme::palette().error,
+                        ),
+                    }
+                };
+
+                ui.horizontal(|ui| {
+                    status_dot(ui, key_status.1);
+                    ui.label(
+                        egui::RichText::new(key_status.0)
+                            .size(11.0)
+                            .color(key_status.1),
+                    );
+                });
+
+                ui.add_space(4.0);
+
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(tr(
+                            selected_lang,
+                            "Минимальный интервал между отчётами (сек):",
+                            "Min interval between reports (sec):",
+                        ))
+                        .size(13.0)
+                        .color(crate::theme::palette().text_weak),
+                    );
+                    let mut rate = draft.hotfix.rate_limit_secs as i32;
+                    if ui
+                        .add(egui::DragValue::new(&mut rate).range(30..=3600).speed(10.0))
+                        .changed()
+                    {
+                        draft.hotfix.rate_limit_secs = rate as u64;
+                    }
+                });
+
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(tr(
+                        selected_lang,
+                        "API ключ и публичный ключ подписи берутся в панели администратора\n\
+                         EvertyDesk → AI Hotfix → Обзор → Интеграция клиента.",
+                        "API key and signing public key are found in the EvertyDesk admin panel\n\
+                         under AI Hotfix → Overview → Client integration.",
+                    ))
+                    .size(11.0)
+                    .color(crate::theme::palette().text_weak),
+                );
+            }
+        },
+    );
 }
 
 /// Small filled circle as a status indicator — avoids Unicode symbols that
