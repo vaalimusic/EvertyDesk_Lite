@@ -2,7 +2,7 @@ use eframe::egui;
 
 use crate::settings::{
     self as settings_mod, AppConfig, CodecPreference, EncoderPreference, FsrQualitySetting,
-    LlmProvider, StreamingMode,
+    LlmProvider, ServerConfig, StreamingMode,
 };
 use crate::ui::widgets::{language_button, settings_section, settings_text_row};
 use crate::{
@@ -49,209 +49,17 @@ impl EvertyDeskApp {
 
                     ui.add_space(8.0);
 
-                    settings_section(ui, tr(selected_lang, "Сеть", "Network"), |ui| {
-                        settings_text_row(
-                            ui,
-                            tr(selected_lang, "ID сервер", "ID server"),
-                            &mut draft.server.id_server,
-                        );
-                        settings_text_row(
-                            ui,
-                            tr(selected_lang, "Relay сервер", "Relay server"),
-                            &mut draft.server.relay_server,
-                        );
-                        settings_text_row(
-                            ui,
-                            tr(selected_lang, "API URL", "API URL"),
-                            &mut draft.server.api_url,
-                        );
-                        settings_text_row(
-                            ui,
-                            tr(selected_lang, "Публичный ключ", "Public key"),
-                            &mut draft.server.public_key,
-                        );
-                    });
+                    network_section(ui, selected_lang, draft);
 
                     ui.add_space(8.0);
 
-                    settings_section(
-                        ui,
-                        tr(selected_lang, "Безопасность", "Security"),
-                        |ui| {
-                            ui.checkbox(
-                                &mut draft.security.require_confirmation,
-                                tr(
-                                    selected_lang,
-                                    "Подтверждать каждое входящее подключение",
-                                    "Confirm every incoming connection",
-                                ),
-                            );
-                            ui.checkbox(
-                                &mut draft.security.allow_keyboard_mouse,
-                                tr(
-                                    selected_lang,
-                                    "Разрешить управление клавиатурой и мышью",
-                                    "Allow keyboard and mouse control",
-                                ),
-                            );
-                            ui.checkbox(
-                                &mut draft.security.allow_clipboard,
-                                tr(
-                                    selected_lang,
-                                    "Разрешить доступ к буферу обмена",
-                                    "Allow clipboard access",
-                                ),
-                            );
-                        },
-                    );
+                    security_section(ui, selected_lang, draft);
 
                     ui.add_space(8.0);
 
                     settings_section(ui, tr(selected_lang, "Видео", "Video"), |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(tr(selected_lang, "Кодек", "Codec"));
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    for codec in codec_preference_order() {
-                                        ui.selectable_value(
-                                            &mut draft.display.codec,
-                                            codec,
-                                            codec.label(),
-                                        );
-                                    }
-                                },
-                            );
-                        });
-                        ui.label(
-                            egui::RichText::new(codec_status_text(draft.display.codec))
-                                .size(12.0)
-                                .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
-                        );
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.label(tr(selected_lang, "Энкодер", "Encoder"));
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    for encoder in encoder_preference_order() {
-                                        ui.selectable_value(
-                                            &mut draft.display.encoder,
-                                            encoder,
-                                            encoder.label(),
-                                        );
-                                    }
-                                },
-                            );
-                        });
-                        ui.label(
-                            egui::RichText::new(crate::video::selected_encoder_label(
-                                draft.display.encoder,
-                            ))
-                            .size(12.0)
-                            .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
-                        );
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.label(tr(selected_lang, "Р РµР¶РёРј", "Mode"));
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    for mode in [
-                                        StreamingMode::Game,
-                                        StreamingMode::Interactive,
-                                        StreamingMode::Support,
-                                    ] {
-                                        ui.selectable_value(
-                                            &mut draft.display.streaming_mode,
-                                            mode,
-                                            mode.label(),
-                                        );
-                                    }
-                                },
-                            );
-                        });
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.label(tr(selected_lang, "Целевой FPS", "Target FPS"));
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    for fps in [60u32, 30, 20, 15] {
-                                        ui.selectable_value(
-                                            &mut draft.display.target_fps,
-                                            fps,
-                                            fps.to_string(),
-                                        );
-                                    }
-                                },
-                            );
-                        });
-                        ui.add_space(6.0);
-                        ui.checkbox(
-                            &mut draft.display.adaptive_quality,
-                            tr(
-                                selected_lang,
-                                "Автоматически снижать FPS при перегрузке декодера",
-                                "Automatically lower FPS when the decoder is overloaded",
-                            ),
-                        );
-                        ui.horizontal(|ui| {
-                            ui.label(tr(selected_lang, "Минимальный FPS", "Minimum FPS"));
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    for fps in [30u32, 20, 15, 10, 5] {
-                                        ui.selectable_value(
-                                            &mut draft.display.min_fps,
-                                            fps,
-                                            fps.to_string(),
-                                        );
-                                    }
-                                },
-                            );
-                        });
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.label("FSR");
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    for quality in fsr_quality_order() {
-                                        ui.selectable_value(
-                                            &mut draft.display.fsr_quality,
-                                            quality,
-                                            quality.label(),
-                                        );
-                                    }
-                                },
-                            );
-                        });
+                        video_settings_body(ui, selected_lang, draft);
                     });
-
-                    ui.add_space(8.0);
-
-                    llm_settings_section(ui, selected_lang, draft);
-
-                    ui.add_space(8.0);
-
-                    settings_section(
-                        ui,
-                        tr(selected_lang, "О программе", "About"),
-                        |ui| {
-                            ui.label(format!("{APP_NAME} v{APP_VERSION}"));
-                            ui.label(tr(
-                                selected_lang,
-                                "RustDesk-совместимый клиент удаленного доступа.",
-                                "RustDesk-compatible remote access client.",
-                            ));
-                            ui.label(format!(
-                                "{}: {}",
-                                tr(selected_lang, "Конфиг", "Config"),
-                                settings_mod::config_path().display()
-                            ));
-                        },
-                    );
                 });
 
                 ui.separator();
@@ -275,7 +83,8 @@ impl EvertyDeskApp {
                             || new_cfg.display.fsr_quality != self.config.display.fsr_quality
                             || (new_cfg.display.fsr_sharpness - self.config.display.fsr_sharpness)
                                 .abs()
-                                > f32::EPSILON;
+                                > f32::EPSILON
+                            || new_cfg.local_password != self.config.local_password;
                         let next_video_fps = new_cfg.display.target_fps.clamp(5, 60) as i32;
                         if host_reconfigure_needed {
                             if let Some(svc) = &self.host_service {
@@ -335,18 +144,18 @@ impl EvertyDeskApp {
                         .strong()
                         .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
                 );
-                ui.add_space(3.0);
+                ui.add_space(2.0);
                 ui.label(
                     egui::RichText::new(self.text(
-                        "Язык, серверы, безопасность, видео и AI терминал",
-                        "Language, servers, security, video and AI terminal",
+                        "Безопасность, видео, сеть и AI терминал",
+                        "Security, video, network and AI terminal",
                     ))
                     .size(13.0)
                     .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
                 );
             });
         });
-        ui.add_space(16.0);
+        ui.add_space(12.0);
 
         let mut selected_lang = self.ui_lang;
         let draft = match self.settings_draft.as_mut() {
@@ -364,9 +173,11 @@ impl EvertyDeskApp {
             current_config.display.streaming_mode,
             current_config.display.fsr_quality,
             current_config.display.fsr_sharpness,
+            current_config.local_password.clone(),
         );
 
         egui::ScrollArea::vertical().show(ui, |ui| {
+            // ── General ──────────────────────────────────────────────────────
             settings_section(ui, tr(selected_lang, "Общие", "General"), |ui| {
                 ui.horizontal(|ui| {
                     ui.label(tr(selected_lang, "Язык интерфейса", "Interface language"));
@@ -379,7 +190,7 @@ impl EvertyDeskApp {
                         }
                     });
                 });
-                ui.add_space(8.0);
+                ui.add_space(6.0);
                 ui.checkbox(
                     &mut draft.ui.show_connection_details,
                     tr(
@@ -391,170 +202,40 @@ impl EvertyDeskApp {
             });
 
             ui.add_space(8.0);
-            settings_section(ui, tr(selected_lang, "Сеть", "Network"), |ui| {
-                settings_text_row(
-                    ui,
-                    tr(selected_lang, "ID сервер", "ID server"),
-                    &mut draft.server.id_server,
-                );
-                settings_text_row(
-                    ui,
-                    tr(selected_lang, "Relay сервер", "Relay server"),
-                    &mut draft.server.relay_server,
-                );
-                settings_text_row(
-                    ui,
-                    tr(selected_lang, "API URL", "API URL"),
-                    &mut draft.server.api_url,
-                );
-                settings_text_row(
-                    ui,
-                    tr(selected_lang, "Публичный ключ", "Public key"),
-                    &mut draft.server.public_key,
-                );
-            });
+
+            // ── Security (with password) ─────────────────────────────────────
+            security_section(ui, selected_lang, draft);
 
             ui.add_space(8.0);
-            settings_section(
-                ui,
-                tr(selected_lang, "Безопасность", "Security"),
-                |ui| {
-                    ui.checkbox(
-                        &mut draft.security.require_confirmation,
-                        tr(
-                            selected_lang,
-                            "Подтверждать каждое входящее подключение",
-                            "Confirm every incoming connection",
-                        ),
-                    );
-                    ui.checkbox(
-                        &mut draft.security.allow_keyboard_mouse,
-                        tr(
-                            selected_lang,
-                            "Разрешить управление клавиатурой и мышью",
-                            "Allow keyboard and mouse control",
-                        ),
-                    );
-                    ui.checkbox(
-                        &mut draft.security.allow_clipboard,
-                        tr(
-                            selected_lang,
-                            "Разрешить доступ к буферу обмена",
-                            "Allow clipboard access",
-                        ),
-                    );
-                },
-            );
 
-            ui.add_space(8.0);
+            // ── Video ─────────────────────────────────────────────────────────
             settings_section(ui, tr(selected_lang, "Видео", "Video"), |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(tr(selected_lang, "Кодек", "Codec"));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        for codec in codec_preference_order() {
-                            ui.selectable_value(&mut draft.display.codec, codec, codec.label());
-                        }
-                    });
-                });
-                ui.label(
-                    egui::RichText::new(codec_status_text(draft.display.codec))
-                        .size(12.0)
-                        .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
-                );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label(tr(selected_lang, "Энкодер", "Encoder"));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        for encoder in encoder_preference_order() {
-                            ui.selectable_value(
-                                &mut draft.display.encoder,
-                                encoder,
-                                encoder.label(),
-                            );
-                        }
-                    });
-                });
-                ui.label(
-                    egui::RichText::new(crate::video::selected_encoder_label(
-                        draft.display.encoder,
-                    ))
-                    .size(12.0)
-                    .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
-                );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label(tr(selected_lang, "Р РµР¶РёРј", "Mode"));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        for mode in [
-                            StreamingMode::Game,
-                            StreamingMode::Interactive,
-                            StreamingMode::Support,
-                        ] {
-                            ui.selectable_value(
-                                &mut draft.display.streaming_mode,
-                                mode,
-                                mode.label(),
-                            );
-                        }
-                    });
-                });
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label(tr(selected_lang, "Целевой FPS", "Target FPS"));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        for fps in [60u32, 30, 20, 15] {
-                            ui.selectable_value(
-                                &mut draft.display.target_fps,
-                                fps,
-                                fps.to_string(),
-                            );
-                        }
-                    });
-                });
-                ui.add_space(6.0);
-                ui.checkbox(
-                    &mut draft.display.adaptive_quality,
-                    tr(
-                        selected_lang,
-                        "Автоматически снижать FPS при перегрузке декодера",
-                        "Automatically lower FPS when the decoder is overloaded",
-                    ),
-                );
-                ui.horizontal(|ui| {
-                    ui.label(tr(selected_lang, "Минимальный FPS", "Minimum FPS"));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        for fps in [30u32, 20, 15, 10, 5] {
-                            ui.selectable_value(&mut draft.display.min_fps, fps, fps.to_string());
-                        }
-                    });
-                });
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label("FSR");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        for quality in fsr_quality_order() {
-                            ui.selectable_value(
-                                &mut draft.display.fsr_quality,
-                                quality,
-                                quality.label(),
-                            );
-                        }
-                    });
-                });
+                video_settings_body(ui, selected_lang, draft);
             });
+
+            ui.add_space(8.0);
+
+            // ── Network (collapsed by default) ───────────────────────────────
+            network_section(ui, selected_lang, draft);
 
             ui.add_space(8.0);
 
             llm_settings_section(ui, selected_lang, draft);
 
             ui.add_space(8.0);
+
+            // ── Windows service ──────────────────────────────────────────────
             settings_section(ui, tr(selected_lang, "Служба", "Service"), |ui| {
-                ui.label(tr(
-                    selected_lang,
-                    "Фоновый режим использует этот же исполняемый файл с аргументом --host.",
-                    "Background mode uses this executable with the --host argument.",
-                ));
-                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(tr(
+                        selected_lang,
+                        "Фоновый режим: тот же исполняемый файл с аргументом --host.",
+                        "Background mode: same executable with the --host argument.",
+                    ))
+                    .size(12.0)
+                    .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                );
+                ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
                     if ui
                         .button(tr(selected_lang, "Установить службу", "Install service"))
@@ -588,7 +269,7 @@ impl EvertyDeskApp {
                     }
                 });
                 if let Some(status) = &self.service_status {
-                    ui.add_space(6.0);
+                    ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(status)
                             .size(12.0)
@@ -598,27 +279,21 @@ impl EvertyDeskApp {
             });
 
             ui.add_space(8.0);
-            settings_section(
-                ui,
-                tr(selected_lang, "О программе", "About"),
-                |ui| {
-                    ui.label(format!("{APP_NAME} v{APP_VERSION}"));
-                    ui.label(tr(
-                        selected_lang,
-                        "RustDesk-совместимый клиент удаленного доступа.",
-                        "RustDesk-compatible remote access client.",
-                    ));
-                    ui.label(format!(
-                        "{}: {}",
-                        tr(selected_lang, "Конфиг", "Config"),
-                        settings_mod::config_path().display()
-                    ));
-                },
-            );
+            settings_section(ui, tr(selected_lang, "О программе", "About"), |ui| {
+                ui.label(
+                    egui::RichText::new(format!("{APP_NAME} v{APP_VERSION}"))
+                        .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                );
+                ui.label(format!(
+                    "{}: {}",
+                    tr(selected_lang, "Конфиг", "Config"),
+                    settings_mod::config_path().display()
+                ));
+            });
         });
 
         self.ui_lang = selected_lang;
-        ui.add_space(12.0);
+        ui.add_space(10.0);
         ui.separator();
         ui.horizontal(|ui| {
             if ui
@@ -638,7 +313,8 @@ impl EvertyDeskApp {
                     || new_cfg.display.streaming_mode != host_reconfigure_source.6
                     || new_cfg.display.fsr_quality != host_reconfigure_source.7
                     || (new_cfg.display.fsr_sharpness - host_reconfigure_source.8).abs()
-                        > f32::EPSILON;
+                        > f32::EPSILON
+                    || new_cfg.local_password != host_reconfigure_source.9;
                 let next_video_fps = new_cfg.display.target_fps.clamp(5, 60) as i32;
                 if host_reconfigure_needed {
                     if let Some(svc) = &self.host_service {
@@ -678,6 +354,317 @@ impl EvertyDeskApp {
     }
 }
 
+// ── Security section (shared by both window and page) ────────────────────────
+
+fn security_section(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut AppConfig) {
+    settings_section(ui, tr(selected_lang, "Безопасность", "Security"), |ui| {
+        // Password row
+        {
+            let label = tr(selected_lang, "Пароль доступа", "Access password");
+            let hint = tr(
+                selected_lang,
+                "Пустой пароль = только подтверждение",
+                "Empty = confirmation only",
+            );
+            let wide = ui.available_width() >= 520.0;
+            if wide {
+                ui.horizontal(|ui| {
+                    ui.set_min_height(36.0);
+                    ui.set_width(ui.available_width());
+                    ui.add_sized(
+                        egui::vec2(150.0, 24.0),
+                        egui::Label::new(
+                            egui::RichText::new(label)
+                                .size(13.0)
+                                .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+                        )
+                        .truncate(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Regenerate button
+                        if ui
+                            .small_button("↻")
+                            .on_hover_text(tr(
+                                selected_lang,
+                                "Сгенерировать новый пароль",
+                                "Generate new password",
+                            ))
+                            .clicked()
+                        {
+                            draft.local_password = crate::settings::generate_numeric_token(6);
+                        }
+                        let width = ui.available_width().min(320.0);
+                        ui.add_sized(
+                            egui::vec2(width, 34.0),
+                            egui::TextEdit::singleline(&mut draft.local_password)
+                                .hint_text(hint)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                    });
+                });
+            } else {
+                ui.label(
+                    egui::RichText::new(label)
+                        .size(13.0)
+                        .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+                );
+                ui.horizontal(|ui| {
+                    let w = ui.available_width() - 36.0;
+                    ui.add_sized(
+                        egui::vec2(w, 34.0),
+                        egui::TextEdit::singleline(&mut draft.local_password)
+                            .hint_text(hint)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    if ui
+                        .small_button("↻")
+                        .on_hover_text(tr(
+                            selected_lang,
+                            "Сгенерировать новый пароль",
+                            "Generate new password",
+                        ))
+                        .clicked()
+                    {
+                        draft.local_password = crate::settings::generate_numeric_token(6);
+                    }
+                });
+            }
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(tr(
+                    selected_lang,
+                    "Клиент вводит пароль — подключение без диалога подтверждения.",
+                    "Client enters this password — connects without the approval dialog.",
+                ))
+                .size(11.0)
+                .color(egui::Color32::from_rgb(0x93, 0x9B, 0xA8)),
+            );
+            ui.add_space(6.0);
+        }
+
+        ui.checkbox(
+            &mut draft.security.require_confirmation,
+            tr(
+                selected_lang,
+                "Подтверждать каждое входящее подключение",
+                "Confirm every incoming connection",
+            ),
+        );
+        ui.add_space(2.0);
+        ui.checkbox(
+            &mut draft.security.allow_keyboard_mouse,
+            tr(
+                selected_lang,
+                "Разрешить управление клавиатурой и мышью",
+                "Allow keyboard and mouse control",
+            ),
+        );
+        ui.add_space(2.0);
+        ui.checkbox(
+            &mut draft.security.allow_clipboard,
+            tr(
+                selected_lang,
+                "Разрешить доступ к буферу обмена",
+                "Allow clipboard access",
+            ),
+        );
+    });
+}
+
+// ── Network section: hidden by default, expandable ───────────────────────────
+
+fn network_section(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut AppConfig) {
+    let default_srv = ServerConfig::default();
+    let is_custom = draft.server.id_server != default_srv.id_server
+        || draft.server.relay_server != default_srv.relay_server
+        || draft.server.public_key != default_srv.public_key
+        || draft.server.api_url != default_srv.api_url;
+
+    settings_section(ui, tr(selected_lang, "Сеть", "Network"), |ui| {
+        // Show current server status
+        if !is_custom {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("✓")
+                        .color(egui::Color32::from_rgb(0x12, 0xC9, 0x72))
+                        .size(14.0),
+                );
+                ui.label(
+                    egui::RichText::new(tr(
+                        selected_lang,
+                        "Everty Desk сервер (по умолчанию)",
+                        "Everty Desk server (default)",
+                    ))
+                    .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+                );
+            });
+        } else {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("★")
+                        .color(egui::Color32::from_rgb(0xF5, 0xA6, 0x23))
+                        .size(14.0),
+                );
+                ui.label(
+                    egui::RichText::new(tr(
+                        selected_lang,
+                        "Используется собственный сервер",
+                        "Using custom server",
+                    ))
+                    .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+                );
+            });
+        }
+
+        ui.add_space(6.0);
+
+        // Collapsible custom server fields
+        let header = if is_custom {
+            tr(
+                selected_lang,
+                "▾ Параметры собственного сервера",
+                "▾ Custom server parameters",
+            )
+        } else {
+            tr(
+                selected_lang,
+                "▸ Использовать другой сервер",
+                "▸ Use a different server",
+            )
+        };
+
+        ui.collapsing(header, |ui| {
+            ui.add_space(4.0);
+            settings_text_row(
+                ui,
+                tr(selected_lang, "ID сервер", "ID server"),
+                &mut draft.server.id_server,
+            );
+            settings_text_row(
+                ui,
+                tr(selected_lang, "Relay сервер", "Relay server"),
+                &mut draft.server.relay_server,
+            );
+            settings_text_row(
+                ui,
+                tr(selected_lang, "API URL", "API URL"),
+                &mut draft.server.api_url,
+            );
+            settings_text_row(
+                ui,
+                tr(selected_lang, "Публичный ключ", "Public key"),
+                &mut draft.server.public_key,
+            );
+            ui.add_space(4.0);
+            if ui
+                .button(tr(
+                    selected_lang,
+                    "Вернуть сервер по умолчанию",
+                    "Reset to default server",
+                ))
+                .clicked()
+            {
+                draft.server = ServerConfig::default();
+            }
+        });
+    });
+}
+
+// ── Video settings body (shared) ─────────────────────────────────────────────
+
+fn video_settings_body(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut AppConfig) {
+    // Row: Codec + Mode on same line
+    ui.horizontal(|ui| {
+        ui.label(tr(selected_lang, "Кодек", "Codec"));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            for codec in codec_preference_order() {
+                ui.selectable_value(&mut draft.display.codec, codec, codec.label());
+            }
+        });
+    });
+    ui.label(
+        egui::RichText::new(codec_status_text(draft.display.codec))
+            .size(11.0)
+            .color(egui::Color32::from_rgb(0x93, 0x9B, 0xA8)),
+    );
+    ui.add_space(4.0);
+
+    // Row: Encoder
+    ui.horizontal(|ui| {
+        ui.label(tr(selected_lang, "Энкодер", "Encoder"));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            for encoder in encoder_preference_order() {
+                ui.selectable_value(&mut draft.display.encoder, encoder, encoder.label());
+            }
+        });
+    });
+    ui.label(
+        egui::RichText::new(crate::video::selected_encoder_label(draft.display.encoder))
+            .size(11.0)
+            .color(egui::Color32::from_rgb(0x93, 0x9B, 0xA8)),
+    );
+    ui.add_space(4.0);
+
+    // Row: Mode
+    ui.horizontal(|ui| {
+        ui.label(tr(selected_lang, "Режим", "Mode"));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            for mode in [
+                StreamingMode::Game,
+                StreamingMode::Interactive,
+                StreamingMode::Support,
+            ] {
+                ui.selectable_value(&mut draft.display.streaming_mode, mode, mode.label());
+            }
+        });
+    });
+    ui.add_space(4.0);
+
+    // Row: Target FPS + Min FPS on same line
+    ui.horizontal(|ui| {
+        ui.label(tr(selected_lang, "FPS", "FPS"));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            for fps in [60u32, 30, 20, 15] {
+                ui.selectable_value(&mut draft.display.target_fps, fps, fps.to_string());
+            }
+        });
+    });
+    ui.add_space(2.0);
+    ui.checkbox(
+        &mut draft.display.adaptive_quality,
+        tr(
+            selected_lang,
+            "Авто-снижать FPS при перегрузке декодера",
+            "Auto-lower FPS when decoder is overloaded",
+        ),
+    );
+    if draft.display.adaptive_quality {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(tr(selected_lang, "Мин. FPS", "Min FPS"))
+                    .size(13.0)
+                    .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                for fps in [30u32, 20, 15, 10, 5] {
+                    ui.selectable_value(&mut draft.display.min_fps, fps, fps.to_string());
+                }
+            });
+        });
+    }
+    ui.add_space(4.0);
+
+    // Row: FSR
+    ui.horizontal(|ui| {
+        ui.label("FSR");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            for quality in fsr_quality_order() {
+                ui.selectable_value(&mut draft.display.fsr_quality, quality, quality.label());
+            }
+        });
+    });
+}
+
 fn llm_settings_section(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut AppConfig) {
     settings_section(
         ui,
@@ -691,6 +678,7 @@ fn llm_settings_section(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut Ap
                     "Enable LLM assistant in terminal",
                 ),
             );
+            ui.add_space(2.0);
             ui.checkbox(
                 &mut draft.llm.auto_suggest,
                 tr(
@@ -700,7 +688,7 @@ fn llm_settings_section(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut Ap
                 ),
             );
 
-            ui.add_space(8.0);
+            ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label(tr(selected_lang, "Провайдер", "Provider"));
                 for provider in [
@@ -712,7 +700,7 @@ fn llm_settings_section(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut Ap
                 }
             });
 
-            ui.add_space(8.0);
+            ui.add_space(6.0);
             match draft.llm.provider {
                 LlmProvider::Ollama => {
                     settings_text_row(
@@ -770,13 +758,13 @@ fn llm_settings_section(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut Ap
                             "Для IAM token укажите значение с префиксом Bearer, для API key можно без префикса.",
                             "For IAM token use the Bearer prefix; API key may be entered without a prefix.",
                         ))
-                        .size(12.0)
-                        .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                        .size(11.0)
+                        .color(egui::Color32::from_rgb(0x93, 0x9B, 0xA8)),
                     );
                 }
             }
 
-            ui.add_space(8.0);
+            ui.add_space(6.0);
             settings_text_row(
                 ui,
                 tr(selected_lang, "Системный prompt", "System prompt"),
@@ -839,7 +827,7 @@ fn settings_secret_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
                 .font(egui::TextStyle::Button),
         );
     }
-    ui.add_space(6.0);
+    ui.add_space(4.0);
 }
 
 fn codec_preference_order() -> [CodecPreference; 5] {

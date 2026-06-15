@@ -5533,7 +5533,8 @@ fn configure_style(ctx: &egui::Context) {
     visuals.widgets.noninteractive.corner_radius = rounding;
 
     visuals.widgets.inactive.bg_fill = input;
-    visuals.widgets.inactive.weak_bg_fill = input;
+    // Slider rail uses weak_bg_fill; keep it visible against white backgrounds.
+    visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(0xE3, 0xE6, 0xEC);
     visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, border);
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, text_strong);
     visuals.widgets.inactive.corner_radius = rounding;
