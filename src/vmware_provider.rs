@@ -17,10 +17,10 @@
 // =============================================================================
 
 use crate::{
-    capability_engine::{Capability, CapabilityState, SessionMode, VmCapabilityGraph},
+    capability_engine::{Capability, SessionMode, VmCapabilityGraph},
     provider_api::{
-        HostInfo, PowerState, ProviderError, ProviderResult, ProviderType, SnapshotInfo,
-        ToolsStatus, VirtualizationProvider, VmInfo,
+        HostInfo, ProviderError, ProviderResult, ProviderType, SnapshotInfo,
+        VirtualizationProvider, VmInfo,
     },
 };
 

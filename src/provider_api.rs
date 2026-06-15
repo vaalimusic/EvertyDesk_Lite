@@ -290,7 +290,7 @@ pub trait VirtualizationProvider: Send + Sync {
     fn power_action(&self, vm_id: &str, action: &str) -> ProviderResult<()>;
 
     // ── Snapshots ─────────────────────────────────────────────────────────────
-    fn list_snapshots(&self, vm_id: &str) -> ProviderResult<Vec<SnapshotInfo>> {
+    fn list_snapshots(&self, _vm_id: &str) -> ProviderResult<Vec<SnapshotInfo>> {
         Err(ProviderError::NotSupported(
             "Snapshots not implemented for this provider".to_owned(),
         ))

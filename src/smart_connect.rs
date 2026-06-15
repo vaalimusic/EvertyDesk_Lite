@@ -18,7 +18,7 @@
 
 use crate::{
     capability_engine::{Capability, CapabilityState, SessionMode, VmCapabilityGraph},
-    provider_api::{BackendDecision, BackendScore, ClipboardMode, PolicyResult, RecordingMode},
+    provider_api::{BackendDecision, BackendScore, PolicyResult, RecordingMode},
 };
 
 // ── Requested mode ────────────────────────────────────────────────────────────

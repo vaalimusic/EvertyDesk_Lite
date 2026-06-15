@@ -4092,14 +4092,17 @@ impl EvertyDeskApp {
             for host in &hosts {
                 for vm in p.list_vms(&host.host_id).unwrap_or_default() {
                     total_vms += 1;
+                    // Сначала все заимствования vm, потом перемещение power_state.
                     let badge = p.get_capabilities(&vm.vm_id).ok().map(|g| {
                         (g.recommended_mode.label().to_owned(), g.recommended_mode.badge_rgb())
                     });
+                    let ip = vm.primary_ip().map(|s| s.to_owned());
+                    let name = vm.name.clone();
                     vms.push(DashVm {
-                        name: vm.name.clone(),
+                        name,
                         power_state: vm.power_state,
                         badge,
-                        ip: vm.primary_ip().map(|s| s.to_owned()),
+                        ip,
                     });
                 }
             }

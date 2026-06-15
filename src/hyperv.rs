@@ -1164,7 +1164,7 @@ fn find_device_path(wmi: &Wmi, class: &str, vm_id: &str) -> Option<String> {
     ];
     for q in &candidates {
         let rows = wmi.query(q);
-        for mut row in rows {
+        for row in rows {
             // Filter by SystemName when scanning all
             if q.contains("SELECT * FROM") && !q.contains("WHERE") {
                 let sn = row.get("SystemName").and_then(|v| v.as_str().map(|s| s.to_owned()));
