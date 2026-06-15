@@ -569,6 +569,12 @@ fn registration_loop(
     let mut last_hb = Instant::now();
     let mut last_tick = Instant::now();
     let mut buf = vec![0u8; 8192];
+    // Once the server accepts our key (RegisterPkResponse result=0), we stop
+    // re-sending RegisterPk on every heartbeat — the server rate-limits it
+    // (TOO_FREQUENT / result=4).  Only RegisterPeer is needed to keep the
+    // registration alive.  We re-send RegisterPk only if the server requests
+    // it via RegisterPeerResponse(request_pk=true).
+    let mut pk_confirmed = false;
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -593,23 +599,30 @@ fn registration_loop(
 
         // ── Heartbeat ─────────────────────────────────────────────────────────
         if last_hb.elapsed() >= HEARTBEAT_INTERVAL {
-            // Send RegisterPk + RegisterPeer (same as initial registration)
-            if let Err(e) = send_register_pk_udp(
-                &socket,
-                &server_addr,
-                &config.local_id,
-                &config.host_sign_pk,
-            ) {
-                return LoopResult::Error(format!("Heartbeat RegisterPk: {e}"));
+            // Only re-send RegisterPk if the server hasn't confirmed it yet.
+            // After the key is confirmed (result=0), heartbeats use RegisterPeer
+            // only — re-sending RegisterPk triggers TOO_FREQUENT (result=4).
+            if !pk_confirmed {
+                if let Err(e) = send_register_pk_udp(
+                    &socket,
+                    &server_addr,
+                    &config.local_id,
+                    &config.host_sign_pk,
+                ) {
+                    return LoopResult::Error(format!("Heartbeat RegisterPk: {e}"));
+                }
+                send_count += 1;
             }
-            send_count += 1;
             if let Err(e) = send_register_peer_udp(&socket, &server_addr, &config.local_id) {
                 return LoopResult::Error(format!("Heartbeat RegisterPeer: {e}"));
             }
             send_count += 1;
             host_log(
                 events,
-                format!("Heartbeat: RegisterPk+RegisterPeer sent → {server_addr} (#{send_count})"),
+                format!(
+                    "Heartbeat: {} → {server_addr} (#{send_count})",
+                    if pk_confirmed { "RegisterPeer" } else { "RegisterPk+RegisterPeer" }
+                ),
             );
             last_hb = Instant::now();
         }
@@ -626,6 +639,7 @@ fn registration_loop(
                                 format!("RegisterPeerResponse  request_pk={}", r.request_pk),
                             );
                             if r.request_pk {
+                                pk_confirmed = false;
                                 if let Err(e) = send_register_pk_udp(
                                     &socket,
                                     &server_addr,
@@ -634,7 +648,7 @@ fn registration_loop(
                                 ) {
                                     return LoopResult::Error(format!("RegisterPk: {e}"));
                                 }
-                                host_log(events, "RegisterPk sent".to_owned());
+                                host_log(events, "RegisterPk sent (server requested)".to_owned());
                             } else {
                                 host_log(events, "Registered ✓ (key already on server)".to_owned());
                                 let _ = events.send(HostEvent::Registered { request_pk: false });
@@ -652,6 +666,7 @@ fn registration_loop(
                             };
                             host_log(events, format!("RegisterPkResponse  result={} ({})", r.result, meaning));
                             if r.result == 0 {
+                                pk_confirmed = true;
                                 host_log(
                                     events,
                                     "Public key accepted — host is online ✓".to_owned(),
