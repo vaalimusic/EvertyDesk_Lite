@@ -273,7 +273,10 @@ pub enum VboxCmd {
     PutString(String),
     /// PS/2 Set-1 make/break scancodes for one special key: &[make_bytes, break_bytes]
     PutScancodes(Vec<u8>, Vec<u8>),
-    MoveMouse(i32, i32),
+    /// Absolute mouse position in [0, 65535] range (maps to guest screen).
+    MoveMouseAbs(u32, u32),
+    /// Mouse button event: "leftdown" / "leftup" / "rightdown" / "rightup".
+    MouseButton(String),
     Stop,
 }
 
@@ -306,8 +309,11 @@ impl VboxSession {
                             thread::sleep(Duration::from_millis(10));
                             let _ = put_scancodes(&uuid, &brk);
                         }
-                        Ok(VboxCmd::MoveMouse(dx, dy)) => {
-                            let _ = vbox_mousemove(&uuid, dx, dy);
+                        Ok(VboxCmd::MoveMouseAbs(x, y)) => {
+                            let _ = vbox_mousemoveabs(&uuid, x, y);
+                        }
+                        Ok(VboxCmd::MouseButton(btn)) => {
+                            let _ = vbox_mousebutton(&uuid, &btn);
                         }
                         Err(_) => break,
                     }
@@ -346,12 +352,20 @@ impl VboxSession {
     }
 }
 
-fn vbox_mousemove(uuid: &str, dx: i32, dy: i32) -> Result<(), String> {
+/// Абсолютное позиционирование мыши в [0, 65535] — гостевые координаты.
+fn vbox_mousemoveabs(uuid: &str, x: u32, y: u32) -> Result<(), String> {
     let vbm = vboxmanage().ok_or_else(|| "VBoxManage не найден".to_owned())?;
-    let (dxs, dys) = (dx.to_string(), dy.to_string());
-    let out = vbm_run(&vbm, &["controlvm", uuid, "mousemove", &dxs, &dys])
-        .ok_or_else(|| "mousemove: таймаут/ошибка запуска".to_owned())?;
-    if out.status.success() { Ok(()) } else { Err("mousemove failed".to_owned()) }
+    let (xs, ys) = (x.to_string(), y.to_string());
+    let out = vbm_run(&vbm, &["controlvm", uuid, "mousemoveabs", &xs, &ys])
+        .ok_or_else(|| "mousemoveabs: таймаут".to_owned())?;
+    if out.status.success() { Ok(()) } else { Err("mousemoveabs failed".to_owned()) }
+}
+
+fn vbox_mousebutton(uuid: &str, btn: &str) -> Result<(), String> {
+    let vbm = vboxmanage().ok_or_else(|| "VBoxManage не найден".to_owned())?;
+    let out = vbm_run(&vbm, &["controlvm", uuid, "mousebutton", btn])
+        .ok_or_else(|| "mousebutton: таймаут".to_owned())?;
+    if out.status.success() { Ok(()) } else { Err(format!("mousebutton {btn} failed")) }
 }
 
 /// PS/2 Set-1 scancode pair for a special key (make, break). Abstracted over
