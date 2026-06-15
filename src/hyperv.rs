@@ -1287,146 +1287,193 @@ pub struct HyperVSession {
     pub cmd_tx: mpsc::SyncSender<HyperVCmd>,
     pub frame_rx: mpsc::Receiver<Frame>,
     pub status_rx: mpsc::Receiver<String>,
+    /// Shared stop flag — set to true when session ends; capture-thread checks this each cycle.
+    stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HyperVSession {
+    /// Запускает две нити:
+    ///
+    /// • **input-thread** — принимает команды из `cmd_rx` и немедленно
+    ///   отправляет WMI-методы клавиатуры/мыши. Никогда не блокируется
+    ///   на захвате кадра. Задержка ввода = только время WMI round-trip
+    ///   (~20–80 ms), а не WMI-capture + sleep.
+    ///
+    /// • **capture-thread** — с целевым интервалом 50 ms захватывает кадры
+    ///   через GetVirtualSystemThumbnailImage. Адаптивно снижает разрешение
+    ///   при медленном WMI. Публикует кадры в `frame_tx`.
+    ///
+    /// Разделение устраняет главную причину задержек: ранее `PressKey` ждал
+    /// завершения `capture_screen()` (50–500 ms), теперь — нет.
     pub fn start(vm: VmInfo) -> Self {
-        let (cmd_tx, cmd_rx) = mpsc::sync_channel::<HyperVCmd>(32);
+        let (cmd_tx, cmd_rx) = mpsc::sync_channel::<HyperVCmd>(64);
         let (frame_tx, frame_rx) = mpsc::sync_channel::<Frame>(2);
-        let (status_tx, status_rx) = mpsc::sync_channel::<String>(8);
+        let (status_tx, status_rx) = mpsc::sync_channel::<String>(16);
+        let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_flag_cap = stop_flag.clone();
 
+        // ── Input thread ─────────────────────────────────────────────────────
+        // Dedicated WMI connection + pre-resolved device paths (no per-event lookup).
+        let vm_id_input = vm.id.clone();
+        let status_tx_input = status_tx.clone();
         std::thread::Builder::new()
-            .name(format!("hyperv-{}", vm.name))
+            .name(format!("hyperv-input-{}", vm.name))
             .spawn(move || {
-                let native = video_resolution(&vm.id).unwrap_or((1280, 720));
+                let (paths, warn) = DevicePaths::resolve(&vm_id_input);
+                if let Some(w) = warn {
+                    let _ = status_tx_input.try_send(w);
+                }
+                let wmi = Wmi::connect();
+                // Block on channel — no spin-sleep needed; input is event-driven.
+                // sync_channel recv() blocks until a command arrives.
+                loop {
+                    let cmd = match cmd_rx.recv() {
+                        Ok(c) => c,
+                        Err(_) => return, // sender dropped → session over
+                    };
+                    match cmd {
+                        HyperVCmd::Stop => return,
+                        HyperVCmd::PressKey(sc) => {
+                            if let (Some(wmi), Some(p)) = (&wmi, &paths.keyboard) {
+                                // No sleep — WMI exec_method_result is already synchronous.
+                                let _ = wmi.exec_method_result(
+                                    p, "PressKey",
+                                    &[("keyCode", WmiVal::I32(sc as i32))],
+                                );
+                            }
+                        }
+                        HyperVCmd::ReleaseKey(sc) => {
+                            if let (Some(wmi), Some(p)) = (&wmi, &paths.keyboard) {
+                                let _ = wmi.exec_method_result(
+                                    p, "ReleaseKey",
+                                    &[("keyCode", WmiVal::I32(sc as i32))],
+                                );
+                            }
+                        }
+                        HyperVCmd::TypeText(t) => {
+                            if let (Some(wmi), Some(p)) = (&wmi, &paths.keyboard) {
+                                let _ = wmi.exec_method_result(
+                                    p, "TypeText",
+                                    &[("asciiText", WmiVal::Str(t))],
+                                );
+                            }
+                        }
+                        HyperVCmd::CtrlAltDel => {
+                            if let (Some(wmi), Some(p)) = (&wmi, &paths.keyboard) {
+                                let _ = wmi.exec_method_result(p, "TypeCtrlAltDel", &[]);
+                            }
+                        }
+                        HyperVCmd::MoveMouse(x, y) => {
+                            if let (Some(wmi), Some(p)) = (&wmi, &paths.mouse) {
+                                let _ = wmi.exec_method_result(
+                                    p, "SetAbsolutePosition",
+                                    &[
+                                        ("horizontalPosition", WmiVal::I32(x as i32)),
+                                        ("verticalPosition",   WmiVal::I32(y as i32)),
+                                    ],
+                                );
+                            }
+                        }
+                        HyperVCmd::ClickMouse(b, press) => {
+                            if let (Some(wmi), Some(p)) = (&wmi, &paths.mouse) {
+                                let method = if press { "ClickButton" } else { "ReleaseButton" };
+                                let _ = wmi.exec_method_result(
+                                    p, method,
+                                    &[("buttonIndex", WmiVal::I32(b as i32))],
+                                );
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("hyperv-input thread");
+
+        // ── Capture thread ───────────────────────────────────────────────────
+        // Handles only GetVirtualSystemThumbnailImage; never touches input.
+        let vm_clone = vm;
+        std::thread::Builder::new()
+            .name(format!("hyperv-cap-{}", vm_clone.name))
+            .spawn(move || {
+                let native = video_resolution(&vm_clone.id).unwrap_or((1280, 720));
                 let (width, height) = cap_resolution(native.0, native.1, 640, 480);
                 let _ = status_tx.try_send(format!(
-                    "Hyper-V capture started: {}x{} (native {}x{})",
+                    "Hyper-V capture started: {}×{} (native {}×{})",
                     width, height, native.0, native.1
                 ));
 
-                // Cache device paths once — avoids WMI lookup on every keypress/mousemove
-                let (paths, warn) = DevicePaths::resolve(&vm.id);
-                if let Some(w) = warn {
-                    let _ = status_tx.try_send(w);
-                }
-                // Keep a persistent WMI connection for input operations
-                let wmi_input = Wmi::connect();
-
                 const FRAME_TARGET_MS: u64 = 50;
-                // Adaptive resolution: auto-reduce if WMI is too slow
                 let mut cur_w = width;
                 let mut cur_h = height;
-                // EMA of capture duration in ms (α=0.2)
                 let mut capture_ema_ms: f32 = 100.0;
                 let mut frame_count: u32 = 0;
                 let mut fps_window_start = std::time::Instant::now();
 
                 loop {
-                let t0 = std::time::Instant::now();
-                // Drain commands
-                loop {
-                    match cmd_rx.try_recv() {
-                        Ok(HyperVCmd::Stop) => return,
-                        Ok(HyperVCmd::PressKey(sc)) => {
-                            if let (Some(wmi), Some(p)) = (&wmi_input, &paths.keyboard) {
-                                let _ = wmi.exec_method_result(p, "PressKey", &[("keyCode", WmiVal::I32(sc as i32))]);
-                                std::thread::sleep(Duration::from_millis(15));
-                            }
-                        }
-                        Ok(HyperVCmd::ReleaseKey(sc)) => {
-                            if let (Some(wmi), Some(p)) = (&wmi_input, &paths.keyboard) {
-                                let _ = wmi.exec_method_result(p, "ReleaseKey", &[("keyCode", WmiVal::I32(sc as i32))]);
-                                std::thread::sleep(Duration::from_millis(15));
-                            }
-                        }
-                        Ok(HyperVCmd::TypeText(t)) => {
-                            if let (Some(wmi), Some(p)) = (&wmi_input, &paths.keyboard) {
-                                let _ = wmi.exec_method_result(p, "TypeText", &[("asciiText", WmiVal::Str(t))]);
-                            }
-                        }
-                        Ok(HyperVCmd::CtrlAltDel) => {
-                            if let (Some(wmi), Some(p)) = (&wmi_input, &paths.keyboard) {
-                                let _ = wmi.exec_method_result(p, "TypeCtrlAltDel", &[]);
-                            }
-                        }
-                        Ok(HyperVCmd::MoveMouse(x, y)) => {
-                            if let (Some(wmi), Some(p)) = (&wmi_input, &paths.mouse) {
-                                let _ = wmi.exec_method_result(p, "SetAbsolutePosition", &[
-                                    ("horizontalPosition", WmiVal::I32(x as i32)),
-                                    ("verticalPosition",   WmiVal::I32(y as i32)),
-                                ]);
-                            }
-                        }
-                        Ok(HyperVCmd::ClickMouse(b, press)) => {
-                            if let (Some(wmi), Some(p)) = (&wmi_input, &paths.mouse) {
-                                let method = if press { "ClickButton" } else { "ReleaseButton" };
-                                let _ = wmi.exec_method_result(p, method, &[("buttonIndex", WmiVal::I32(b as i32))]);
-                            }
-                        }
-                        Err(_) => break,
+                    // Capture thread exits when stop_flag is set (by HyperVSession::stop).
+                    if stop_flag_cap.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
                     }
-                }
-                // Capture frame and measure WMI call duration
-                let cap_t0 = std::time::Instant::now();
-                match capture_screen(&vm.id, &vm.wmi_path, cur_w, cur_h) {
-                    Ok(rgba) => {
-                        let cap_ms = cap_t0.elapsed().as_millis() as f32;
-                        // EMA update (α=0.25)
-                        capture_ema_ms = capture_ema_ms * 0.75 + cap_ms * 0.25;
 
-                        // #8 Adaptive resolution: if consistently slow, halve; if fast, try to restore
-                        if capture_ema_ms > 500.0 && cur_w > 320 {
-                            cur_w = (cur_w / 2).max(320);
-                            cur_h = (cur_h / 2).max(240);
-                            let _ = status_tx.try_send(format!(
-                                "WMI медленно ({:.0}ms) — снижаю разрешение до {}×{}", capture_ema_ms, cur_w, cur_h
-                            ));
-                            capture_ema_ms = 300.0; // reset estimate
-                        } else if capture_ema_ms < 200.0 && cur_w < width {
-                            // Recover resolution when WMI speeds up
-                            cur_w = (cur_w * 3 / 2).min(width);
-                            cur_h = (cur_h * 3 / 2).min(height);
+                    let t0 = std::time::Instant::now();
+
+                    let cap_t0 = std::time::Instant::now();
+                    match capture_screen(&vm_clone.id, &vm_clone.wmi_path, cur_w, cur_h) {
+                        Ok(rgba) => {
+                            let cap_ms = cap_t0.elapsed().as_millis() as f32;
+                            capture_ema_ms = capture_ema_ms * 0.75 + cap_ms * 0.25;
+
+                            // Adaptive resolution
+                            if capture_ema_ms > 500.0 && cur_w > 320 {
+                                cur_w = (cur_w / 2).max(320);
+                                cur_h = (cur_h / 2).max(240);
+                                let _ = status_tx.try_send(format!(
+                                    "WMI медленно ({:.0}ms) — снижаю разрешение до {}×{}",
+                                    capture_ema_ms, cur_w, cur_h
+                                ));
+                                capture_ema_ms = 300.0;
+                            } else if capture_ema_ms < 200.0 && cur_w < width {
+                                cur_w = (cur_w * 3 / 2).min(width);
+                                cur_h = (cur_h * 3 / 2).min(height);
+                            }
+
+                            // FPS counter every 5s
+                            frame_count += 1;
+                            let fps_elapsed = fps_window_start.elapsed();
+                            if fps_elapsed >= Duration::from_secs(5) {
+                                let fps = frame_count as f32 / fps_elapsed.as_secs_f32();
+                                let _ = status_tx.try_send(format!(
+                                    "● VM активна | {:.1} fps | {}×{} | WMI {:.0}ms",
+                                    fps, cur_w, cur_h, capture_ema_ms
+                                ));
+                                frame_count = 0;
+                                fps_window_start = std::time::Instant::now();
+                            }
+
+                            let _ = frame_tx.try_send(Frame {
+                                rgba,
+                                width: cur_w as u32,
+                                height: cur_h as u32,
+                            });
                         }
-
-                        // #1 FPS counter: report actual capture rate every 5s
-                        frame_count += 1;
-                        let fps_elapsed = fps_window_start.elapsed();
-                        if fps_elapsed >= Duration::from_secs(5) {
-                            let fps = frame_count as f32 / fps_elapsed.as_secs_f32();
-                            let has_mouse = paths.mouse.is_some();
-                            let mouse_str = if has_mouse { "мышь ✓" } else { "мышь ✗ (нет IS)" };
-                            let _ = status_tx.try_send(format!(
-                                "● VM активна | {:.1} fps | {}×{} | WMI {:.0}ms | {}",
-                                fps, cur_w, cur_h, capture_ema_ms, mouse_str
-                            ));
-                            frame_count = 0;
-                            fps_window_start = std::time::Instant::now();
+                        Err(err) => {
+                            let _ = status_tx.try_send(err);
                         }
+                    }
 
-                        let _ = frame_tx.try_send(Frame {
-                            rgba,
-                            width: cur_w as u32,
-                            height: cur_h as u32,
-                        });
+                    let elapsed = t0.elapsed();
+                    let target = Duration::from_millis(FRAME_TARGET_MS);
+                    if elapsed < target {
+                        std::thread::sleep(target - elapsed);
                     }
-                    Err(err) => {
-                        let _ = status_tx.try_send(err);
-                    }
-                }
-                let elapsed = t0.elapsed();
-                let target = Duration::from_millis(FRAME_TARGET_MS);
-                if elapsed < target {
-                    std::thread::sleep(target - elapsed);
-                }
                 }
             })
-            .expect("hyperv thread");
+            .expect("hyperv-cap thread");
 
         HyperVSession {
             cmd_tx,
             frame_rx,
             status_rx,
+            stop_flag,
         }
     }
 
@@ -1443,7 +1490,11 @@ impl HyperVSession {
     }
 
     pub fn stop(self) {
+        // Signal capture-thread to exit on its next loop iteration.
+        self.stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Signal input-thread to exit (unblocks recv()).
         let _ = self.cmd_tx.try_send(HyperVCmd::Stop);
+        // Dropping cmd_tx also causes input-thread recv() to return Err → exit.
     }
 }
 
