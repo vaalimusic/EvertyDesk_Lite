@@ -530,23 +530,48 @@ fn dispatch_key(vm_id: &str, ev: &crate::rustdesk_proto::KeyEvent) {
                 Ok(())
             }
             Some(Union::Unicode(ch)) => {
-                if (ev.press || ev.down) && *ch != 0 {
-                    if let Some(c) = char::from_u32(*ch) {
-                        if !mods.is_empty() {
-                            // FIX-3: пробуем ASCII-VK, если нет — пробуем кириллицу→VK.
-                            // Это позволяет Ctrl+А (RU) → Ctrl+VK_F вместо игнора модификатора.
-                            let vk = ascii_scancode(c).or_else(|| cyrillic_to_vk(c));
-                            if let Some(scan) = vk {
-                                mods.iter().for_each(|m| send_press(*m));
-                                send_press(scan);
-                                send_release(scan);
-                                mods.iter().rev().for_each(|m| send_release(*m));
-                                return Ok(());
-                            }
-                            // Если нет VK-маппинга — TypeText без модификаторов
-                            // (лучше получить символ без mod, чем вообще ничего).
+                if *ch == 0 { return Ok(()); }
+                let Some(c) = char::from_u32(*ch) else { return Ok(()); };
+
+                // VK-код клавиши: сначала ASCII-пунктуация/буквы, потом JCUKEN-кириллица.
+                // TypeText больше НЕ используется для одиночных символов:
+                //   TypeText("с") → WMI делает VkKeyScanW на хосте → неожиданный
+                //   символ ('~') или ничего. PressKey/ReleaseKey даёт VM сырой VK-код
+                //   и VM сама декодирует по своей раскладке.
+                let vk = ascii_scancode(c).or_else(|| cyrillic_to_vk(c));
+
+                match vk {
+                    Some(vk_code) => {
+                        // PressKey + (опционально) ReleaseKey в зависимости от ev.
+                        if ev.press || ev.down {
+                            mods.iter().for_each(|m| send_press(*m));
+                            send_press(vk_code);
                         }
-                        send_text(c.to_string());
+                        if ev.press {
+                            // Одиночный клик — сразу отпускаем
+                            send_release(vk_code);
+                            mods.iter().rev().for_each(|m| send_release(*m));
+                        } else if !ev.down {
+                            // Key-up (down=false, press=false)
+                            send_release(vk_code);
+                            mods.iter().rev().for_each(|m| send_release(*m));
+                        }
+                        // Если down=true && press=false: клавиша удерживается,
+                        // ReleaseKey придёт отдельным событием.
+                    }
+                    None => {
+                        // Нет VK-маппинга (emoji, нестандартный Unicode и т.п.).
+                        // TypeText как last-resort только для ASCII — для не-ASCII
+                        // надёжного способа нет в WMI BasicRescue режиме.
+                        if (ev.press || ev.down) && c.is_ascii_graphic() {
+                            if !mods.is_empty() {
+                                mods.iter().for_each(|m| send_press(*m));
+                            }
+                            send_text(c.to_string());
+                            if !mods.is_empty() {
+                                mods.iter().rev().for_each(|m| send_release(*m));
+                            }
+                        }
                     }
                 }
                 Ok(())
@@ -605,20 +630,55 @@ fn control_key_scancode(ck: i32) -> Option<u32> {
     })
 }
 
-/// ASCII-символ → Windows VK-код базовой клавиши (US-раскладка).
-/// Нужно для сочетаний с модификаторами (Ctrl+C, Ctrl+V и т.п.).
-/// Для букв VK = код заглавной ('A'=0x41), цифры VK = ASCII ('0'=0x30).
+/// Символ → Windows VK-код физической клавиши (US QWERTY раскладка).
+///
+/// Возвращает VK "базовой" клавиши без учёта Shift — модификаторы берём
+/// из `ev.modifiers` (клиент сам отслеживает Shift, Ctrl, Alt).
+///
+/// Примеры:
+///   'a'/'A' → VK_A (0x41)   — Shift в modifiers
+///   '!'     → VK_1 (0x31)   — Shift в modifiers
+///   '~'     → VK_OEM_3 (0xC0) — Shift в modifiers
+///   '-'/'_' → VK_OEM_MINUS (0xBD)
+///
+/// Прежде функция возвращала None для пунктуации, и диспетчер
+/// откатывался к TypeText, которая для не-ASCII символов делала мусор
+/// ('с' → '~') или ничего не отправляла. Теперь все US-символы покрыты.
 #[cfg(windows)]
 fn ascii_scancode(c: char) -> Option<u32> {
-    if c.is_ascii_alphabetic() {
-        Some(c.to_ascii_uppercase() as u32)
-    } else if c.is_ascii_digit() {
-        Some(c as u32)
-    } else if c == ' ' {
-        Some(0x20)
-    } else {
-        None
-    }
+    Some(match c {
+        // Буквы: VK = код заглавной буквы (0x41–0x5A).
+        'a'..='z' | 'A'..='Z' => c.to_ascii_uppercase() as u32,
+        // Цифры (0x30–0x39).
+        '0'..='9' => c as u32,
+        ' ' => 0x20, // VK_SPACE
+        '\t' => 0x09, // VK_TAB
+        // Shifted-цифры: клиент посылает Unicode символ + Shift в modifiers.
+        // Возвращаем VK базовой цифровой клавиши, Shift уже есть в mods.
+        '!' => 0x31, // Shift+1
+        '@' => 0x32, // Shift+2
+        '#' => 0x33, // Shift+3
+        '$' => 0x34, // Shift+4
+        '%' => 0x35, // Shift+5
+        '^' => 0x36, // Shift+6
+        '&' => 0x37, // Shift+7
+        '*' => 0x38, // Shift+8
+        '(' => 0x39, // Shift+9
+        ')' => 0x30, // Shift+0
+        // Пунктуация (base key без Shift / со Shift через modifiers).
+        '-' | '_'  => 0xBD, // VK_OEM_MINUS
+        '=' | '+'  => 0xBB, // VK_OEM_PLUS
+        '[' | '{'  => 0xDB, // VK_OEM_4
+        ']' | '}'  => 0xDD, // VK_OEM_6
+        ';' | ':'  => 0xBA, // VK_OEM_1
+        '\''| '"'  => 0xDE, // VK_OEM_7
+        '`' | '~'  => 0xC0, // VK_OEM_3
+        ',' | '<'  => 0xBC, // VK_OEM_COMMA
+        '.' | '>'  => 0xBE, // VK_OEM_PERIOD
+        '/' | '?'  => 0xBF, // VK_OEM_2
+        '\\' | '|' => 0xDC, // VK_OEM_5
+        _ => return None,
+    })
 }
 
 /// FIX-3: Кириллица (JCUKEN) → Windows VK-код физической позиции клавиши.
