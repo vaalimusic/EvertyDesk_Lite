@@ -28,6 +28,7 @@ mod hyperv;
 #[cfg(windows)]
 mod hyperv_rdp;
 mod lan_discovery;
+mod hotfix;
 mod llm;
 mod mf_encode;
 mod mf_video;
@@ -192,6 +193,11 @@ fn tr(lang: UiLang, ru: &'static str, en: &'static str) -> &'static str {
 /// стандартный вывод тоже остался. Помогает диагностировать «выкидывает» без
 /// отладочной сборки у пользователя.
 fn install_panic_logger() {
+    // Load config once so the hotfix report has correct api_key / device_id.
+    let hotfix_cfg = AppConfig::load_or_create();
+    let hotfix_state: Arc<Mutex<hotfix::HotfixState>> =
+        Arc::new(Mutex::new(hotfix::HotfixState::default()));
+
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let location = info
@@ -223,6 +229,19 @@ fn install_panic_logger() {
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
             let _ = writeln!(f, "{record}");
         }
+
+        // Отправляем краш-репорт в AI Hotfix Pipeline (в фоне).
+        hotfix::report(
+            format!("{}:{}", location, &msg[..msg.len().min(120)]),
+            "core".to_owned(),
+            "PANIC".to_owned(),
+            msg.clone(),
+            format!("{backtrace}"),
+            hotfix_cfg.hotfix.clone(),
+            hotfix_cfg.clone(),
+            Arc::clone(&hotfix_state),
+        );
+
         prev(info);
     }));
 }
@@ -1200,6 +1219,11 @@ struct EvertyDeskApp {
     /// Нативное разрешение хоста (объявляется в PeerInfo / SessionEvent::Displays).
     /// FSR апскейлит каждый входящий кадр до этого разрешения.
     fsr_native_size: Option<(u32, u32)>,
+
+    // ── AI Hotfix ─────────────────────────────────────────────────────────────
+    hotfix_state: Arc<Mutex<hotfix::HotfixState>>,
+    /// Pending consent dialog from hotfix tick (shown as egui window).
+    hotfix_consent: Option<hotfix::ConsentRequest>,
     // ── System tray ───────────────────────────────────────────────────────────
 }
 
@@ -1488,6 +1512,8 @@ impl EvertyDeskApp {
                 })
             },
             fsr_native_size: None,
+            hotfix_state: Arc::new(Mutex::new(hotfix::HotfixState::default())),
+            hotfix_consent: None,
         }
     }
 
@@ -2380,6 +2406,7 @@ impl EvertyDeskApp {
         self.poll_terminal_ai();
         self.maybe_request_terminal_auto_ai();
         self.poll_host_service();
+        self.poll_hotfix(ctx);
         #[cfg(windows)]
         self.poll_hyperv_session(ctx);
         if let Some(image) = self.pending_image.take() {
@@ -2539,6 +2566,56 @@ impl EvertyDeskApp {
             && ctx.input(|input| input.key_pressed(egui::Key::Enter))
         {
             self.connect();
+        }
+    }
+
+    fn poll_hotfix(&mut self, ctx: &egui::Context) {
+        // Tick TTL-rollbacks and pick up any pending consent requests.
+        let state = Arc::clone(&self.hotfix_state);
+        if let Some(req) = hotfix::tick(&state, &mut self.config) {
+            if self.hotfix_consent.is_none() {
+                self.hotfix_consent = Some(req);
+            }
+        }
+
+        // Show consent dialog if needed.
+        if let Some(req) = self.hotfix_consent.clone() {
+            let mut open = true;
+            egui::Window::new("AI Hotfix — требуется подтверждение")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label(egui::RichText::new(&req.summary).size(13.0));
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(format!("Риск: {}", req.risk_level))
+                        .size(12.0)
+                        .color(egui::Color32::YELLOW));
+                    ui.add_space(4.0);
+                    for action in &req.actions_human {
+                        ui.label(format!("• {action}"));
+                    }
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(
+                        "Изменения будут автоматически отменены через некоторое время если станет хуже."
+                    ).size(11.0).color(egui::Color32::GRAY));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("✓ Применить").clicked() {
+                            hotfix::confirm_consent(&state, &mut self.config);
+                            self.hotfix_consent = None;
+                        }
+                        if ui.button("✗ Отказаться").clicked() {
+                            hotfix::deny_consent(&state);
+                            self.hotfix_consent = None;
+                        }
+                    });
+                });
+            if !open {
+                hotfix::deny_consent(&state);
+                self.hotfix_consent = None;
+            }
         }
     }
 
