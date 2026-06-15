@@ -200,8 +200,12 @@ pub fn apply_palette(ctx: &egui::Context, p: &Palette) {
     v.extreme_bg_color = p.surface_sunken;
     v.faint_bg_color = p.surface_raised;
     v.window_stroke = Stroke::new(1.0, p.border);
-    v.override_text_color = Some(p.text);
+    // НЕ ставим override_text_color: он перебивает «слабый» цвет, из-за чего
+    // плейсхолдеры (hint_text) становятся невидимыми. Базовый цвет текста идёт
+    // из widgets.noninteractive.fg_stroke ниже, weak/hint — производный от него.
     v.hyperlink_color = p.accent;
+    v.warn_fg_color = p.warning;
+    v.error_fg_color = p.danger;
 
     v.selection.bg_fill = p.selection_bg;
     v.selection.stroke = Stroke::new(1.0, p.selection_stroke);
@@ -223,11 +227,14 @@ pub fn apply_palette(ctx: &egui::Context, p: &Palette) {
     let radius = CornerRadius::same(10);
     let radius_lg = CornerRadius::same(12);
 
-    // noninteractive — карты, лейблы, контейнеры
+    // noninteractive — карты, лейблы, контейнеры.
+    // fg_stroke = основной цвет текста по умолчанию (ui.label без явного цвета).
+    // egui выводит из него и weak_text_color (плейсхолдеры) — поэтому здесь
+    // именно `text`, а не `text_weak`, иначе весь текст станет блеклым.
     v.widgets.noninteractive.bg_fill = p.surface;
     v.widgets.noninteractive.weak_bg_fill = p.surface;
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, p.border);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, p.text_weak);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
     v.widgets.noninteractive.corner_radius = radius_lg;
 
     // inactive — кнопки/поля в покое

@@ -268,7 +268,7 @@ pub(crate) fn compact_text_input(
     } else if response.hovered() {
         egui::Stroke::new(1.6, egui::Color32::from_rgb(0x7F, 0x98, 0xB8))
     } else {
-        egui::Stroke::new(1.5, egui::Color32::from_rgb(0x9E, 0xAC, 0xBF))
+        egui::Stroke::new(1.5, crate::theme::palette().text_muted)
     };
     ui.painter()
         .rect_filled(rect, egui::CornerRadius::same(10), fill);
@@ -347,7 +347,7 @@ pub(crate) fn language_button(ui: &mut egui::Ui, label: &str, active: bool) -> e
         crate::theme::palette().surface_raised
     };
     let stroke = if active {
-        egui::Color32::from_rgb(0xD0, 0xD6, 0xE0)
+        crate::theme::palette().text_muted
     } else {
         crate::theme::palette().border
     };
@@ -639,7 +639,7 @@ pub(crate) fn info_metric(ui: &mut egui::Ui, label: &str, value: &str, color: eg
         ui.label(
             egui::RichText::new(label)
                 .size(11.0)
-                .color(egui::Color32::from_rgb(0x8A, 0x93, 0xA3)),
+                .color(crate::theme::palette().text_muted),
         );
         ui.label(egui::RichText::new(value).size(17.0).strong().color(color));
     });

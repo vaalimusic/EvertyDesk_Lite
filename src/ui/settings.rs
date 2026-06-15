@@ -458,7 +458,7 @@ fn security_section(
                     "Client enters this password — connects without the approval dialog. Press Save.",
                 ))
                 .size(11.0)
-                .color(egui::Color32::from_rgb(0x93, 0x9B, 0xA8)),
+                .color(crate::theme::palette().text_muted),
             );
             ui.add_space(6.0);
         }
@@ -508,7 +508,7 @@ fn network_section(
     settings_section(ui, tr(selected_lang, "Сеть", "Network"), |ui| {
         if is_custom {
             ui.horizontal(|ui| {
-                status_dot(ui, egui::Color32::from_rgb(0xF5, 0xA6, 0x23));
+                status_dot(ui, crate::theme::palette().warning);
                 ui.label(
                     egui::RichText::new(tr(
                         selected_lang,
@@ -645,7 +645,7 @@ fn video_settings_body(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut App
     ui.label(
         egui::RichText::new(codec_status_text(draft.display.codec))
             .size(11.0)
-            .color(egui::Color32::from_rgb(0x93, 0x9B, 0xA8)),
+            .color(crate::theme::palette().text_muted),
     );
     ui.add_space(4.0);
 
@@ -661,7 +661,7 @@ fn video_settings_body(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut App
     ui.label(
         egui::RichText::new(crate::video::selected_encoder_label(draft.display.encoder))
             .size(11.0)
-            .color(egui::Color32::from_rgb(0x93, 0x9B, 0xA8)),
+            .color(crate::theme::palette().text_muted),
     );
     ui.add_space(4.0);
 
@@ -819,7 +819,7 @@ fn llm_settings_section(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut Ap
                             "For IAM token use the Bearer prefix; API key may be entered without a prefix.",
                         ))
                         .size(11.0)
-                        .color(egui::Color32::from_rgb(0x93, 0x9B, 0xA8)),
+                        .color(crate::theme::palette().text_muted),
                     );
                 }
             }

@@ -131,7 +131,7 @@ impl EvertyDeskApp {
                             egui::RichText::new("TERMINAL")
                                 .size(13.0)
                                 .strong()
-                                .color(egui::Color32::from_rgb(0x7D, 0xF2, 0xB3)),
+                                .color(crate::theme::palette().success),
                         );
                         ui.add_space(8.0);
                         terminal_badge(
@@ -218,7 +218,7 @@ impl EvertyDeskApp {
                                     egui::RichText::new("$")
                                         .monospace()
                                         .size(16.0)
-                                        .color(egui::Color32::from_rgb(0x7D, 0xF2, 0xB3)),
+                                        .color(crate::theme::palette().success),
                                 );
                                 let response = terminal_text_edit_scope(ui, |ui| {
                                     ui.add_sized(
@@ -273,7 +273,7 @@ impl EvertyDeskApp {
                                     egui::RichText::new(self.text("AI задача", "AI task"))
                                         .size(12.0)
                                         .strong()
-                                        .color(egui::Color32::from_rgb(0x9D, 0xA8, 0xBA)),
+                                        .color(crate::theme::palette().text_muted),
                                 );
                                 let goal_width = (ui.available_width() - 246.0).max(180.0);
                                 terminal_text_edit_scope(ui, |ui| {
@@ -320,7 +320,7 @@ impl EvertyDeskApp {
                                 ui.label(
                                     egui::RichText::new(status)
                                         .size(12.0)
-                                        .color(egui::Color32::from_rgb(0x9D, 0xA8, 0xBA)),
+                                        .color(crate::theme::palette().text_muted),
                                 );
                             }
 
@@ -502,7 +502,7 @@ fn terminal_text_edit_scope<R>(
         visuals.extreme_bg_color = egui::Color32::TRANSPARENT;
         visuals.selection.bg_fill = egui::Color32::from_rgb(0x19, 0x5B, 0x45);
         visuals.selection.stroke =
-            egui::Stroke::new(1.0, egui::Color32::from_rgb(0x7D, 0xF2, 0xB3));
+            egui::Stroke::new(1.0, crate::theme::palette().success);
 
         visuals.widgets.noninteractive.bg_fill = egui::Color32::TRANSPARENT;
         visuals.widgets.noninteractive.weak_bg_fill = egui::Color32::TRANSPARENT;

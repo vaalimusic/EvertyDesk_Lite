@@ -108,7 +108,7 @@ fn vm_provider_badge(id: &str) -> (&'static str, egui::Color32) {
     if id.starts_with("vbox:") {
         ("VIRTUALBOX", egui::Color32::from_rgb(0xE8, 0x8A, 0x2E))
     } else {
-        ("HYPER-V", egui::Color32::from_rgb(0x3B, 0x9E, 0xE8))
+        ("HYPER-V", crate::theme::palette().info)
     }
 }
 
@@ -2931,7 +2931,7 @@ impl EvertyDeskApp {
         let dot_color = if online {
             egui::Color32::WHITE
         } else {
-            egui::Color32::from_rgb(0xFF, 0xD1, 0x6A)
+            crate::theme::palette().warning
         };
         let cap_label = if online {
             tr(lang, "В сети", "Online")
@@ -3468,7 +3468,7 @@ impl EvertyDeskApp {
                             .color(if self.hyperv_fps_display >= 1.5 {
                                 crate::theme::palette().success
                             } else {
-                                egui::Color32::from_rgb(0xFF, 0x80, 0x00)
+                                crate::theme::palette().warning
                             }),
                     );
                 });
@@ -3480,7 +3480,7 @@ impl EvertyDeskApp {
             ui.label(
                 egui::RichText::new(&self.hyperv_status)
                     .small()
-                    .color(egui::Color32::from_rgb(0x80, 0x80, 0xA0)),
+                    .color(crate::theme::palette().text_weak),
             );
         }
         ui.add_space(10.0);
@@ -3525,8 +3525,8 @@ impl EvertyDeskApp {
                     let is_active = self.hyperv_console_vm == Some(i);
                     let state_color = match vm.state {
                         hyperv::VmState::Running => crate::theme::palette().success,
-                        hyperv::VmState::Off => egui::Color32::from_rgb(0xA0, 0xA0, 0xA0),
-                        _ => egui::Color32::from_rgb(0xFF, 0xA5, 0x00),
+                        hyperv::VmState::Off => crate::theme::palette().text_muted,
+                        _ => crate::theme::palette().warning,
                     };
                     let row_fill = if is_active {
                         crate::theme::accent_tint(&crate::theme::palette(), 0.16)
@@ -3558,7 +3558,7 @@ impl EvertyDeskApp {
                                     ),
                                     hyperv::VmProvider::VMware => (
                                         "VMware",
-                                        egui::Color32::from_rgb(0x60, 0x7D, 0x8B),
+                                        crate::theme::palette().text_weak,
                                     ),
                                 };
                                 egui::Frame::NONE
@@ -3582,7 +3582,7 @@ impl EvertyDeskApp {
                                         ),
                                         hyperv::ConsoleMode::ThumbnailOnly => (
                                             "WMI",
-                                            egui::Color32::from_rgb(0x80, 0x80, 0x80),
+                                            crate::theme::palette().text_weak,
                                             "Integration Services не обнаружены — только WMI-превью (1–2 FPS)",
                                         ),
                                         hyperv::ConsoleMode::Other => ("", egui::Color32::TRANSPARENT, ""),
@@ -3740,13 +3740,13 @@ impl EvertyDeskApp {
             ui.label(egui::RichText::new("🖱 Enhanced Session (RDP over VMBus)").size(13.0).strong());
             ui.label(egui::RichText::new(&self.hyperv_status).small().color(egui::Color32::GRAY));
             if rdp_bytes > 0 {
-                ui.label(egui::RichText::new(format!("Получено {rdp_bytes} байт RDP (декодер не подключён)")).small().color(egui::Color32::from_rgb(0xFF, 0xA0, 0x00)));
+                ui.label(egui::RichText::new(format!("Получено {rdp_bytes} байт RDP (декодер не подключён)")).small().color(crate::theme::palette().warning));
             }
             ui.add_space(4.0);
             ui.label(egui::RichText::new(
                 "Транспорт VMBus активен. Для полноценного отображения требуется\n\
                  интеграция RDP-декодера (ironrdp). В следующей версии."
-            ).small().color(egui::Color32::from_rgb(0x60, 0x60, 0x60)));
+            ).small().color(crate::theme::palette().text_weak));
             return;
         }
 
@@ -3773,6 +3773,14 @@ impl EvertyDeskApp {
                         session.send(hyperv::HyperVCmd::ReleaseKey(0x20));
                         session.send(hyperv::HyperVCmd::ReleaseKey(0x5B));
                     }
+                    if ui.small_button("⇪ Caps")
+                        .on_hover_text("Переключить Caps Lock в VM (если регистр инвертирован — нажмите один раз)")
+                        .clicked()
+                    {
+                        // VK_CAPITAL = 0x14 — тумблер регистра внутри гостевой ОС.
+                        session.send(hyperv::HyperVCmd::PressKey(0x14));
+                        session.send(hyperv::HyperVCmd::ReleaseKey(0x14));
+                    }
                 }
             });
         });
@@ -3784,7 +3792,7 @@ impl EvertyDeskApp {
                 ui.label(
                     egui::RichText::new("⚠ Мышь недоступна — установите Integration Services в гостевой ОС")
                         .small()
-                        .color(egui::Color32::from_rgb(0xFF, 0xA5, 0x00)),
+                        .color(crate::theme::palette().warning),
                 );
                 if ui.small_button("Как?").on_hover_text(
                     "В гостевой Windows: Диспетчер устройств → обновить драйверы\n\
@@ -3987,7 +3995,7 @@ impl EvertyDeskApp {
                 egui::Align2::CENTER_CENTER,
                 "Загрузка экрана VM...",
                 egui::FontId::proportional(14.0),
-                egui::Color32::from_rgb(0x80, 0x80, 0xA0),
+                crate::theme::palette().text_weak,
             );
         }
     }
@@ -4035,7 +4043,7 @@ impl EvertyDeskApp {
             let pid = provider.provider_id().to_owned();
             let (prov_color, prov_label) = match &ptype {
                 provider_api::ProviderType::HyperV => {
-                    (egui::Color32::from_rgb(0x3B, 0x9E, 0xE8), "HYPER-V")
+                    (crate::theme::palette().info, "HYPER-V")
                 }
                 provider_api::ProviderType::VMware => {
                     (egui::Color32::from_rgb(0x60, 0xA8, 0xE0), "VMWARE")
@@ -4046,7 +4054,7 @@ impl EvertyDeskApp {
                 provider_api::ProviderType::Libvirt => {
                     (egui::Color32::from_rgb(0x58, 0xD6, 0x8D), "LIBVIRT")
                 }
-                _ => (egui::Color32::from_rgb(0x90, 0x90, 0x90), "PROVIDER"),
+                _ => (crate::theme::palette().text_muted, "PROVIDER"),
             };
 
             egui::Frame::NONE
@@ -4097,11 +4105,11 @@ impl EvertyDeskApp {
                                     provider_api::PowerState::Running =>
                                         (crate::theme::palette().success, "Running"),
                                     provider_api::PowerState::Stopped =>
-                                        (egui::Color32::from_rgb(0x80, 0x80, 0x80), "Stopped"),
+                                        (crate::theme::palette().text_weak, "Stopped"),
                                     provider_api::PowerState::Paused =>
-                                        (egui::Color32::from_rgb(0xFF, 0xBF, 0x00), "Paused"),
+                                        (crate::theme::palette().warning, "Paused"),
                                     _ =>
-                                        (egui::Color32::from_rgb(0x60, 0x60, 0x60), "Unknown"),
+                                        (crate::theme::palette().text_weak, "Unknown"),
                                 };
                                 ui.colored_label(dot_color, "●");
                                 ui.label(
@@ -5176,7 +5184,7 @@ impl EvertyDeskApp {
                     ui.spacing_mut().item_spacing.y = 7.0;
                     // Группируем по провайдеру: Hyper-V, затем VirtualBox.
                     for (prefix, title, color) in [
-                        ("hyperv:", "HYPER-V", egui::Color32::from_rgb(0x3B, 0x9E, 0xE8)),
+                        ("hyperv:", "HYPER-V", crate::theme::palette().info),
                         ("vbox:", "VIRTUALBOX", egui::Color32::from_rgb(0xE8, 0x8A, 0x2E)),
                     ] {
                         let group: Vec<&RemoteVmEntry> =
@@ -5207,7 +5215,7 @@ impl EvertyDeskApp {
         let dot = if vm.connectable {
             crate::theme::palette().success
         } else {
-            egui::Color32::from_rgb(0x9A, 0x9A, 0x9A)
+            crate::theme::palette().text_muted
         };
         let vm_id = vm.id.clone();
         let vm_name = vm.name.clone();
@@ -5581,7 +5589,7 @@ impl EvertyDeskApp {
                         ui,
                         None,
                         &format!("{}×{}", self.remote_size[0], self.remote_size[1]),
-                        egui::Color32::from_rgb(0xC8, 0xD0, 0xDD),
+                        crate::theme::palette().text_muted,
                     );
                     ui.add_space(6.0);
                 }
@@ -5598,9 +5606,9 @@ impl EvertyDeskApp {
                 let (codec_label, codec_color) = match self.last_frame_codec.as_str() {
                     "H264" | "H265" | "AV1" | "VP9" => (
                         self.last_frame_codec.as_str(),
-                        egui::Color32::from_rgb(0x5A, 0xE0, 0x9A),
+                        crate::theme::palette().accent,
                     ),
-                    "PNG" => ("PNG", egui::Color32::from_rgb(0xF0, 0xC0, 0x50)),
+                    "PNG" => ("PNG", crate::theme::palette().warning),
                     _ => ("—", egui::Color32::GRAY),
                 };
                 let _ = stat_pill(ui, None, codec_label, codec_color);
@@ -5608,11 +5616,11 @@ impl EvertyDeskApp {
                 // Задержка
                 if let Some(ms) = self.latency_ms {
                     let lat_color = if ms <= 40 {
-                        egui::Color32::from_rgb(0x5A, 0xE0, 0x9A)
+                        crate::theme::palette().accent
                     } else if ms <= 90 {
-                        egui::Color32::from_rgb(0xF0, 0xC0, 0x50)
+                        crate::theme::palette().warning
                     } else {
-                        egui::Color32::from_rgb(0xE0, 0x70, 0x70)
+                        crate::theme::palette().danger
                     };
                     let _ = stat_pill(ui, None, &format!("{ms} ms"), lat_color);
                     ui.add_space(6.0);
@@ -5620,9 +5628,9 @@ impl EvertyDeskApp {
                 // EVRT бейдж
                 if self.evrt_active {
                     let pressure_color = match self.evrt_pressure.as_str() {
-                        "critical" => egui::Color32::from_rgb(0xE0, 0x60, 0x60),
-                        "high" => egui::Color32::from_rgb(0xF0, 0xC0, 0x50),
-                        _ => egui::Color32::from_rgb(0x32, 0xD8, 0x8C),
+                        "critical" => crate::theme::palette().danger,
+                        "high" => crate::theme::palette().warning,
+                        _ => crate::theme::palette().accent,
                     };
                     let _ = stat_pill(ui, Some(pressure_color), "⚡ EVRT", pressure_color);
                     ui.add_space(6.0);
@@ -5640,7 +5648,7 @@ impl EvertyDeskApp {
                             if self.show_stream_info {
                                 crate::theme::palette().accent
                             } else {
-                                egui::Color32::from_rgb(0xB0, 0xB8, 0xC4)
+                                crate::theme::palette().text_muted
                             },
                         ))
                         .frame(false),
@@ -5654,7 +5662,7 @@ impl EvertyDeskApp {
                         ui,
                         Some(stream_health_color(&self.stream_health)),
                         &self.stream_health,
-                        egui::Color32::from_rgb(0xB8, 0xC2, 0xD0),
+                        crate::theme::palette().text_muted,
                     );
                     if self.remote_input_focused {
                         ui.add_space(6.0);
@@ -5693,7 +5701,7 @@ impl EvertyDeskApp {
             .show(ctx, |ui| {
                 let green = crate::theme::palette().accent;
                 let white = egui::Color32::from_rgb(0x1A, 0x1F, 0x2A);
-                let amber = egui::Color32::from_rgb(0xE0, 0xA0, 0x30);
+                let amber = crate::theme::palette().warning;
 
                 // ── Видео ──────────────────────────────────────────────────────
                 ui.label(
@@ -5820,7 +5828,7 @@ impl EvertyDeskApp {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         let pc = match self.evrt_pressure.as_str() {
-                            "critical" => egui::Color32::from_rgb(0xE0, 0x60, 0x60),
+                            "critical" => crate::theme::palette().danger,
                             "high" => amber,
                             _ => green,
                         };
@@ -6755,11 +6763,11 @@ fn stream_health_color(text: &str) -> egui::Color32 {
 /// Цвет точки и порог здоровья по FPS: зелёный/жёлтый/красный.
 fn health_dot(fps: f32) -> (egui::Color32, bool) {
     if fps >= 20.0 {
-        (egui::Color32::from_rgb(0x32, 0xD8, 0x8C), true)
+        (crate::theme::palette().accent, true)
     } else if fps >= 8.0 {
-        (egui::Color32::from_rgb(0xF0, 0xC0, 0x50), false)
+        (crate::theme::palette().warning, false)
     } else {
-        (egui::Color32::from_rgb(0xE0, 0x70, 0x70), false)
+        (crate::theme::palette().danger, false)
     }
 }
 
@@ -7412,13 +7420,13 @@ fn info_row(ui: &mut egui::Ui, label: &str, value: &str) {
         ui.label(
             egui::RichText::new(label)
                 .size(13.0)
-                .color(egui::Color32::from_rgb(0x80, 0x80, 0x80)),
+                .color(crate::theme::palette().text_weak),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
                 egui::RichText::new(value)
                     .size(13.0)
-                    .color(egui::Color32::from_rgb(0xCC, 0xCC, 0xCC)),
+                    .color(crate::theme::palette().text_muted),
             );
         });
     });

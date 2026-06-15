@@ -28,7 +28,7 @@ impl EvertyDeskApp {
                         self.config.ui.contacts.len()
                     ))
                     .size(12.5)
-                    .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                    .color(crate::theme::palette().text_weak),
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -40,9 +40,9 @@ impl EvertyDeskApp {
                         tr(lang, "Вход нужен", "Sign in")
                     },
                     if self.config.ui.address_book_signed_in {
-                        egui::Color32::from_rgb(0x12, 0xC9, 0x72)
+                        crate::theme::palette().accent
                     } else {
-                        egui::Color32::from_rgb(0xA8, 0xB0, 0xBE)
+                        crate::theme::palette().text_muted
                     },
                 );
             });
@@ -127,7 +127,7 @@ impl EvertyDeskApp {
                 ui.label(
                     egui::RichText::new(status)
                         .size(12.0)
-                        .color(egui::Color32::from_rgb(0x57, 0x60, 0x70)),
+                        .color(crate::theme::palette().text_weak),
                 );
             }
         });
@@ -163,7 +163,7 @@ impl EvertyDeskApp {
                         "The address book is empty. Add the first contact from the button above.",
                     ))
                     .size(13.0)
-                    .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                    .color(crate::theme::palette().text_weak),
                 );
             });
         } else if visible_indices.is_empty() {
@@ -171,7 +171,7 @@ impl EvertyDeskApp {
                 ui.label(
                     egui::RichText::new(tr(lang, "Ничего не найдено.", "Nothing found."))
                         .size(13.0)
-                        .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                        .color(crate::theme::palette().text_weak),
                 );
             });
         } else {
@@ -298,9 +298,9 @@ impl EvertyDeskApp {
                                 tr(lang, "offline", "offline")
                             },
                             if self.config.ui.address_book_signed_in {
-                                egui::Color32::from_rgb(0x12, 0xC9, 0x72)
+                                crate::theme::palette().accent
                             } else {
-                                egui::Color32::from_rgb(0xA8, 0xB0, 0xBE)
+                                crate::theme::palette().text_muted
                             },
                         );
                     });
@@ -382,14 +382,14 @@ impl EvertyDeskApp {
                 ui.label(
                     egui::RichText::new(format!("API: {}", self.config.server.api_url))
                         .size(11.5)
-                        .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                        .color(crate::theme::palette().text_weak),
                 );
                 if let Some(status) = &self.address_book_status {
                     ui.add_space(6.0);
                     ui.label(
                         egui::RichText::new(status)
                             .size(12.0)
-                            .color(egui::Color32::from_rgb(0x57, 0x60, 0x70)),
+                            .color(crate::theme::palette().text_weak),
                     );
                 }
             });
@@ -540,7 +540,7 @@ impl EvertyDeskApp {
                             egui::RichText::new(format_peer_id(&contact.remote_id))
                                 .size(13.0)
                                 .monospace()
-                                .color(egui::Color32::from_rgb(0x57, 0x60, 0x70)),
+                                .color(crate::theme::palette().text_weak),
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -552,9 +552,9 @@ impl EvertyDeskApp {
                                 tr(lang, "offline", "offline")
                             },
                             if contact.online {
-                                egui::Color32::from_rgb(0x12, 0xC9, 0x72)
+                                crate::theme::palette().accent
                             } else {
-                                egui::Color32::from_rgb(0xA8, 0xB0, 0xBE)
+                                crate::theme::palette().text_muted
                             },
                         );
                     });
@@ -813,7 +813,7 @@ fn draw_contact_tile(
                         egui::RichText::new(format_peer_id(&contact.remote_id))
                             .size(12.5)
                             .monospace()
-                            .color(egui::Color32::from_rgb(0x57, 0x60, 0x70)),
+                            .color(crate::theme::palette().text_weak),
                     )
                     .truncate(),
                 );
@@ -852,7 +852,7 @@ fn draw_contact_tile(
             egui::Label::new(
                 egui::RichText::new(note)
                     .size(12.0)
-                    .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                    .color(crate::theme::palette().text_weak),
             )
             .truncate(),
         );
@@ -867,9 +867,9 @@ fn draw_contact_tile(
                     tr(lang, "offline", "offline")
                 },
                 if contact.online {
-                    egui::Color32::from_rgb(0x12, 0xC9, 0x72)
+                    crate::theme::palette().accent
                 } else {
-                    egui::Color32::from_rgb(0xA8, 0xB0, 0xBE)
+                    crate::theme::palette().text_muted
                 },
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -897,7 +897,7 @@ fn contact_tile_frame(online: bool) -> egui::Frame {
         .stroke(egui::Stroke::new(
             1.0,
             if online {
-                egui::Color32::from_rgb(0xB8, 0xE8, 0xCE)
+                crate::theme::palette().success
             } else {
                 crate::theme::palette().surface_sunken
             },
@@ -913,7 +913,7 @@ fn status_dot(ui: &mut egui::Ui, label: &str, dot: egui::Color32) {
         ui.label(
             egui::RichText::new(label)
                 .size(11.5)
-                .color(egui::Color32::from_rgb(0x57, 0x60, 0x70)),
+                .color(crate::theme::palette().text_weak),
         );
     });
 }
@@ -928,7 +928,7 @@ fn compact_labeled_text_input(
     ui.label(
         egui::RichText::new(label)
             .size(12.5)
-            .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+            .color(crate::theme::palette().text_weak),
     );
     ui.add_sized(
         egui::vec2(ui.available_width(), 34.0),
@@ -947,7 +947,7 @@ fn compact_info_row(ui: &mut egui::Ui, label: &str, value: &str) {
             egui::Label::new(
                 egui::RichText::new(label)
                     .size(12.0)
-                    .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                    .color(crate::theme::palette().text_weak),
             )
             .truncate(),
         );
