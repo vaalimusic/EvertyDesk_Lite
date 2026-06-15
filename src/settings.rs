@@ -322,6 +322,9 @@ pub struct UiConfig {
     pub address_book_guid: String,
     #[serde(default)]
     pub agent_machine_id: String,
+    /// Тема оформления (тёмная/светлая).
+    #[serde(default)]
+    pub theme_mode: crate::theme::ThemeMode,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -382,6 +385,7 @@ impl Default for UiConfig {
             address_book_access_token: String::new(),
             address_book_guid: String::new(),
             agent_machine_id: String::new(),
+            theme_mode: crate::theme::ThemeMode::default(),
         }
     }
 }

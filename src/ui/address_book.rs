@@ -747,10 +747,10 @@ impl EvertyDeskApp {
 
 fn compact_panel_frame() -> egui::Frame {
     egui::Frame::NONE
-        .fill(egui::Color32::from_rgb(0xFF, 0xFF, 0xFF))
+        .fill(crate::theme::palette().surface)
         .stroke(egui::Stroke::new(
             1.0,
-            egui::Color32::from_rgb(0xE2, 0xE6, 0xEE),
+            crate::theme::palette().surface_sunken,
         ))
         .corner_radius(egui::CornerRadius::same(8))
         .inner_margin(egui::Margin::symmetric(12, 10))
@@ -890,16 +890,16 @@ fn draw_contact_tile(
 fn contact_tile_frame(online: bool) -> egui::Frame {
     egui::Frame::NONE
         .fill(if online {
-            egui::Color32::from_rgb(0xFA, 0xFF, 0xFC)
+            crate::theme::palette().surface_raised
         } else {
-            egui::Color32::from_rgb(0xFF, 0xFF, 0xFF)
+            crate::theme::palette().surface
         })
         .stroke(egui::Stroke::new(
             1.0,
             if online {
                 egui::Color32::from_rgb(0xB8, 0xE8, 0xCE)
             } else {
-                egui::Color32::from_rgb(0xE2, 0xE6, 0xEE)
+                crate::theme::palette().surface_sunken
             },
         ))
         .corner_radius(egui::CornerRadius::same(8))

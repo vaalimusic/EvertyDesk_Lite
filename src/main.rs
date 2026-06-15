@@ -5,6 +5,7 @@
 
 mod address_book;
 mod capability_engine;
+mod theme;
 mod libvirt_provider;
 mod proxmox_provider;
 mod provider_api;
@@ -648,7 +649,9 @@ fn run_gui(renderer: eframe::Renderer) -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             configure_ui_scale(&cc.egui_ctx);
-            configure_style(&cc.egui_ctx);
+            // Тема из конфига (тёмная по умолчанию).
+            let theme_mode = settings::AppConfig::load_or_create().ui.theme_mode;
+            theme::apply(&cc.egui_ctx, theme_mode);
             eprintln!(
                 "[EvertyDesk] Build codecs: {}",
                 crate::video::build_codec_label()
@@ -2422,7 +2425,7 @@ impl EvertyDeskApp {
         ctx.layer_painter(egui::LayerId::background()).rect_filled(
             screen_rect,
             egui::CornerRadius::ZERO,
-            egui::Color32::from_rgb(0xFB, 0xFC, 0xFE),
+            crate::theme::palette().bg,
         );
 
         // ── Left sidebar: logo · navigation · settings ───────────────────────
@@ -2431,10 +2434,10 @@ impl EvertyDeskApp {
             .exact_size(220.0)
             .frame(
                 egui::Frame::NONE
-                    .fill(egui::Color32::from_rgb(0xF7, 0xF8, 0xFA))
+                    .fill(crate::theme::palette().surface)
                     .stroke(egui::Stroke::new(
                         1.0,
-                        egui::Color32::from_rgb(0xEA, 0xEC, 0xF0),
+                        crate::theme::palette().border,
                     ))
                     .corner_radius(egui::CornerRadius::ZERO)
                     .inner_margin(egui::Margin::symmetric(18, 20))
@@ -2445,7 +2448,7 @@ impl EvertyDeskApp {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE
-                    .fill(egui::Color32::from_rgb(0xFB, 0xFC, 0xFE))
+                    .fill(crate::theme::palette().bg)
                     .inner_margin(egui::Margin {
                         left: 26,
                         right: 24,
@@ -2657,12 +2660,12 @@ impl EvertyDeskApp {
             p.rect_filled(
                 rect,
                 egui::CornerRadius::same(12),
-                egui::Color32::from_rgb(0xFC, 0xFD, 0xFF),
+                crate::theme::palette().surface_raised,
             );
             p.rect_stroke(
                 rect,
                 egui::CornerRadius::same(12),
-                egui::Stroke::new(1.0, egui::Color32::from_rgb(0xE5, 0xE8, 0xEF)),
+                egui::Stroke::new(1.0, crate::theme::palette().border),
                 egui::StrokeKind::Inside,
             );
             if let Some(texture) = self.ensure_app_logo_texture(ui.ctx()) {
@@ -2679,7 +2682,7 @@ impl EvertyDeskApp {
                     egui::Align2::CENTER_CENTER,
                     "E",
                     egui::FontId::proportional(26.0),
-                    egui::Color32::from_rgb(0x16, 0x18, 0x20),
+                    crate::theme::palette().accent,
                 );
             }
             ui.add_space(10.0);
@@ -2690,12 +2693,12 @@ impl EvertyDeskApp {
                     egui::RichText::new(APP_NAME)
                         .size(14.0)
                         .strong()
-                        .color(egui::Color32::from_rgb(0x17, 0x1A, 0x22)),
+                        .color(crate::theme::palette().text),
                 );
                 ui.label(
                     egui::RichText::new(format!("v{APP_VERSION}"))
                         .size(12.0)
-                        .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                        .color(crate::theme::palette().text_weak),
                 );
             });
         });
@@ -2778,13 +2781,13 @@ impl EvertyDeskApp {
 
     /// Right-hand "This computer" card: your ID, password, and host status.
     fn this_computer_card(&mut self, ui: &mut egui::Ui, _min_h: f32) {
-        let gray = egui::Color32::from_rgb(0x50, 0x58, 0x68);
+        let gray = crate::theme::palette().text_weak;
         card_frame().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.label(
                 egui::RichText::new(self.text("Этот компьютер", "This computer"))
                     .size(18.0)
-                    .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                    .color(crate::theme::palette().text),
             );
             ui.add_space(16.0);
 
@@ -2797,7 +2800,7 @@ impl EvertyDeskApp {
                 ui.label(
                     egui::RichText::new(format_peer_id(&self.config.local_id))
                         .size(26.0)
-                        .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                        .color(crate::theme::palette().text),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if icon_button(ui, "copy")
@@ -2830,7 +2833,7 @@ impl EvertyDeskApp {
                 ui.label(
                     egui::RichText::new(pw_text)
                         .size(22.0)
-                        .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                        .color(crate::theme::palette().text),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if icon_button(ui, "copy")
@@ -2864,9 +2867,9 @@ impl EvertyDeskApp {
                 let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                 let base = if online {
-                    egui::Color32::from_rgb(0x12, 0xC9, 0x72)
+                    crate::theme::palette().accent
                 } else {
-                    egui::Color32::from_rgb(0x12, 0xC9, 0x72)
+                    crate::theme::palette().accent
                 };
                 ui.painter().circle_filled(rect.center(), 5.0, base);
                 ui.add_space(12.0);
@@ -2969,7 +2972,7 @@ impl EvertyDeskApp {
         ui.label(
             egui::RichText::new(self.text("Недавние", "Recent"))
                 .size(12.0)
-                .color(egui::Color32::from_rgb(0x8A, 0x93, 0xA3)),
+                .color(crate::theme::palette().text_muted),
         );
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
@@ -3035,7 +3038,7 @@ impl EvertyDeskApp {
                         ui.label(
                             egui::RichText::new(self.text("ID партнера", "Partner ID"))
                                 .size(14.0)
-                                .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+                                .color(crate::theme::palette().text_weak),
                         );
                         let remote_id_response = compact_text_input(
                             ui,
@@ -3052,7 +3055,7 @@ impl EvertyDeskApp {
                             ui.label(
                                 egui::RichText::new(password_label)
                                     .size(14.0)
-                                    .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+                                    .color(crate::theme::palette().text_weak),
                             );
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -3462,7 +3465,7 @@ impl EvertyDeskApp {
                         egui::RichText::new(format!("{:.1} fps", self.hyperv_fps_display))
                             .small()
                             .color(if self.hyperv_fps_display >= 1.5 {
-                                egui::Color32::from_rgb(0x22, 0xC5, 0x5E)
+                                crate::theme::palette().success
                             } else {
                                 egui::Color32::from_rgb(0xFF, 0x80, 0x00)
                             }),
@@ -3520,7 +3523,7 @@ impl EvertyDeskApp {
                     let vm = &self.hyperv_vms[i];
                     let is_active = self.hyperv_console_vm == Some(i);
                     let state_color = match vm.state {
-                        hyperv::VmState::Running => egui::Color32::from_rgb(0x22, 0xC5, 0x5E),
+                        hyperv::VmState::Running => crate::theme::palette().success,
                         hyperv::VmState::Off => egui::Color32::from_rgb(0xA0, 0xA0, 0xA0),
                         _ => egui::Color32::from_rgb(0xFF, 0xA5, 0x00),
                     };
@@ -3864,7 +3867,7 @@ impl EvertyDeskApp {
             {
                 let focused = resp.has_focus() || resp.clicked();
                 let border_color = if focused {
-                    egui::Color32::from_rgb(0x12, 0xC9, 0x72)
+                    crate::theme::palette().accent
                 } else {
                     egui::Color32::from_rgba_unmultiplied(0x80, 0x80, 0x80, 0x60)
                 };
@@ -3899,35 +3902,51 @@ impl EvertyDeskApp {
                         }
                     }
                 });
-                // Hyper-V keyboard — VK codes for special keys, TypeText for printable
+                // Hyper-V keyboard — унифицировано с сетевым путём (vm_bridge):
+                //   • Event::Text → печатаемые символы через char_to_vk_shift
+                //     (PressKey с физическим VK + авто-Shift; TypeText больше НЕ
+                //     используется — он давал 'с'→'~' и был ненадёжен).
+                //   • Event::Key → ТОЛЬКО спец-клавиши (стрелки, F1-F12, Enter…)
+                //     и буквенно-цифровые combo с Ctrl/Alt (Ctrl+C). Обычные буквы
+                //     обрабатывает Text-путь — иначе двойной ввод (Text + Key).
+                const VK_SHIFT: u32 = 0x10;
                 ui.input(|i| {
                     for ev in &i.raw.events {
                         match ev {
                             egui::Event::Text(t) => {
-                                session.send(hyperv::HyperVCmd::TypeText(t.clone()));
-                            }
-                            egui::Event::Key { key, pressed, modifiers, .. } => {
-                                // Collect active modifier VKs
-                                let mut mods: Vec<u32> = Vec::new();
-                                if modifiers.ctrl  { mods.push(0x11); } // VK_CONTROL
-                                if modifiers.alt   { mods.push(0x12); } // VK_MENU
-                                if modifiers.shift { mods.push(0x10); } // VK_SHIFT
-                                if modifiers.command { mods.push(0x5B); } // VK_LWIN
-                                let vk_opt = egui_key_to_vkcode(*key)
-                                    .or_else(|| egui_letter_to_vkcode(*key));
-                                if let Some(vk) = vk_opt {
-                                    if *pressed {
-                                        if !mods.is_empty() {
-                                            for m in &mods { session.send(hyperv::HyperVCmd::PressKey(*m)); }
+                                for c in t.chars() {
+                                    match crate::vm_bridge::char_to_vk_shift(c) {
+                                        Some((vk, shift)) => {
+                                            if shift { session.send(hyperv::HyperVCmd::PressKey(VK_SHIFT)); }
                                             session.send(hyperv::HyperVCmd::PressKey(vk));
                                             session.send(hyperv::HyperVCmd::ReleaseKey(vk));
-                                            for m in mods.iter().rev() { session.send(hyperv::HyperVCmd::ReleaseKey(*m)); }
-                                        } else {
-                                            session.send(hyperv::HyperVCmd::PressKey(vk));
+                                            if shift { session.send(hyperv::HyperVCmd::ReleaseKey(VK_SHIFT)); }
                                         }
-                                    } else if mods.is_empty() {
-                                        session.send(hyperv::HyperVCmd::ReleaseKey(vk));
+                                        None => {
+                                            // Нет VK-маппинга (emoji и т.п.) — last-resort TypeText.
+                                            session.send(hyperv::HyperVCmd::TypeText(c.to_string()));
+                                        }
                                     }
+                                }
+                            }
+                            egui::Event::Key { key, pressed, modifiers, .. } => {
+                                let has_combo = modifiers.ctrl || modifiers.alt || modifiers.command;
+                                // Спец-клавиши обрабатываем всегда; буквы/цифры — только в combo.
+                                let vk_opt = egui_key_to_vkcode(*key)
+                                    .or_else(|| if has_combo { egui_letter_to_vkcode(*key) } else { None });
+                                let Some(vk) = vk_opt else { continue; };
+
+                                let mut mods: Vec<u32> = Vec::new();
+                                if modifiers.ctrl    { mods.push(0x11); } // VK_CONTROL
+                                if modifiers.alt     { mods.push(0x12); } // VK_MENU
+                                if modifiers.shift   { mods.push(VK_SHIFT); }
+                                if modifiers.command { mods.push(0x5B); } // VK_LWIN
+
+                                if *pressed {
+                                    for m in &mods { session.send(hyperv::HyperVCmd::PressKey(*m)); }
+                                    session.send(hyperv::HyperVCmd::PressKey(vk));
+                                    session.send(hyperv::HyperVCmd::ReleaseKey(vk));
+                                    for m in mods.iter().rev() { session.send(hyperv::HyperVCmd::ReleaseKey(*m)); }
                                 }
                             }
                             _ => {}
@@ -3992,7 +4011,7 @@ impl EvertyDeskApp {
             ui.label(
                 egui::RichText::new(format!("Провайдеры: {total}"))
                     .size(12.0)
-                    .color(egui::Color32::from_rgb(0xA7, 0xB4, 0xC2)),
+                    .color(crate::theme::palette().text_muted),
             );
             // Count total VMs across all providers
             let total_vms: usize = providers.iter().map(|p| {
@@ -4004,7 +4023,7 @@ impl EvertyDeskApp {
                 ui.label(
                     egui::RichText::new(format!("| VM: {total_vms}"))
                         .size(12.0)
-                        .color(egui::Color32::from_rgb(0xA7, 0xB4, 0xC2)),
+                        .color(crate::theme::palette().text_muted),
                 );
             }
         });
@@ -4056,7 +4075,7 @@ impl EvertyDeskApp {
                         // Status badge
                         let reachable = provider.list_hosts().is_ok();
                         let (status_dot, status_text) = if reachable {
-                            (egui::Color32::from_rgb(0x22, 0xC5, 0x5E), "Healthy")
+                            (crate::theme::palette().success, "Healthy")
                         } else {
                             (egui::Color32::from_rgb(0xFF, 0x60, 0x00), "Unavailable")
                         };
@@ -4075,7 +4094,7 @@ impl EvertyDeskApp {
                                 // Power state dot
                                 let (dot_color, state_label) = match vm.power_state {
                                     provider_api::PowerState::Running =>
-                                        (egui::Color32::from_rgb(0x22, 0xC5, 0x5E), "Running"),
+                                        (crate::theme::palette().success, "Running"),
                                     provider_api::PowerState::Stopped =>
                                         (egui::Color32::from_rgb(0x80, 0x80, 0x80), "Stopped"),
                                     provider_api::PowerState::Paused =>
@@ -4087,7 +4106,7 @@ impl EvertyDeskApp {
                                 ui.label(
                                     egui::RichText::new(&vm.name)
                                         .size(12.0)
-                                        .color(egui::Color32::from_rgb(0xF2, 0xF6, 0xFA)),
+                                        .color(crate::theme::palette().surface_raised),
                                 );
                                 ui.label(
                                     egui::RichText::new(state_label)
@@ -4239,7 +4258,7 @@ impl EvertyDeskApp {
             egui::RichText::new(self.text("История подключений", "Connection history"))
                 .size(28.0)
                 .strong()
-                .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                .color(crate::theme::palette().text),
         );
         ui.add_space(4.0);
         ui.label(
@@ -4248,7 +4267,7 @@ impl EvertyDeskApp {
                 "Recent IDs are stored locally. You can add a note.",
             ))
             .size(13.0)
-            .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+            .color(crate::theme::palette().text_weak),
         );
         ui.add_space(16.0);
 
@@ -4270,7 +4289,7 @@ impl EvertyDeskApp {
                                 egui::RichText::new(format_peer_id(&entry.remote_id))
                                     .size(22.0)
                                     .strong()
-                                    .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                                    .color(crate::theme::palette().text),
                             );
                             ui.label(
                                 egui::RichText::new(format!(
@@ -4279,7 +4298,7 @@ impl EvertyDeskApp {
                                     entry.connect_count
                                 ))
                                 .size(12.0)
-                                .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                                .color(crate::theme::palette().text_weak),
                             );
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4298,7 +4317,7 @@ impl EvertyDeskApp {
                     ui.label(
                         egui::RichText::new(tr(self.ui_lang, "Заметка", "Note"))
                             .size(12.0)
-                            .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+                            .color(crate::theme::palette().text_weak),
                     );
                     ui.add_sized(
                         egui::vec2(ui.available_width(), 40.0),
@@ -4348,7 +4367,7 @@ impl EvertyDeskApp {
                     egui::RichText::new(format!("ID: {}", format_peer_id(&peer_id)))
                         .size(22.0)
                         .strong()
-                        .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                        .color(crate::theme::palette().text),
                 );
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
@@ -4356,7 +4375,7 @@ impl EvertyDeskApp {
                         .add(
                             egui::Button::new(self.text("Разрешить", "Allow"))
                                 .min_size(egui::vec2(132.0, 40.0))
-                                .fill(egui::Color32::from_rgb(0x12, 0xC9, 0x72)),
+                                .fill(crate::theme::palette().accent),
                         )
                         .clicked()
                     {
@@ -4389,7 +4408,7 @@ impl EvertyDeskApp {
                     egui::RichText::new(self.text("Этот компьютер", "This computer"))
                         .size(34.0)
                         .strong()
-                        .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                        .color(crate::theme::palette().text),
                 );
                 ui.add_space(6.0);
                 ui.label(
@@ -4398,7 +4417,7 @@ impl EvertyDeskApp {
                         "Share this ID and password for direct unattended access",
                     ))
                     .size(15.0)
-                    .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                    .color(crate::theme::palette().text_weak),
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4414,7 +4433,7 @@ impl EvertyDeskApp {
             ui.label(
                 egui::RichText::new(self.text("Данные доступа", "Access credentials"))
                     .size(18.0)
-                    .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                    .color(crate::theme::palette().text),
             );
             ui.add_space(22.0);
             ui.horizontal(|ui| {
@@ -4422,12 +4441,12 @@ impl EvertyDeskApp {
                     ui.label(
                         egui::RichText::new(self.text("Ваш ID", "Your ID"))
                             .size(12.0)
-                            .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+                            .color(crate::theme::palette().text_weak),
                     );
                     ui.label(
                         egui::RichText::new(format_peer_id(&self.config.local_id))
                             .size(28.0)
-                            .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                            .color(crate::theme::palette().text),
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4449,7 +4468,7 @@ impl EvertyDeskApp {
                     ui.label(
                         egui::RichText::new(self.text("Пароль доступа", "Access password"))
                             .size(12.0)
-                            .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+                            .color(crate::theme::palette().text_weak),
                     );
                     let pw_text = if self.show_host_password {
                         self.config.local_password.clone()
@@ -4459,7 +4478,7 @@ impl EvertyDeskApp {
                     ui.label(
                         egui::RichText::new(pw_text)
                             .size(24.0)
-                            .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                            .color(crate::theme::palette().text),
                     );
                 });
                 let show_label = self.text("показать", "show");
@@ -4487,7 +4506,7 @@ impl EvertyDeskApp {
             ui.label(
                 egui::RichText::new(self.text("Доступ", "Sharing"))
                     .size(18.0)
-                    .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                    .color(crate::theme::palette().text),
             );
             ui.add_space(22.0);
             ui.horizontal(|ui| {
@@ -4501,13 +4520,13 @@ impl EvertyDeskApp {
                     egui::RichText::new(label)
                         .size(16.0)
                         .strong()
-                        .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                        .color(crate::theme::palette().text),
                 )
                 .min_size(egui::vec2(180.0, 54.0))
-                .fill(egui::Color32::from_rgb(0xFF, 0xFF, 0xFF))
+                .fill(crate::theme::palette().surface)
                 .stroke(egui::Stroke::new(
                     1.0,
-                    egui::Color32::from_rgb(0xE3, 0xE6, 0xEC),
+                    crate::theme::palette().border,
                 ))
                 .corner_radius(egui::CornerRadius::same(10));
                 if ui.add(button).clicked() {
@@ -4524,7 +4543,7 @@ impl EvertyDeskApp {
             ui.label(
                 egui::RichText::new(&self.host_status)
                     .size(13.0)
-                    .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                    .color(crate::theme::palette().text_weak),
             );
             if let Some(video_status) = &self.host_video_status {
                 ui.add_space(6.0);
@@ -4532,7 +4551,7 @@ impl EvertyDeskApp {
                     egui::RichText::new(format!("Video: {video_status}"))
                         .monospace()
                         .size(10.5)
-                        .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                        .color(crate::theme::palette().text_weak),
                 );
             }
         });
@@ -5145,7 +5164,7 @@ impl EvertyDeskApp {
                             "Список пуст. Нажмите ↻ Обновить.\n\nДоступно, если удалённый \
                              хост — Windows с Hyper-V, либо на хосте установлен VirtualBox.",
                         )
-                        .color(egui::Color32::from_rgb(0xA7, 0xB4, 0xC2)),
+                        .color(crate::theme::palette().text_muted),
                     );
                     return;
                 }
@@ -5185,7 +5204,7 @@ impl EvertyDeskApp {
     fn remote_vm_row(&mut self, ui: &mut egui::Ui, vm: &RemoteVmEntry, is_attached: bool) {
         let (prov_label, prov_color) = vm_provider_badge(&vm.id);
         let dot = if vm.connectable {
-            egui::Color32::from_rgb(0x22, 0xC5, 0x5E)
+            crate::theme::palette().success
         } else {
             egui::Color32::from_rgb(0x9A, 0x9A, 0x9A)
         };
@@ -5223,7 +5242,7 @@ impl EvertyDeskApp {
                             egui::RichText::new(name)
                                 .strong()
                                 .size(14.0)
-                                .color(egui::Color32::from_rgb(0xF2, 0xF6, 0xFA)),
+                                .color(crate::theme::palette().surface_raised),
                         );
                         ui.horizontal(|ui| {
                             // Чип провайдера
@@ -5242,7 +5261,7 @@ impl EvertyDeskApp {
                             ui.label(
                                 egui::RichText::new(&vm.state)
                                     .size(11.0)
-                                    .color(egui::Color32::from_rgb(0xA7, 0xB4, 0xC2)),
+                                    .color(crate::theme::palette().text_muted),
                             );
                             // ── Capability mode badge ─────────────────────────
                             if let (Some(label), Some((r, g, b))) = (&cap_mode_label, cap_mode_rgb) {
@@ -5269,7 +5288,7 @@ impl EvertyDeskApp {
                                 ui.label(
                                     egui::RichText::new("● подключено")
                                         .size(11.0)
-                                        .color(egui::Color32::from_rgb(0x22, 0xC5, 0x5E)),
+                                        .color(crate::theme::palette().success),
                                 );
                             } else if ui
                                 .add_enabled(vm.connectable, egui::Button::new("Подключиться"))
@@ -5618,7 +5637,7 @@ impl EvertyDeskApp {
                     let info_btn = ui.add(
                         egui::Button::new(egui::RichText::new("ℹ Детали").size(11.5).color(
                             if self.show_stream_info {
-                                egui::Color32::from_rgb(0x12, 0xC9, 0x72)
+                                crate::theme::palette().accent
                             } else {
                                 egui::Color32::from_rgb(0xB0, 0xB8, 0xC4)
                             },
@@ -5671,7 +5690,7 @@ impl EvertyDeskApp {
             .default_width(380.0)
             .anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, -56.0])
             .show(ctx, |ui| {
-                let green = egui::Color32::from_rgb(0x12, 0xC9, 0x72);
+                let green = crate::theme::palette().accent;
                 let white = egui::Color32::from_rgb(0x1A, 0x1F, 0x2A);
                 let amber = egui::Color32::from_rgb(0xE0, 0xA0, 0x30);
 
@@ -5794,7 +5813,7 @@ impl EvertyDeskApp {
                         ui.label(
                             egui::RichText::new(format!("→ {}", self.evrt_host_addr))
                                 .size(11.0)
-                                .color(egui::Color32::from_rgb(0x8A, 0x93, 0xA3)),
+                                .color(crate::theme::palette().text_muted),
                         );
                     });
                     ui.add_space(6.0);
@@ -5839,7 +5858,7 @@ impl EvertyDeskApp {
                             self.evrt_packets_received,
                         ))
                         .size(11.0)
-                        .color(egui::Color32::from_rgb(0x8A, 0x93, 0xA3)),
+                        .color(crate::theme::palette().text_muted),
                     );
                 } else {
                     ui.add_space(10.0);
@@ -5849,7 +5868,7 @@ impl EvertyDeskApp {
                             "📡 TCP relay (EVRT inactive)",
                         ))
                         .size(11.5)
-                        .color(egui::Color32::from_rgb(0x8A, 0x93, 0xA3)),
+                        .color(crate::theme::palette().text_muted),
                     );
                 }
             });
@@ -7211,71 +7230,9 @@ fn configure_ui_scale(ctx: &egui::Context) {
     ctx.set_zoom_factor(zoom);
 }
 
-fn configure_style(ctx: &egui::Context) {
-    use egui::{Color32, CornerRadius, Stroke};
-
-    let bg = Color32::from_rgb(0xFB, 0xFC, 0xFE);
-    let panel = Color32::from_rgb(0xFF, 0xFF, 0xFF);
-    let card = Color32::from_rgb(0xFF, 0xFF, 0xFF);
-    let input = Color32::from_rgb(0xFF, 0xFF, 0xFF);
-    let border = Color32::from_rgb(0xE3, 0xE6, 0xEC);
-    let border_hover = Color32::from_rgb(0xD8, 0xDC, 0xE4);
-    let border_focus = Color32::from_rgb(0xC7, 0xCD, 0xD8);
-    let text = Color32::from_rgb(0x13, 0x17, 0x21);
-    let text_weak = Color32::from_rgb(0x67, 0x70, 0x80);
-    let text_strong = Color32::from_rgb(0x22, 0x27, 0x32);
-
-    let mut visuals = egui::Visuals::light();
-    visuals.panel_fill = bg;
-    visuals.window_fill = panel;
-    visuals.extreme_bg_color = input;
-    visuals.faint_bg_color = card;
-    visuals.window_stroke = Stroke::new(1.0, border);
-
-    visuals.selection.bg_fill = Color32::from_rgb(0xB9, 0xD7, 0xFF);
-    visuals.selection.stroke = Stroke::new(1.0, Color32::from_rgb(0x3D, 0x73, 0xB8));
-
-    let rounding = CornerRadius::same(12);
-    visuals.widgets.noninteractive.bg_fill = card;
-    visuals.widgets.noninteractive.weak_bg_fill = card;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, border);
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text_weak);
-    visuals.widgets.noninteractive.corner_radius = rounding;
-
-    visuals.widgets.inactive.bg_fill = input;
-    // Slider rail uses weak_bg_fill; keep it visible against white backgrounds.
-    visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(0xE3, 0xE6, 0xEC);
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, border);
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, text_strong);
-    visuals.widgets.inactive.corner_radius = rounding;
-
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(0xFA, 0xFB, 0xFD);
-    visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(0xFA, 0xFB, 0xFD);
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, border_hover);
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, text);
-    visuals.widgets.hovered.corner_radius = rounding;
-
-    visuals.widgets.active.bg_fill = Color32::from_rgb(0xF3, 0xF5, 0xF8);
-    visuals.widgets.active.weak_bg_fill = Color32::from_rgb(0xF3, 0xF5, 0xF8);
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0, border_focus);
-    visuals.widgets.active.fg_stroke = Stroke::new(1.0, text);
-    visuals.widgets.active.corner_radius = rounding;
-
-    visuals.widgets.open.bg_fill = card;
-    visuals.widgets.open.bg_stroke = Stroke::new(1.0, border);
-    visuals.widgets.open.fg_stroke = Stroke::new(1.0, text);
-    visuals.widgets.open.corner_radius = rounding;
-
-    ctx.set_visuals(visuals);
-
-    let mut style = (*ctx.global_style()).clone();
-    style.spacing.item_spacing = egui::vec2(12.0, 9.0);
-    style.spacing.button_padding = egui::vec2(16.0, 9.0);
-    style.spacing.menu_margin = egui::Margin::same(8);
-    style.spacing.window_margin = egui::Margin::same(16);
-    style.spacing.interact_size.y = 34.0;
-    ctx.set_global_style(style);
-}
+// Тема и стиль теперь живут в `theme.rs` (дизайн-система с токенами).
+// `theme::apply(ctx, mode)` настраивает egui Visuals+Style и обновляет
+// глобальную палитру, доступную через `theme::palette()`.
 
 #[allow(dead_code)]
 const SERVICE_NAME: &str = "EvertyDeskLite";

@@ -226,7 +226,7 @@ impl EvertyDeskApp {
                                         egui::TextEdit::singleline(&mut self.shell_input)
                                             .hint_text("command")
                                             .font(egui::TextStyle::Monospace)
-                                            .text_color(egui::Color32::from_rgb(0xF5, 0xF8, 0xFC))
+                                            .text_color(crate::theme::palette().surface_raised)
                                             .frame(egui::Frame::NONE),
                                     )
                                 });
@@ -282,7 +282,7 @@ impl EvertyDeskApp {
                                         egui::TextEdit::singleline(&mut self.terminal_goal)
                                             .hint_text(task_hint)
                                             .font(egui::TextStyle::Button)
-                                            .text_color(egui::Color32::from_rgb(0xF5, 0xF8, 0xFC))
+                                            .text_color(crate::theme::palette().surface_raised)
                                             .frame(egui::Frame::NONE),
                                     );
                                 });
@@ -332,7 +332,7 @@ impl EvertyDeskApp {
                                         ui.label(
                                             egui::RichText::new(&self.terminal_ai_answer)
                                                 .size(13.0)
-                                                .color(egui::Color32::from_rgb(0xE5, 0xEC, 0xF7)),
+                                                .color(crate::theme::palette().surface_sunken),
                                         );
                                     });
                                 ui.add_space(6.0);

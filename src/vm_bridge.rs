@@ -588,6 +588,22 @@ fn dispatch_key(vm_id: &str, ev: &crate::rustdesk_proto::KeyEvent) {
     }
 }
 
+/// Символ → (VK-код физической клавиши, нужен ли Shift) на US-раскладке.
+///
+/// Единая точка маппинга для ОБОИХ путей ввода:
+///   • сетевой (dispatch_key, Android/удалённый клиент)
+///   • локальный (main.rs hyperv_ui, хост к своим же VM)
+///
+/// Поддерживает ASCII (буквы/цифры/пунктуацию) и кириллицу (JCUKEN→позиция).
+/// Регистр (Shift) выводится из самого символа, не из внешнего состояния —
+/// устраняет "залипший Shift" и двойной ввод TypeText+PressKey.
+#[cfg(windows)]
+pub fn char_to_vk_shift(c: char) -> Option<(u32, bool)> {
+    ascii_scancode(c)
+        .or_else(|| cyrillic_to_vk(c))
+        .map(|vk| (vk, needs_shift(c)))
+}
+
 /// Windows Virtual-Key код (VK_*) для управляющей клавиши.
 /// ВАЖНО: `Msvm_Keyboard.PressKey` ожидает VK-код, НЕ PS/2 scancode.
 /// `ck` — значение enum ControlKey из RustDesk message.proto (реальные номера).

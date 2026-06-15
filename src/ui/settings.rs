@@ -147,7 +147,7 @@ impl EvertyDeskApp {
                     egui::RichText::new(self.text("Настройки", "Settings"))
                         .size(28.0)
                         .strong()
-                        .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                        .color(crate::theme::palette().text),
                 );
                 ui.add_space(2.0);
                 ui.label(
@@ -156,7 +156,7 @@ impl EvertyDeskApp {
                         "Security, video, network and AI terminal",
                     ))
                     .size(13.0)
-                    .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                    .color(crate::theme::palette().text_weak),
                 );
             });
         });
@@ -203,6 +203,24 @@ impl EvertyDeskApp {
                     });
                 });
                 ui.add_space(6.0);
+                // Переключатель темы оформления — с мгновенным предпросмотром.
+                ui.horizontal(|ui| {
+                    ui.label(tr(selected_lang, "Тема оформления", "Theme"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        use crate::theme::ThemeMode;
+                        let dark_label = tr(selected_lang, "🌙 Тёмная", "🌙 Dark");
+                        let light_label = tr(selected_lang, "☀ Светлая", "☀ Light");
+                        if language_button(ui, light_label, draft.ui.theme_mode == ThemeMode::Light).clicked() {
+                            draft.ui.theme_mode = ThemeMode::Light;
+                            crate::theme::apply(ui.ctx(), ThemeMode::Light);
+                        }
+                        if language_button(ui, dark_label, draft.ui.theme_mode == ThemeMode::Dark).clicked() {
+                            draft.ui.theme_mode = ThemeMode::Dark;
+                            crate::theme::apply(ui.ctx(), ThemeMode::Dark);
+                        }
+                    });
+                });
+                ui.add_space(6.0);
                 ui.checkbox(
                     &mut draft.ui.show_connection_details,
                     tr(
@@ -245,7 +263,7 @@ impl EvertyDeskApp {
                         "Background mode: same executable with the --host argument.",
                     ))
                     .size(12.0)
-                    .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                    .color(crate::theme::palette().text_weak),
                 );
                 ui.add_space(6.0);
                 ui.horizontal_wrapped(|ui| {
@@ -285,7 +303,7 @@ impl EvertyDeskApp {
                     ui.label(
                         egui::RichText::new(status)
                             .size(12.0)
-                            .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                            .color(crate::theme::palette().text_weak),
                     );
                 }
             });
@@ -294,7 +312,7 @@ impl EvertyDeskApp {
             settings_section(ui, tr(selected_lang, "О программе", "About"), |ui| {
                 ui.label(
                     egui::RichText::new(format!("{APP_NAME} v{APP_VERSION}"))
-                        .color(egui::Color32::from_rgb(0x13, 0x17, 0x21)),
+                        .color(crate::theme::palette().text),
                 );
                 ui.label(format!(
                     "{}: {}",
@@ -347,6 +365,8 @@ impl EvertyDeskApp {
                 self.settings_draft = Some(new_cfg);
             }
             if ui.button(tr(selected_lang, "Отменить", "Cancel")).clicked() {
+                // Откатываем тему-предпросмотр к сохранённой.
+                crate::theme::apply(ui.ctx(), self.config.ui.theme_mode);
                 self.settings_draft = Some(self.config.clone());
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -393,7 +413,7 @@ fn security_section(
                     egui::Label::new(
                         egui::RichText::new(label)
                             .size(13.0)
-                            .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+                            .color(crate::theme::palette().text_weak),
                     )
                     .truncate(),
                 );
@@ -495,7 +515,7 @@ fn network_section(
                         "Используется собственный сервер",
                         "Using custom server",
                     ))
-                    .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+                    .color(crate::theme::palette().text_weak),
                 );
             });
             ui.add_space(6.0);
@@ -539,14 +559,14 @@ fn network_section(
             }
         } else {
             ui.horizontal(|ui| {
-                status_dot(ui, egui::Color32::from_rgb(0x12, 0xC9, 0x72));
+                status_dot(ui, crate::theme::palette().accent);
                 ui.label(
                     egui::RichText::new(tr(
                         selected_lang,
                         "Everty Desk сервер (по умолчанию)",
                         "Everty Desk server (default)",
                     ))
-                    .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+                    .color(crate::theme::palette().text_weak),
                 );
             });
             ui.add_space(6.0);
@@ -683,7 +703,7 @@ fn video_settings_body(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut App
             ui.label(
                 egui::RichText::new(tr(selected_lang, "Мин. FPS", "Min FPS"))
                     .size(13.0)
-                    .color(egui::Color32::from_rgb(0x67, 0x70, 0x80)),
+                    .color(crate::theme::palette().text_weak),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 for fps in [30u32, 20, 15, 10, 5] {
@@ -840,7 +860,7 @@ fn settings_secret_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
                 egui::Label::new(
                     egui::RichText::new(label)
                         .size(13.0)
-                        .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+                        .color(crate::theme::palette().text_weak),
                 )
                 .truncate(),
             );
@@ -858,7 +878,7 @@ fn settings_secret_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
         ui.label(
             egui::RichText::new(label)
                 .size(13.0)
-                .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+                .color(crate::theme::palette().text_weak),
         );
         ui.add_sized(
             egui::vec2(ui.available_width(), 34.0),

@@ -10,6 +10,7 @@
 
 // ── Core-модули (нужны клиентскому пути transport → evrt_client → декод) ──────
 pub mod capability_engine;
+pub mod theme;
 pub mod libvirt_provider;
 pub mod proxmox_provider;
 pub mod provider_api;
