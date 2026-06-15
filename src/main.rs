@@ -2714,7 +2714,7 @@ impl EvertyDeskApp {
         ui.add_space(8.0);
         #[cfg(windows)]
         {
-            let hv_label = self.text("Виртуальные машины", "Virtual Machines");
+            let hv_label = self.text("VM", "VM");
             self.nav_item(ui, AppMode::HyperV, hv_label, "server");
             ui.add_space(8.0);
         }
@@ -3203,7 +3203,7 @@ impl EvertyDeskApp {
                 ui.label(
                     egui::RichText::new("Ваш ID")
                         .size(11.5)
-                        .color(egui::Color32::GRAY),
+                        .color(crate::theme::palette().text_muted),
                 );
                 ui.horizontal(|ui| {
                     // Large monospace ID — like RustDesk
@@ -3227,7 +3227,7 @@ impl EvertyDeskApp {
                 ui.label(
                     egui::RichText::new("Пароль")
                         .size(11.5)
-                        .color(egui::Color32::GRAY),
+                        .color(crate::theme::palette().text_muted),
                 );
                 ui.horizontal(|ui| {
                     let pw_text = if self.show_host_password {
@@ -3292,21 +3292,28 @@ impl EvertyDeskApp {
 
         // Pending incoming connection
         if let Some(peer_id) = self.host_pending_peer.clone() {
-            ui.add_space(8.0);
+            let t = crate::theme::palette();
+            ui.add_space(theme::space::SM);
             egui::Frame::group(ui.style())
-                .fill(egui::Color32::from_rgba_premultiplied(60, 110, 180, 40))
-                .inner_margin(egui::Margin::same(10))
+                .fill(crate::theme::accent_tint(&t, 0.12))
+                .stroke(egui::Stroke::new(1.0, crate::theme::tint(t.accent, 0.45)))
+                .corner_radius(egui::CornerRadius::same(theme::radius::LG))
+                .inner_margin(egui::Margin::same(theme::space::MD as i8))
                 .show(ui, |ui| {
                     ui.label(
-                        egui::RichText::new(format!("📡 Входящий запрос от: {peer_id}")).strong(),
+                        egui::RichText::new(format!("📡 Входящий запрос от: {peer_id}"))
+                            .strong()
+                            .color(t.text),
                     );
-                    ui.add_space(6.0);
+                    ui.add_space(theme::space::SM);
                     ui.horizontal(|ui| {
                         if ui
                             .add(
-                                egui::Button::new("✓ Принять")
-                                    .min_size(egui::vec2(100.0, 28.0))
-                                    .fill(egui::Color32::from_rgb(40, 160, 80)),
+                                egui::Button::new(
+                                    egui::RichText::new("✓ Принять").color(t.accent_fg),
+                                )
+                                .min_size(egui::vec2(100.0, 28.0))
+                                .fill(t.accent),
                             )
                             .clicked()
                         {
@@ -3315,9 +3322,11 @@ impl EvertyDeskApp {
                         }
                         if ui
                             .add(
-                                egui::Button::new("✗ Отклонить")
-                                    .min_size(egui::vec2(100.0, 28.0))
-                                    .fill(egui::Color32::from_rgb(200, 60, 60)),
+                                egui::Button::new(
+                                    egui::RichText::new("✗ Отклонить").color(t.danger),
+                                )
+                                .min_size(egui::vec2(100.0, 28.0))
+                                .fill(crate::theme::tint(t.danger, 0.14)),
                             )
                             .clicked()
                         {
@@ -3447,7 +3456,7 @@ impl EvertyDeskApp {
             if let Some(t) = self.hyperv_last_refresh {
                 let secs = t.elapsed().as_secs();
                 let age = if secs < 60 { format!("{secs}с назад") } else { format!("{}м назад", secs / 60) };
-                ui.label(egui::RichText::new(age).small().color(egui::Color32::GRAY));
+                ui.label(egui::RichText::new(age).small().color(crate::theme::palette().text_muted));
             }
             let any_session = self.hyperv_session.is_some() || self.vbox_session.is_some() || self.hyperv_rdp_session.is_some();
             if any_session && ui.button("✕  Отключиться").clicked() {
@@ -3497,7 +3506,7 @@ impl EvertyDeskApp {
         if self.hyperv_loading && self.hyperv_vms.is_empty() {
             ui.label(
                 egui::RichText::new("Сканирование гипервизоров (Hyper-V, VirtualBox, VMware)...")
-                    .color(egui::Color32::GRAY),
+                    .color(crate::theme::palette().text_muted),
             );
             ui.ctx().request_repaint_after(Duration::from_millis(250));
             return;
@@ -3508,7 +3517,7 @@ impl EvertyDeskApp {
                     "Гипервизоры не обнаружены (Hyper-V, VirtualBox, VMware).\n\
                      Нажмите «Обновить» для повторного поиска.",
                 )
-                .color(egui::Color32::GRAY),
+                .color(crate::theme::palette().text_muted),
             );
             return;
         }
@@ -3544,7 +3553,7 @@ impl EvertyDeskApp {
                                 ui.label(
                                     egui::RichText::new(vm.state.label())
                                         .small()
-                                        .color(egui::Color32::GRAY),
+                                        .color(crate::theme::palette().text_muted),
                                 );
                                 // Provider badge
                                 let (badge_text, badge_color) = match vm.provider {
@@ -3738,7 +3747,7 @@ impl EvertyDeskApp {
             ui.separator();
             ui.add_space(4.0);
             ui.label(egui::RichText::new("🖱 Enhanced Session (RDP over VMBus)").size(13.0).strong());
-            ui.label(egui::RichText::new(&self.hyperv_status).small().color(egui::Color32::GRAY));
+            ui.label(egui::RichText::new(&self.hyperv_status).small().color(crate::theme::palette().text_muted));
             if rdp_bytes > 0 {
                 ui.label(egui::RichText::new(format!("Получено {rdp_bytes} байт RDP (декодер не подключён)")).small().color(crate::theme::palette().warning));
             }
@@ -3809,7 +3818,7 @@ impl EvertyDeskApp {
         if let Some(session) = &self.hyperv_session {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Горячие клавиши:").small().color(egui::Color32::GRAY));
+                ui.label(egui::RichText::new("Горячие клавиши:").small().color(crate::theme::palette().text_muted));
                 // Ctrl+A
                 if ui.small_button("Ctrl+A").clicked() {
                     session.send(hyperv::HyperVCmd::PressKey(0x11));
@@ -4009,7 +4018,7 @@ impl EvertyDeskApp {
         if providers.is_empty() {
             ui.label(
                 egui::RichText::new("Нет зарегистрированных провайдеров")
-                    .color(egui::Color32::GRAY)
+                    .color(crate::theme::palette().text_muted)
                     .size(12.0),
             );
             return;
@@ -4120,7 +4129,7 @@ impl EvertyDeskApp {
                                 ui.label(
                                     egui::RichText::new(state_label)
                                         .size(10.5)
-                                        .color(egui::Color32::GRAY),
+                                        .color(crate::theme::palette().text_muted),
                                 );
                                 // Show recommended mode from capabilities
                                 if let Ok(graph) = provider.get_capabilities(&vm.vm_id) {
@@ -4154,13 +4163,13 @@ impl EvertyDeskApp {
                         ui.label(
                             egui::RichText::new("Инвентарь недоступен")
                                 .size(11.0)
-                                .color(egui::Color32::GRAY),
+                                .color(crate::theme::palette().text_muted),
                         );
                     } else if vm_count == 0 {
                         ui.label(
                             egui::RichText::new("VM не обнаружены")
                                 .size(11.0)
-                                .color(egui::Color32::GRAY),
+                                .color(crate::theme::palette().text_muted),
                         );
                     }
                 });
@@ -5458,7 +5467,7 @@ impl EvertyDeskApp {
                                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
                                     if let Some(arr) = v.get("checkpoints").and_then(|x| x.as_array()) {
                                         if arr.is_empty() {
-                                            ui.label(egui::RichText::new("Нет контрольных точек").color(egui::Color32::GRAY).size(11.0));
+                                            ui.label(egui::RichText::new("Нет контрольных точек").color(crate::theme::palette().text_muted).size(11.0));
                                         }
                                         for cp in arr {
                                             let name = cp.get("name").and_then(|x| x.as_str()).unwrap_or("Без имени");
@@ -5467,7 +5476,7 @@ impl EvertyDeskApp {
                                             let ctype = cp.get("type").and_then(|x| x.as_str()).unwrap_or("");
                                             ui.horizontal(|ui| {
                                                 ui.label(egui::RichText::new(name).size(11.5).strong());
-                                                ui.label(egui::RichText::new(format!("[{ctype}] {time}")).size(10.0).color(egui::Color32::GRAY));
+                                                ui.label(egui::RichText::new(format!("[{ctype}] {time}")).size(10.0).color(crate::theme::palette().text_muted));
                                                 let path_str = path.to_owned();
                                                 let vm_id2 = vm_id.clone();
                                                 if ui.small_button("↩ Apply").clicked() {
@@ -5493,7 +5502,7 @@ impl EvertyDeskApp {
                                     }
                                 }
                             } else {
-                                ui.label(egui::RichText::new("Загрузка…").color(egui::Color32::GRAY).size(11.0));
+                                ui.label(egui::RichText::new("Загрузка…").color(crate::theme::palette().text_muted).size(11.0));
                             }
                         });
                 }
@@ -5609,7 +5618,7 @@ impl EvertyDeskApp {
                         crate::theme::palette().accent,
                     ),
                     "PNG" => ("PNG", crate::theme::palette().warning),
-                    _ => ("—", egui::Color32::GRAY),
+                    _ => ("—", crate::theme::palette().text_muted),
                 };
                 let _ = stat_pill(ui, None, codec_label, codec_color);
                 ui.add_space(6.0);
@@ -6003,7 +6012,7 @@ impl EvertyDeskApp {
                             egui::Color32::from_rgb(220, 180, 60),
                             "Screenshot fallback, higher latency",
                         ),
-                        _ => ("no frame", egui::Color32::GRAY, "No frames received yet"),
+                        _ => ("no frame", crate::theme::palette().text_muted, "No frames received yet"),
                     };
                     ui.label(
                         egui::RichText::new(codec_label)
@@ -6113,7 +6122,7 @@ impl EvertyDeskApp {
                         ui.label(
                             egui::RichText::new("наведите мышь → ввод")
                                 .size(11.0)
-                                .color(egui::Color32::GRAY),
+                                .color(crate::theme::palette().text_muted),
                         );
                     }
                     // Pending indicator

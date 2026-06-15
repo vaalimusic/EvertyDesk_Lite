@@ -11,7 +11,12 @@
 //! Скриншот-поллинг медленнее Hyper-V thumbnail, но не требует агента и работает
 //! с любым гостём. Для интерактива позже — VRDP (встроенный RDP VirtualBox).
 
-use std::{process::Command, sync::mpsc, thread, time::Duration};
+use std::{
+    process::{Command, Output, Stdio},
+    sync::{mpsc, OnceLock},
+    thread,
+    time::{Duration, Instant},
+};
 
 #[derive(Debug, Clone)]
 pub struct VboxVm {
@@ -21,25 +26,81 @@ pub struct VboxVm {
     pub running: bool,
 }
 
-/// Найти бинарь VBoxManage: PATH или типичные места установки.
-fn vboxmanage() -> Option<String> {
-    // 1) на PATH
-    for cand in ["VBoxManage", "vboxmanage"] {
-        if Command::new(cand).arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
-            return Some(cand.to_owned());
+/// Таймаут по умолчанию для VBoxManage. Если процесс завис (частая беда на
+/// Windows при проблемах с COM/драйвером VirtualBox) — мы его убиваем, а не
+/// виснем навсегда. Это устраняло «выкидывает»: раньше зависший VBoxManage
+/// блокировал host/UI-поток бесконечно.
+const VBOX_CMD_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// Запустить команду с таймаутом. None при ошибке запуска ИЛИ при таймауте
+/// (процесс убивается). Никогда не блокирует дольше `timeout`.
+fn output_timeout(mut cmd: Command, timeout: Duration) -> Option<Output> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                // Процесс завершился — забираем вывод.
+                return child.wait_with_output().ok();
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    // Завис — убиваем и сообщаем «нет результата».
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return None,
         }
     }
-    // 2) типичные пути
+}
+
+/// Удобная обёртка: VBoxManage с аргументами и стандартным таймаутом.
+fn vbm_run(vbm: &str, args: &[&str]) -> Option<Output> {
+    let mut cmd = Command::new(vbm);
+    cmd.args(args);
+    output_timeout(cmd, VBOX_CMD_TIMEOUT)
+}
+
+/// Кэш найденного пути к VBoxManage. Поиск (включая запуск `--version`)
+/// выполняется ОДИН раз за сессию, а не на каждый скриншот/команду.
+fn vboxmanage() -> Option<String> {
+    static CACHE: OnceLock<Option<String>> = OnceLock::new();
+    CACHE.get_or_init(detect_vboxmanage).clone()
+}
+
+/// Найти бинарь VBoxManage: PATH или типичные места установки.
+fn detect_vboxmanage() -> Option<String> {
+    // 1) типичные пути (проверка существования файла — дёшево, без запуска)
     let candidates = [
         r"C:\Program Files\Oracle\VirtualBox\VBoxManage.exe",
         r"C:\Program Files\Oracle\VirtualBox\VBoxManage",
         "/usr/bin/VBoxManage",
         "/usr/local/bin/VBoxManage",
+        "/opt/homebrew/bin/VBoxManage",
         "/Applications/VirtualBox.app/Contents/MacOS/VBoxManage",
     ];
     for path in candidates {
         if std::path::Path::new(path).exists() {
             return Some(path.to_owned());
+        }
+    }
+    // 2) на PATH — проверяем запуском `--version` с таймаутом.
+    for cand in ["VBoxManage", "vboxmanage"] {
+        let mut cmd = Command::new(cand);
+        cmd.arg("--version");
+        if let Some(out) = output_timeout(cmd, Duration::from_secs(3)) {
+            if out.status.success() {
+                return Some(cand.to_owned());
+            }
         }
     }
     None
@@ -71,7 +132,7 @@ pub fn list_vms() -> Vec<VboxVm> {
 }
 
 fn run_list(vbm: &str, kind: &str) -> Vec<(String, String)> {
-    let Ok(out) = Command::new(vbm).args(["list", kind]).output() else {
+    let Some(out) = vbm_run(vbm, &["list", kind]) else {
         return Vec::new();
     };
     if !out.status.success() {
@@ -106,11 +167,8 @@ pub fn screenshot(uuid: &str) -> Option<(u32, u32, Vec<u8>)> {
     let mut path = std::env::temp_dir();
     path.push(format!("evd_vbox_{}.png", sanitize(uuid)));
 
-    let out = Command::new(&vbm)
-        .args(["controlvm", uuid, "screenshotpng"])
-        .arg(&path)
-        .output()
-        .ok()?;
+    let path_str = path.to_string_lossy().into_owned();
+    let out = vbm_run(&vbm, &["controlvm", uuid, "screenshotpng", &path_str])?;
     if !out.status.success() {
         return None;
     }
@@ -125,10 +183,8 @@ pub fn screenshot(uuid: &str) -> Option<(u32, u32, Vec<u8>)> {
 /// Напечатать строку в гостя (VBoxManage keyboardputstring).
 pub fn put_string(uuid: &str, text: &str) -> Result<(), String> {
     let vbm = vboxmanage().ok_or_else(|| "VBoxManage не найден".to_owned())?;
-    let out = Command::new(&vbm)
-        .args(["controlvm", uuid, "keyboardputstring", text])
-        .output()
-        .map_err(|e| format!("keyboardputstring: {e}"))?;
+    let out = vbm_run(&vbm, &["controlvm", uuid, "keyboardputstring", text])
+        .ok_or_else(|| "keyboardputstring: таймаут/ошибка запуска".to_owned())?;
     if out.status.success() {
         Ok(())
     } else {
@@ -146,10 +202,10 @@ pub fn put_scancodes(uuid: &str, codes: &[u8]) -> Result<(), String> {
     }
     let vbm = vboxmanage().ok_or_else(|| "VBoxManage не найден".to_owned())?;
     let hex: Vec<String> = codes.iter().map(|b| format!("{b:02x}")).collect();
-    let mut cmd = Command::new(&vbm);
-    cmd.args(["controlvm", uuid, "keyboardputscancode"]);
-    cmd.args(&hex);
-    let out = cmd.output().map_err(|e| format!("keyboardputscancode: {e}"))?;
+    let mut args: Vec<&str> = vec!["controlvm", uuid, "keyboardputscancode"];
+    args.extend(hex.iter().map(|s| s.as_str()));
+    let out = vbm_run(&vbm, &args)
+        .ok_or_else(|| "keyboardputscancode: таймаут/ошибка запуска".to_owned())?;
     if out.status.success() {
         Ok(())
     } else {
@@ -250,10 +306,9 @@ impl VboxSession {
 
 fn vbox_mousemove(uuid: &str, dx: i32, dy: i32) -> Result<(), String> {
     let vbm = vboxmanage().ok_or_else(|| "VBoxManage не найден".to_owned())?;
-    let out = Command::new(&vbm)
-        .args(["controlvm", uuid, "mousemove", &dx.to_string(), &dy.to_string()])
-        .output()
-        .map_err(|e| e.to_string())?;
+    let (dxs, dys) = (dx.to_string(), dy.to_string());
+    let out = vbm_run(&vbm, &["controlvm", uuid, "mousemove", &dxs, &dys])
+        .ok_or_else(|| "mousemove: таймаут/ошибка запуска".to_owned())?;
     if out.status.success() { Ok(()) } else { Err("mousemove failed".to_owned()) }
 }
 
