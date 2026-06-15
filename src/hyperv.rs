@@ -705,47 +705,55 @@ fn rgb565_to_rgba(rgb565: &[u8], width: usize, height: usize) -> Vec<u8> {
     rgba
 }
 
-pub fn press_key(vm_id: &str, scan_code: u32) {
-    kbd_exec(vm_id, "PressKey", scan_code);
+pub fn press_key(vm_id: &str, scan_code: u32) -> Result<(), String> {
+    kbd_exec(vm_id, "PressKey", scan_code)
 }
 
-pub fn release_key(vm_id: &str, scan_code: u32) {
-    kbd_exec(vm_id, "ReleaseKey", scan_code);
+pub fn release_key(vm_id: &str, scan_code: u32) -> Result<(), String> {
+    kbd_exec(vm_id, "ReleaseKey", scan_code)
 }
 
-pub fn type_text(vm_id: &str, text: &str) {
-    let Some(wmi) = Wmi::connect() else { return };
-    let Some(path) = find_device_path(&wmi, "Msvm_Keyboard", vm_id) else { return };
-    let _ = wmi.exec_method(&path, "TypeText", &[("asciiText", WmiVal::Str(text.to_owned()))]);
+pub fn type_text(vm_id: &str, text: &str) -> Result<(), String> {
+    let wmi = Wmi::connect().ok_or_else(|| "WMI connect failed".to_owned())?;
+    let path = find_device_path(&wmi, "Msvm_Keyboard", vm_id)
+        .ok_or_else(|| "Msvm_Keyboard не найден".to_owned())?;
+    wmi.exec_method_result(&path, "TypeText", &[("asciiText", WmiVal::Str(text.to_owned()))])
+        .map(|_| ())
 }
 
-fn kbd_exec(vm_id: &str, method: &str, scan_code: u32) {
-    let Some(wmi) = Wmi::connect() else { return };
-    let Some(path) = find_device_path(&wmi, "Msvm_Keyboard", vm_id) else { return };
+fn kbd_exec(vm_id: &str, method: &str, scan_code: u32) -> Result<(), String> {
+    let wmi = Wmi::connect().ok_or_else(|| "WMI connect failed".to_owned())?;
+    let path = find_device_path(&wmi, "Msvm_Keyboard", vm_id)
+        .ok_or_else(|| "Msvm_Keyboard не найден".to_owned())?;
     // VT_I4: провайдер виртуализации отвергает VT_UI4 (WBEM_E_TYPE_MISMATCH).
-    let _ = wmi.exec_method(&path, method, &[("scanCode", WmiVal::I32(scan_code as i32))]);
+    wmi.exec_method_result(&path, method, &[("scanCode", WmiVal::I32(scan_code as i32))])
+        .map(|_| ())
 }
 
 /// x, y in 0–65535 (normalized to VM display).
-pub fn move_mouse(vm_id: &str, x: u32, y: u32) {
-    let Some(wmi) = Wmi::connect() else { return };
-    let Some(path) = find_device_path(&wmi, "Msvm_Mouse", vm_id) else { return };
-    let _ = wmi.exec_method(
+pub fn move_mouse(vm_id: &str, x: u32, y: u32) -> Result<(), String> {
+    let wmi = Wmi::connect().ok_or_else(|| "WMI connect failed".to_owned())?;
+    let path = find_device_path(&wmi, "Msvm_Mouse", vm_id)
+        .ok_or_else(|| "Msvm_Mouse не найден".to_owned())?;
+    wmi.exec_method_result(
         &path,
         "SetAbsolutePosition",
         &[
             ("horizontalPosition", WmiVal::I32(x as i32)),
             ("verticalPosition", WmiVal::I32(y as i32)),
         ],
-    );
+    )
+    .map(|_| ())
 }
 
 /// button: 1=left, 2=right, 3=middle.
-pub fn click_mouse(vm_id: &str, button: u32, press: bool) {
-    let Some(wmi) = Wmi::connect() else { return };
-    let Some(path) = find_device_path(&wmi, "Msvm_Mouse", vm_id) else { return };
+pub fn click_mouse(vm_id: &str, button: u32, press: bool) -> Result<(), String> {
+    let wmi = Wmi::connect().ok_or_else(|| "WMI connect failed".to_owned())?;
+    let path = find_device_path(&wmi, "Msvm_Mouse", vm_id)
+        .ok_or_else(|| "Msvm_Mouse не найден".to_owned())?;
     let method = if press { "ClickButton" } else { "ReleaseButton" };
-    let _ = wmi.exec_method(&path, method, &[("buttonIndex", WmiVal::I32(button as i32))]);
+    wmi.exec_method_result(&path, method, &[("buttonIndex", WmiVal::I32(button as i32))])
+        .map(|_| ())
 }
 
 fn find_device_path(wmi: &Wmi, class: &str, vm_id: &str) -> Option<String> {
@@ -804,11 +812,11 @@ impl HyperVSession {
                 loop {
                     match cmd_rx.try_recv() {
                         Ok(HyperVCmd::Stop) => return,
-                        Ok(HyperVCmd::PressKey(sc)) => press_key(&vm.id, sc),
-                        Ok(HyperVCmd::ReleaseKey(sc)) => release_key(&vm.id, sc),
-                        Ok(HyperVCmd::TypeText(t)) => type_text(&vm.id, &t),
-                        Ok(HyperVCmd::MoveMouse(x, y)) => move_mouse(&vm.id, x, y),
-                        Ok(HyperVCmd::ClickMouse(b, p)) => click_mouse(&vm.id, b, p),
+                        Ok(HyperVCmd::PressKey(sc)) => { let _ = press_key(&vm.id, sc); }
+                        Ok(HyperVCmd::ReleaseKey(sc)) => { let _ = release_key(&vm.id, sc); }
+                        Ok(HyperVCmd::TypeText(t)) => { let _ = type_text(&vm.id, &t); }
+                        Ok(HyperVCmd::MoveMouse(x, y)) => { let _ = move_mouse(&vm.id, x, y); }
+                        Ok(HyperVCmd::ClickMouse(b, p)) => { let _ = click_mouse(&vm.id, b, p); }
                         Err(_) => break,
                     }
                 }

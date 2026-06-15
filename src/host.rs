@@ -2399,15 +2399,23 @@ fn handle_client_input_pipeline(
             host_log(events, format!("Host VM: attach '{vm_id}' → {status}"));
             let _ = cmd_tx.send(PipelineCmd::RefreshDisplay(0));
             let _ = peer_msg_tx.send(vm_misc_message(misc::Union::VmStatus(status)));
-            // Follow-up: после прогрева захвата шлём реальный статус потока,
-            // чтобы клиент не «висел» на «Подключение…».
+            // Периодический pump статуса, пока VM прикреплена: клиент не «висит»
+            // на «Подключение…», плюс всплывают ошибки ввода (диагностика).
             if attaching {
                 let tx = peer_msg_tx.clone();
                 thread::spawn(move || {
-                    thread::sleep(Duration::from_millis(700));
-                    if crate::vm_bridge::is_attached() {
+                    let mut last = String::new();
+                    for _ in 0..150 {
+                        // ~5 минут максимум
+                        thread::sleep(Duration::from_millis(2000));
+                        if !crate::vm_bridge::is_attached() {
+                            break;
+                        }
                         let live = format!("● Поток VM активен — {}", crate::vm_bridge::status());
-                        let _ = tx.send(vm_misc_message(misc::Union::VmStatus(live)));
+                        if live != last {
+                            let _ = tx.send(vm_misc_message(misc::Union::VmStatus(live.clone())));
+                            last = live;
+                        }
                     }
                 });
             }
