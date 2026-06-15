@@ -103,6 +103,29 @@ struct RemoteVmEntry {
     checkpoints_json: Option<String>,
 }
 
+// ── Кэш снимка дашборда провайдеров ──────────────────────────────────────────
+// Раньше дашборд вызывал list_hosts/list_vms/get_capabilities КАЖДЫЙ кадр —
+// для Hyper-V это синхронный WMI-скан 60 раз/сек → лютый фриз. Теперь снимок
+// собирается раз в несколько секунд и рендерится из кэша.
+struct DashVm {
+    name: String,
+    power_state: provider_api::PowerState,
+    /// (ярлык режима, цвет) — из recommended_mode capability-графа.
+    badge: Option<(String, (u8, u8, u8))>,
+    ip: Option<String>,
+}
+struct DashProvider {
+    ptype: provider_api::ProviderType,
+    pid: String,
+    reachable: bool,
+    vms: Vec<DashVm>,
+}
+struct DashSnapshot {
+    at: std::time::Instant,
+    providers: Vec<DashProvider>,
+    total_vms: usize,
+}
+
 /// Метка+цвет чипа провайдера по префиксу id ("hyperv:" / "vbox:").
 fn vm_provider_badge(id: &str) -> (&'static str, egui::Color32) {
     if id.starts_with("vbox:") {
@@ -1146,6 +1169,9 @@ struct EvertyDeskApp {
     /// Runtime registry of all connected hypervisor providers.
     /// Hyper-V (local) + FakeProviders registered at startup for multi-provider demo.
     provider_registry: std::sync::Arc<provider_api::ProviderRegistry>,
+    /// Кэш снимка дашборда — чтобы не вызывать провайдеры (WMI/VBoxManage)
+    /// на каждом кадре. Пересобирается раз в несколько секунд.
+    dashboard_snapshot: Option<DashSnapshot>,
 
     // ── Remote VM control panels ──────────────────────────────────────────────
     /// VM id для которой открыта панель управления (power / checkpoint / rescue).
@@ -1436,6 +1462,7 @@ impl EvertyDeskApp {
                 // VBoxManage. Никаких фейковых демо-провайдеров в продакшене.
                 Arc::new(ProviderRegistry::new())
             },
+            dashboard_snapshot: None,
             remote_ctrl_vm_id: String::new(),
             remote_power_panel_open: false,
             remote_checkpoint_panel_open: false,
@@ -4052,9 +4079,58 @@ impl EvertyDeskApp {
     /// ADR-001: UI reads CapabilityGraph, not provider-specific fields.
     /// §51 plan: multi-provider dashboard.
     #[cfg(windows)]
-    fn universal_provider_dashboard_ui(&mut self, ui: &mut egui::Ui) {
+    /// Пересобрать снимок дашборда (синхронные вызовы провайдеров). Дорого —
+    /// вызывается не чаще раза в несколько секунд из universal_provider_dashboard_ui.
+    fn rebuild_dashboard_snapshot(&mut self) {
         let providers = self.provider_registry.all();
-        if providers.is_empty() {
+        let mut out = Vec::with_capacity(providers.len());
+        let mut total_vms = 0usize;
+        for p in &providers {
+            let reachable = p.list_hosts().is_ok();
+            let hosts = p.list_hosts().unwrap_or_default();
+            let mut vms = Vec::new();
+            for host in &hosts {
+                for vm in p.list_vms(&host.host_id).unwrap_or_default() {
+                    total_vms += 1;
+                    let badge = p.get_capabilities(&vm.vm_id).ok().map(|g| {
+                        (g.recommended_mode.label().to_owned(), g.recommended_mode.badge_rgb())
+                    });
+                    vms.push(DashVm {
+                        name: vm.name.clone(),
+                        power_state: vm.power_state,
+                        badge,
+                        ip: vm.primary_ip().map(|s| s.to_owned()),
+                    });
+                }
+            }
+            out.push(DashProvider {
+                ptype: p.provider_type(),
+                pid: p.provider_id().to_owned(),
+                reachable,
+                vms,
+            });
+        }
+        self.dashboard_snapshot = Some(DashSnapshot {
+            at: std::time::Instant::now(),
+            providers: out,
+            total_vms,
+        });
+    }
+
+    #[cfg(windows)]
+    fn universal_provider_dashboard_ui(&mut self, ui: &mut egui::Ui) {
+        // Обновляем снимок не чаще раза в 5 секунд (а не каждый кадр).
+        let stale = self
+            .dashboard_snapshot
+            .as_ref()
+            .map(|s| s.at.elapsed() > Duration::from_secs(5))
+            .unwrap_or(true);
+        if stale {
+            self.rebuild_dashboard_snapshot();
+        }
+        let Some(snapshot) = &self.dashboard_snapshot else { return; };
+
+        if snapshot.providers.is_empty() {
             ui.label(
                 egui::RichText::new("Нет зарегистрированных провайдеров")
                     .color(crate::theme::palette().text_muted)
@@ -4063,22 +4139,16 @@ impl EvertyDeskApp {
             return;
         }
 
-        let total = providers.len();
+        let total = snapshot.providers.len();
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new(format!("Провайдеры: {total}"))
                     .size(12.0)
                     .color(crate::theme::palette().text_muted),
             );
-            // Count total VMs across all providers
-            let total_vms: usize = providers.iter().map(|p| {
-                p.list_hosts().ok()
-                    .map(|hosts| hosts.iter().map(|h| p.list_vms(&h.host_id).ok().map(|v| v.len()).unwrap_or(0)).sum::<usize>())
-                    .unwrap_or(0)
-            }).sum();
-            if total_vms > 0 {
+            if snapshot.total_vms > 0 {
                 ui.label(
-                    egui::RichText::new(format!("| VM: {total_vms}"))
+                    egui::RichText::new(format!("| VM: {}", snapshot.total_vms))
                         .size(12.0)
                         .color(crate::theme::palette().text_muted),
                 );
@@ -4086,28 +4156,19 @@ impl EvertyDeskApp {
         });
         ui.add_space(6.0);
 
-        for provider in &providers {
-            let ptype = provider.provider_type();
-            let pid = provider.provider_id().to_owned();
-            let (prov_color, prov_label) = match &ptype {
-                provider_api::ProviderType::HyperV => {
-                    (crate::theme::palette().info, "HYPER-V")
-                }
-                provider_api::ProviderType::VMware => {
-                    (egui::Color32::from_rgb(0x60, 0xA8, 0xE0), "VMWARE")
-                }
-                provider_api::ProviderType::Proxmox => {
-                    (egui::Color32::from_rgb(0xE5, 0x7E, 0x25), "PROXMOX")
-                }
-                provider_api::ProviderType::Libvirt => {
-                    (egui::Color32::from_rgb(0x58, 0xD6, 0x8D), "LIBVIRT")
-                }
+        for provider in &snapshot.providers {
+            let (prov_color, prov_label) = match &provider.ptype {
+                provider_api::ProviderType::HyperV => (crate::theme::palette().info, "HYPER-V"),
+                provider_api::ProviderType::VMware => (crate::theme::palette().info, "VMWARE"),
+                provider_api::ProviderType::Proxmox => (crate::theme::palette().warning, "PROXMOX"),
+                provider_api::ProviderType::Libvirt => (crate::theme::palette().success, "LIBVIRT"),
                 _ => (crate::theme::palette().text_muted, "PROVIDER"),
             };
 
             egui::Frame::NONE
-                .fill(egui::Color32::from_rgb(0x12, 0x1E, 0x2C))
-                .corner_radius(egui::CornerRadius::same(6))
+                .fill(crate::theme::palette().surface_raised)
+                .stroke(egui::Stroke::new(1.0, crate::theme::palette().border))
+                .corner_radius(egui::CornerRadius::same(crate::theme::radius::MD))
                 .inner_margin(egui::Margin::same(8))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -4125,90 +4186,71 @@ impl EvertyDeskApp {
                                 );
                             });
                         ui.label(
-                            egui::RichText::new(&pid)
+                            egui::RichText::new(&provider.pid)
                                 .size(12.0)
-                                .color(egui::Color32::from_rgb(0xE0, 0xE8, 0xF4)),
+                                .color(crate::theme::palette().text),
                         );
-                        // Status badge
-                        let reachable = provider.list_hosts().is_ok();
-                        let (status_dot, status_text) = if reachable {
+                        let (status_dot, status_text) = if provider.reachable {
                             (crate::theme::palette().success, "Healthy")
                         } else {
-                            (egui::Color32::from_rgb(0xFF, 0x60, 0x00), "Unavailable")
+                            (crate::theme::palette().danger, "Unavailable")
                         };
                         ui.colored_label(status_dot, format!("● {status_text}"));
                     });
 
-                    // VM list from this provider
-                    let hosts = provider.list_hosts().unwrap_or_default();
-                    let mut vm_count = 0usize;
-                    for host in &hosts {
-                        let vms = provider.list_vms(&host.host_id).unwrap_or_default();
-                        vm_count += vms.len();
-                        for vm in &vms {
-                            ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                // Power state dot
-                                let (dot_color, state_label) = match vm.power_state {
-                                    provider_api::PowerState::Running =>
-                                        (crate::theme::palette().success, "Running"),
-                                    provider_api::PowerState::Stopped =>
-                                        (crate::theme::palette().text_weak, "Stopped"),
-                                    provider_api::PowerState::Paused =>
-                                        (crate::theme::palette().warning, "Paused"),
-                                    _ =>
-                                        (crate::theme::palette().text_weak, "Unknown"),
-                                };
-                                ui.colored_label(dot_color, "●");
+                    for vm in &provider.vms {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            let (dot_color, state_label) = match vm.power_state {
+                                provider_api::PowerState::Running =>
+                                    (crate::theme::palette().success, "Running"),
+                                provider_api::PowerState::Stopped =>
+                                    (crate::theme::palette().text_weak, "Stopped"),
+                                provider_api::PowerState::Paused =>
+                                    (crate::theme::palette().warning, "Paused"),
+                                _ => (crate::theme::palette().text_weak, "Unknown"),
+                            };
+                            ui.colored_label(dot_color, "●");
+                            ui.label(
+                                egui::RichText::new(&vm.name)
+                                    .size(12.0)
+                                    .color(crate::theme::palette().text),
+                            );
+                            ui.label(
+                                egui::RichText::new(state_label)
+                                    .size(10.5)
+                                    .color(crate::theme::palette().text_muted),
+                            );
+                            if let Some((label, (r, g, b))) = &vm.badge {
+                                let badge_color = egui::Color32::from_rgb(*r, *g, *b);
+                                egui::Frame::NONE
+                                    .fill(badge_color.gamma_multiply(0.20))
+                                    .corner_radius(egui::CornerRadius::same(3))
+                                    .inner_margin(egui::Margin::symmetric(4, 1))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new(label).size(9.5).color(badge_color),
+                                        );
+                                    });
+                            }
+                            if let Some(ip) = &vm.ip {
                                 ui.label(
-                                    egui::RichText::new(&vm.name)
-                                        .size(12.0)
-                                        .color(crate::theme::palette().surface_raised),
+                                    egui::RichText::new(ip)
+                                        .size(10.0)
+                                        .color(crate::theme::palette().info),
                                 );
-                                ui.label(
-                                    egui::RichText::new(state_label)
-                                        .size(10.5)
-                                        .color(crate::theme::palette().text_muted),
-                                );
-                                // Show recommended mode from capabilities
-                                if let Ok(graph) = provider.get_capabilities(&vm.vm_id) {
-                                    let (r, g, b) = graph.recommended_mode.badge_rgb();
-                                    let badge_color = egui::Color32::from_rgb(r, g, b);
-                                    egui::Frame::NONE
-                                        .fill(badge_color.gamma_multiply(0.20))
-                                        .corner_radius(egui::CornerRadius::same(3))
-                                        .inner_margin(egui::Margin::symmetric(4, 1))
-                                        .show(ui, |ui| {
-                                            ui.label(
-                                                egui::RichText::new(
-                                                    graph.recommended_mode.label(),
-                                                )
-                                                .size(9.5)
-                                                .color(badge_color),
-                                            );
-                                        });
-                                }
-                                if let Some(ip) = vm.primary_ip() {
-                                    ui.label(
-                                        egui::RichText::new(ip)
-                                            .size(10.0)
-                                            .color(egui::Color32::from_rgb(0x80, 0xC0, 0xFF)),
-                                    );
-                                }
-                            });
-                        }
+                            }
+                        });
                     }
-                    if vm_count == 0 && hosts.is_empty() {
+                    if provider.vms.is_empty() {
                         ui.label(
-                            egui::RichText::new("Инвентарь недоступен")
-                                .size(11.0)
-                                .color(crate::theme::palette().text_muted),
-                        );
-                    } else if vm_count == 0 {
-                        ui.label(
-                            egui::RichText::new("VM не обнаружены")
-                                .size(11.0)
-                                .color(crate::theme::palette().text_muted),
+                            egui::RichText::new(if provider.reachable {
+                                "VM не обнаружены"
+                            } else {
+                                "Инвентарь недоступен"
+                            })
+                            .size(11.0)
+                            .color(crate::theme::palette().text_muted),
                         );
                     }
                 });
