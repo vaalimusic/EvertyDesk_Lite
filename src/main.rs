@@ -977,6 +977,8 @@ struct EvertyDeskApp {
     show_settings: bool,
     /// Editable copy of config while the settings window is open.
     settings_draft: Option<AppConfig>,
+    /// Temporary buffer for custom network inputs (never pre-filled with default server values).
+    settings_custom_server: crate::settings::ServerConfig,
 
     // ── FSR (клиентская сторона) ──────────────────────────────────────────────
     /// Адаптер FSR — апскейлит входящий видео-поток перед отображением.
@@ -1206,6 +1208,12 @@ impl EvertyDeskApp {
             host_pending_peer: None,
             show_settings: false,
             settings_draft: None,
+            settings_custom_server: crate::settings::ServerConfig {
+                id_server: String::new(),
+                relay_server: String::new(),
+                api_url: String::new(),
+                public_key: String::new(),
+            },
 
             // FSR: включается из config.display.fsr_quality
             fsr_viewer: {

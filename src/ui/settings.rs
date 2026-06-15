@@ -49,7 +49,7 @@ impl EvertyDeskApp {
 
                     ui.add_space(8.0);
 
-                    network_section(ui, selected_lang, draft);
+                    network_section(ui, selected_lang, draft, &mut self.settings_custom_server);
 
                     ui.add_space(8.0);
 
@@ -134,6 +134,11 @@ impl EvertyDeskApp {
     pub(crate) fn settings_ui(&mut self, ui: &mut egui::Ui) {
         if self.settings_draft.is_none() {
             self.settings_draft = Some(self.config.clone());
+            // Pre-fill custom server buffer only when already using a custom server.
+            let default_srv = ServerConfig::default();
+            if self.config.server != default_srv {
+                self.settings_custom_server = self.config.server.clone();
+            }
         }
 
         ui.horizontal(|ui| {
@@ -176,7 +181,14 @@ impl EvertyDeskApp {
             current_config.local_password.clone(),
         );
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        // Reserve bottom area for Save/Cancel buttons before the scroll area,
+        // otherwise ScrollArea expands to fill all height and buttons go off-screen.
+        let buttons_h = 58.0;
+        let scroll_h = (ui.available_height() - buttons_h).max(200.0);
+
+        egui::ScrollArea::vertical()
+            .max_height(scroll_h)
+            .show(ui, |ui| {
             // ── General ──────────────────────────────────────────────────────
             settings_section(ui, tr(selected_lang, "Общие", "General"), |ui| {
                 ui.horizontal(|ui| {
@@ -216,7 +228,7 @@ impl EvertyDeskApp {
             ui.add_space(8.0);
 
             // ── Network (collapsed by default) ───────────────────────────────
-            network_section(ui, selected_lang, draft);
+            network_section(ui, selected_lang, draft, &mut self.settings_custom_server);
 
             ui.add_space(8.0);
 
@@ -461,33 +473,20 @@ fn security_section(
 }
 
 // ── Network section: hidden by default, expandable ───────────────────────────
+// `custom_server` is a separate buffer that starts empty (never pre-filled with
+// the default Everty server values), so the real server address is never shown.
 
-fn network_section(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut AppConfig) {
+fn network_section(
+    ui: &mut egui::Ui,
+    selected_lang: UiLang,
+    draft: &mut AppConfig,
+    custom_server: &mut ServerConfig,
+) {
     let default_srv = ServerConfig::default();
-    let is_custom = draft.server.id_server != default_srv.id_server
-        || draft.server.relay_server != default_srv.relay_server
-        || draft.server.public_key != default_srv.public_key
-        || draft.server.api_url != default_srv.api_url;
+    let is_custom = draft.server != default_srv;
 
     settings_section(ui, tr(selected_lang, "Сеть", "Network"), |ui| {
-        // Show current server status
-        if !is_custom {
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new("✓")
-                        .color(egui::Color32::from_rgb(0x12, 0xC9, 0x72))
-                        .size(14.0),
-                );
-                ui.label(
-                    egui::RichText::new(tr(
-                        selected_lang,
-                        "Everty Desk сервер (по умолчанию)",
-                        "Everty Desk server (default)",
-                    ))
-                    .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
-                );
-            });
-        } else {
+        if is_custom {
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new("★")
@@ -503,27 +502,8 @@ fn network_section(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut AppConf
                     .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
                 );
             });
-        }
-
-        ui.add_space(6.0);
-
-        // Collapsible custom server fields
-        let header = if is_custom {
-            tr(
-                selected_lang,
-                "▾ Параметры собственного сервера",
-                "▾ Custom server parameters",
-            )
-        } else {
-            tr(
-                selected_lang,
-                "▸ Использовать другой сервер",
-                "▸ Use a different server",
-            )
-        };
-
-        ui.collapsing(header, |ui| {
-            ui.add_space(4.0);
+            ui.add_space(6.0);
+            // When custom is active, show and edit the actual custom values.
             settings_text_row(
                 ui,
                 tr(selected_lang, "ID сервер", "ID server"),
@@ -554,8 +534,87 @@ fn network_section(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut AppConf
                 .clicked()
             {
                 draft.server = ServerConfig::default();
+                *custom_server = ServerConfig {
+                    id_server: String::new(),
+                    relay_server: String::new(),
+                    api_url: String::new(),
+                    public_key: String::new(),
+                };
             }
-        });
+        } else {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("✓")
+                        .color(egui::Color32::from_rgb(0x12, 0xC9, 0x72))
+                        .size(14.0),
+                );
+                ui.label(
+                    egui::RichText::new(tr(
+                        selected_lang,
+                        "Everty Desk сервер (по умолчанию)",
+                        "Everty Desk server (default)",
+                    ))
+                    .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+                );
+            });
+            ui.add_space(6.0);
+            // Show empty input fields. If the user fills ID + key, apply as custom.
+            ui.collapsing(
+                tr(
+                    selected_lang,
+                    "▸ Использовать другой сервер",
+                    "▸ Use a different server",
+                ),
+                |ui| {
+                    ui.add_space(4.0);
+                    settings_text_row(
+                        ui,
+                        tr(selected_lang, "ID сервер", "ID server"),
+                        &mut custom_server.id_server,
+                    );
+                    settings_text_row(
+                        ui,
+                        tr(selected_lang, "Relay сервер", "Relay server"),
+                        &mut custom_server.relay_server,
+                    );
+                    settings_text_row(
+                        ui,
+                        tr(selected_lang, "API URL", "API URL"),
+                        &mut custom_server.api_url,
+                    );
+                    settings_text_row(
+                        ui,
+                        tr(selected_lang, "Публичный ключ", "Public key"),
+                        &mut custom_server.public_key,
+                    );
+                    ui.add_space(4.0);
+                    // Apply custom server when ID server is provided.
+                    let can_apply = !custom_server.id_server.trim().is_empty();
+                    if ui
+                        .add_enabled(
+                            can_apply,
+                            egui::Button::new(tr(
+                                selected_lang,
+                                "Применить собственный сервер",
+                                "Apply custom server",
+                            )),
+                        )
+                        .on_disabled_hover_text(tr(
+                            selected_lang,
+                            "Введите адрес ID сервера",
+                            "Enter an ID server address",
+                        ))
+                        .clicked()
+                    {
+                        // Fill missing fields with the custom ID server as fallback.
+                        if custom_server.relay_server.trim().is_empty() {
+                            custom_server.relay_server = custom_server.id_server.clone();
+                        }
+                        draft.server = custom_server.clone();
+                    }
+                },
+            );
+        }
     });
 }
 

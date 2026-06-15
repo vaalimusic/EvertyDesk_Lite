@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 // ── Server configuration ─────────────────────────────────────────────────────
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub api_url: String,
     pub id_server: String,
