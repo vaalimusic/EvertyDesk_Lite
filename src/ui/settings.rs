@@ -1087,6 +1087,38 @@ fn hotfix_settings_section(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut
                     .size(11.0)
                     .color(crate::theme::palette().text_weak),
                 );
+
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                ui.horizontal(|ui| {
+                    let btn = ui.button(tr(
+                        selected_lang,
+                        "Отправить тестовый краш-отчёт",
+                        "Send test crash report",
+                    ));
+                    ui.label(
+                        egui::RichText::new(tr(
+                            selected_lang,
+                            "← проверь в ЛК что появилась запись",
+                            "← check admin panel for a new entry",
+                        ))
+                        .size(11.0)
+                        .color(crate::theme::palette().text_weak),
+                    );
+                    if btn.clicked() {
+                        crate::hotfix::submit_crash_sync(
+                            "test_crash_manual".to_owned(),
+                            "settings_ui".to_owned(),
+                            "TEST".to_owned(),
+                            "Тестовый краш-отчёт из настроек EvertyDesk Lite".to_owned(),
+                            "no stack trace (manual test)".to_owned(),
+                            &draft.hotfix,
+                            draft,
+                        );
+                    }
+                });
             }
         },
     );
