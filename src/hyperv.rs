@@ -424,14 +424,29 @@ unsafe fn collect_rows(enumerator: IEnumWbemClassObject) -> Vec<HashMap<String, 
     rows
 }
 
-/// Extract the class name from a WMI object path like
-/// `\\SERVER\ROOT\virtualization\v2:Msvm_VirtualSystemManagementService.Name="..."`
+/// Extract the class name from a WMI object path.
+///
+/// Handles both absolute and relative paths:
+///   Absolute: `\\SERVER\ROOT\virtualization\v2:Msvm_Keyboard.CreationClassName=...`
+///             → find `:`, then take up to first `.`  → `Msvm_Keyboard`
+///   Relative: `Msvm_Keyboard.CreationClassName="Msvm_Keyboard",DeviceID="Microsoft:abc"`
+///             → DeviceID contains `:` — DO NOT use find(':') on relative path!
+///             → Just take up to first `.`            → `Msvm_Keyboard`
+///
+/// BUG HISTORY: The old code always did find(':') first. On relative paths this found
+/// the `:` INSIDE `"Microsoft:GUID"` in the DeviceID value, producing garbage as the
+/// class name → GetObject failed → ALL keyboard/mouse WMI calls silently dropped.
 fn obj_path_class(path: &str) -> &str {
-    // WMI path: \\SERVER\namespace:ClassName.key="val"
-    // The namespace separator is the FIRST colon (not last — DeviceID can contain "Microsoft:GUID")
-    let after_colon = path.find(':').map(|i| &path[i + 1..]).unwrap_or(path);
-    let before_dot = after_colon.find('.').map(|i| &after_colon[..i]).unwrap_or(after_colon);
-    before_dot
+    if path.starts_with("\\\\") {
+        // Absolute path: \\SERVER\namespace:ClassName.key=val
+        // The ONE legitimate colon is the namespace separator before the class name.
+        let after_colon = path.find(':').map(|i| &path[i + 1..]).unwrap_or(path);
+        after_colon.find('.').map(|i| &after_colon[..i]).unwrap_or(after_colon)
+    } else {
+        // Relative path: ClassName.key="val",key2="Microsoft:something"
+        // Class name is everything before the first dot.
+        path.find('.').map(|i| &path[..i]).unwrap_or(path)
+    }
 }
 
 fn wide_null(value: &str) -> Vec<u16> {
@@ -1362,12 +1377,21 @@ impl HyperVSession {
                 }
 
                 // Helper: flush батч TypeText за один WMI-вызов.
+                // Логирует WMI ошибку чтобы было видно ПОЧЕМУ символы не вводятся.
                 let flush_text = |batch: &mut String, wmi: &Option<Wmi>, kbd: &Option<String>| {
                     if batch.is_empty() { return; }
                     if let (Some(wmi), Some(p)) = (wmi, kbd) {
-                        let _ = wmi.exec_method_result(
+                        if let Err(e) = wmi.exec_method_result(
                             p, "TypeText",
                             &[("asciiText", WmiVal::Str(batch.clone()))],
+                        ) {
+                            let _ = status_tx_input.try_send(
+                                format!("⚠ TypeText WMI err: {e}")
+                            );
+                        }
+                    } else if kbd.is_none() {
+                        let _ = status_tx_input.try_send(
+                            "⚠ ввод: Msvm_Keyboard path = None, символы теряются".into()
                         );
                     }
                     batch.clear();
@@ -1406,19 +1430,27 @@ impl HyperVSession {
                             HyperVCmd::PressKey(sc) => {
                                 flush_text(&mut text_batch, &wmi, &paths.keyboard);
                                 if let (Some(wmi), Some(p)) = (&wmi, &paths.keyboard) {
-                                    let _ = wmi.exec_method_result(
+                                    if let Err(e) = wmi.exec_method_result(
                                         p, "PressKey",
                                         &[("keyCode", WmiVal::I32(sc as i32))],
-                                    );
+                                    ) {
+                                        let _ = status_tx_input.try_send(
+                                            format!("⚠ PressKey(0x{sc:02X}) WMI err: {e}")
+                                        );
+                                    }
                                 }
                             }
                             HyperVCmd::ReleaseKey(sc) => {
                                 flush_text(&mut text_batch, &wmi, &paths.keyboard);
                                 if let (Some(wmi), Some(p)) = (&wmi, &paths.keyboard) {
-                                    let _ = wmi.exec_method_result(
+                                    if let Err(e) = wmi.exec_method_result(
                                         p, "ReleaseKey",
                                         &[("keyCode", WmiVal::I32(sc as i32))],
-                                    );
+                                    ) {
+                                        let _ = status_tx_input.try_send(
+                                            format!("⚠ ReleaseKey(0x{sc:02X}) WMI err: {e}")
+                                        );
+                                    }
                                 }
                             }
                             HyperVCmd::CtrlAltDel => {
@@ -1466,7 +1498,9 @@ impl HyperVSession {
             .name(format!("hyperv-cap-{}", vm_clone.name))
             .spawn(move || {
                 let native = video_resolution(&vm_clone.id).unwrap_or((1280, 720));
-                let (width, height) = cap_resolution(native.0, native.1, 640, 480);
+                // 1280×720 даёт читаемый шрифт; адаптивный даунскейл снизит
+                // разрешение автоматически если WMI будет медленнее 500 ms.
+                let (width, height) = cap_resolution(native.0, native.1, 1280, 720);
                 let _ = status_tx.try_send(format!(
                     "Hyper-V capture started: {}×{} (native {}×{})",
                     width, height, native.0, native.1
