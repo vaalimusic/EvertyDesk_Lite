@@ -1997,8 +1997,9 @@ fn start_hung_window_guardian() {
                         misses = 0;
                         continue;
                     }
-                    // WM_NULL with a long timeout. A single miss can happen
-                    // during GPU/DXGI teardown, so require several misses.
+                    // WM_NULL with a 3-second timeout. Two consecutive misses
+                    // before killing: one is enough to confirm a GPU deadlock,
+                    // two guards against a transient stall during DXGI teardown.
                     let mut result = 0usize;
                     let ok = SendMessageTimeoutA(
                         hwnd,
@@ -2006,7 +2007,7 @@ fn start_hung_window_guardian() {
                         WPARAM(0),
                         LPARAM(0),
                         SMTO_ABORTIFHUNG,
-                        8000,
+                        3000,
                         Some(&mut result),
                     );
                     if ok.0 != 0 {
@@ -2014,7 +2015,7 @@ fn start_hung_window_guardian() {
                         continue;
                     }
                     misses += 1;
-                    if misses >= 3 {
+                    if misses >= 2 {
                         eprintln!("[guardian] Render thread stuck — hiding window");
                         ShowWindow(hwnd, SW_HIDE);
                         thread::sleep(Duration::from_millis(200));
