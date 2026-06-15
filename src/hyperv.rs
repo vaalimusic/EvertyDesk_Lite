@@ -391,8 +391,10 @@ pub fn list_vms() -> Vec<VmInfo> {
 
 fn list_vms_com() -> Vec<VmInfo> {
     let Some(wmi) = Wmi::connect() else { return vec![] };
+    // НЕ проецируем __PATH в SELECT: у virtualization-провайдера это может
+    // вернуть 0 строк. read_all_properties дочитывает __PATH через obj.Get.
     let rows = wmi.query(
-        "SELECT Name, ElementName, Caption, Description, EnabledState, __PATH \
+        "SELECT Name, ElementName, Caption, Description, EnabledState \
          FROM Msvm_ComputerSystem",
     );
     rows.into_iter()
@@ -593,38 +595,52 @@ pub fn capture_screen(vm_id: &str, vm_wmi_path: &str, width: u16, height: u16) -
 }
 
 fn management_service_path(wmi: &Wmi) -> Option<String> {
-    let mut row = wmi
-        .query("SELECT __PATH, Name FROM Msvm_VirtualSystemManagementService")
+    // Проекция `__PATH` в SELECT отвергается некоторыми сборками virtualization
+    // провайдера (запрос возвращает 0 строк). Берём `SELECT *` — read_all_properties
+    // сам дочитывает __PATH через obj.Get.
+    if let Some(mut row) = wmi
+        .query("SELECT * FROM Msvm_VirtualSystemManagementService")
         .into_iter()
-        .next()?;
-    take_non_empty_string(&mut row, "__PATH").or_else(|| {
-        take_non_empty_string(&mut row, "Name").map(|name| {
-            format!(
-                "Msvm_VirtualSystemManagementService.CreationClassName=\"Msvm_VirtualSystemManagementService\",Name=\"{}\"",
-                escape_wmi_key(&name)
-            )
-        })
-    })
+        .next()
+    {
+        if let Some(path) = take_non_empty_string(&mut row, "__PATH")
+            .or_else(|| take_non_empty_string(&mut row, "__RELPATH"))
+        {
+            return Some(path);
+        }
+    }
+    // Fallback: сервис — singleton с Name="vmms". Строим полный ключевой путь
+    // (все 4 ключа), чтобы ExecMethod работал даже если запрос вернул пусто.
+    Some(well_known_management_service_path())
+}
+
+/// Полный путь singleton-сервиса управления Hyper-V (ключи: CreationClassName,
+/// Name="vmms", SystemCreationClassName, SystemName=имя хоста).
+fn well_known_management_service_path() -> String {
+    let host = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "localhost".to_owned());
+    format!(
+        "Msvm_VirtualSystemManagementService.CreationClassName=\"Msvm_VirtualSystemManagementService\",\
+Name=\"vmms\",SystemCreationClassName=\"Msvm_ComputerSystem\",SystemName=\"{}\"",
+        escape_wmi_key(&host)
+    )
 }
 
 fn current_setting_path(wmi: &Wmi, vm_id: &str, vm_wmi_path: &str) -> Option<String> {
     let q = format!(
         "ASSOCIATORS OF {{{vm_wmi_path}}} WHERE ResultClass = Msvm_VirtualSystemSettingData"
     );
-    if let Some(path) = wmi.query(&q)
-        .into_iter()
-        .next()?
-        .remove("__PATH")?
-        .as_str()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(str::to_owned)
-    {
-        return Some(path);
+    // Без `?`: если ASSOCIATORS вернул пусто — падаем в SELECT-fallback ниже,
+    // а не выходим из функции.
+    if let Some(mut row) = wmi.query(&q).into_iter().next() {
+        if let Some(path) = take_non_empty_string(&mut row, "__PATH")
+            .or_else(|| take_non_empty_string(&mut row, "__RELPATH"))
+        {
+            return Some(path);
+        }
     }
 
     let q = format!(
-        "SELECT __PATH, InstanceID FROM Msvm_VirtualSystemSettingData \
+        "SELECT * FROM Msvm_VirtualSystemSettingData \
          WHERE VirtualSystemIdentifier = '{}' \
          AND VirtualSystemType = 'Microsoft:Hyper-V:System:Realized'",
         escape_wmi_value(vm_id)
@@ -710,7 +726,7 @@ pub fn click_mouse(vm_id: &str, button: u32, press: bool) {
 }
 
 fn find_device_path(wmi: &Wmi, class: &str, vm_id: &str) -> Option<String> {
-    let q = format!("SELECT __PATH FROM {class} WHERE SystemName = '{vm_id}'");
+    let q = format!("SELECT * FROM {class} WHERE SystemName = '{vm_id}'");
     wmi.query(&q)
         .into_iter()
         .next()?
