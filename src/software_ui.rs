@@ -14,7 +14,7 @@ use minifb::{
     WindowOptions,
 };
 
-use crate::{configure_style, configure_ui_scale, video, EvertyDeskApp, APP_NAME};
+use crate::{configure_ui_scale, video, EvertyDeskApp, APP_NAME};
 
 const WIDTH: usize = 1100;
 const HEIGHT: usize = 760;
@@ -63,7 +63,6 @@ pub fn run_software_ui() -> Result<(), String> {
     ctx.set_pixels_per_point(1.0);
     configure_ui_scale(&ctx);
     configure_software_fonts(&ctx);
-    configure_style(&ctx);
 
     let mut app = EvertyDeskApp::new();
     let mut painter = SoftwarePainter::default();
