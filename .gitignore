@@ -42,5 +42,5 @@ diag_stderr.txt
 /screenshots/
 /logs/
 /reports/
-/docs/
+#/docs/
 /dist/
