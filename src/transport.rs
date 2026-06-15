@@ -160,6 +160,12 @@ pub enum SessionEvent {
     VmList(String),
     /// Agentless VM: статус VM-сессии от хоста.
     VmStatus(String),
+    /// Agentless VM: результат power operation.
+    VmPowerResult(String),
+    /// Agentless VM: capability graph JSON.
+    VmCapabilities(String),
+    /// Agentless VM: список чекпоинтов (JSON).
+    VmCheckpoints(String),
 }
 
 #[derive(Clone, Debug)]
@@ -245,6 +251,14 @@ pub enum SessionCommand {
     ListVms,
     /// Agentless VM: прикрепиться к VM по id (пустая строка = отсоединиться).
     AttachVm(String),
+    /// Agentless VM: power action. JSON: {"vm_id","vm_path","action"}
+    VmPowerOp(String),
+    /// Agentless VM: запросить capability graph для vm_id.
+    VmCapabilityRequest(String),
+    /// Agentless VM: операция с чекпоинтом. JSON: {"vm_id","op","path"}
+    VmCheckpointOp(String),
+    /// Agentless VM: rescue input. JSON: {"vm_id","input_type","text"}
+    VmRescueInput(String),
     Close,
 }
 
@@ -1032,6 +1046,42 @@ impl TransportClient {
                         // Свежее видео после переключения источника (VM ↔ экран).
                         live_video_seen = false;
                         last_decoder_recovery = Some(Instant::now());
+                    }
+                    SessionCommand::VmPowerOp(json) => {
+                        flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
+                        let msg = PeerMessage {
+                            union: Some(peer_message::Union::Misc(Misc {
+                                union: Some(misc::Union::VmPowerOp(json)),
+                            })),
+                        };
+                        let _ = send_framed(&mut relay, &encode_peer_message(&msg));
+                    }
+                    SessionCommand::VmCapabilityRequest(vm_id) => {
+                        flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
+                        let msg = PeerMessage {
+                            union: Some(peer_message::Union::Misc(Misc {
+                                union: Some(misc::Union::VmCapabilityRequest(vm_id)),
+                            })),
+                        };
+                        let _ = send_framed(&mut relay, &encode_peer_message(&msg));
+                    }
+                    SessionCommand::VmCheckpointOp(json) => {
+                        flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
+                        let msg = PeerMessage {
+                            union: Some(peer_message::Union::Misc(Misc {
+                                union: Some(misc::Union::VmCheckpointOp(json)),
+                            })),
+                        };
+                        let _ = send_framed(&mut relay, &encode_peer_message(&msg));
+                    }
+                    SessionCommand::VmRescueInput(json) => {
+                        flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
+                        let msg = PeerMessage {
+                            union: Some(peer_message::Union::Misc(Misc {
+                                union: Some(misc::Union::VmRescueInput(json)),
+                            })),
+                        };
+                        let _ = send_framed(&mut relay, &encode_peer_message(&msg));
                     }
                     SessionCommand::Close => {
                         flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
@@ -3163,6 +3213,18 @@ fn handle_session_message(
                 Some(misc::Union::VmStatus(status)) => {
                     eprintln!("[session] VM status: {status}");
                     let _ = events.send(SessionEvent::VmStatus(status.clone()));
+                }
+                Some(misc::Union::VmPowerResult(json)) => {
+                    eprintln!("[session] VM power result: {json}");
+                    let _ = events.send(SessionEvent::VmPowerResult(json.clone()));
+                }
+                Some(misc::Union::VmCapabilityGraph(json)) => {
+                    eprintln!("[session] VM capabilities received");
+                    let _ = events.send(SessionEvent::VmCapabilities(json.clone()));
+                }
+                Some(misc::Union::VmCheckpoints(json)) => {
+                    eprintln!("[session] VM checkpoints received");
+                    let _ = events.send(SessionEvent::VmCheckpoints(json.clone()));
                 }
                 other => {
                     eprintln!(

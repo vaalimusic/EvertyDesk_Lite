@@ -780,7 +780,8 @@ pub struct TestDelay {
 pub struct Misc {
     #[prost(
         oneof = "misc::Union",
-        tags = "5, 7, 10, 12, 28, 30, 31, 35, 37, 100, 101, 102, 110, 111, 112, 113"
+        tags = "5, 7, 10, 12, 28, 30, 31, 35, 37, 100, 101, 102, 110, 111, 112, 113, \
+                114, 115, 116, 117, 118, 119, 120"
     )]
     pub union: Option<misc::Union>,
 }
@@ -842,6 +843,41 @@ pub mod misc {
         /// Хост → клиент: статус VM-сессии (старт/ошибка/разрешение).
         #[prost(string, tag = "113")]
         VmStatus(String),
+
+        // ── Power operations ───────────────────────────────────────────────
+        /// Клиент → хост: выполнить power action.
+        /// JSON: {"vm_id":"...", "vm_path":"...", "action":"start|stop|shutdown|restart|pause|resume|save"}
+        #[prost(string, tag = "114")]
+        VmPowerOp(String),
+        /// Хост → клиент: результат power operation.
+        /// JSON: {"vm_id":"...", "action":"...", "ok":true, "error":""}
+        #[prost(string, tag = "115")]
+        VmPowerResult(String),
+
+        // ── Capability graph ───────────────────────────────────────────────
+        /// Клиент → хост: запрос capability graph для VM.
+        /// Значение: vm_id
+        #[prost(string, tag = "116")]
+        VmCapabilityRequest(String),
+        /// Хост → клиент: capability graph (JSON VmCapabilityGraph).
+        #[prost(string, tag = "117")]
+        VmCapabilityGraph(String),
+
+        // ── Checkpoint operations ──────────────────────────────────────────
+        /// Клиент → хост: операция с чекпоинтом.
+        /// JSON: {"vm_id":"...", "op":"list|create|apply|delete", "path":"...checkpoint_wmi_path..."}
+        #[prost(string, tag = "118")]
+        VmCheckpointOp(String),
+        /// Хост → клиент: результат checkpoint operation.
+        /// JSON: {"vm_id":"...", "op":"...", "ok":true, "error":"", "checkpoints":[...]}
+        #[prost(string, tag = "119")]
+        VmCheckpoints(String),
+
+        // ── Rescue input ───────────────────────────────────────────────────
+        /// Клиент → хост: rescue input (Ctrl+Alt+Del, type text, etc.).
+        /// JSON: {"vm_id":"...", "input_type":"ctrl_alt_del|type_text|press_key", "text":"..."}
+        #[prost(string, tag = "120")]
+        VmRescueInput(String),
     }
 }
 

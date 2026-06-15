@@ -644,3 +644,136 @@ fn json_str(s: &str) -> String {
     out.push('"');
     out
 }
+
+// ── Capability graph ─────────────────────────────────────────────────────────
+
+/// Получить capability graph для VM в JSON. Для non-Windows всегда Unsupported.
+pub fn get_capability_graph(vm_id: &str) -> String {
+    #[cfg(windows)]
+    {
+        // Найти VM в локальном инвентаре
+        let (_, real_id) = vm_id.split_once(':').unwrap_or(("hyperv", vm_id));
+        let vms = crate::hyperv::list_vms();
+        if let Some(vm) = vms.iter().find(|v| v.id == real_id) {
+            return crate::capability_engine::evaluate(vm).to_json();
+        }
+        // VM не найдена — Unknown
+        crate::capability_engine::VmCapabilityGraph {
+            vm_id: vm_id.to_owned(),
+            preview: crate::capability_engine::Capability::unknown("VM_NOT_FOUND"),
+            keyboard_rescue: crate::capability_engine::Capability::unknown("VM_NOT_FOUND"),
+            rdp_relay: crate::capability_engine::Capability::unknown("VM_NOT_FOUND"),
+            enhanced_session: crate::capability_engine::Capability::unknown("VM_NOT_FOUND"),
+            hv_socket: crate::capability_engine::Capability::experimental("HVSOCKET_EXPERIMENTAL_DISABLED"),
+            clipboard: crate::capability_engine::Capability::unknown("VM_NOT_FOUND"),
+            recommended_mode: crate::capability_engine::SessionMode::Offline,
+            constraints: vec!["VM not found in local inventory".to_owned()],
+        }.to_json()
+    }
+    #[cfg(not(windows))]
+    crate::capability_engine::evaluate_stub(vm_id).to_json()
+}
+
+// ── Checkpoint operations ─────────────────────────────────────────────────────
+
+/// Обработать запрос checkpoint операции (JSON {"vm_id","op","path"}).
+/// Возвращает JSON-результат.
+pub fn checkpoint_op(json: &str) -> String {
+    #[cfg(windows)]
+    {
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(json) else {
+            return r#"{"ok":false,"error":"invalid json","checkpoints":[]}"#.to_owned();
+        };
+        let vm_id = val.get("vm_id").and_then(|v| v.as_str()).unwrap_or("");
+        let op = val.get("op").and_then(|v| v.as_str()).unwrap_or("list");
+        let path = val.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        let vm_path = val.get("vm_path").and_then(|v| v.as_str()).unwrap_or("");
+        let (provider, real_id) = vm_id.split_once(':').unwrap_or(("hyperv", vm_id));
+        match (provider, op) {
+            ("hyperv", "list") => {
+                let checkpoints = crate::hyperv::list_checkpoints(real_id);
+                let items: Vec<String> = checkpoints.iter().map(|c| {
+                    format!(
+                        r#"{{"name":{},"path":{},"created_time":{},"type":{}}}"#,
+                        json_str(&c.name),
+                        json_str(&c.wmi_path),
+                        json_str(&c.created_time),
+                        json_str(&c.checkpoint_type),
+                    )
+                }).collect();
+                format!(r#"{{"vm_id":{},"op":"list","ok":true,"error":"","checkpoints":[{}]}}"#,
+                    json_str(vm_id), items.join(","))
+            }
+            ("hyperv", "create") => {
+                let effective_path = if !vm_path.is_empty() { vm_path.to_owned() }
+                    else { format!("Msvm_ComputerSystem.CreationClassName=\"Msvm_ComputerSystem\",Name=\"{real_id}\"") };
+                match crate::hyperv::create_checkpoint(&effective_path, None) {
+                    Ok(name) => format!(r#"{{"vm_id":{},"op":"create","ok":true,"error":"","name":{}}}"#,
+                        json_str(vm_id), json_str(&name)),
+                    Err(e) => format!(r#"{{"vm_id":{},"op":"create","ok":false,"error":{}}}"#,
+                        json_str(vm_id), json_str(&e)),
+                }
+            }
+            ("hyperv", "apply") => {
+                match crate::hyperv::apply_checkpoint(path) {
+                    Ok(()) => format!(r#"{{"vm_id":{},"op":"apply","ok":true,"error":""}}"#, json_str(vm_id)),
+                    Err(e) => format!(r#"{{"vm_id":{},"op":"apply","ok":false,"error":{}}}"#, json_str(vm_id), json_str(&e)),
+                }
+            }
+            ("hyperv", "delete") => {
+                match crate::hyperv::delete_checkpoint(path) {
+                    Ok(()) => format!(r#"{{"vm_id":{},"op":"delete","ok":true,"error":""}}"#, json_str(vm_id)),
+                    Err(e) => format!(r#"{{"vm_id":{},"op":"delete","ok":false,"error":{}}}"#, json_str(vm_id), json_str(&e)),
+                }
+            }
+            _ => format!(r#"{{"ok":false,"error":"unsupported: {provider}/{op}","checkpoints":[]}}"#),
+        }
+    }
+    #[cfg(not(windows))]
+    r#"{"ok":false,"error":"checkpoints only on Windows host","checkpoints":[]}"#.to_owned()
+}
+
+// ── Rescue input ──────────────────────────────────────────────────────────────
+
+/// Обработать rescue input JSON {"vm_id","input_type","text"}.
+/// Выполняется на хосте с гипервизором.
+pub fn rescue_input(json: &str) {
+    #[cfg(windows)]
+    {
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(json) else { return };
+        let vm_id = val.get("vm_id").and_then(|v| v.as_str()).unwrap_or("");
+        let input_type = val.get("input_type").and_then(|v| v.as_str()).unwrap_or("");
+        let text = val.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let (provider, real_id) = vm_id.split_once(':').unwrap_or(("hyperv", vm_id));
+        match (provider, input_type) {
+            ("hyperv", "ctrl_alt_del") => {
+                let _ = send_ctrl_alt_del_hyperv(real_id);
+            }
+            ("hyperv", "type_text") => {
+                let _ = crate::hyperv::type_text(real_id, text);
+                note_input(if text.is_empty() { "type_text: пустая строка" } else { "type_text: OK" });
+            }
+            ("hyperv", "press_key") => {
+                if let Ok(vk) = text.trim_start_matches("0x").parse::<u32>().or_else(|_| u32::from_str_radix(text.trim_start_matches("0x"), 16)) {
+                    let _ = crate::hyperv::press_key(real_id, vk);
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    let _ = crate::hyperv::release_key(real_id, vk);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(windows)]
+fn send_ctrl_alt_del_hyperv(vm_id: &str) -> Result<(), String> {
+    // Приоритет: активная HyperVSession (если vm_bridge используется через сессию)
+    if let Ok(s) = state().lock() {
+        if let Some(tx) = &s.hyperv_cmd_tx {
+            let _ = tx.try_send(crate::hyperv::HyperVCmd::CtrlAltDel);
+            return Ok(());
+        }
+    }
+    // Fallback: прямой WMI вызов без сессии
+    crate::hyperv::send_ctrl_alt_del(vm_id)
+}

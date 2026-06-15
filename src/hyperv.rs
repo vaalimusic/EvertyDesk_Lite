@@ -767,15 +767,48 @@ fn escape_wmi_value(value: &str) -> String {
 }
 
 /// WMI RequestedState values for Msvm_ComputerSystem.RequestStateChange.
+#[derive(Debug, Clone, PartialEq)]
 pub enum VmPowerAction {
-    /// Start (Enabled)
+    /// Start (Enabled) — RequestedState=2
     Start,
-    /// Hard power-off
+    /// Hard power-off — RequestedState=3
     Stop,
-    /// Reboot (not a direct WMI state — implemented as stop then start)
+    /// Graceful shutdown (via Integration Services) — RequestedState=4
+    Shutdown,
+    /// Reboot (stop then start) — RequestedState=11 or stop+start
     Restart,
-    /// Save state (hibernate)
+    /// Pause — RequestedState=9
+    Pause,
+    /// Resume from pause — RequestedState=2 (same as Start)
+    Resume,
+    /// Save state — RequestedState=32770
     Save,
+}
+
+impl VmPowerAction {
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "start"    => Self::Start,
+            "stop"     => Self::Stop,
+            "shutdown" => Self::Shutdown,
+            "restart"  => Self::Restart,
+            "pause"    => Self::Pause,
+            "resume"   => Self::Resume,
+            "save"     => Self::Save,
+            _ => return None,
+        })
+    }
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Start    => "Start",
+            Self::Stop     => "Force Off",
+            Self::Shutdown => "Shutdown",
+            Self::Restart  => "Restart",
+            Self::Pause    => "Pause",
+            Self::Resume   => "Resume",
+            Self::Save     => "Save",
+        }
+    }
 }
 
 /// Send a power action to a Hyper-V VM. Non-blocking — fires and forgets.
@@ -784,17 +817,171 @@ pub fn request_power_action(vm_wmi_path: &str, action: VmPowerAction) {
     std::thread::spawn(move || {
         let Some(wmi) = Wmi::connect() else { return; };
         match action {
-            VmPowerAction::Start  => { let _ = wmi.exec_method_result(&path, "RequestStateChange", &[("RequestedState", WmiVal::I32(2))]); }
-            VmPowerAction::Stop   => { let _ = wmi.exec_method_result(&path, "RequestStateChange", &[("RequestedState", WmiVal::I32(3))]); }
-            VmPowerAction::Save   => { let _ = wmi.exec_method_result(&path, "RequestStateChange", &[("RequestedState", WmiVal::I32(32770))]); }
-            VmPowerAction::Restart => {
+            VmPowerAction::Start    => { let _ = wmi.exec_method_result(&path, "RequestStateChange", &[("RequestedState", WmiVal::I32(2))]); }
+            VmPowerAction::Stop     => { let _ = wmi.exec_method_result(&path, "RequestStateChange", &[("RequestedState", WmiVal::I32(3))]); }
+            VmPowerAction::Shutdown => { let _ = wmi.exec_method_result(&path, "RequestStateChange", &[("RequestedState", WmiVal::I32(4))]); }
+            VmPowerAction::Pause    => { let _ = wmi.exec_method_result(&path, "RequestStateChange", &[("RequestedState", WmiVal::I32(9))]); }
+            VmPowerAction::Resume   => { let _ = wmi.exec_method_result(&path, "RequestStateChange", &[("RequestedState", WmiVal::I32(2))]); }
+            VmPowerAction::Save     => { let _ = wmi.exec_method_result(&path, "RequestStateChange", &[("RequestedState", WmiVal::I32(32770))]); }
+            VmPowerAction::Restart  => {
                 // Stop then start — both async, give stop time to complete
                 let _ = wmi.exec_method_result(&path, "RequestStateChange", &[("RequestedState", WmiVal::I32(3))]);
-                std::thread::sleep(Duration::from_secs(3));
+                std::thread::sleep(Duration::from_secs(4));
                 let _ = wmi.exec_method_result(&path, "RequestStateChange", &[("RequestedState", WmiVal::I32(2))]);
             }
         }
     });
+}
+
+// ── Checkpoints (Snapshots) ───────────────────────────────────────────────────
+
+/// Информация о чекпоинте (снапшоте) VM.
+#[derive(Debug, Clone)]
+pub struct CheckpointInfo {
+    /// Имя чекпоинта (ElementName).
+    pub name: String,
+    /// WMI-путь объекта Msvm_VirtualSystemSettingData (для Apply/Delete).
+    pub wmi_path: String,
+    /// Время создания (строка из WMI — ISO или Windows format).
+    pub created_time: String,
+    /// Тип: "Standard" | "Production" | "ProductionFallback" | "Unknown".
+    pub checkpoint_type: String,
+    /// InstanceID (стабильный идентификатор).
+    pub instance_id: String,
+}
+
+/// Получить список чекпоинтов VM.
+/// Возвращает пустой вектор если VM не найдена, WMI недоступна, или чекпоинтов нет.
+pub fn list_checkpoints(vm_id: &str) -> Vec<CheckpointInfo> {
+    let Some(wmi) = Wmi::connect() else { return Vec::new() };
+    // Чекпоинты — Msvm_VirtualSystemSettingData с VirtualSystemIdentifier = vm_guid
+    // И VirtualSystemType != 'Microsoft:Hyper-V:System:Realized' (это основная конфигурация).
+    // Snapshot types: 'Microsoft:Hyper-V:Snapshot:Realized', 'Microsoft:Hyper-V:Snapshot:Recovery'
+    let q = format!(
+        "SELECT * FROM Msvm_VirtualSystemSettingData \
+         WHERE VirtualSystemIdentifier = '{}' \
+         AND VirtualSystemType <> 'Microsoft:Hyper-V:System:Realized'",
+        escape_wmi_value(vm_id)
+    );
+    let rows = wmi.query(&q);
+    rows.into_iter()
+        .filter_map(|mut row| {
+            let name = row
+                .remove("ElementName")
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "Checkpoint".to_owned());
+            let path = take_non_empty_string(&mut row, "__PATH")
+                .or_else(|| take_non_empty_string(&mut row, "__RELPATH"))?;
+            let created_time = row
+                .remove("CreationTime")
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_default();
+            let instance_id = row
+                .remove("InstanceID")
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_default();
+            let vm_type = row
+                .remove("VirtualSystemType")
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_default();
+            let checkpoint_type = classify_checkpoint_type(&vm_type);
+            Some(CheckpointInfo {
+                name,
+                wmi_path: path,
+                created_time,
+                checkpoint_type,
+                instance_id,
+            })
+        })
+        .collect()
+}
+
+fn classify_checkpoint_type(vm_type: &str) -> String {
+    if vm_type.contains("Snapshot:Realized") {
+        "Standard".to_owned()
+    } else if vm_type.contains("Snapshot:Recovery") {
+        "Production".to_owned()
+    } else if vm_type.contains("Snapshot") {
+        "Snapshot".to_owned()
+    } else {
+        "Unknown".to_owned()
+    }
+}
+
+/// Получить путь сервиса снапшотов (Msvm_VirtualSystemSnapshotService).
+fn snapshot_service_path(wmi: &Wmi) -> Option<String> {
+    if let Some(mut row) = wmi
+        .query("SELECT * FROM Msvm_VirtualSystemSnapshotService")
+        .into_iter()
+        .next()
+    {
+        if let Some(path) = take_non_empty_string(&mut row, "__PATH")
+            .or_else(|| take_non_empty_string(&mut row, "__RELPATH"))
+        {
+            return Some(path);
+        }
+    }
+    // Fallback: singleton с Name="vsss"
+    let host = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "localhost".to_owned());
+    Some(format!(
+        "Msvm_VirtualSystemSnapshotService.CreationClassName=\"Msvm_VirtualSystemSnapshotService\",\
+Name=\"vsss\",SystemCreationClassName=\"Msvm_ComputerSystem\",SystemName=\"{}\"",
+        escape_wmi_key(&host)
+    ))
+}
+
+/// Создать стандартный чекпоинт для VM.
+/// vm_wmi_path — WMI-путь Msvm_ComputerSystem VM.
+/// name — имя чекпоинта (если None, используется дата/время).
+/// Возвращает имя созданного чекпоинта или ошибку.
+pub fn create_checkpoint(vm_wmi_path: &str, name: Option<&str>) -> Result<String, String> {
+    let wmi = Wmi::connect().ok_or_else(|| "WMI connect failed".to_owned())?;
+    let svc_path = snapshot_service_path(&wmi)
+        .ok_or_else(|| "Msvm_VirtualSystemSnapshotService not found".to_owned())?;
+
+    // SnapshotType: 2 = Standard, 3 = Production
+    let in_params: Vec<(&str, WmiVal)> = vec![
+        ("AffectedSystem", WmiVal::Str(vm_wmi_path.to_owned())),
+        ("SnapshotType", WmiVal::I32(2)),
+    ];
+
+    let _out = wmi
+        .exec_method_result(&svc_path, "CreateSnapshot", &in_params)
+        .map_err(|e| format!("CreateSnapshot: {e}"))?;
+
+    let display_name = name
+        .unwrap_or("Checkpoint")
+        .to_owned();
+    Ok(display_name)
+}
+
+/// Применить (восстановить) чекпоинт.
+/// snapshot_wmi_path — WMI-путь Msvm_VirtualSystemSettingData (из CheckpointInfo.wmi_path).
+pub fn apply_checkpoint(snapshot_wmi_path: &str) -> Result<(), String> {
+    let wmi = Wmi::connect().ok_or_else(|| "WMI connect failed".to_owned())?;
+    let svc_path = snapshot_service_path(&wmi)
+        .ok_or_else(|| "Msvm_VirtualSystemSnapshotService not found".to_owned())?;
+    wmi.exec_method_result(
+        &svc_path,
+        "ApplySnapshot",
+        &[("Snapshot", WmiVal::Str(snapshot_wmi_path.to_owned()))],
+    )
+    .map(|_| ())
+    .map_err(|e| format!("ApplySnapshot: {e}"))
+}
+
+/// Удалить чекпоинт и его дерево (если есть дочерние снапшоты).
+pub fn delete_checkpoint(snapshot_wmi_path: &str) -> Result<(), String> {
+    let wmi = Wmi::connect().ok_or_else(|| "WMI connect failed".to_owned())?;
+    let svc_path = snapshot_service_path(&wmi)
+        .ok_or_else(|| "Msvm_VirtualSystemSnapshotService not found".to_owned())?;
+    wmi.exec_method_result(
+        &svc_path,
+        "DestroySnapshot",
+        &[("AffectedSnapshot", WmiVal::Str(snapshot_wmi_path.to_owned()))],
+    )
+    .map(|_| ())
+    .map_err(|e| format!("DestroySnapshot: {e}"))
 }
 
 /// Returns raw RGB bytes (3 bytes/pixel, width × height). None if VM is off or on error.
@@ -948,6 +1135,15 @@ fn rgb565_to_rgba(rgb565: &[u8], width: usize, height: usize) -> Vec<u8> {
         rgba.push(255);
     }
     rgba
+}
+
+/// Отправить Ctrl+Alt+Del в VM (через WMI Msvm_Keyboard.TypeCtrlAltDel).
+pub fn send_ctrl_alt_del(vm_id: &str) -> Result<(), String> {
+    let wmi = Wmi::connect().ok_or_else(|| "WMI connect failed".to_owned())?;
+    let path = find_device_path(&wmi, "Msvm_Keyboard", vm_id)
+        .ok_or_else(|| "Msvm_Keyboard не найден".to_owned())?;
+    wmi.exec_method_result(&path, "TypeCtrlAltDel", &[])
+        .map(|_| ())
 }
 
 pub fn press_key(vm_id: &str, scan_code: u32) -> Result<(), String> {

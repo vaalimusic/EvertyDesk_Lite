@@ -2420,6 +2420,37 @@ fn handle_client_input_pipeline(
                 });
             }
         }
+        // ── VM Power Operation ──────────────────────────────────────────────────
+        Some(peer_message::Union::Misc(Misc {
+            union: Some(misc::Union::VmPowerOp(json)),
+        })) => {
+            host_log(events, format!("Host VM: power op запрошен: {json}"));
+            let result = handle_vm_power_op(&json);
+            let _ = peer_msg_tx.send(vm_misc_message(misc::Union::VmPowerResult(result)));
+        }
+        // ── VM Capability Request ───────────────────────────────────────────────
+        Some(peer_message::Union::Misc(Misc {
+            union: Some(misc::Union::VmCapabilityRequest(vm_id)),
+        })) => {
+            host_log(events, format!("Host VM: capability graph запрошен для {vm_id}"));
+            let graph_json = crate::vm_bridge::get_capability_graph(&vm_id);
+            let _ = peer_msg_tx.send(vm_misc_message(misc::Union::VmCapabilityGraph(graph_json)));
+        }
+        // ── VM Checkpoint Operation ─────────────────────────────────────────────
+        Some(peer_message::Union::Misc(Misc {
+            union: Some(misc::Union::VmCheckpointOp(json)),
+        })) => {
+            host_log(events, format!("Host VM: checkpoint op: {json}"));
+            let result = crate::vm_bridge::checkpoint_op(&json);
+            let _ = peer_msg_tx.send(vm_misc_message(misc::Union::VmCheckpoints(result)));
+        }
+        // ── VM Rescue Input ─────────────────────────────────────────────────────
+        Some(peer_message::Union::Misc(Misc {
+            union: Some(misc::Union::VmRescueInput(json)),
+        })) => {
+            host_log(events, format!("Host VM: rescue input: {json}"));
+            crate::vm_bridge::rescue_input(&json);
+        }
         Some(peer_message::Union::Misc(Misc {
             union: Some(misc::Union::Option(option)),
         })) => {
@@ -4096,6 +4127,61 @@ fn append_evrt_session_token(endpoints: &str, token: &str) -> String {
     } else {
         format!("{endpoints},token={token}")
     }
+}
+
+/// Обработать VmPowerOp JSON и вернуть JSON-результат.
+fn handle_vm_power_op(json: &str) -> String {
+    #[cfg(windows)]
+    {
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(json) else {
+            return r#"{"ok":false,"error":"invalid json"}"#.to_owned();
+        };
+        let vm_id = val.get("vm_id").and_then(|v| v.as_str()).unwrap_or("");
+        let vm_path = val.get("vm_path").and_then(|v| v.as_str()).unwrap_or("");
+        let action_str = val.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        let provider = if vm_id.starts_with("hyperv:") { "hyperv" }
+                       else if vm_id.starts_with("vbox:") { "vbox" }
+                       else { "hyperv" };
+        let real_id = vm_id.splitn(2, ':').nth(1).unwrap_or(vm_id);
+        match provider {
+            "hyperv" => {
+                if let Some(action) = crate::hyperv::VmPowerAction::from_str(action_str) {
+                    let path = if !vm_path.is_empty() { vm_path.to_owned() }
+                               else { format!("Msvm_ComputerSystem.CreationClassName=\"Msvm_ComputerSystem\",Name=\"{real_id}\"") };
+                    crate::hyperv::request_power_action(&path, action);
+                    format!(r#"{{"vm_id":{vm_id_json},"action":{action_json},"ok":true,"error":""}}"#,
+                        vm_id_json = serde_json::Value::String(vm_id.to_owned()),
+                        action_json = serde_json::Value::String(action_str.to_owned()))
+                } else {
+                    format!(r#"{{"ok":false,"error":"unknown action: {action_str}"}}"#)
+                }
+            }
+            "vbox" => {
+                // VBoxManage controlvm <uuid> <acpipowerbutton|poweroff|pause|resume|savestate>
+                let vbox_action = match action_str {
+                    "start"    => "startvm",
+                    "stop"     => "poweroff",
+                    "shutdown" => "acpipowerbutton",
+                    "pause"    => "pause",
+                    "resume"   => "resume",
+                    "save"     => "savestate",
+                    other      => return format!(r#"{{"ok":false,"error":"unknown vbox action: {other}"}}"#),
+                };
+                let ok = if action_str == "start" {
+                    std::process::Command::new("VBoxManage").args(["startvm", real_id]).status().map(|s| s.success()).unwrap_or(false)
+                } else {
+                    std::process::Command::new("VBoxManage").args(["controlvm", real_id, vbox_action]).status().map(|s| s.success()).unwrap_or(false)
+                };
+                format!(r#"{{"vm_id":{vm_id_json},"action":{action_json},"ok":{ok},"error":""}}"#,
+                    vm_id_json = serde_json::Value::String(vm_id.to_owned()),
+                    action_json = serde_json::Value::String(action_str.to_owned()),
+                    ok = ok)
+            }
+            _ => r#"{"ok":false,"error":"unknown provider"}"#.to_owned(),
+        }
+    }
+    #[cfg(not(windows))]
+    r#"{"ok":false,"error":"power ops only available on Windows host"}"#.to_owned()
 }
 
 fn vm_misc_message(union: misc::Union) -> PeerMessage {
