@@ -1313,77 +1313,148 @@ impl HyperVSession {
         let stop_flag_cap = stop_flag.clone();
 
         // ── Input thread ─────────────────────────────────────────────────────
-        // Dedicated WMI connection + pre-resolved device paths (no per-event lookup).
+        // Выделенный поток только для WMI-ввода — не блокируется захватом кадров.
+        //
+        // FIX-1: Retry keyboard path — Msvm_Keyboard может быть недоступен
+        //   при старте VM (Integration Services ещё не готов). Повторяем до 5 раз.
+        //
+        // FIX-2: Батчевый TypeText — сначала блокируемся на recv(), потом drain
+        //   все уже ожидающие TypeText в одну строку → один WMI-вызов вместо N.
+        //   Для быстрой печати это снижает задержку с N×80ms до 1×80ms.
+        //
+        // FIX-3: Modifier + кириллица — если ascii_scancode не знает символ,
+        //   пробуем cyrillic_to_vk (позиционная таблица RU-JCUKEN→EN).
+        //   Ctrl+А → PressKey(VK_CONTROL)+PressKey(VK_F) вместо TypeText("а").
         let vm_id_input = vm.id.clone();
         let status_tx_input = status_tx.clone();
         std::thread::Builder::new()
             .name(format!("hyperv-input-{}", vm.name))
             .spawn(move || {
-                let (paths, warn) = DevicePaths::resolve(&vm_id_input);
-                if let Some(w) = warn {
-                    let _ = status_tx_input.try_send(w);
-                }
+                // FIX-1: Retry until Msvm_Keyboard path is resolved.
                 let wmi = Wmi::connect();
-                // Block on channel — no spin-sleep needed; input is event-driven.
-                // sync_channel recv() blocks until a command arrives.
+                let mut paths = {
+                    let (p, warn) = DevicePaths::resolve(&vm_id_input);
+                    if let Some(w) = warn { let _ = status_tx_input.try_send(w); }
+                    p
+                };
+                if paths.keyboard.is_none() {
+                    let _ = status_tx_input.try_send(
+                        "⚠ Msvm_Keyboard не найден, жду Integration Services…".into()
+                    );
+                    for attempt in 1u32..=5 {
+                        std::thread::sleep(Duration::from_secs(3));
+                        let (p2, warn2) = DevicePaths::resolve(&vm_id_input);
+                        if let Some(w) = warn2 { let _ = status_tx_input.try_send(w); }
+                        if p2.keyboard.is_some() {
+                            paths = p2;
+                            let _ = status_tx_input.try_send(format!(
+                                "✓ Msvm_Keyboard найден (попытка {}) — ввод активен", attempt + 1
+                            ));
+                            break;
+                        }
+                        if attempt == 5 {
+                            let _ = status_tx_input.try_send(
+                                "✗ Msvm_Keyboard недоступен — клавиатура WMI не работает. \
+                                 Попробуйте Enhanced Session или переключитесь в BasicRescue позже.".into()
+                            );
+                        }
+                    }
+                }
+
+                // Helper: flush батч TypeText за один WMI-вызов.
+                let flush_text = |batch: &mut String, wmi: &Option<Wmi>, kbd: &Option<String>| {
+                    if batch.is_empty() { return; }
+                    if let (Some(wmi), Some(p)) = (wmi, kbd) {
+                        let _ = wmi.exec_method_result(
+                            p, "TypeText",
+                            &[("asciiText", WmiVal::Str(batch.clone()))],
+                        );
+                    }
+                    batch.clear();
+                };
+
                 loop {
-                    let cmd = match cmd_rx.recv() {
+                    // Ждём хотя бы одну команду (не спим попусту).
+                    let first = match cmd_rx.recv() {
                         Ok(c) => c,
-                        Err(_) => return, // sender dropped → session over
+                        Err(_) => return,
                     };
-                    match cmd {
-                        HyperVCmd::Stop => return,
-                        HyperVCmd::PressKey(sc) => {
-                            if let (Some(wmi), Some(p)) = (&wmi, &paths.keyboard) {
-                                // No sleep — WMI exec_method_result is already synchronous.
-                                let _ = wmi.exec_method_result(
-                                    p, "PressKey",
-                                    &[("keyCode", WmiVal::I32(sc as i32))],
-                                );
-                            }
+
+                    // FIX-2: Накапливаем все уже лежащие команды в буфер.
+                    let mut pending = vec![first];
+                    loop {
+                        match cmd_rx.try_recv() {
+                            Ok(c) => pending.push(c),
+                            Err(_) => break,
                         }
-                        HyperVCmd::ReleaseKey(sc) => {
-                            if let (Some(wmi), Some(p)) = (&wmi, &paths.keyboard) {
-                                let _ = wmi.exec_method_result(
-                                    p, "ReleaseKey",
-                                    &[("keyCode", WmiVal::I32(sc as i32))],
-                                );
+                    }
+
+                    // Обрабатываем пачку: TypeText-ы батчуем, остальное — сразу.
+                    let mut text_batch = String::new();
+                    let mut stop = false;
+
+                    for cmd in pending {
+                        match cmd {
+                            HyperVCmd::Stop => { stop = true; break; }
+
+                            // FIX-2: Не отправляем сразу — копим в text_batch.
+                            HyperVCmd::TypeText(t) => {
+                                text_batch.push_str(&t);
                             }
-                        }
-                        HyperVCmd::TypeText(t) => {
-                            if let (Some(wmi), Some(p)) = (&wmi, &paths.keyboard) {
-                                let _ = wmi.exec_method_result(
-                                    p, "TypeText",
-                                    &[("asciiText", WmiVal::Str(t))],
-                                );
+
+                            // Перед любым non-text событием сначала сбрасываем текст.
+                            HyperVCmd::PressKey(sc) => {
+                                flush_text(&mut text_batch, &wmi, &paths.keyboard);
+                                if let (Some(wmi), Some(p)) = (&wmi, &paths.keyboard) {
+                                    let _ = wmi.exec_method_result(
+                                        p, "PressKey",
+                                        &[("keyCode", WmiVal::I32(sc as i32))],
+                                    );
+                                }
                             }
-                        }
-                        HyperVCmd::CtrlAltDel => {
-                            if let (Some(wmi), Some(p)) = (&wmi, &paths.keyboard) {
-                                let _ = wmi.exec_method_result(p, "TypeCtrlAltDel", &[]);
+                            HyperVCmd::ReleaseKey(sc) => {
+                                flush_text(&mut text_batch, &wmi, &paths.keyboard);
+                                if let (Some(wmi), Some(p)) = (&wmi, &paths.keyboard) {
+                                    let _ = wmi.exec_method_result(
+                                        p, "ReleaseKey",
+                                        &[("keyCode", WmiVal::I32(sc as i32))],
+                                    );
+                                }
                             }
-                        }
-                        HyperVCmd::MoveMouse(x, y) => {
-                            if let (Some(wmi), Some(p)) = (&wmi, &paths.mouse) {
-                                let _ = wmi.exec_method_result(
-                                    p, "SetAbsolutePosition",
-                                    &[
-                                        ("horizontalPosition", WmiVal::I32(x as i32)),
-                                        ("verticalPosition",   WmiVal::I32(y as i32)),
-                                    ],
-                                );
+                            HyperVCmd::CtrlAltDel => {
+                                flush_text(&mut text_batch, &wmi, &paths.keyboard);
+                                if let (Some(wmi), Some(p)) = (&wmi, &paths.keyboard) {
+                                    let _ = wmi.exec_method_result(p, "TypeCtrlAltDel", &[]);
+                                }
                             }
-                        }
-                        HyperVCmd::ClickMouse(b, press) => {
-                            if let (Some(wmi), Some(p)) = (&wmi, &paths.mouse) {
-                                let method = if press { "ClickButton" } else { "ReleaseButton" };
-                                let _ = wmi.exec_method_result(
-                                    p, method,
-                                    &[("buttonIndex", WmiVal::I32(b as i32))],
-                                );
+                            HyperVCmd::MoveMouse(x, y) => {
+                                flush_text(&mut text_batch, &wmi, &paths.keyboard);
+                                if let (Some(wmi), Some(p)) = (&wmi, &paths.mouse) {
+                                    let _ = wmi.exec_method_result(
+                                        p, "SetAbsolutePosition",
+                                        &[
+                                            ("horizontalPosition", WmiVal::I32(x as i32)),
+                                            ("verticalPosition",   WmiVal::I32(y as i32)),
+                                        ],
+                                    );
+                                }
+                            }
+                            HyperVCmd::ClickMouse(b, press) => {
+                                flush_text(&mut text_batch, &wmi, &paths.keyboard);
+                                if let (Some(wmi), Some(p)) = (&wmi, &paths.mouse) {
+                                    let method = if press { "ClickButton" } else { "ReleaseButton" };
+                                    let _ = wmi.exec_method_result(
+                                        p, method,
+                                        &[("buttonIndex", WmiVal::I32(b as i32))],
+                                    );
+                                }
                             }
                         }
                     }
+
+                    // Сбрасываем оставшийся текст-батч.
+                    flush_text(&mut text_batch, &wmi, &paths.keyboard);
+                    if stop { return; }
                 }
             })
             .expect("hyperv-input thread");

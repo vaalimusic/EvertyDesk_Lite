@@ -507,13 +507,18 @@ fn dispatch_key(vm_id: &str, ev: &crate::rustdesk_proto::KeyEvent) {
                 if (ev.press || ev.down) && *ch != 0 {
                     if let Some(c) = char::from_u32(*ch) {
                         if !mods.is_empty() {
-                            if let Some(scan) = ascii_scancode(c) {
+                            // FIX-3: пробуем ASCII-VK, если нет — пробуем кириллицу→VK.
+                            // Это позволяет Ctrl+А (RU) → Ctrl+VK_F вместо игнора модификатора.
+                            let vk = ascii_scancode(c).or_else(|| cyrillic_to_vk(c));
+                            if let Some(scan) = vk {
                                 mods.iter().for_each(|m| send_press(*m));
                                 send_press(scan);
                                 send_release(scan);
                                 mods.iter().rev().for_each(|m| send_release(*m));
                                 return Ok(());
                             }
+                            // Если нет VK-маппинга — TypeText без модификаторов
+                            // (лучше получить символ без mod, чем вообще ничего).
                         }
                         send_text(c.to_string());
                     }
@@ -588,6 +593,59 @@ fn ascii_scancode(c: char) -> Option<u32> {
     } else {
         None
     }
+}
+
+/// FIX-3: Кириллица (JCUKEN) → Windows VK-код физической позиции клавиши.
+///
+/// Msvm_Keyboard.PressKey принимает VK-код (позицию клавиши), а не символ.
+/// Если оператор набирает на русской раскладке, клиент шлёт Unicode кириллицы.
+/// Без этого маппинга Ctrl+А (Select All на RU) → ничего, с ним → Ctrl+VK_F.
+/// Работает только если в VM тоже стоит русская раскладка (JCUKEN, стандарт RU).
+///
+/// Строчные и заглавные буквы маппятся на одинаковый VK (shift обрабатывает VM).
+#[cfg(windows)]
+fn cyrillic_to_vk(c: char) -> Option<u32> {
+    // Таблица: кириллица (lowercase) → VK латинской клавиши на той же позиции.
+    // Стандарт: Windows JCUKEN (Russian QWERTY-позиционный).
+    let lower = c.to_lowercase().next()?;
+    Some(match lower {
+        // Верхний ряд (цифры пропускаем — они совпадают с ASCII)
+        'й' => 0x51, // Q
+        'ц' => 0x57, // W
+        'у' => 0x45, // E
+        'к' => 0x52, // R
+        'е' => 0x54, // T
+        'н' => 0x59, // Y
+        'г' => 0x55, // U
+        'ш' => 0x49, // I
+        'щ' => 0x4F, // O
+        'з' => 0x50, // P
+        'х' => 0xDB, // [ (VK_OEM_4)
+        'ъ' => 0xDD, // ] (VK_OEM_6)
+        // Средний ряд
+        'ф' => 0x41, // A
+        'ы' => 0x53, // S
+        'в' => 0x44, // D
+        'а' => 0x46, // F
+        'п' => 0x47, // G
+        'р' => 0x48, // H
+        'о' => 0x4A, // J
+        'л' => 0x4B, // K
+        'д' => 0x4C, // L
+        'ж' => 0xBA, // ; (VK_OEM_1)
+        'э' => 0xDE, // ' (VK_OEM_7)
+        // Нижний ряд
+        'я' => 0x5A, // Z
+        'ч' => 0x58, // X
+        'с' => 0x43, // C
+        'м' => 0x56, // V
+        'и' => 0x42, // B
+        'т' => 0x4E, // N
+        'ь' => 0x4D, // M
+        'б' => 0xBC, // , (VK_OEM_COMMA)
+        'ю' => 0xBE, // . (VK_OEM_PERIOD)
+        _ => return None,
+    })
 }
 
 #[cfg(not(windows))]
