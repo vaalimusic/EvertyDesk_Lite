@@ -542,33 +542,40 @@ fn dispatch_key(vm_id: &str, ev: &crate::rustdesk_proto::KeyEvent) {
 
                 match vk {
                     Some(vk_code) => {
-                        // PressKey + (опционально) ReleaseKey в зависимости от ev.
-                        if ev.press || ev.down {
+                        // Различаем два режима отправки:
+                        //
+                        // ev.press=true — "атомарное" нажатие от клиента (press+release одним
+                        //   пакетом). Модификаторы из ev.modifiers нужно обработать явно здесь,
+                        //   потому что для такого события не будет отдельных ControlKey-событий.
+                        //
+                        // ev.down/up пара — реальные key-down / key-up. Модификаторы (Shift,
+                        //   Ctrl, Alt) уже обработаны их собственными ControlKey-событиями.
+                        //   Здесь мы их НЕ трогаем — иначе Shift нажимается дважды, а потом
+                        //   преждевременно отпускается на key-up символа, хотя оператор ещё
+                        //   держит Shift. Это была причина лишних заглавных букв.
+                        if ev.press {
+                            // Атомарное нажатие: жмём модификаторы + клавишу, потом отпускаем.
                             mods.iter().for_each(|m| send_press(*m));
                             send_press(vk_code);
-                        }
-                        if ev.press {
-                            // Одиночный клик — сразу отпускаем
                             send_release(vk_code);
                             mods.iter().rev().for_each(|m| send_release(*m));
-                        } else if !ev.down {
-                            // Key-up (down=false, press=false)
+                        } else if ev.down {
+                            // Key-down: только саму клавишу — модификаторы уже нажаты.
+                            send_press(vk_code);
+                        } else {
+                            // Key-up: только саму клавишу — модификаторы отпустятся своими событиями.
                             send_release(vk_code);
-                            mods.iter().rev().for_each(|m| send_release(*m));
                         }
-                        // Если down=true && press=false: клавиша удерживается,
-                        // ReleaseKey придёт отдельным событием.
                     }
                     None => {
                         // Нет VK-маппинга (emoji, нестандартный Unicode и т.п.).
-                        // TypeText как last-resort только для ASCII — для не-ASCII
-                        // надёжного способа нет в WMI BasicRescue режиме.
+                        // TypeText как last-resort только для ASCII-графики.
                         if (ev.press || ev.down) && c.is_ascii_graphic() {
-                            if !mods.is_empty() {
+                            if ev.press {
                                 mods.iter().for_each(|m| send_press(*m));
                             }
                             send_text(c.to_string());
-                            if !mods.is_empty() {
+                            if ev.press {
                                 mods.iter().rev().for_each(|m| send_release(*m));
                             }
                         }
