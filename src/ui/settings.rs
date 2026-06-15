@@ -954,6 +954,7 @@ fn default_config_from(config: &AppConfig) -> AppConfig {
         security: settings_mod::SecurityConfig::default(),
         display: settings_mod::DisplayConfig::default(),
         llm: settings_mod::LlmConfig::default(),
+        hotfix: config.hotfix.clone(),
         local_id: config.local_id.clone(),
         local_password: config.local_password.clone(),
         ui: config.ui.clone(),
@@ -1015,17 +1016,17 @@ fn hotfix_settings_section(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut
                 ui.add_space(4.0);
 
                 // Проверка ключа — показываем статус
-                let key_status = if draft.hotfix.signing_public_key.trim().is_empty() {
+                let key_status: (String, egui::Color32) = if draft.hotfix.signing_public_key.trim().is_empty() {
                     (
-                        tr(selected_lang, "Ключ подписи не задан — подпись не проверяется", "Signing key not set — signatures won't be verified"),
-                        crate::theme::palette().warn,
+                        tr(selected_lang, "Ключ подписи не задан — подпись не проверяется", "Signing key not set — signatures won't be verified").to_owned(),
+                        crate::theme::palette().warning,
                     )
                 } else {
                     match base64::engine::general_purpose::STANDARD
                         .decode(draft.hotfix.signing_public_key.trim())
                     {
                         Ok(b) if b.len() == 32 => (
-                            tr(selected_lang, "Ключ корректен (32 байта Ed25519)", "Key valid (32-byte Ed25519)"),
+                            tr(selected_lang, "Ключ корректен (32 байта Ed25519)", "Key valid (32-byte Ed25519)").to_owned(),
                             crate::theme::palette().success,
                         ),
                         Ok(b) => (
@@ -1035,11 +1036,11 @@ fn hotfix_settings_section(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut
                                 b.len(),
                                 tr(selected_lang, "байт, ожидается 32", "bytes, expected 32")
                             ),
-                            crate::theme::palette().error,
+                            crate::theme::palette().danger,
                         ),
                         Err(_) => (
-                            tr(selected_lang, "Ошибка декодирования Base64", "Base64 decode error"),
-                            crate::theme::palette().error,
+                            tr(selected_lang, "Ошибка декодирования Base64", "Base64 decode error").to_owned(),
+                            crate::theme::palette().danger,
                         ),
                     }
                 };
