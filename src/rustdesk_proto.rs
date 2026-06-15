@@ -190,7 +190,8 @@ pub struct RegisterPk {
 /// ID server → Host: public key registration result.
 #[derive(Clone, PartialEq, Message)]
 pub struct RegisterPkResponse {
-    /// 0 = OK, 1 = UUID_MISMATCH, 2 = NOT_SUPPORT, 3 = SERVER_ERROR, 4 = INVALID_ID_FORMAT
+    /// 0 = OK, 1 = UUID_MISMATCH, 2 = NOT_SUPPORT, 3 = SERVER_ERROR,
+    /// 4 = NOT_DEPLOYED (newer hbbr pro) / INVALID_ID_FORMAT (older hbbr open-source)
     #[prost(int32, tag = "1")]
     pub result: i32,
 }

@@ -642,7 +642,15 @@ fn registration_loop(
                             }
                         }
                         Some(rendezvous_message::Union::RegisterPkResponse(r)) => {
-                            host_log(events, format!("RegisterPkResponse  result={}", r.result));
+                            let meaning = match r.result {
+                                0 => "OK",
+                                1 => "UUID_MISMATCH",
+                                2 => "NOT_SUPPORT",
+                                3 => "SERVER_ERROR",
+                                4 => "INVALID_ID_FORMAT / NOT_DEPLOYED",
+                                _ => "unknown",
+                            };
+                            host_log(events, format!("RegisterPkResponse  result={} ({})", r.result, meaning));
                             if r.result == 0 {
                                 host_log(
                                     events,
@@ -652,8 +660,8 @@ fn registration_loop(
                                 let _ = events.send(HostEvent::StateChanged(HostState::Ready));
                             } else {
                                 return LoopResult::Error(format!(
-                                    "RegisterPk rejected (result={})",
-                                    r.result
+                                    "RegisterPk rejected: {} ({})",
+                                    meaning, r.result
                                 ));
                             }
                         }

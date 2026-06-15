@@ -431,6 +431,12 @@ impl AppConfig {
         if let Ok(raw) = fs::read_to_string(&path) {
             if let Ok(mut config) = serde_json::from_str::<Self>(&raw) {
                 let mut changed = false;
+                // Migrate old purely-numeric IDs (e.g. "874375039") — hbbr rejects
+                // IDs that start with a digit (INVALID_ID_FORMAT).
+                if config.local_id.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(true) {
+                    config.local_id = generate_host_id();
+                    changed = true;
+                }
                 // Lazily generate the stable sign key pair for older configs.
                 if config.host_sign_pk.len() != 32 || config.host_sign_sk.len() != 64 {
                     let (pk, sk) = crate::crypto::gen_sign_keypair();
@@ -458,7 +464,7 @@ impl AppConfig {
         let (sign_pk, sign_sk) = crate::crypto::gen_sign_keypair();
         let config = Self {
             server: ServerConfig::default(),
-            local_id: generate_numeric_token(9),
+            local_id: generate_host_id(),
             local_password: generate_numeric_token(6),
             security: SecurityConfig::default(),
             display: DisplayConfig::default(),
@@ -554,6 +560,26 @@ pub fn generate_numeric_token(len: usize) -> String {
     let mut value = nanos ^ (std::process::id() as u128);
     let mut out = String::with_capacity(len);
     for _ in 0..len {
+        out.push(char::from(b'0' + (value % 10) as u8));
+        value = value / 10 + 17;
+    }
+    out
+}
+
+/// Generate a 9-character host ID that hbbr will accept: starts with a letter
+/// ('e'–'n' range so it's visually distinct), followed by 8 random digits.
+pub fn generate_host_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let mut value = nanos ^ (std::process::id() as u128);
+    // First char: letter 'e'..'n' (10 options, derived from value)
+    let letter = char::from(b'e' + (value % 10) as u8);
+    value = value / 10 + 31;
+    let mut out = String::with_capacity(9);
+    out.push(letter);
+    for _ in 0..8 {
         out.push(char::from(b'0' + (value % 10) as u8));
         value = value / 10 + 17;
     }
