@@ -133,27 +133,33 @@ impl Wmi {
     }
 
     /// Call a WMI method. in_params: list of (name, value) to set on the input object.
-    /// Returns output properties map.
+    /// Returns output properties map. Тонкая Option-обёртка для вызовов,
+    /// которым не нужна детальная ошибка (ввод).
     fn exec_method(
         &self,
         obj_path: &str,
         method: &str,
         in_params: &[(&str, WmiVal)],
     ) -> Option<HashMap<String, WmiVal>> {
+        self.exec_method_result(obj_path, method, in_params).ok()
+    }
+
+    /// Детальная версия: возвращает конкретную ошибку с HRESULT на каждом шаге,
+    /// чтобы было видно ЧТО именно упало (GetObject/GetMethod/Put/ExecMethod).
+    fn exec_method_result(
+        &self,
+        obj_path: &str,
+        method: &str,
+        in_params: &[(&str, WmiVal)],
+    ) -> Result<HashMap<String, WmiVal>, String> {
         unsafe {
             // Get the class to obtain the method input signature
             let class_name = obj_path_class(obj_path);
             let mut class_obj: Option<IWbemClassObject> = None;
             self.svc
-                .GetObject(
-                    &BSTR::from(class_name),
-                    0,
-                    None,
-                    Some(&mut class_obj),
-                    None,
-                )
-                .ok()?;
-            let class_obj = class_obj?;
+                .GetObject(&BSTR::from(class_name), 0, None, Some(&mut class_obj), None)
+                .map_err(|e| format!("GetObject({class_name}) {}", hr(&e)))?;
+            let class_obj = class_obj.ok_or_else(|| format!("GetObject({class_name}) пусто"))?;
 
             // Get method in-param signature and spawn an instance
             let mut in_sig: Option<IWbemClassObject> = None;
@@ -161,9 +167,12 @@ impl Wmi {
             let method_w = wide_null(method);
             class_obj
                 .GetMethod(PCWSTR(method_w.as_ptr()), 0, &mut in_sig, &mut _out_sig)
-                .ok()?;
+                .map_err(|e| format!("GetMethod({method}) {}", hr(&e)))?;
 
-            let in_instance = in_sig?.SpawnInstance(0).ok()?;
+            let in_instance = in_sig
+                .ok_or_else(|| format!("GetMethod({method}) нет in-сигнатуры"))?
+                .SpawnInstance(0)
+                .map_err(|e| format!("SpawnInstance {}", hr(&e)))?;
 
             // Fill in-params
             for (name, val) in in_params {
@@ -171,7 +180,7 @@ impl Wmi {
                 let var = wmi_val_to_variant(val);
                 in_instance
                     .Put(PCWSTR(name_w.as_ptr()), 0, &var, 0)
-                    .ok()?;
+                    .map_err(|e| format!("Put({name}) {}", hr(&e)))?;
             }
 
             // Execute method
@@ -186,12 +195,17 @@ impl Wmi {
                     Some(&mut out_obj as *mut _),
                     None,
                 )
-                .ok()?;
+                .map_err(|e| format!("ExecMethod({method}) {}", hr(&e)))?;
 
-            let out = out_obj?;
-            Some(read_all_properties(&out))
+            let out = out_obj.ok_or_else(|| format!("ExecMethod({method}) пустой результат"))?;
+            Ok(read_all_properties(&out))
         }
     }
+}
+
+/// Краткий HRESULT в hex + сообщение.
+fn hr(e: &windows::core::Error) -> String {
+    format!("hr=0x{:08X}", e.code().0 as u32)
 }
 
 // ── WMI value type ────────────────────────────────────────────────────────────
@@ -570,16 +584,17 @@ pub fn capture_screen(vm_id: &str, vm_wmi_path: &str, width: u16, height: u16) -
     let setting_path = current_setting_path(&wmi, vm_id, vm_wmi_path)
         .ok_or_else(|| "Msvm_VirtualSystemSettingData path not found".to_owned())?;
 
-    let out = wmi.exec_method(
-        &svc_path,
-        "GetVirtualSystemThumbnailImage",
-        &[
-            ("TargetSystem", WmiVal::Str(setting_path)),
-            ("WidthPixels", WmiVal::U16(width)),
-            ("HeightPixels", WmiVal::U16(height)),
-        ],
-    )
-    .ok_or_else(|| "GetVirtualSystemThumbnailImage ExecMethod failed".to_owned())?;
+    let out = wmi
+        .exec_method_result(
+            &svc_path,
+            "GetVirtualSystemThumbnailImage",
+            &[
+                ("TargetSystem", WmiVal::Str(setting_path.clone())),
+                ("WidthPixels", WmiVal::U16(width)),
+                ("HeightPixels", WmiVal::U16(height)),
+            ],
+        )
+        .map_err(|e| format!("GetThumbnail [{e}]; svc={svc_path}; target={setting_path}"))?;
 
     if let Some(rv) = out.get("ReturnValue").and_then(WmiVal::as_u32) {
         if rv != 0 {
@@ -628,30 +643,33 @@ Name=\"vmms\",SystemCreationClassName=\"Msvm_ComputerSystem\",SystemName=\"{}\""
 }
 
 fn current_setting_path(wmi: &Wmi, vm_id: &str, vm_wmi_path: &str) -> Option<String> {
-    let q = format!(
-        "ASSOCIATORS OF {{{vm_wmi_path}}} WHERE ResultClass = Msvm_VirtualSystemSettingData"
-    );
-    // Без `?`: если ASSOCIATORS вернул пусто — падаем в SELECT-fallback ниже,
-    // а не выходим из функции.
-    if let Some(mut row) = wmi.query(&q).into_iter().next() {
-        if let Some(path) = take_non_empty_string(&mut row, "__PATH")
-            .or_else(|| take_non_empty_string(&mut row, "__RELPATH"))
-        {
-            return Some(path);
-        }
-    }
-
+    // Сначала — «realized» настройка по фильтру (GetThumbnail требует именно её,
+    // а не snapshot-настройку, которую ASSOCIATORS может вернуть первой).
     let q = format!(
         "SELECT * FROM Msvm_VirtualSystemSettingData \
          WHERE VirtualSystemIdentifier = '{}' \
          AND VirtualSystemType = 'Microsoft:Hyper-V:System:Realized'",
         escape_wmi_value(vm_id)
     );
+    if let Some(mut row) = wmi.query(&q).into_iter().next() {
+        if let Some(path) = take_non_empty_string(&mut row, "__PATH")
+            .or_else(|| take_non_empty_string(&mut row, "__RELPATH"))
+            .or_else(|| {
+                take_non_empty_string(&mut row, "InstanceID")
+                    .map(|instance_id| virtual_system_setting_path(&instance_id))
+            })
+        {
+            return Some(path);
+        }
+    }
+
+    // Fallback: первая ассоциированная настройка VM.
+    let q = format!(
+        "ASSOCIATORS OF {{{vm_wmi_path}}} WHERE ResultClass = Msvm_VirtualSystemSettingData"
+    );
     let mut row = wmi.query(&q).into_iter().next()?;
-    take_non_empty_string(&mut row, "__PATH").or_else(|| {
-        take_non_empty_string(&mut row, "InstanceID")
-            .map(|instance_id| virtual_system_setting_path(&instance_id))
-    })
+    take_non_empty_string(&mut row, "__PATH")
+        .or_else(|| take_non_empty_string(&mut row, "__RELPATH"))
 }
 
 /// Ограничить разрешение thumbnail рамкой max_w×max_h с сохранением пропорций.
