@@ -1053,6 +1053,9 @@ fn relay_session_inner(
     }
 
     // ── 3. Auth: send Hash (encrypted), verify LoginRequest ───────────────────
+    // Clear any stale approval state for this peer from a previous session.
+    approvals().lock().unwrap().remove(peer_id);
+
     let salt = format!("{:016x}", random_u64());
     let challenge = format!("{:016x}", random_u64());
 
@@ -1063,14 +1066,24 @@ fn relay_session_inner(
         })),
     };
     send_peer_enc(&mut relay, &mut cipher, &hash_msg)?;
+    host_log(events, format!("Hash challenge sent to {peer_id} — awaiting LoginRequest…"));
 
     // Wait for a LoginRequest with a valid password. On empty/wrong password
     // we send the RustDesk-standard error ("Empty Password" / "Wrong Password")
     // and KEEP the connection open so the peer prompts and retries — closing
     // here is what made the phone show "wrong password" with no input box.
+    //
+    // Wall-clock deadline: even if keepalives keep arriving (resetting the
+    // per-read socket timeout), we abort if no LoginRequest comes within 90s.
+    let login_deadline = Instant::now() + Duration::from_secs(90);
     let mut others = 0u32;
     let mut pw_attempts = 0u32;
     let login = loop {
+        if Instant::now() >= login_deadline {
+            return Err(format!(
+                "Login timeout: no LoginRequest from {peer_id} in 90s"
+            ));
+        }
         let msg = match recv_peer_enc(&mut relay, &mut cipher) {
             Ok(Some(m)) => m,
             Ok(None) => continue, // keepalive
@@ -1136,13 +1149,17 @@ fn relay_session_inner(
                 let reply = PeerMessage {
                     union: Some(peer_message::Union::TestDelay(d)),
                 };
+                host_log(events, format!("TestDelay echoed for {peer_id}"));
                 let _ = send_peer_enc(&mut relay, &mut cipher, &reply);
             }
             other => {
                 others += 1;
                 host_log(
                     events,
-                    format!("Pre-login peer message: {}", peer_msg_kind(&other)),
+                    format!(
+                        "Pre-login msg #{others} from {peer_id}: {}",
+                        peer_msg_kind(&other)
+                    ),
                 );
                 if others > 40 {
                     return Err("Too many non-login messages".to_owned());
