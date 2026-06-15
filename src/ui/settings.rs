@@ -53,7 +53,7 @@ impl EvertyDeskApp {
 
                     ui.add_space(8.0);
 
-                    security_section(ui, selected_lang, draft);
+                    security_section(ui, selected_lang, draft, &mut self.show_password);
 
                     ui.add_space(8.0);
 
@@ -204,7 +204,7 @@ impl EvertyDeskApp {
             ui.add_space(8.0);
 
             // ── Security (with password) ─────────────────────────────────────
-            security_section(ui, selected_lang, draft);
+            security_section(ui, selected_lang, draft, &mut self.show_password);
 
             ui.add_space(8.0);
 
@@ -356,66 +356,36 @@ impl EvertyDeskApp {
 
 // ── Security section (shared by both window and page) ────────────────────────
 
-fn security_section(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut AppConfig) {
+fn security_section(
+    ui: &mut egui::Ui,
+    selected_lang: UiLang,
+    draft: &mut AppConfig,
+    show_password: &mut bool,
+) {
     settings_section(ui, tr(selected_lang, "Безопасность", "Security"), |ui| {
-        // Password row
+        // ── Password row ─────────────────────────────────────────────────────
         {
             let label = tr(selected_lang, "Пароль доступа", "Access password");
             let hint = tr(
                 selected_lang,
-                "Пустой пароль = только подтверждение",
-                "Empty = confirmation only",
+                "Не задан — нужно подтверждение",
+                "Not set — approval required",
             );
-            let wide = ui.available_width() >= 520.0;
-            if wide {
-                ui.horizontal(|ui| {
-                    ui.set_min_height(36.0);
-                    ui.set_width(ui.available_width());
-                    ui.add_sized(
-                        egui::vec2(150.0, 24.0),
-                        egui::Label::new(
-                            egui::RichText::new(label)
-                                .size(13.0)
-                                .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
-                        )
-                        .truncate(),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Regenerate button
-                        if ui
-                            .small_button("↻")
-                            .on_hover_text(tr(
-                                selected_lang,
-                                "Сгенерировать новый пароль",
-                                "Generate new password",
-                            ))
-                            .clicked()
-                        {
-                            draft.local_password = crate::settings::generate_numeric_token(6);
-                        }
-                        let width = ui.available_width().min(320.0);
-                        ui.add_sized(
-                            egui::vec2(width, 34.0),
-                            egui::TextEdit::singleline(&mut draft.local_password)
-                                .hint_text(hint)
-                                .font(egui::TextStyle::Monospace),
-                        );
-                    });
-                });
-            } else {
-                ui.label(
-                    egui::RichText::new(label)
-                        .size(13.0)
-                        .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+            let eye_icon = if *show_password { "🙈" } else { "👁" };
+
+            ui.horizontal(|ui| {
+                ui.set_min_height(36.0);
+                ui.set_width(ui.available_width());
+                ui.add_sized(
+                    egui::vec2(150.0, 24.0),
+                    egui::Label::new(
+                        egui::RichText::new(label)
+                            .size(13.0)
+                            .color(egui::Color32::from_rgb(0x50, 0x58, 0x68)),
+                    )
+                    .truncate(),
                 );
-                ui.horizontal(|ui| {
-                    let w = ui.available_width() - 36.0;
-                    ui.add_sized(
-                        egui::vec2(w, 34.0),
-                        egui::TextEdit::singleline(&mut draft.local_password)
-                            .hint_text(hint)
-                            .font(egui::TextStyle::Monospace),
-                    );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .small_button("↻")
                         .on_hover_text(tr(
@@ -427,14 +397,33 @@ fn security_section(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut AppCon
                     {
                         draft.local_password = crate::settings::generate_numeric_token(6);
                     }
+                    if ui
+                        .small_button(eye_icon)
+                        .on_hover_text(tr(
+                            selected_lang,
+                            "Показать / скрыть пароль",
+                            "Show / hide password",
+                        ))
+                        .clicked()
+                    {
+                        *show_password = !*show_password;
+                    }
+                    let width = ui.available_width().min(300.0);
+                    ui.add_sized(
+                        egui::vec2(width, 34.0),
+                        egui::TextEdit::singleline(&mut draft.local_password)
+                            .hint_text(hint)
+                            .password(!*show_password)
+                            .font(egui::TextStyle::Monospace),
+                    );
                 });
-            }
+            });
             ui.add_space(2.0);
             ui.label(
                 egui::RichText::new(tr(
                     selected_lang,
-                    "Клиент вводит пароль — подключение без диалога подтверждения.",
-                    "Client enters this password — connects without the approval dialog.",
+                    "Клиент вводит этот пароль — подключается без диалога подтверждения. Нажмите Сохранить.",
+                    "Client enters this password — connects without the approval dialog. Press Save.",
                 ))
                 .size(11.0)
                 .color(egui::Color32::from_rgb(0x93, 0x9B, 0xA8)),
