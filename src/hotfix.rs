@@ -85,63 +85,82 @@ struct DisplaySnapshot {
 
 // ── Wire-форматы API ──────────────────────────────────────────────────────────
 
+// Запрос POST /api/v1/incidents — вложенная структура как ожидает сервер.
 #[derive(Serialize)]
 struct IncidentPayload {
     schema_version: u8,
-    client_incident_id: String,
+    incident_id: String,    // client-generated UUID (idempotency key)
     device_id: String,
+    app: IncidentApp,
+    incident: IncidentInfo,
+    environment: IncidentEnv,
+}
+
+#[derive(Serialize)]
+struct IncidentApp {
+    name: String,
+    version: String,
+}
+
+#[derive(Serialize)]
+struct IncidentInfo {
+    #[serde(rename = "type")]
     incident_type: String,
     severity: String,
     component: String,
     error_code: String,
     crash_signature: String,
-    app_version: String,
-    os_family: String,
-    distro: String,
-    gpu_vendor: String,
-    driver_version: String,
-    renderer_backend: String,
-    evrt_transport: String,
-    provider_type: String,
-    detail: IncidentDetail,
+    message: String,
+    occurred_at: String,
 }
 
 #[derive(Serialize)]
-struct IncidentDetail {
-    message: String,
-    stack_trace: String,
+struct IncidentEnv {
+    os: EnvOs,
+    hardware: EnvHardware,
+    graphics: EnvGraphics,
+    network: EnvNetwork,
+    detail: EnvDetail,
 }
 
+#[derive(Serialize)]
+struct EnvOs { family: String, name: String }
+
+#[derive(Serialize)]
+struct EnvGpu { vendor: String, driver_version: String }
+
+#[derive(Serialize)]
+struct EnvHardware { gpu: EnvGpu }
+
+#[derive(Serialize)]
+struct EnvGraphics { renderer_backend: String }
+
+#[derive(Serialize)]
+struct EnvNetwork { transport: String }
+
+// Extra field for stack trace — sервер хранит в raw_payload.
+#[derive(Serialize)]
+struct EnvDetail { stack_trace: String }
+
+// POST /api/v1/incidents → {"accepted":true,"server_incident_id":"..."}
 #[derive(Deserialize, Debug)]
 struct SubmitResponse {
-    data: SubmitData,
+    server_incident_id: String,
 }
 
-#[derive(Deserialize, Debug)]
-struct SubmitData {
-    incident_id: String,
-}
-
+// GET /api/v1/incidents/{id}/analysis → {"status":"...","plan_id":"..."}
 #[derive(Deserialize, Debug)]
 struct AnalysisResponse {
-    data: AnalysisData,
-}
-
-#[derive(Deserialize, Debug)]
-struct AnalysisData {
     status: String, // queued | analyzing | ready | failed
+    #[serde(default)]
     plan_id: Option<String>,
 }
 
+// GET /api/v1/remediation-plans/{id} → {"plan_id":"...","decision":"...",...}
 #[derive(Deserialize, Debug)]
 struct PlanResponse {
-    data: PlanData,
-}
-
-#[derive(Deserialize, Debug)]
-struct PlanData {
-    id: String,
-    decision: String, // apply | no_action | manual_review
+    plan_id: String,
+    decision: String,
     risk_level: String,
     requires_user_consent: bool,
     ttl_seconds: u64,
@@ -149,7 +168,7 @@ struct PlanData {
     rollback_actions: Vec<PlanAction>,
     summary: Option<PlanSummary>,
     signature: PlanSignature,
-    payload: String, // JSON строка payload для верификации
+    payload: String, // JSON строка подписанного тела (для верификации Ed25519)
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -192,29 +211,22 @@ pub fn submit_crash_sync(
     app_config: &AppConfig,
 ) {
     if !config.enabled || config.api_key.is_empty() {
+        eprintln!("[hotfix] submit_crash_sync skipped: enabled={} key_empty={}", config.enabled, config.api_key.is_empty());
         return;
     }
     let fp = collect_fingerprint();
-    let payload = IncidentPayload {
-        schema_version: 1,
-        client_incident_id: uuid::Uuid::new_v4().to_string(),
-        device_id: app_config.ui.agent_machine_id.clone(),
-        incident_type: "crash".to_owned(),
-        severity: "error".to_owned(),
+    let payload = build_incident_payload(
+        uuid::Uuid::new_v4().to_string(),
+        app_config.ui.agent_machine_id.clone(),
+        crash_signature,
         component,
         error_code,
-        crash_signature,
-        app_version: env!("CARGO_PKG_VERSION").to_owned(),
-        os_family: fp.os_family,
-        distro: fp.distro,
-        gpu_vendor: fp.gpu_vendor,
-        driver_version: fp.driver_version,
-        renderer_backend: fp.renderer_backend,
-        evrt_transport: fp.evrt_transport,
-        provider_type: fp.provider_type,
-        detail: IncidentDetail { message, stack_trace },
-    };
+        message,
+        stack_trace,
+        &fp,
+    );
     let url = format!("{}/api/v1/incidents", app_config.server.api_url.trim_end_matches('/'));
+    eprintln!("[hotfix] submitting to {url}");
     // 5 секунд максимум — не блокируем процесс надолго при завершении.
     match ureq::post(&url)
         .timeout(Duration::from_secs(5))
@@ -224,6 +236,70 @@ pub fn submit_crash_sync(
     {
         Ok(_) => eprintln!("[hotfix] crash submitted ok"),
         Err(e) => eprintln!("[hotfix] crash submit failed: {e}"),
+    }
+}
+
+fn build_incident_payload(
+    incident_id: String,
+    device_id: String,
+    crash_signature: String,
+    component: String,
+    error_code: String,
+    message: String,
+    stack_trace: String,
+    fp: &Fingerprint,
+) -> IncidentPayload {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    // RFC3339 approximation from unix timestamp
+    let secs = now.as_secs();
+    let occurred_at = format!(
+        "{}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        1970 + secs / 31_557_600,
+        ((secs % 31_557_600) / 2_629_800) + 1,
+        ((secs % 2_629_800) / 86400) + 1,
+        (secs % 86400) / 3600,
+        (secs % 3600) / 60,
+        secs % 60,
+    );
+    IncidentPayload {
+        schema_version: 1,
+        incident_id,
+        device_id,
+        app: IncidentApp {
+            name: "EvertyDesk Lite".to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+        },
+        incident: IncidentInfo {
+            incident_type: "crash".to_owned(),
+            severity: "error".to_owned(),
+            component,
+            error_code,
+            crash_signature,
+            message,
+            occurred_at,
+        },
+        environment: IncidentEnv {
+            os: EnvOs {
+                family: fp.os_family.clone(),
+                name: fp.distro.clone(),
+            },
+            hardware: EnvHardware {
+                gpu: EnvGpu {
+                    vendor: fp.gpu_vendor.clone(),
+                    driver_version: fp.driver_version.clone(),
+                },
+            },
+            graphics: EnvGraphics {
+                renderer_backend: fp.renderer_backend.clone(),
+            },
+            network: EnvNetwork {
+                transport: fp.evrt_transport.clone(),
+            },
+            detail: EnvDetail { stack_trace },
+        },
     }
 }
 
@@ -373,32 +449,23 @@ fn run_report(
     let device_id = app_config.ui.agent_machine_id.clone();
 
     let fp = collect_fingerprint();
-
     let incident_id = uuid::Uuid::new_v4().to_string();
-    let payload = IncidentPayload {
-        schema_version: 1,
-        client_incident_id: incident_id.clone(),
-        device_id: device_id.clone(),
-        incident_type: "crash".to_owned(),
-        severity: "error".to_owned(),
-        component: component.clone(),
-        error_code: error_code.clone(),
-        crash_signature: crash_signature.clone(),
-        app_version: env!("CARGO_PKG_VERSION").to_owned(),
-        os_family: fp.os_family.clone(),
-        distro: fp.distro.clone(),
-        gpu_vendor: fp.gpu_vendor.clone(),
-        driver_version: fp.driver_version.clone(),
-        renderer_backend: fp.renderer_backend.clone(),
-        evrt_transport: fp.evrt_transport.clone(),
-        provider_type: fp.provider_type.clone(),
-        detail: IncidentDetail { message, stack_trace },
-    };
+
+    let payload = build_incident_payload(
+        incident_id.clone(),
+        device_id.clone(),
+        crash_signature,
+        component,
+        error_code,
+        message,
+        stack_trace,
+        &fp,
+    );
 
     let submit_url = format!("{api_base}/api/v1/incidents");
     let resp: SubmitResponse = post_json_auth(&submit_url, &config.api_key, &payload)
         .map_err(|e| format!("submit: {e}"))?;
-    let server_incident_id = resp.data.incident_id;
+    let server_incident_id = resp.server_incident_id;
 
     // Поллинг анализа (до 2 минут, каждые 5 секунд)
     let analysis_url = format!("{api_base}/api/v1/incidents/{server_incident_id}/analysis");
@@ -407,9 +474,9 @@ fn run_report(
         thread::sleep(Duration::from_secs(5));
         let ar: AnalysisResponse = get_json_auth(&analysis_url, &config.api_key)
             .map_err(|e| format!("poll analysis: {e}"))?;
-        match ar.data.status.as_str() {
+        match ar.status.as_str() {
             "ready" => {
-                plan_id = ar.data.plan_id;
+                plan_id = ar.plan_id;
                 break;
             }
             "failed" => return Err("AI analysis failed".to_owned()),
@@ -418,18 +485,17 @@ fn run_report(
     }
 
     let plan_id = match plan_id {
-        Some(id) => id,
-        None => return Ok(()), // timeout — нет плана, это нормально
+        Some(id) if !id.is_empty() => id,
+        _ => return Ok(()), // timeout или нет плана — нормально
     };
 
     // Загрузить план
     let plan_url = format!("{api_base}/api/v1/remediation-plans/{plan_id}");
-    let pr: PlanResponse = get_json_auth(&plan_url, &config.api_key)
+    let plan: PlanResponse = get_json_auth(&plan_url, &config.api_key)
         .map_err(|e| format!("get plan: {e}"))?;
-    let plan = pr.data;
 
     // Если решение no_action — ничего не делаем
-    if plan.decision == "no_action" {
+    if plan.decision == "no_action" || plan.decision == "advice_only" {
         return Ok(());
     }
 
@@ -586,7 +652,6 @@ struct Fingerprint {
     driver_version: String,
     renderer_backend: String,
     evrt_transport: String,
-    provider_type: String,
 }
 
 fn collect_fingerprint() -> Fingerprint {
@@ -615,7 +680,6 @@ fn collect_fingerprint() -> Fingerprint {
         driver_version: String::new(),
         renderer_backend,
         evrt_transport,
-        provider_type: String::new(),
     }
 }
 
