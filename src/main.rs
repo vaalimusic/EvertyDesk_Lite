@@ -4319,12 +4319,19 @@ impl EvertyDeskApp {
                                         ui.colored_label(dot, "●");
                                         ui.vertical(|ui| {
                                             ui.label(
-                                                egui::RichText::new(&vm.name).strong().size(14.0),
+                                                egui::RichText::new(&vm.name)
+                                                    .strong()
+                                                    .size(14.0)
+                                                    .color(egui::Color32::from_rgb(
+                                                        0xF2, 0xF6, 0xFA,
+                                                    )),
                                             );
                                             ui.label(
                                                 egui::RichText::new(&vm.state)
                                                     .size(11.0)
-                                                    .color(egui::Color32::GRAY),
+                                                    .color(egui::Color32::from_rgb(
+                                                        0xA7, 0xB4, 0xC2,
+                                                    )),
                                             );
                                         });
                                         ui.with_layout(

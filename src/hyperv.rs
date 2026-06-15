@@ -636,6 +636,21 @@ fn current_setting_path(wmi: &Wmi, vm_id: &str, vm_wmi_path: &str) -> Option<Str
     })
 }
 
+/// Ограничить разрешение thumbnail рамкой max_w×max_h с сохранением пропорций.
+/// Чётные размеры (требование энкодеров H264). Если уже меньше — без изменений.
+fn cap_resolution(w: u16, h: u16, max_w: u16, max_h: u16) -> (u16, u16) {
+    if w == 0 || h == 0 {
+        return (1280, 720);
+    }
+    if w <= max_w && h <= max_h {
+        return (w & !1, h & !1);
+    }
+    let scale = (max_w as f32 / w as f32).min(max_h as f32 / h as f32);
+    let nw = ((w as f32 * scale) as u16).max(2) & !1;
+    let nh = ((h as f32 * scale) as u16).max(2) & !1;
+    (nw, nh)
+}
+
 fn rgb565_to_rgba(rgb565: &[u8], width: usize, height: usize) -> Vec<u8> {
     let px_count = width.saturating_mul(height);
     let mut rgba = Vec::with_capacity(px_count.saturating_mul(4));
@@ -736,10 +751,14 @@ impl HyperVSession {
         std::thread::Builder::new()
             .name(format!("hyperv-{}", vm.name))
             .spawn(move || {
-                let (width, height) = video_resolution(&vm.id).unwrap_or((1280, 720));
+                let native = video_resolution(&vm.id).unwrap_or((1280, 720));
+                // Кап разрешения thumbnail: на хостах без аппаратного энкодера
+                // (OpenH264-SW) 1080p даёт encode_ms 200–2500 → <1 fps. Меньший
+                // thumbnail Hyper-V рендерит сам → софт-энкод тянет реалтайм.
+                let (width, height) = cap_resolution(native.0, native.1, 1280, 720);
                 let _ = status_tx.try_send(format!(
-                    "Hyper-V capture started: {}x{}",
-                    width, height
+                    "Hyper-V capture started: {}x{} (native {}x{})",
+                    width, height, native.0, native.1
                 ));
                 loop {
                 // Drain commands
