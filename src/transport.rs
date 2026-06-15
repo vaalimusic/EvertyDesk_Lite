@@ -4583,6 +4583,9 @@ fn describe_rendezvous_response(message: &RendezvousMessage) -> Result<Rendezvou
         Some(rendezvous_message::Union::FetchLocalAddr(_)) => {
             Err("Unexpected FetchLocalAddr response".to_owned())
         }
+        Some(rendezvous_message::Union::PeerDiscovery(_)) => {
+            Err("Unexpected PeerDiscovery response".to_owned())
+        }
         None => Err("Empty rendezvous response".to_owned()),
     }
 }

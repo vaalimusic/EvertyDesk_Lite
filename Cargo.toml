@@ -114,6 +114,9 @@ windows = { version = "0.48", features = [
     "Win32_Networking_WinSock",
     # Shared foundation types (HWND, HDC, HBITMAP …)
     "Win32_Foundation",
+    # Hyper-V VM console (WMI)
+    "Win32_System_Wmi",
+    "Win32_System_Ole",
 ], optional = true }
 
 # -----------------------------------------------------------------------

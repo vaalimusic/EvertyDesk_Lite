@@ -15,6 +15,9 @@ mod evrt_session;
 mod frame_queue;
 mod fsr;
 mod host;
+#[cfg(windows)]
+mod hyperv;
+mod lan_discovery;
 mod llm;
 mod mf_encode;
 mod mf_video;
@@ -37,7 +40,11 @@ use std::{
     collections::HashMap,
     fs,
     path::PathBuf,
-    sync::mpsc::{self, Receiver},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver},
+        Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -65,6 +72,7 @@ const SESSION_LOG_TRIM_LINES: usize = 500;
 enum AppMode {
     Connect,
     Host,
+    HyperV,
     History,
     Contacts,
     Settings,
@@ -971,6 +979,21 @@ struct EvertyDeskApp {
     host_log: Vec<String>,
     /// Pending incoming connection (peer_id) waiting for Accept/Reject.
     host_pending_peer: Option<String>,
+    /// Stop signal for the LAN discovery thread (None = not running).
+    lan_discovery_stop: Option<Arc<AtomicBool>>,
+
+    // ── Hyper-V console ───────────────────────────────────────────────────────
+    #[cfg(windows)]
+    hyperv_vms: Vec<hyperv::VmInfo>,
+    #[cfg(windows)]
+    hyperv_session: Option<hyperv::HyperVSession>,
+    #[cfg(windows)]
+    hyperv_texture: Option<TextureHandle>,
+    #[cfg(windows)]
+    hyperv_status: String,
+    /// Which VM is currently open in the console view (index into hyperv_vms)
+    #[cfg(windows)]
+    hyperv_console_vm: Option<usize>,
 
     // ── Settings window ───────────────────────────────────────────────────────
     /// Whether the settings panel is visible.
@@ -1206,6 +1229,17 @@ impl EvertyDeskApp {
             host_state: HostState::Connecting,
             host_log: vec![format!("[{}] Автозапуск доступа...", timestamp_hms())],
             host_pending_peer: None,
+            lan_discovery_stop: None,
+            #[cfg(windows)]
+            hyperv_vms: Vec::new(),
+            #[cfg(windows)]
+            hyperv_session: None,
+            #[cfg(windows)]
+            hyperv_texture: None,
+            #[cfg(windows)]
+            hyperv_status: String::new(),
+            #[cfg(windows)]
+            hyperv_console_vm: None,
             show_settings: false,
             settings_draft: None,
             settings_custom_server: crate::settings::ServerConfig {
@@ -2057,6 +2091,8 @@ impl EvertyDeskApp {
         self.poll_terminal_ai();
         self.maybe_request_terminal_auto_ai();
         self.poll_host_service();
+        #[cfg(windows)]
+        self.poll_hyperv_session(ctx);
         if let Some(image) = self.pending_image.take() {
             if let Some(texture) = self.remote_texture.as_mut() {
                 texture.set(image, remote_texture_options());
@@ -2197,6 +2233,8 @@ impl EvertyDeskApp {
             .show(ctx, |ui| match self.mode {
                 AppMode::Connect => self.connect_ui(ui),
                 AppMode::Host => self.host_ui(ui),
+                #[cfg(windows)]
+                AppMode::HyperV => self.hyperv_ui(ui),
                 AppMode::History => self.history_ui(ui),
                 AppMode::Contacts => self.contacts_ui(ui),
                 AppMode::Settings => self.settings_ui(ui),
@@ -2446,6 +2484,12 @@ impl EvertyDeskApp {
         ui.add_space(8.0);
         self.nav_item(ui, AppMode::Host, host_label, "monitor");
         ui.add_space(8.0);
+        #[cfg(windows)]
+        {
+            let hv_label = self.text("Hyper-V", "Hyper-V");
+            self.nav_item(ui, AppMode::HyperV, hv_label, "server");
+            ui.add_space(8.0);
+        }
         self.nav_item(ui, AppMode::History, history_label, "history");
         ui.add_space(8.0);
         self.nav_item(ui, AppMode::Contacts, contacts_label, "contacts");
@@ -3090,6 +3134,192 @@ impl EvertyDeskApp {
         }
     }
 
+    // ── Hyper-V UI ────────────────────────────────────────────────────────────
+
+    #[cfg(windows)]
+    fn hyperv_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading(egui::RichText::new("Hyper-V VMs").size(20.0).strong());
+        ui.add_space(12.0);
+
+        // Toolbar: Refresh + Disconnect
+        ui.horizontal(|ui| {
+            if ui.button("⟳  Обновить список").clicked() {
+                self.hyperv_vms = hyperv::list_vms();
+            }
+            if self.hyperv_session.is_some() {
+                if ui.button("✕  Отключиться").clicked() {
+                    if let Some(s) = self.hyperv_session.take() {
+                        s.stop();
+                    }
+                    self.hyperv_console_vm = None;
+                    self.hyperv_texture = None;
+                    self.hyperv_status.clear();
+                }
+            }
+        });
+        ui.add_space(10.0);
+
+        // If no VMs loaded yet, try auto-loading
+        if self.hyperv_vms.is_empty() {
+            self.hyperv_vms = hyperv::list_vms();
+        }
+
+        if self.hyperv_vms.is_empty() {
+            ui.label(
+                egui::RichText::new("Hyper-V не обнаружен или ВМ отсутствуют.")
+                    .color(egui::Color32::GRAY),
+            );
+            return;
+        }
+
+        // VM list (top half)
+        let console_open = self.hyperv_session.is_some();
+        let list_height = if console_open { 160.0 } else { ui.available_height() };
+
+        egui::ScrollArea::vertical()
+            .id_salt("hv_vm_list")
+            .max_height(list_height)
+            .show(ui, |ui| {
+                let count = self.hyperv_vms.len();
+                for i in 0..count {
+                    let vm = &self.hyperv_vms[i];
+                    let is_active = self.hyperv_console_vm == Some(i);
+                    let state_color = match vm.state {
+                        hyperv::VmState::Running => egui::Color32::from_rgb(0x22, 0xC5, 0x5E),
+                        hyperv::VmState::Off => egui::Color32::from_rgb(0xA0, 0xA0, 0xA0),
+                        _ => egui::Color32::from_rgb(0xFF, 0xA5, 0x00),
+                    };
+
+                    let row_fill = if is_active {
+                        egui::Color32::from_rgb(0xE8, 0xF0, 0xFE)
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    };
+
+                    egui::Frame::NONE
+                        .fill(row_fill)
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .inner_margin(egui::Margin::symmetric(8, 6))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.colored_label(state_color, "●");
+                                ui.label(egui::RichText::new(&vm.name).strong());
+                                ui.label(
+                                    egui::RichText::new(vm.state.label())
+                                        .small()
+                                        .color(egui::Color32::GRAY),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let can_connect = vm.state.is_connectable();
+                                        ui.add_enabled_ui(can_connect, |ui| {
+                                            if ui.small_button("Подключиться").clicked() {
+                                                let vm_clone = self.hyperv_vms[i].clone();
+                                                if let Some(s) = self.hyperv_session.take() {
+                                                    s.stop();
+                                                }
+                                                self.hyperv_session =
+                                                    Some(hyperv::HyperVSession::start(vm_clone));
+                                                self.hyperv_console_vm = Some(i);
+                                                self.hyperv_texture = None;
+                                                self.hyperv_status = "Starting Hyper-V capture...".to_owned();
+                                            }
+                                        });
+                                    },
+                                );
+                            });
+                        });
+                    ui.add_space(2.0);
+                }
+            });
+
+        // VM console (bottom half)
+        if self.hyperv_session.is_some() {
+            ui.separator();
+            ui.add_space(6.0);
+
+            if let Some(vm_idx) = self.hyperv_console_vm {
+                let vm_name = self.hyperv_vms.get(vm_idx).map(|v| v.name.as_str()).unwrap_or("VM");
+                ui.label(
+                    egui::RichText::new(format!("Консоль: {vm_name}"))
+                        .size(13.0)
+                        .strong(),
+                );
+            }
+            ui.add_space(4.0);
+
+            let avail = ui.available_size();
+            if let Some(tex) = &self.hyperv_texture {
+                let img = egui::Image::new(tex)
+                    .fit_to_exact_size(avail)
+                    .sense(egui::Sense::click_and_drag());
+                let resp = ui.add(img);
+
+                // Forward mouse clicks
+                if let Some(session) = &self.hyperv_session {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let rect = resp.rect;
+                        let nx = ((pos.x - rect.left()) / rect.width() * 65535.0) as u32;
+                        let ny = ((pos.y - rect.top()) / rect.height() * 65535.0) as u32;
+                        session.send(hyperv::HyperVCmd::MoveMouse(nx, ny));
+                        if resp.clicked() {
+                            session.send(hyperv::HyperVCmd::ClickMouse(1, true));
+                            session.send(hyperv::HyperVCmd::ClickMouse(1, false));
+                        }
+                        if resp.secondary_clicked() {
+                            session.send(hyperv::HyperVCmd::ClickMouse(2, true));
+                            session.send(hyperv::HyperVCmd::ClickMouse(2, false));
+                        }
+                    }
+                    // Forward keyboard when console is focused
+                    if resp.hovered() {
+                        ui.input(|i| {
+                            for ev in &i.raw.events {
+                                if let egui::Event::Key { key, pressed, .. } = ev {
+                                    let sc = egui_key_to_scancode(*key);
+                                    if sc != 0 {
+                                        if *pressed {
+                                            session.send(hyperv::HyperVCmd::PressKey(sc));
+                                        } else {
+                                            session.send(hyperv::HyperVCmd::ReleaseKey(sc));
+                                        }
+                                    }
+                                }
+                                if let egui::Event::Text(t) = ev {
+                                    session.send(hyperv::HyperVCmd::TypeText(t.clone()));
+                                }
+                            }
+                        });
+                    }
+                }
+            } else {
+                ui.centered_and_justified(|ui| {
+                    ui.label(egui::RichText::new("Загрузка экрана VM...").color(egui::Color32::GRAY));
+                });
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn poll_hyperv_session(&mut self, ctx: &egui::Context) {
+        let Some(session) = &self.hyperv_session else { return };
+        let Some(frame) = session.try_recv_frame() else { return };
+
+        // RGB → RGBA
+        let w = frame.width as usize;
+        let h = frame.height as usize;
+        if frame.rgba.len() == w * h * 4 {
+            let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &frame.rgba);
+            self.hyperv_texture = Some(ctx.load_texture(
+                "hyperv_frame",
+                img,
+                egui::TextureOptions::LINEAR,
+            ));
+        }
+        ctx.request_repaint();
+    }
+
     fn history_ui(&mut self, ui: &mut egui::Ui) {
         ui.label(
             egui::RichText::new(self.text("История подключений", "Connection history"))
@@ -3437,6 +3667,14 @@ impl EvertyDeskApp {
         self.host_state = HostState::Connecting;
         self.host_video_status = None;
         self.host_service = Some(HostService::start(self.config.clone()));
+
+        // Start LAN discovery so viewers on the same network can find us.
+        if self.lan_discovery_stop.is_none() {
+            let stop = Arc::new(AtomicBool::new(false));
+            let config_arc = Arc::new(Mutex::new(self.config.clone()));
+            lan_discovery::start(config_arc, stop.clone());
+            self.lan_discovery_stop = Some(stop);
+        }
     }
 
     fn stop_host_service(&mut self) {
@@ -3444,6 +3682,10 @@ impl EvertyDeskApp {
             svc.stop();
             self.host_log
                 .push(format!("[{}] Хост-сервис остановлен.", timestamp_hms()));
+        }
+        // Stop LAN discovery thread.
+        if let Some(stop) = self.lan_discovery_stop.take() {
+            stop.store(true, Ordering::Relaxed);
         }
         self.host_state = HostState::Idle;
         self.host_pending_peer = None;
@@ -5439,6 +5681,33 @@ fn egui_key_to_control_key(key: egui::Key) -> Option<ControlKey> {
 }
 
 /// Keys that should fire repeatedly when held down (navigation, delete, etc.)
+/// Map egui Key to PS/2 scan code set 1 (for Hyper-V Msvm_Keyboard).
+#[cfg(windows)]
+fn egui_key_to_scancode(key: egui::Key) -> u32 {
+    use egui::Key::*;
+    match key {
+        Escape => 0x01, F1 => 0x3B, F2 => 0x3C, F3 => 0x3D, F4 => 0x3E,
+        F5 => 0x3F, F6 => 0x40, F7 => 0x41, F8 => 0x42, F9 => 0x43,
+        F10 => 0x44, F11 => 0x57, F12 => 0x58,
+        Num1 => 0x02, Num2 => 0x03, Num3 => 0x04, Num4 => 0x05,
+        Num5 => 0x06, Num6 => 0x07, Num7 => 0x08, Num8 => 0x09,
+        Num9 => 0x0A, Num0 => 0x0B,
+        A => 0x1E, B => 0x30, C => 0x2E, D => 0x20, E => 0x12,
+        F => 0x21, G => 0x22, H => 0x23, I => 0x17, J => 0x24,
+        K => 0x25, L => 0x26, M => 0x32, N => 0x31, O => 0x18,
+        P => 0x19, Q => 0x10, R => 0x13, S => 0x1F, T => 0x14,
+        U => 0x16, V => 0x2F, W => 0x11, X => 0x2D, Y => 0x15,
+        Z => 0x2C,
+        Space => 0x39, Enter => 0x1C, Backspace => 0x0E, Tab => 0x0F,
+        ArrowLeft => 0xE04B, ArrowRight => 0xE04D,
+        ArrowUp => 0xE048, ArrowDown => 0xE050,
+        Home => 0xE047, End => 0xE04F,
+        PageUp => 0xE049, PageDown => 0xE051,
+        Insert => 0xE052, Delete => 0xE053,
+        _ => 0,
+    }
+}
+
 fn key_allows_repeat(key: egui::Key) -> bool {
     matches!(
         key,

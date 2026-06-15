@@ -209,7 +209,7 @@ pub struct KeyExchange {
 pub struct RendezvousMessage {
     #[prost(
         oneof = "rendezvous_message::Union",
-        tags = "6, 7, 15, 16, 8, 9, 11, 12, 18, 19, 23, 24, 25, 20, 21"
+        tags = "6, 7, 15, 16, 8, 9, 11, 12, 18, 19, 23, 24, 25, 20, 21, 30"
     )]
     pub union: Option<rendezvous_message::Union>,
 }
@@ -218,9 +218,9 @@ pub mod rendezvous_message {
     use prost::Oneof;
 
     use super::{
-        FetchLocalAddr, KeyExchange, OnlineRequest, OnlineResponse, PunchHole, PunchHoleRequest,
-        PunchHoleResponse, RegisterPeer, RegisterPeerResponse, RegisterPk, RegisterPkResponse,
-        RelayResponse, RequestRelay, TestNatRequest, TestNatResponse,
+        FetchLocalAddr, KeyExchange, OnlineRequest, OnlineResponse, PeerDiscovery, PunchHole,
+        PunchHoleRequest, PunchHoleResponse, RegisterPeer, RegisterPeerResponse, RegisterPk,
+        RegisterPkResponse, RelayResponse, RequestRelay, TestNatRequest, TestNatResponse,
     };
 
     #[derive(Clone, PartialEq, Oneof)]
@@ -262,7 +262,31 @@ pub mod rendezvous_message {
         TestNatRequest(TestNatRequest),
         #[prost(message, tag = "21")]
         TestNatResponse(TestNatResponse),
+        /// LAN peer discovery (broadcast ping/pong). (real tag 30)
+        #[prost(message, tag = "30")]
+        PeerDiscovery(PeerDiscovery),
     }
+}
+
+/// LAN peer discovery (tag 30 in real RustDesk proto).
+/// Viewer broadcasts `cmd="ping"`, host replies `cmd="pong"` with its info.
+#[derive(Clone, PartialEq, Message)]
+pub struct PeerDiscovery {
+    /// "ping" (viewer searching) or "pong" (host responding)
+    #[prost(string, tag = "1")]
+    pub cmd: String,
+    #[prost(string, tag = "2")]
+    pub mac: String,
+    #[prost(string, tag = "3")]
+    pub id: String,
+    #[prost(string, tag = "4")]
+    pub hostname: String,
+    #[prost(string, tag = "5")]
+    pub username: String,
+    #[prost(string, tag = "6")]
+    pub platform: String,
+    #[prost(string, tag = "7")]
+    pub misc: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
