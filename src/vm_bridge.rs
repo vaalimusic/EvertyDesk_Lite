@@ -26,7 +26,10 @@ struct Shared {
     /// сравнивает свою эпоху и завершается, если она устарела.
     generation: u64,
     /// id прикреплённой VM (None = транслируем физический экран хоста).
+    /// Для Hyper-V — GUID, для VirtualBox — UUID (без префикса провайдера).
     attached_id: Option<String>,
+    /// Провайдер активной VM: "hyperv" | "vbox".
+    provider: String,
     width: u32,
     height: u32,
     /// Последний кадр VM в формате BGRA (как ждёт энкодер pipeline).
@@ -42,6 +45,7 @@ impl Default for Shared {
         Shared {
             generation: 0,
             attached_id: None,
+            provider: String::new(),
             width: 0,
             height: 0,
             bgra: Vec::new(),
@@ -84,7 +88,6 @@ pub fn status() -> String {
 
 /// Записать заметку о вводе (ошибку/успех инжекта). Обновляет только при смене,
 /// чтобы не молотить лог.
-#[cfg(windows)]
 fn note_input(msg: &str) {
     if let Ok(mut s) = state().lock() {
         if s.input_note != msg {
@@ -112,13 +115,19 @@ pub fn list_json() -> String {
 }
 
 /// Прикрепиться к VM по id (пустая строка = отсоединиться). Возвращает
-/// человекочитаемый статус.
+/// человекочитаемый статус. id в формате "provider:realid"
+/// (provider: "hyperv" | "vbox"); без префикса — считаем hyperv.
 pub fn attach(vm_id: &str) -> Result<String, String> {
     if vm_id.trim().is_empty() {
         detach();
         return Ok("Отсоединено — снова физический экран хоста".to_owned());
     }
-    attach_impl(vm_id)
+    let (provider, real_id) = vm_id.split_once(':').unwrap_or(("hyperv", vm_id));
+    match provider {
+        "vbox" => attach_vbox(real_id),
+        "hyperv" => attach_hyperv(real_id),
+        other => Err(format!("неизвестный провайдер VM: {other}")),
+    }
 }
 
 /// Отсоединиться: вернуть трансляцию физического экрана хоста.
@@ -127,11 +136,13 @@ pub fn detach() {
         if s.attached_id.is_some() {
             s.generation = s.generation.wrapping_add(1);
             s.attached_id = None;
+            s.provider = String::new();
             s.have_frame = false;
             s.bgra = Vec::new();
             s.width = 0;
             s.height = 0;
             s.status = "Отсоединено".to_owned();
+            s.input_note = String::new();
         }
     }
 }
@@ -151,33 +162,42 @@ pub fn active_frame(out: &mut Vec<u8>) -> Option<(u32, u32)> {
 /// Роутинг мыши: если VM активна — отправляет в VM и возвращает `true`
 /// (хост НЕ инжектит событие в свою ОС).
 pub fn route_mouse(ev: &crate::rustdesk_proto::MouseEvent) -> bool {
-    let (id, w, h) = {
+    let (id, provider, w, h) = {
         let s = match state().lock() {
             Ok(s) => s,
             Err(_) => return false,
         };
         match &s.attached_id {
-            Some(id) => (id.clone(), s.width.max(1), s.height.max(1)),
+            Some(id) => (id.clone(), s.provider.clone(), s.width.max(1), s.height.max(1)),
             None => return false,
         }
     };
-    dispatch_mouse(&id, ev, w, h);
+    match provider.as_str() {
+        "vbox" => {
+            // VBoxManage не имеет публичного mouse API → мышь пока не поддержана.
+            note_input("мышь VirtualBox: нет CLI API (TODO: VRDP)");
+        }
+        _ => dispatch_mouse(&id, ev, w, h),
+    }
     true
 }
 
 /// Роутинг клавиатуры: если VM активна — отправляет в VM, возвращает `true`.
 pub fn route_key(ev: &crate::rustdesk_proto::KeyEvent) -> bool {
-    let id = {
+    let (id, provider) = {
         let s = match state().lock() {
             Ok(s) => s,
             Err(_) => return false,
         };
         match &s.attached_id {
-            Some(id) => id.clone(),
+            Some(id) => (id.clone(), s.provider.clone()),
             None => return false,
         }
     };
-    dispatch_key(&id, ev);
+    match provider.as_str() {
+        "vbox" => dispatch_key_vbox(&id, ev),
+        _ => dispatch_key(&id, ev),
+    }
     true
 }
 
@@ -190,28 +210,148 @@ pub struct VmEntry {
     pub connectable: bool,
 }
 
-#[cfg(windows)]
+/// Агрегированный список VM всех провайдеров. id с префиксом провайдера
+/// ("hyperv:GUID" / "vbox:UUID"), чтобы attach знал куда роутить.
 fn list_vms_entries() -> Vec<VmEntry> {
-    hyperv::list_vms()
-        .into_iter()
-        .map(|v| VmEntry {
-            id: v.id,
+    let mut out = Vec::new();
+
+    #[cfg(windows)]
+    for v in hyperv::list_vms() {
+        out.push(VmEntry {
+            id: format!("hyperv:{}", v.id),
             name: v.name,
             state: v.state.label().to_owned(),
             connectable: v.state.is_connectable(),
-        })
-        .collect()
+        });
+    }
+
+    for v in crate::virtualbox::list_vms() {
+        out.push(VmEntry {
+            id: format!("vbox:{}", v.id),
+            name: format!("{} · VirtualBox", v.name),
+            state: if v.running { "Running" } else { "Off" }.to_owned(),
+            connectable: v.running,
+        });
+    }
+
+    out
 }
 
-#[cfg(not(windows))]
-fn list_vms_entries() -> Vec<VmEntry> {
-    Vec::new()
+// ── Общая установка активной VM ──────────────────────────────────────────────
+
+/// Зафиксировать новую активную VM, вернуть её «эпоху» для pump-потока.
+fn begin_attach(provider: &str, id: &str, name: &str) -> Result<u64, String> {
+    let mut s = state().lock().map_err(|_| "lock".to_owned())?;
+    s.generation = s.generation.wrapping_add(1);
+    s.attached_id = Some(id.to_owned());
+    s.provider = provider.to_owned();
+    s.have_frame = false;
+    s.input_note = String::new();
+    s.status = format!("Подключение к VM «{name}»…");
+    Ok(s.generation)
 }
 
-// ── Windows: реальный attach через Hyper-V ───────────────────────────────────
+/// Обновить кадр активной VM (если эпоха ещё актуальна).
+fn push_frame(gen: u64, w: u32, h: u32, bgra: Vec<u8>) {
+    if let Ok(mut s) = state().lock() {
+        if s.generation == gen {
+            s.width = w;
+            s.height = h;
+            s.bgra = bgra;
+            s.have_frame = true;
+        }
+    }
+}
+
+fn gen_is_current(gen: u64) -> bool {
+    state().lock().map(|s| s.generation == gen).unwrap_or(false)
+}
+
+// ── VirtualBox attach (кросс-платформенно, через VBoxManage) ──────────────────
+
+fn attach_vbox(uuid: &str) -> Result<String, String> {
+    let vm = crate::virtualbox::list_vms()
+        .into_iter()
+        .find(|v| v.id == uuid)
+        .ok_or_else(|| format!("VirtualBox VM {uuid} не найдена"))?;
+    if !vm.running {
+        return Err(format!("VM «{}» выключена — запустите её в VirtualBox", vm.name));
+    }
+    let gen = begin_attach("vbox", &vm.id, &vm.name)?;
+    let name = vm.name.clone();
+    let id = vm.id.clone();
+    std::thread::Builder::new()
+        .name("vm-bridge-vbox".into())
+        .spawn(move || vbox_pump(id, gen))
+        .map_err(|e| format!("spawn vbox pump: {e}"))?;
+    Ok(format!("Подключение к VirtualBox VM «{name}»…"))
+}
+
+fn vbox_pump(uuid: String, gen: u64) {
+    loop {
+        if !gen_is_current(gen) {
+            return;
+        }
+        match crate::virtualbox::screenshot(&uuid) {
+            Some((w, h, rgba)) => push_frame(gen, w, h, rgba_to_bgra(&rgba)),
+            None => {
+                if let Ok(mut s) = state().lock() {
+                    if s.generation == gen && !s.have_frame {
+                        s.status = "VirtualBox: жду первый кадр…".to_owned();
+                    }
+                }
+            }
+        }
+        std::thread::sleep(crate::virtualbox::SCREENSHOT_INTERVAL);
+    }
+}
+
+/// VirtualBox клавиатура: текст через keyboardputstring, спецклавиши — TODO.
+fn dispatch_key_vbox(uuid: &str, ev: &crate::rustdesk_proto::KeyEvent) {
+    use crate::rustdesk_proto::key_event::Union;
+    if !(ev.press || ev.down) {
+        return; // putstring сам жмёт+отпускает; реагируем только на нажатие
+    }
+    let res = match &ev.union {
+        Some(Union::Unicode(ch)) => {
+            if let Some(c) = char::from_u32(*ch) {
+                crate::virtualbox::put_string(uuid, &c.to_string())
+            } else {
+                Ok(())
+            }
+        }
+        Some(Union::ControlKey(ck)) => {
+            // Enter/Backspace/Tab/Esc через PS/2 scancode (set-1).
+            match vbox_ctrl_scancodes(*ck) {
+                Some((make, brk)) => crate::virtualbox::put_scancodes(uuid, &[make, brk]),
+                None => Ok(()),
+            }
+        }
+        None => Ok(()),
+    };
+    match res {
+        Ok(()) => note_input("клава VirtualBox ок"),
+        Err(e) => note_input(&format!("клава VirtualBox: {e}")),
+    }
+}
+
+/// PS/2 set-1 (make, break) для частых спецклавиш VirtualBox.
+fn vbox_ctrl_scancodes(ck: i32) -> Option<(u8, u8)> {
+    // ControlKey enum: Return=27, Backspace=2, Tab=31, Escape=8, Space=30.
+    Some(match ck {
+        27 => (0x1C, 0x9C), // Enter
+        2 => (0x0E, 0x8E),  // Backspace
+        31 => (0x0F, 0x8F), // Tab
+        8 => (0x01, 0x81),  // Escape
+        30 => (0x39, 0xB9), // Space
+        _ => return None,
+    })
+}
+
+// ── Hyper-V attach (Windows) ─────────────────────────────────────────────────
 
 #[cfg(windows)]
-fn attach_impl(vm_id: &str) -> Result<String, String> {
+fn attach_hyperv(vm_id: &str) -> Result<String, String> {
     let vm = hyperv::list_vms()
         .into_iter()
         .find(|v| v.id == vm_id)
@@ -225,15 +365,7 @@ fn attach_impl(vm_id: &str) -> Result<String, String> {
         ));
     }
 
-    let gen = {
-        let mut s = state().lock().map_err(|_| "lock".to_owned())?;
-        s.generation = s.generation.wrapping_add(1);
-        s.attached_id = Some(vm.id.clone());
-        s.have_frame = false;
-        s.status = format!("Подключение к VM «{}»…", vm.name);
-        s.generation
-    };
-
+    let gen = begin_attach("hyperv", &vm.id, &vm.name)?;
     let vm_name = vm.name.clone();
     std::thread::Builder::new()
         .name("vm-bridge-pump".into())
@@ -241,6 +373,11 @@ fn attach_impl(vm_id: &str) -> Result<String, String> {
         .map_err(|e| format!("spawn pump: {e}"))?;
 
     Ok(format!("Подключение к VM «{vm_name}»…"))
+}
+
+#[cfg(not(windows))]
+fn attach_hyperv(_vm_id: &str) -> Result<String, String> {
+    Err("Hyper-V доступен только на Windows-хосте".to_owned())
 }
 
 #[cfg(windows)]
@@ -273,11 +410,6 @@ fn pump_loop(vm: hyperv::VmInfo, gen: u64) {
         }
         std::thread::sleep(std::time::Duration::from_millis(8));
     }
-}
-
-#[cfg(not(windows))]
-fn attach_impl(_vm_id: &str) -> Result<String, String> {
-    Err("Agentless-доступ к VM доступен только на Windows-хосте (Hyper-V)".to_owned())
 }
 
 // ── Диспетчеризация ввода в VM ───────────────────────────────────────────────
@@ -466,7 +598,6 @@ fn norm(v: i32, span: u32) -> u32 {
     ((v * 65535) / span).clamp(0, 65535) as u32
 }
 
-#[cfg(windows)]
 fn rgba_to_bgra(rgba: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(rgba.len());
     for px in rgba.chunks_exact(4) {

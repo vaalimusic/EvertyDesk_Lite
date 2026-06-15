@@ -32,6 +32,7 @@ mod ui;
 mod video;
 mod video_pipeline;
 mod videotoolbox;
+mod virtualbox;
 mod vm_bridge;
 mod vp9_mf;
 #[cfg(feature = "live-vpx-system")]
@@ -86,6 +87,15 @@ struct RemoteVmEntry {
     name: String,
     state: String,
     connectable: bool,
+}
+
+/// Метка+цвет чипа провайдера по префиксу id ("hyperv:" / "vbox:").
+fn vm_provider_badge(id: &str) -> (&'static str, egui::Color32) {
+    if id.starts_with("vbox:") {
+        ("VIRTUALBOX", egui::Color32::from_rgb(0xE8, 0x8A, 0x2E))
+    } else {
+        ("HYPER-V", egui::Color32::from_rgb(0x3B, 0x9E, 0xE8))
+    }
 }
 
 /// Распарсить JSON-список VM от хоста: `[{"id","name","state","connectable"}]`.
@@ -4254,120 +4264,152 @@ impl EvertyDeskApp {
         });
     }
 
-    /// Панель agentless-VM: список VM удалённого хоста-гипервизора и
+    /// Панель agentless-VM: список VM удалённого хоста (Hyper-V + VirtualBox) и
     /// подключение к ним без агента в гостевой ОС.
     fn remote_vm_window(&mut self, ctx: &egui::Context) {
         let mut open = self.remote_vm_panel_open;
         egui::Window::new("🖧  Виртуальные машины хоста")
             .open(&mut open)
             .resizable(true)
-            .default_width(380.0)
+            .default_width(480.0)
+            .default_height(560.0)
+            .min_width(380.0)
             .show(ctx, |ui| {
+                // ── Шапка: счётчик + действия ──────────────────────────────────
+                let total = self.remote_vms.len();
+                let running = self.remote_vms.iter().filter(|v| v.connectable).count();
                 ui.horizontal(|ui| {
-                    if ui.button("↻ Обновить список").clicked() {
-                        self.send_command(SessionCommand::ListVms);
-                    }
-                    if !self.remote_attached_vm.is_empty()
-                        && ui.button("⏏ Вернуться к экрану хоста").clicked()
-                    {
-                        self.remote_attached_vm.clear();
-                        self.send_command(SessionCommand::AttachVm(String::new()));
-                    }
+                    ui.label(
+                        egui::RichText::new(format!("{total} VM · {running} запущено"))
+                            .size(13.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(0xE6, 0xED, 0xF3)),
+                    );
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui.button("↻").on_hover_text("Обновить список").clicked() {
+                                self.send_command(SessionCommand::ListVms);
+                            }
+                            if !self.remote_attached_vm.is_empty()
+                                && ui
+                                    .button("⏏ Экран хоста")
+                                    .on_hover_text("Отключиться от VM, вернуть экран хоста")
+                                    .clicked()
+                            {
+                                self.remote_attached_vm.clear();
+                                self.send_command(SessionCommand::AttachVm(String::new()));
+                            }
+                        },
+                    );
                 });
 
                 if !self.remote_vm_status.is_empty() {
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(&self.remote_vm_status)
-                            .size(12.0)
+                            .size(11.5)
                             .color(egui::Color32::from_rgb(0x9A, 0xC9, 0xB8)),
                     );
                 }
                 ui.separator();
 
                 if self.remote_vms.is_empty() {
-                    ui.add_space(8.0);
+                    ui.add_space(10.0);
                     ui.label(
-                        "Список пуст. Нажмите «Обновить». Доступно, если удалённый \
-                         хост — Windows с ролью Hyper-V.",
+                        egui::RichText::new(
+                            "Список пуст. Нажмите ↻ Обновить.\n\nДоступно, если удалённый \
+                             хост — Windows с Hyper-V, либо на хосте установлен VirtualBox.",
+                        )
+                        .color(egui::Color32::from_rgb(0xA7, 0xB4, 0xC2)),
                     );
                     return;
                 }
 
                 let vms = self.remote_vms.clone();
                 let attached = self.remote_attached_vm.clone();
-                egui::ScrollArea::vertical()
-                    .max_height(360.0)
-                    .show(ui, |ui| {
-                        for vm in &vms {
-                            let is_attached = vm.id == attached;
-                            let dot = if vm.connectable {
-                                egui::Color32::from_rgb(0x22, 0xC5, 0x5E)
-                            } else {
-                                egui::Color32::from_rgb(0x9A, 0x9A, 0x9A)
-                            };
-                            egui::Frame::NONE
-                                .fill(if is_attached {
-                                    egui::Color32::from_rgb(0x1C, 0x33, 0x2A)
-                                } else {
-                                    egui::Color32::from_rgb(0x16, 0x24, 0x36)
-                                })
-                                .corner_radius(egui::CornerRadius::same(8))
-                                .inner_margin(egui::Margin::same(10))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.colored_label(dot, "●");
-                                        ui.vertical(|ui| {
-                                            ui.label(
-                                                egui::RichText::new(&vm.name)
-                                                    .strong()
-                                                    .size(14.0)
-                                                    .color(egui::Color32::from_rgb(
-                                                        0xF2, 0xF6, 0xFA,
-                                                    )),
-                                            );
-                                            ui.label(
-                                                egui::RichText::new(&vm.state)
-                                                    .size(11.0)
-                                                    .color(egui::Color32::from_rgb(
-                                                        0xA7, 0xB4, 0xC2,
-                                                    )),
-                                            );
-                                        });
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                if is_attached {
-                                                    ui.label(
-                                                        egui::RichText::new("● подключено")
-                                                            .size(11.0)
-                                                            .color(egui::Color32::from_rgb(
-                                                                0x22, 0xC5, 0x5E,
-                                                            )),
-                                                    );
-                                                } else if ui
-                                                    .add_enabled(
-                                                        vm.connectable,
-                                                        egui::Button::new("Подключиться"),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    self.remote_attached_vm = vm.id.clone();
-                                                    self.remote_vm_status =
-                                                        format!("Подключение к «{}»…", vm.name);
-                                                    self.send_command(SessionCommand::AttachVm(
-                                                        vm.id.clone(),
-                                                    ));
-                                                }
-                                            },
-                                        );
-                                    });
-                                });
-                            ui.add_space(6.0);
-                        }
-                    });
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 7.0;
+                    for vm in &vms {
+                        self.remote_vm_row(ui, vm, vm.id == attached);
+                    }
+                });
             });
         self.remote_vm_panel_open = open;
+    }
+
+    /// Одна строка-карточка VM в панели.
+    fn remote_vm_row(&mut self, ui: &mut egui::Ui, vm: &RemoteVmEntry, is_attached: bool) {
+        let (prov_label, prov_color) = vm_provider_badge(&vm.id);
+        let dot = if vm.connectable {
+            egui::Color32::from_rgb(0x22, 0xC5, 0x5E)
+        } else {
+            egui::Color32::from_rgb(0x9A, 0x9A, 0x9A)
+        };
+        egui::Frame::NONE
+            .fill(if is_attached {
+                egui::Color32::from_rgb(0x1C, 0x33, 0x2A)
+            } else {
+                egui::Color32::from_rgb(0x16, 0x24, 0x36)
+            })
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::same(11))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.colored_label(dot, "●");
+                    ui.add_space(2.0);
+                    ui.vertical(|ui| {
+                        // Имя без суффикса «· VirtualBox» (его покажем чипом).
+                        let name = vm.name.split(" · ").next().unwrap_or(&vm.name);
+                        ui.label(
+                            egui::RichText::new(name)
+                                .strong()
+                                .size(14.0)
+                                .color(egui::Color32::from_rgb(0xF2, 0xF6, 0xFA)),
+                        );
+                        ui.horizontal(|ui| {
+                            // Чип провайдера
+                            egui::Frame::NONE
+                                .fill(prov_color.gamma_multiply(0.25))
+                                .corner_radius(egui::CornerRadius::same(4))
+                                .inner_margin(egui::Margin::symmetric(6, 1))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        egui::RichText::new(prov_label)
+                                            .size(10.0)
+                                            .strong()
+                                            .color(prov_color),
+                                    );
+                                });
+                            ui.label(
+                                egui::RichText::new(&vm.state)
+                                    .size(11.0)
+                                    .color(egui::Color32::from_rgb(0xA7, 0xB4, 0xC2)),
+                            );
+                        });
+                    });
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if is_attached {
+                                ui.label(
+                                    egui::RichText::new("● подключено")
+                                        .size(11.0)
+                                        .color(egui::Color32::from_rgb(0x22, 0xC5, 0x5E)),
+                                );
+                            } else if ui
+                                .add_enabled(vm.connectable, egui::Button::new("Подключиться"))
+                                .clicked()
+                            {
+                                self.remote_attached_vm = vm.id.clone();
+                                self.remote_vm_status = format!("Подключение к «{}»…", vm.name);
+                                self.send_command(SessionCommand::AttachVm(vm.id.clone()));
+                            }
+                        },
+                    );
+                });
+            });
     }
 
     #[allow(deprecated)]

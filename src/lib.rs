@@ -29,6 +29,7 @@ pub mod transport;
 pub mod video;
 pub mod video_pipeline;
 pub mod videotoolbox;
+pub mod virtualbox;
 pub mod vm_bridge;
 pub mod vp9_mf;
 
