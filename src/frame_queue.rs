@@ -490,6 +490,11 @@ pub struct ChannelReassembler {
     dropped_frames: u64,
     last_dropped_id: Option<u32>,
     buffered_bytes: usize,
+    /// FEC-метаданные по frame_id (приходят отдельными TYPE_FEC-пакетами).
+    /// Используются для восстановления единичной потери в группе.
+    pending_fec: std::collections::HashMap<u32, Vec<crate::evrt::FecMeta>>,
+    /// Сколько пакетов восстановлено через FEC (статистика/диагностика).
+    fec_recovered: u64,
 }
 
 impl ChannelReassembler {
@@ -503,6 +508,8 @@ impl ChannelReassembler {
             dropped_frames: 0,
             last_dropped_id: None,
             buffered_bytes: 0,
+            pending_fec: std::collections::HashMap::new(),
+            fec_recovered: 0,
         }
     }
 
@@ -513,6 +520,11 @@ impl ChannelReassembler {
         self.latest_completed_id = None;
         self.waiting_after_loss = false;
         self.last_dropped_id = None;
+        self.pending_fec.clear();
+    }
+
+    pub fn fec_recovered(&self) -> u64 {
+        self.fec_recovered
     }
 
     pub fn set_codec_config(&mut self, payload: Vec<u8>) {
@@ -612,18 +624,103 @@ impl ChannelReassembler {
         if let Some(bytes) = assembly.set(pkt.packet_index, pkt.payload.clone()) {
             self.buffered_bytes = self.buffered_bytes.saturating_add(bytes);
         } else {
-            return None; // РґСѓР±Р»СЊ
-        }
-        if !assembly.is_complete() {
-            return None;
+            return None; // дубль
         }
 
-        // Кадр собран
-        let assembly = self.frames.remove(&pkt.frame_id).unwrap();
+        // Попробовать восстановить недостающие пакеты через FEC, если есть.
+        if !self.frames.get(&pkt.frame_id).map(|a| a.is_complete()).unwrap_or(false) {
+            self.try_fec_recover(pkt.frame_id);
+        }
+
+        self.finalize_frame(pkt.frame_id)
+    }
+
+    /// Принять FEC-пакет (TYPE_FEC). Сохраняет parity-метаданные и пробует
+    /// восстановить недостающий пакет кадра. Возвращает готовый кадр, если
+    /// восстановление его завершило.
+    pub fn on_fec_packet(&mut self, pkt: &EvrtPacket) -> Option<(Vec<u8>, bool, i32, u64)> {
+        // Игнорируем FEC для уже завершённых/слишком старых кадров.
+        if let Some(completed) = self.latest_completed_id {
+            if pkt.frame_id <= completed {
+                return None;
+            }
+        }
+        let Some(meta) = crate::evrt::parse_fec_payload(pkt.frame_id, &pkt.payload) else {
+            return None;
+        };
+        self.pending_fec.entry(pkt.frame_id).or_default().push(meta);
+
+        // Восстановление возможно только если кадр уже начал собираться.
+        if self.frames.contains_key(&pkt.frame_id) {
+            self.try_fec_recover(pkt.frame_id);
+            return self.finalize_frame(pkt.frame_id);
+        }
+        None
+    }
+
+    /// Для каждой известной FEC-группы кадра: если не хватает РОВНО одного
+    /// data-пакета — восстанавливает его XOR-ом и добавляет в сборку.
+    fn try_fec_recover(&mut self, frame_id: u32) {
+        let Some(fecs) = self.pending_fec.get(&frame_id).cloned() else {
+            return;
+        };
+        for fec in &fecs {
+            // Кадр уже мог собраться предыдущей итерацией.
+            let (is_key, complete) = match self.frames.get(&frame_id) {
+                Some(a) => (a.is_key_frame, a.is_complete()),
+                None => return,
+            };
+            if complete {
+                return;
+            }
+
+            // Собираем присутствующие пакеты группы и пытаемся восстановить.
+            // Скоуп ограничивает immutable-borrow, чтобы дальше взять mut-borrow.
+            let recovered_opt = {
+                let assembly = match self.frames.get(&frame_id) {
+                    Some(a) => a,
+                    None => return,
+                };
+                let base = fec.base_index;
+                let end = base.saturating_add(fec.group_size as u16);
+                let mut present: Vec<(u16, &[u8])> = Vec::new();
+                for idx in base..end {
+                    if let Some(Some(p)) = assembly.parts.get(idx as usize) {
+                        present.push((idx, p.as_slice()));
+                    }
+                }
+                crate::evrt::fec_recover_one(fec, &present)
+            };
+
+            if let Some((missing_idx, recovered)) = recovered_opt {
+                // Бюджет памяти + проверка индекса.
+                if !self.reserve_buffer(recovered.len(), frame_id, is_key) {
+                    continue;
+                }
+                if let Some(asm) = self.frames.get_mut(&frame_id) {
+                    if !asm.has_part(missing_idx) {
+                        if let Some(bytes) = asm.set(missing_idx, recovered) {
+                            self.buffered_bytes = self.buffered_bytes.saturating_add(bytes);
+                            self.fec_recovered += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Завершить кадр, если он полностью собран. Общая точка для on_packet и
+    /// on_fec_packet.
+    fn finalize_frame(&mut self, frame_id: u32) -> Option<(Vec<u8>, bool, i32, u64)> {
+        if !self.frames.get(&frame_id).map(|a| a.is_complete()).unwrap_or(false) {
+            return None;
+        }
+        let assembly = self.frames.remove(&frame_id).unwrap();
         self.buffered_bytes = self
             .buffered_bytes
             .saturating_sub(assembly.buffered_bytes());
         self.latest_completed_id = Some(assembly.frame_id);
+        self.pending_fec.remove(&frame_id); // FEC для этого кадра больше не нужен
         let delay_ms = assembly.assembly_delay_ms();
         let pts = assembly.presentation_time_us;
         let key = assembly.is_key_frame;
@@ -631,10 +728,6 @@ impl ChannelReassembler {
 
         if key {
             self.waiting_after_loss = false;
-            // Prepend codec config (SPS/PPS) к keyframe when the encoder
-            // exposes it separately. Direct NVENC usually returns Annex-B
-            // keyframes that already contain parameter sets, so do not drop
-            // the frame just because a separate CodecConfig packet is absent.
             if let Some(ref cfg) = self.latest_codec_config {
                 let mut combined = cfg.clone();
                 combined.extend_from_slice(&bytes);
@@ -644,7 +737,7 @@ impl ChannelReassembler {
         }
 
         if self.waiting_after_loss {
-            self.mark_frame_dropped(pkt.frame_id);
+            self.mark_frame_dropped(frame_id);
             return None;
         }
 
@@ -1235,5 +1328,52 @@ mod tests {
         let mut jitter = AdaptiveJitter::new();
         let ms = jitter.update(Pressure::Normal, 5, 0, 0, false);
         assert_eq!(ms, 0);
+    }
+
+    #[test]
+    fn fec_recovers_lost_video_packet_in_reassembler() {
+        // Кадр из 3 пакетов: имитируем потерю среднего пакета, FEC восстанавливает.
+        let frame_id = 100u32;
+        let pts = 5000u64;
+        // payload, который разобьётся на 3 пакета.
+        let payload = vec![0x5A_u8; crate::evrt::MAX_PAYLOAD_SIZE * 2 + 64];
+        let (data_pkts, fec_pkts) =
+            crate::evrt::packetize_video_with_fec(frame_id, pts, false, &payload, None);
+        assert_eq!(data_pkts.len(), 3);
+        assert_eq!(fec_pkts.len(), 1);
+
+        let mut re = ChannelReassembler::new();
+        // Подаём пакеты 0 и 2 (пакет 1 «потерян»).
+        let p0 = crate::evrt::parse(&data_pkts[0], data_pkts[0].len()).unwrap();
+        let p2 = crate::evrt::parse(&data_pkts[2], data_pkts[2].len()).unwrap();
+        assert!(re.on_packet(&p0).is_none());
+        assert!(re.on_packet(&p2).is_none());
+
+        // Теперь приходит FEC — должен восстановить пакет 1 и завершить кадр.
+        let fec = crate::evrt::parse(&fec_pkts[0], fec_pkts[0].len()).unwrap();
+        let result = re.on_fec_packet(&fec);
+        assert!(result.is_some(), "FEC должен был восстановить кадр");
+        let (bytes, _key, _ms, got_pts) = result.unwrap();
+        assert_eq!(bytes, payload, "восстановленный кадр должен совпадать с оригиналом");
+        assert_eq!(got_pts, pts);
+        assert_eq!(re.fec_recovered(), 1);
+    }
+
+    #[test]
+    fn fec_does_not_recover_two_losses() {
+        let frame_id = 7u32;
+        let payload = vec![0x33_u8; crate::evrt::MAX_PAYLOAD_SIZE * 2 + 10];
+        let (data_pkts, fec_pkts) =
+            crate::evrt::packetize_video_with_fec(frame_id, 0, false, &payload, None);
+        assert_eq!(data_pkts.len(), 3);
+
+        let mut re = ChannelReassembler::new();
+        // Только пакет 0 — потеряны 1 и 2.
+        let p0 = crate::evrt::parse(&data_pkts[0], data_pkts[0].len()).unwrap();
+        assert!(re.on_packet(&p0).is_none());
+        let fec = crate::evrt::parse(&fec_pkts[0], fec_pkts[0].len()).unwrap();
+        // Две потери в одной группе — FEC не восстанавливает.
+        assert!(re.on_fec_packet(&fec).is_none());
+        assert_eq!(re.fec_recovered(), 0);
     }
 }

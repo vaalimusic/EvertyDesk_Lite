@@ -259,6 +259,17 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
                             evrt::TYPE_CODEC_CONFIG => {
                                 reassembler.set_codec_config(pkt.payload.clone());
                             }
+                            evrt::TYPE_FEC => {
+                                // FEC-пакет: может восстановить потерянный data-пакет
+                                // и завершить кадр без ожидания IDR.
+                                if let Some((bytes, key, delay_ms, pts)) =
+                                    reassembler.on_fec_packet(&pkt)
+                                {
+                                    recv_assembly_delay.store(delay_ms, Ordering::Relaxed);
+                                    recv_assembled.fetch_add(1, Ordering::Relaxed);
+                                    recv_queue.enqueue(bytes, key, pts);
+                                }
+                            }
                             evrt::TYPE_VIDEO_FRAME => {
                                 let drops_before = reassembler.dropped_frames();
                                 if let Some((bytes, key, delay_ms, pts)) =

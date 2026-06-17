@@ -251,6 +251,61 @@ pub fn packetize_video_frame_authenticated(
     )
 }
 
+/// Пакетизировать видеокадр СОГЛАСОВАННО с FEC: возвращает (data_пакеты,
+/// fec_пакеты). Чанки бьются с запасом под FEC-заголовок, чтобы parity-пакет
+/// (header + XOR(чанк)) гарантированно влезал в одну MTU-датаграмму.
+///
+/// FEC строится только для многопакетных кадров (одиночный XOR-ом не защитить).
+/// Для key-frame'ов FEC особенно ценен: их потеря вызывает долгий фриз до IDR.
+pub fn packetize_video_with_fec(
+    frame_id: u32,
+    presentation_time_us: u64,
+    is_key_frame: bool,
+    payload: &[u8],
+    session_token: Option<&str>,
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let base_max = if session_token.is_some_and(valid_session_token) {
+        MAX_AUTH_PAYLOAD_SIZE
+    } else {
+        MAX_PAYLOAD_SIZE
+    };
+    // Резервируем место под FEC-заголовок, чтобы parity влез в датаграмму.
+    let chunk_size = base_max.saturating_sub(FEC_HEADER_LEN).max(1);
+    let flags = if is_key_frame { FLAG_KEY_FRAME } else { 0 };
+
+    if payload.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let packet_count = payload.len().div_ceil(chunk_size);
+    if packet_count == 0 || packet_count > MAX_FRAME_PACKET_COUNT {
+        return (Vec::new(), Vec::new());
+    }
+
+    let chunks: Vec<&[u8]> = payload.chunks(chunk_size).collect();
+    let mut data = Vec::with_capacity(chunks.len());
+    for (i, chunk) in chunks.iter().enumerate() {
+        data.push(build_packet_authenticated(
+            TYPE_VIDEO_FRAME,
+            flags,
+            frame_id,
+            i as u16,
+            packet_count as u16,
+            presentation_time_us,
+            chunk,
+            session_token,
+        ));
+    }
+
+    // FEC только при ≥2 пакетах.
+    let fec = if chunks.len() >= 2 {
+        build_fec_packets(frame_id, presentation_time_us, flags, &chunks, session_token)
+    } else {
+        Vec::new()
+    };
+
+    (data, fec)
+}
+
 /// Пакетизировать enhancement-кадр.
 pub fn packetize_enhancement_frame(
     frame_id: u32,

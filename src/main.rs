@@ -1278,6 +1278,9 @@ struct EvertyDeskApp {
     remote_rescue_panel_open: bool,
     /// Буфер ввода текста для TypeText в BasicRescue.
     remote_rescue_text: String,
+    /// Ожидающее подтверждения опасное действие питания VM:
+    /// (vm_id, action, vm_name, человекочитаемое описание). Показывает диалог.
+    pending_vm_action: Option<(String, String, String, String)>,
 
     // ── Settings window ───────────────────────────────────────────────────────
     /// Whether the settings panel is visible.
@@ -1605,6 +1608,7 @@ impl EvertyDeskApp {
             remote_checkpoint_panel_open: false,
             remote_rescue_panel_open: false,
             remote_rescue_text: String::new(),
+            pending_vm_action: None,
             show_settings: false,
             settings_draft: None,
             settings_custom_server: crate::settings::ServerConfig {
@@ -2587,6 +2591,9 @@ impl EvertyDeskApp {
         }
         if self.connected && self.remote_vm_panel_open {
             self.remote_vm_window(ctx);
+        }
+        if self.pending_vm_action.is_some() {
+            self.vm_action_confirm_window(ctx);
         }
         if self.host_pending_peer.is_some() {
             self.incoming_approval_window(ctx);
@@ -5910,38 +5917,193 @@ impl EvertyDeskApp {
         }
     }
 
+    /// Диалог подтверждения опасного действия питания VM (stop/shutdown/restart/pause).
+    fn vm_action_confirm_window(&mut self, ctx: &egui::Context) {
+        let Some((vm_id, action, vm_name, desc)) = self.pending_vm_action.clone() else {
+            return;
+        };
+        let t = crate::theme::palette();
+        // Цвет/значок зависят от опасности действия.
+        let (accent, glyph) = match action.as_str() {
+            "stop" => (t.danger, egui_phosphor::regular::STOP),
+            "shutdown" => (t.warning, egui_phosphor::regular::POWER),
+            "restart" => (t.info, egui_phosphor::regular::ARROWS_CLOCKWISE),
+            _ => (t.text_weak, egui_phosphor::regular::PAUSE),
+        };
+
+        egui::Window::new("vm_action_confirm")
+            .collapsible(false)
+            .resizable(false)
+            .title_bar(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .frame(
+                egui::Frame::NONE
+                    .fill(t.surface)
+                    .stroke(egui::Stroke::new(1.0, t.border))
+                    .corner_radius(egui::CornerRadius::same(crate::theme::radius::XL))
+                    .inner_margin(egui::Margin::same(20))
+                    .shadow(ctx.global_style().visuals.window_shadow),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
+                    ui.painter().rect_filled(
+                        r,
+                        egui::CornerRadius::same(crate::theme::radius::LG),
+                        crate::theme::tint(accent, 0.18),
+                    );
+                    ui.painter().text(
+                        r.center(),
+                        egui::Align2::CENTER_CENTER,
+                        glyph,
+                        egui::FontId::proportional(22.0),
+                        accent,
+                    );
+                    ui.add_space(4.0);
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new("Подтвердите действие").size(17.0).strong().color(t.text));
+                        ui.label(
+                            egui::RichText::new(vm_name.split(" · ").next().unwrap_or(&vm_name))
+                                .size(12.0)
+                                .color(t.text_weak),
+                        );
+                    });
+                });
+                ui.add_space(14.0);
+                ui.label(
+                    egui::RichText::new(format!("Вы собираетесь {desc}."))
+                        .size(13.5)
+                        .color(t.text),
+                );
+                ui.add_space(18.0);
+                ui.horizontal(|ui| {
+                    let btn_w = (ui.available_width() - 10.0) / 2.0;
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Подтвердить").size(14.0).strong().color(t.accent_fg),
+                            )
+                            .fill(accent)
+                            .min_size(egui::vec2(btn_w, 42.0))
+                            .corner_radius(egui::CornerRadius::same(crate::theme::radius::MD)),
+                        )
+                        .clicked()
+                    {
+                        let payload =
+                            serde_json::json!({ "vm_id": vm_id, "action": action }).to_string();
+                        self.send_command(SessionCommand::VmPowerOp(payload));
+                        self.pending_vm_action = None;
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("Отмена").size(14.0).color(t.text))
+                                .min_size(egui::vec2(btn_w, 42.0))
+                                .corner_radius(egui::CornerRadius::same(crate::theme::radius::MD)),
+                        )
+                        .clicked()
+                    {
+                        self.pending_vm_action = None;
+                    }
+                });
+            });
+    }
+
     fn incoming_approval_window(&mut self, ctx: &egui::Context) {
         let Some(peer_id) = self.host_pending_peer.clone() else {
             return;
         };
-        egui::Window::new(self.text("Входящее подключение", "Incoming connection"))
+        let t = crate::theme::palette();
+
+        // Кто подключается: если ID есть в адресной книге — показываем имя.
+        let normalized = normalize_remote_id(&peer_id);
+        let contact_name = self
+            .config
+            .ui
+            .contacts
+            .iter()
+            .find(|c| normalize_remote_id(&c.remote_id) == normalized)
+            .map(|c| c.name.clone());
+
+        let title = self.text("Входящее подключение", "Incoming connection");
+        let subtitle = self.text(
+            "Запрос на удалённый доступ к этому компьютеру",
+            "Request for remote access to this computer",
+        );
+        let allow_txt = self.text("Разрешить", "Allow");
+        let reject_txt = self.text("Отклонить", "Reject");
+        let id_caption = self.text("ID", "ID");
+
+        egui::Window::new(title)
             .collapsible(false)
             .resizable(false)
+            .title_bar(false) // свой заголовок — egui-titlebar выглядит чужеродно
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .frame(
+                egui::Frame::NONE
+                    .fill(t.surface)
+                    .stroke(egui::Stroke::new(1.0, t.border))
+                    .corner_radius(egui::CornerRadius::same(crate::theme::radius::XL))
+                    .inner_margin(egui::Margin::same(20))
+                    .shadow(ctx.global_style().visuals.window_shadow),
+            )
             .show(ctx, |ui| {
-                ui.set_min_width(360.0);
-                ui.label(
-                    egui::RichText::new(self.text(
-                        "Удаленный пользователь хочет подключиться без пароля.",
-                        "A remote user wants to connect without a password.",
-                    ))
-                    .size(15.0)
-                    .color(crate::theme::palette().text),
-                );
-                ui.add_space(10.0);
-                ui.label(
-                    egui::RichText::new(format!("ID: {}", format_peer_id(&peer_id)))
-                        .size(22.0)
-                        .strong()
-                        .color(crate::theme::palette().text),
-                );
-                ui.add_space(14.0);
+                ui.set_width(360.0);
+
+                // Шапка: иконка-аватар + заголовок.
                 ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
+                    ui.painter().rect_filled(
+                        r,
+                        egui::CornerRadius::same(crate::theme::radius::LG),
+                        crate::theme::accent_tint(&t, 0.18),
+                    );
+                    ui.painter().text(
+                        r.center(),
+                        egui::Align2::CENTER_CENTER,
+                        egui_phosphor::regular::PLUGS_CONNECTED,
+                        egui::FontId::proportional(22.0),
+                        t.accent,
+                    );
+                    ui.add_space(4.0);
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new(title).size(17.0).strong().color(t.text));
+                        ui.label(egui::RichText::new(subtitle).size(12.0).color(t.text_weak));
+                    });
+                });
+
+                ui.add_space(16.0);
+
+                // Кто: имя (если знаем) + ID на утопленной плашке.
+                crate::theme::sunken().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    if let Some(name) = &contact_name {
+                        ui.label(egui::RichText::new(name).size(16.0).strong().color(t.text));
+                        ui.add_space(2.0);
+                    }
+                    ui.label(egui::RichText::new(id_caption).size(11.0).color(t.text_muted));
+                    ui.label(
+                        egui::RichText::new(format_peer_id(&peer_id))
+                            .size(22.0)
+                            .strong()
+                            .monospace()
+                            .color(t.text),
+                    );
+                });
+
+                ui.add_space(18.0);
+
+                // Кнопки: Разрешить (акцент) + Отклонить (danger-контур).
+                ui.horizontal(|ui| {
+                    let btn_w = (ui.available_width() - 10.0) / 2.0;
                     if ui
                         .add(
-                            egui::Button::new(self.text("Разрешить", "Allow"))
-                                .min_size(egui::vec2(132.0, 40.0))
-                                .fill(crate::theme::palette().accent),
+                            egui::Button::new(
+                                egui::RichText::new(allow_txt).size(14.0).strong().color(t.accent_fg),
+                            )
+                            .fill(t.accent)
+                            .min_size(egui::vec2(btn_w, 42.0))
+                            .corner_radius(egui::CornerRadius::same(crate::theme::radius::MD)),
                         )
                         .clicked()
                     {
@@ -5952,8 +6114,13 @@ impl EvertyDeskApp {
                     }
                     if ui
                         .add(
-                            egui::Button::new(self.text("Отклонить", "Reject"))
-                                .min_size(egui::vec2(132.0, 40.0)),
+                            egui::Button::new(
+                                egui::RichText::new(reject_txt).size(14.0).color(t.danger),
+                            )
+                            .fill(crate::theme::tint(t.danger, 0.10))
+                            .stroke(egui::Stroke::new(1.0, crate::theme::tint(t.danger, 0.40)))
+                            .min_size(egui::vec2(btn_w, 42.0))
+                            .corner_radius(egui::CornerRadius::same(crate::theme::radius::MD)),
                         )
                         .clicked()
                     {
@@ -6565,17 +6732,18 @@ impl EvertyDeskApp {
         ctx: &egui::Context,
         detached_window: bool,
     ) {
+        use egui_phosphor::regular as ph;
+        let t = crate::theme::palette();
         ui.spacing_mut().item_spacing.x = 4.0;
-        ui.horizontal_wrapped(|ui| {
+        ui.horizontal(|ui| {
+            // ── Группа: навигация / сеанс ─────────────────────────────────────
             if !detached_window
-                && remote_icon_button(ui, "←", "Закрыть экран без отключения сеанса").clicked()
+                && remote_icon_button(ui, ph::ARROW_LEFT, "Свернуть экран (сеанс активен)").clicked()
             {
                 self.close_remote_viewer_panel();
                 return;
             }
-
-            if remote_icon_button(ui, "⏻", "Завершить удаленный сеанс").clicked()
-            {
+            if remote_icon_button_danger(ui, ph::SIGN_OUT, "Завершить удалённый сеанс").clicked() {
                 self.remote_viewer_open = false;
                 self.remote_input_focused = false;
                 self.release_remote_modifiers();
@@ -6588,24 +6756,23 @@ impl EvertyDeskApp {
                 return;
             }
 
+            toolbar_sep(ui);
             self.remote_display_selector_ui(
                 ui,
-                if detached_window {
-                    "remote-display"
-                } else {
-                    "software-remote-display"
-                },
+                if detached_window { "remote-display" } else { "software-remote-display" },
             );
 
+            // ── Группа: ввод текста / буфер ───────────────────────────────────
+            toolbar_sep(ui);
             ui.add(
                 egui::TextEdit::singleline(&mut self.text_to_send)
-                    .hint_text("Текст")
-                    .desired_width(if detached_window { 140.0 } else { 160.0 }),
+                    .hint_text("Текст в удалённый ввод")
+                    .desired_width(if detached_window { 130.0 } else { 150.0 }),
             );
             let send_text = remote_icon_button_enabled(
                 ui,
                 !self.text_to_send.is_empty(),
-                "↵",
+                ph::PAPER_PLANE_RIGHT,
                 "Отправить текст",
             );
             if send_text.clicked()
@@ -6617,59 +6784,57 @@ impl EvertyDeskApp {
                 self.send_command(SessionCommand::KeyText(text));
                 self.request_visual_refresh_after_input();
             }
-            if remote_icon_button(ui, "⧉", "Вставить локальный буфер").clicked()
-            {
+            if remote_icon_button(ui, ph::CLIPBOARD, "Вставить локальный буфер в удалённый").clicked() {
                 self.paste_local_clipboard_to_remote();
             }
 
-            if remote_icon_button(ui, "↻", "Перезапросить live-video и контрольный PNG-кадр")
-                .clicked()
-            {
+            // ── Группа: вид / захват ──────────────────────────────────────────
+            toolbar_sep(ui);
+            if remote_icon_button(ui, ph::ARROWS_CLOCKWISE, "Обновить live-video и контрольный кадр").clicked() {
                 self.refresh_remote_screen();
             }
-            if remote_icon_button(ui, "PNG", "Сохранить текущий кадр").clicked()
-            {
+            if remote_icon_button(ui, ph::CAMERA, "Сохранить текущий кадр (PNG)").clicked() {
                 self.save_current_frame_png();
             }
-            if remote_icon_toggle(ui, "⇱", self.fit_to_window, "Масштабировать экран под окно")
-                .clicked()
-            {
+            if remote_icon_toggle(ui, ph::ARROWS_IN, self.fit_to_window, "Вписать экран в окно").clicked() {
                 self.fit_to_window = !self.fit_to_window;
                 self.save_ui_config();
             }
-            if remote_icon_button(
-                ui,
-                if self.remote_fullscreen { "□" } else { "⛶" },
-                "Полный экран (F11)",
-            )
-            .clicked()
-            {
+            if remote_icon_button(ui, ph::CORNERS_OUT, "Полный экран (F11)").clicked() {
                 self.set_remote_fullscreen(ctx, !self.remote_fullscreen);
             }
 
-            ui.menu_button(
-                format!(
-                    "AV {} {}",
-                    self.config.display.codec.label(),
-                    self.video_fps
-                ),
-                |ui| self.remote_video_profile_menu_ui(ui),
-            );
-            if remote_icon_toggle(
-                ui,
-                "VM",
-                self.remote_vm_panel_open,
-                "Виртуальные машины на хосте (agentless)",
-            )
-            .clicked()
-            {
-                self.remote_vm_panel_open = !self.remote_vm_panel_open;
-                if self.remote_vm_panel_open {
-                    self.send_command(SessionCommand::ListVms);
+            // ── Правая группа: профиль AV, VM, меню (заполняет пространство) ──
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.menu_button(egui::RichText::new(ph::DOTS_THREE).size(16.0), |ui| {
+                    self.remote_more_menu_ui(ui)
+                });
+                if remote_icon_toggle(
+                    ui,
+                    ph::DESKTOP,
+                    self.remote_vm_panel_open,
+                    "Виртуальные машины на хосте (agentless)",
+                )
+                .clicked()
+                {
+                    self.remote_vm_panel_open = !self.remote_vm_panel_open;
+                    if self.remote_vm_panel_open {
+                        self.send_command(SessionCommand::ListVms);
+                    }
                 }
-            }
-
-            ui.menu_button("⋯", |ui| self.remote_more_menu_ui(ui));
+                // Профиль кодека/FPS — компактный бейдж-меню.
+                ui.menu_button(
+                    egui::RichText::new(format!(
+                        "{}  {} · {}fps",
+                        ph::SLIDERS_HORIZONTAL,
+                        self.config.display.codec.label(),
+                        self.video_fps
+                    ))
+                    .size(12.5)
+                    .color(t.text),
+                    |ui| self.remote_video_profile_menu_ui(ui),
+                );
+            });
         });
     }
 
@@ -6899,70 +7064,36 @@ impl EvertyDeskApp {
                 // ── Power + Control buttons row ───────────────────────────────
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    // Power: Start
-                    if ui
-                        .add(egui::Button::new("▶").small())
-                        .on_hover_text("Запустить VM")
-                        .clicked()
-                    {
-                        let payload = serde_json::json!({
-                            "vm_id": vm_id,
-                            "action": "start"
-                        })
-                        .to_string();
+                    use egui_phosphor::regular as ph;
+                    // Запуск — безопасное действие, выполняется сразу (зелёный значок).
+                    if power_icon_button(ui, ph::PLAY, t.success, "Запустить VM").clicked() {
+                        let payload = serde_json::json!({ "vm_id": vm_id, "action": "start" }).to_string();
                         self.send_command(SessionCommand::VmPowerOp(payload));
                     }
-                    // Power: Stop (hard)
-                    if ui
-                        .add(egui::Button::new("⏹").small())
-                        .on_hover_text("Выключить VM (hard stop)")
-                        .clicked()
-                    {
-                        let payload = serde_json::json!({
-                            "vm_id": vm_id,
-                            "action": "stop"
-                        })
-                        .to_string();
-                        self.send_command(SessionCommand::VmPowerOp(payload));
+                    // Опасные действия — через подтверждение (ставим pending).
+                    if power_icon_button(ui, ph::STOP, t.danger, "Выключить VM (hard stop)").clicked() {
+                        self.pending_vm_action = Some((
+                            vm_id.clone(), "stop".into(), vm_name.clone(),
+                            "жёстко выключить (hard stop) — несохранённые данные в гостевой ОС будут потеряны".into(),
+                        ));
                     }
-                    // Power: Shutdown (guest)
-                    if ui
-                        .add(egui::Button::new("⏻").small())
-                        .on_hover_text("Завершить работу (guest shutdown)")
-                        .clicked()
-                    {
-                        let payload = serde_json::json!({
-                            "vm_id": vm_id,
-                            "action": "shutdown"
-                        })
-                        .to_string();
-                        self.send_command(SessionCommand::VmPowerOp(payload));
+                    if power_icon_button(ui, ph::POWER, t.warning, "Завершить работу (guest shutdown)").clicked() {
+                        self.pending_vm_action = Some((
+                            vm_id.clone(), "shutdown".into(), vm_name.clone(),
+                            "корректно завершить работу гостевой ОС".into(),
+                        ));
                     }
-                    // Power: Restart
-                    if ui
-                        .add(egui::Button::new("⟳").small())
-                        .on_hover_text("Перезапустить VM")
-                        .clicked()
-                    {
-                        let payload = serde_json::json!({
-                            "vm_id": vm_id,
-                            "action": "restart"
-                        })
-                        .to_string();
-                        self.send_command(SessionCommand::VmPowerOp(payload));
+                    if power_icon_button(ui, ph::ARROWS_CLOCKWISE, t.info, "Перезапустить VM").clicked() {
+                        self.pending_vm_action = Some((
+                            vm_id.clone(), "restart".into(), vm_name.clone(),
+                            "перезапустить виртуальную машину".into(),
+                        ));
                     }
-                    // Power: Pause
-                    if ui
-                        .add(egui::Button::new("⏸").small())
-                        .on_hover_text("Пауза VM")
-                        .clicked()
-                    {
-                        let payload = serde_json::json!({
-                            "vm_id": vm_id,
-                            "action": "pause"
-                        })
-                        .to_string();
-                        self.send_command(SessionCommand::VmPowerOp(payload));
+                    if power_icon_button(ui, ph::PAUSE, t.text_weak, "Пауза VM").clicked() {
+                        self.pending_vm_action = Some((
+                            vm_id.clone(), "pause".into(), vm_name.clone(),
+                            "приостановить (pause) выполнение VM".into(),
+                        ));
                     }
                     ui.separator();
                     // Checkpoint toggle
@@ -8293,6 +8424,22 @@ fn remote_viewer_initial_size(remote_size: [usize; 2]) -> [f32; 2] {
     ]
 }
 
+/// Размер иконочной кнопки тулбара сессии (enterprise — компактно и ровно).
+const TOOLBAR_BTN: egui::Vec2 = egui::Vec2::new(32.0, 30.0);
+
+/// Вертикальный разделитель групп тулбара (тонкая линия в цвете границы).
+fn toolbar_sep(ui: &mut egui::Ui) {
+    ui.add_space(4.0);
+    let h = 20.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, h), egui::Sense::hover());
+    ui.painter().vline(
+        rect.center().x,
+        (rect.center().y - h / 2.0)..=(rect.center().y + h / 2.0),
+        egui::Stroke::new(1.0, crate::theme::palette().border),
+    );
+    ui.add_space(4.0);
+}
+
 fn remote_icon_button(ui: &mut egui::Ui, icon: &str, tooltip: &str) -> egui::Response {
     remote_icon_button_enabled(ui, true, icon, tooltip)
 }
@@ -8303,9 +8450,24 @@ fn remote_icon_button_enabled(
     icon: &str,
     tooltip: &str,
 ) -> egui::Response {
+    let t = crate::theme::palette();
     ui.add_enabled(
         enabled,
-        egui::Button::new(egui::RichText::new(icon).size(14.0)).min_size(egui::vec2(34.0, 30.0)),
+        egui::Button::new(egui::RichText::new(icon).size(16.0).color(t.text))
+            .min_size(TOOLBAR_BTN)
+            .corner_radius(egui::CornerRadius::same(crate::theme::radius::SM)),
+    )
+    .on_hover_text(tooltip)
+}
+
+/// Опасная иконочная кнопка тулбара (завершить сеанс) — danger-акцент.
+fn remote_icon_button_danger(ui: &mut egui::Ui, icon: &str, tooltip: &str) -> egui::Response {
+    let t = crate::theme::palette();
+    ui.add(
+        egui::Button::new(egui::RichText::new(icon).size(16.0).color(t.danger))
+            .min_size(TOOLBAR_BTN)
+            .fill(crate::theme::tint(t.danger, 0.10))
+            .corner_radius(egui::CornerRadius::same(crate::theme::radius::SM)),
     )
     .on_hover_text(tooltip)
 }
@@ -8316,10 +8478,13 @@ fn remote_icon_toggle(
     selected: bool,
     tooltip: &str,
 ) -> egui::Response {
+    let t = crate::theme::palette();
+    let txt = if selected { t.accent } else { t.text };
     ui.add(
-        egui::Button::new(egui::RichText::new(icon).size(14.0))
+        egui::Button::new(egui::RichText::new(icon).size(16.0).color(txt))
             .selected(selected)
-            .min_size(egui::vec2(34.0, 30.0)),
+            .min_size(TOOLBAR_BTN)
+            .corner_radius(egui::CornerRadius::same(crate::theme::radius::SM)),
     )
     .on_hover_text(tooltip)
 }
@@ -9173,6 +9338,32 @@ fn run_service_command(action: &str) -> Result<String, String> {
 fn paint_status_dot(ui: &mut egui::Ui, color: egui::Color32) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
     ui.painter().circle_filled(rect.center(), 4.0, color);
+}
+
+/// Квадратная кнопка-значок управления питанием VM: Phosphor-глиф в цвете
+/// действия, подложка-tint этого же цвета. Единый стиль для play/stop/power/…
+fn power_icon_button(
+    ui: &mut egui::Ui,
+    glyph: &str,
+    color: egui::Color32,
+    tooltip: &str,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(30.0, 28.0), egui::Sense::click());
+    let bg = if response.hovered() {
+        crate::theme::tint(color, 0.22)
+    } else {
+        crate::theme::tint(color, 0.12)
+    };
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(crate::theme::radius::SM), bg);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        egui::FontId::proportional(15.0),
+        color,
+    );
+    response.on_hover_text(tooltip)
 }
 
 /// A `label … value` row for the This Computer info block.

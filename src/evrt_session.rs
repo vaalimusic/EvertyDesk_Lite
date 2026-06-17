@@ -266,6 +266,11 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
     let mut pacer = UdpPacer::new();
     let mut waiting_for_idr = true;
 
+    // FEC включён по умолчанию; отключается через EVERTYDESK_FEC=0 (диагностика).
+    let fec_enabled = std::env::var("EVERTYDESK_FEC")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("off") && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+
     // HNS PTS (как в EvertyGame _sampleTimeHns)
     let mut sample_hns: u64 = 0;
     let hns_per_frame = |fps: u32| 10_000_000u64 / fps.max(1) as u64;
@@ -371,17 +376,45 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
         sample_hns = sample_hns.wrapping_add(hns_per_frame(cur_fps));
 
         // ── Пакетизация и отправка ────────────────────────────────────────────
-        let pkts = evrt::packetize_video_frame_authenticated(
-            frame.frame_id,
-            pts_us,
-            frame.is_idr,
-            &frame.bytes,
-            session_token.as_deref(),
-        );
+        // FEC включён → согласованная пакетизация (чанки с запасом под parity).
+        // Иначе — обычная пакетизация полным размером (минимум пакетов).
+        let (pkts, fec_pkts) = if fec_enabled {
+            evrt::packetize_video_with_fec(
+                frame.frame_id,
+                pts_us,
+                frame.is_idr,
+                &frame.bytes,
+                session_token.as_deref(),
+            )
+        } else {
+            (
+                evrt::packetize_video_frame_authenticated(
+                    frame.frame_id,
+                    pts_us,
+                    frame.is_idr,
+                    &frame.bytes,
+                    session_token.as_deref(),
+                ),
+                Vec::new(),
+            )
+        };
+
+        let mut send_failed = false;
         for pkt in &pkts {
             if pacer.send(&socket, pkt, peer_addr, pacing_bps).is_err() {
                 stop.store(true, Ordering::Relaxed);
+                send_failed = true;
                 break;
+            }
+        }
+        // ── FEC: parity-пакеты после data ─────────────────────────────────────
+        // Восстанавливают единичные потери без ретрансмиссии.
+        if !send_failed {
+            for pkt in &fec_pkts {
+                if pacer.send(&socket, pkt, peer_addr, pacing_bps).is_err() {
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
             }
         }
     }
