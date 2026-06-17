@@ -1,0 +1,14 @@
+D:\github_project\EvertyDesk_Lite\vendor\ironrdp-session\target\debug\deps\thiserror-ec832127c5a49c2f.d: C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.18\src\lib.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.18\src\aserror.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.18\src\display.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.18\src\var.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.18\src\private.rs D:\github_project\EvertyDesk_Lite\vendor\ironrdp-session\target\debug\build\thiserror-b4a5788c3cb484e9\out/private.rs
+
+D:\github_project\EvertyDesk_Lite\vendor\ironrdp-session\target\debug\deps\libthiserror-ec832127c5a49c2f.rlib: C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.18\src\lib.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.18\src\aserror.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.18\src\display.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.18\src\var.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.18\src\private.rs D:\github_project\EvertyDesk_Lite\vendor\ironrdp-session\target\debug\build\thiserror-b4a5788c3cb484e9\out/private.rs
+
+D:\github_project\EvertyDesk_Lite\vendor\ironrdp-session\target\debug\deps\libthiserror-ec832127c5a49c2f.rmeta: C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.18\src\lib.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.18\src\aserror.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.18\src\display.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.18\src\var.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.18\src\private.rs D:\github_project\EvertyDesk_Lite\vendor\ironrdp-session\target\debug\build\thiserror-b4a5788c3cb484e9\out/private.rs
+
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.18\src\lib.rs:
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.18\src\aserror.rs:
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.18\src\display.rs:
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.18\src\var.rs:
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\thiserror-2.0.18\src\private.rs:
+D:\github_project\EvertyDesk_Lite\vendor\ironrdp-session\target\debug\build\thiserror-b4a5788c3cb484e9\out/private.rs:
+
+# env-dep:OUT_DIR=D:\\github_project\\EvertyDesk_Lite\\vendor\\ironrdp-session\\target\\debug\\build\\thiserror-b4a5788c3cb484e9\\out

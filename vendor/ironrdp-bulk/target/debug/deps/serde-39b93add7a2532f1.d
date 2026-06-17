@@ -1,0 +1,14 @@
+D:\github_project\EvertyDesk_Lite\vendor\ironrdp-bulk\target\debug\deps\serde-39b93add7a2532f1.d: C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs D:\github_project\EvertyDesk_Lite\vendor\ironrdp-bulk\target\debug\build\serde-c931910bffe7a249\out/private.rs
+
+D:\github_project\EvertyDesk_Lite\vendor\ironrdp-bulk\target\debug\deps\libserde-39b93add7a2532f1.rlib: C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs D:\github_project\EvertyDesk_Lite\vendor\ironrdp-bulk\target\debug\build\serde-c931910bffe7a249\out/private.rs
+
+D:\github_project\EvertyDesk_Lite\vendor\ironrdp-bulk\target\debug\deps\libserde-39b93add7a2532f1.rmeta: C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs D:\github_project\EvertyDesk_Lite\vendor\ironrdp-bulk\target\debug\build\serde-c931910bffe7a249\out/private.rs
+
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\lib.rs:
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\integer128.rs:
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\mod.rs:
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\de.rs:
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\serde-1.0.228\src\private\ser.rs:
+D:\github_project\EvertyDesk_Lite\vendor\ironrdp-bulk\target\debug\build\serde-c931910bffe7a249\out/private.rs:
+
+# env-dep:OUT_DIR=D:\\github_project\\EvertyDesk_Lite\\vendor\\ironrdp-bulk\\target\\debug\\build\\serde-c931910bffe7a249\\out

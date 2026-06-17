@@ -1,0 +1,11 @@
+D:\github_project\EvertyDesk_Lite\vendor\ironrdp-session\target\debug\deps\inout-13f4863a1031aae3.d: C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.2\src\lib.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.2\src\errors.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.2\src\inout.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.2\src\inout_buf.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.2\src\reserved.rs
+
+D:\github_project\EvertyDesk_Lite\vendor\ironrdp-session\target\debug\deps\libinout-13f4863a1031aae3.rlib: C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.2\src\lib.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.2\src\errors.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.2\src\inout.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.2\src\inout_buf.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.2\src\reserved.rs
+
+D:\github_project\EvertyDesk_Lite\vendor\ironrdp-session\target\debug\deps\libinout-13f4863a1031aae3.rmeta: C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.2\src\lib.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.2\src\errors.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.2\src\inout.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.2\src\inout_buf.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.2\src\reserved.rs
+
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.2\src\lib.rs:
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.2\src\errors.rs:
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.2\src\inout.rs:
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.2\src\inout_buf.rs:
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\inout-0.2.2\src\reserved.rs:

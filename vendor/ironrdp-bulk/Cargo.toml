@@ -1,0 +1,29 @@
+[package]
+name = "ironrdp-bulk"
+version = "0.1.1"
+description = "Bulk compression algorithms (MPPC, XCRUSH, NCRUSH) for IronRDP — vendored fork with a self-healing HistoryBufferOverflow patch for VirtualBox VRDE compatibility"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/Devolutions/IronRDP"
+repository = "https://github.com/Devolutions/IronRDP"
+authors = ["Devolutions Inc. <infos@devolutions.net>", "Teleport <goteleport.com>"]
+keywords = ["rdp", "remote-desktop", "network", "client", "protocol"]
+categories = ["network-programming"]
+
+[lib]
+doctest = false
+
+[features]
+default = ["std"]
+std = ["alloc"]
+alloc = []
+
+[dependencies]
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[[bench]]
+name = "bulk_compression"
+harness = false

@@ -1,0 +1,10 @@
+D:\github_project\EvertyDesk_Lite\vendor\ironrdp-session\target\debug\deps\ironrdp_displaycontrol-77fd98c52ec17424.d: C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.6.0\src\lib.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.6.0\src\client.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.6.0\src\pdu\mod.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.6.0\src\server.rs
+
+D:\github_project\EvertyDesk_Lite\vendor\ironrdp-session\target\debug\deps\libironrdp_displaycontrol-77fd98c52ec17424.rlib: C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.6.0\src\lib.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.6.0\src\client.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.6.0\src\pdu\mod.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.6.0\src\server.rs
+
+D:\github_project\EvertyDesk_Lite\vendor\ironrdp-session\target\debug\deps\libironrdp_displaycontrol-77fd98c52ec17424.rmeta: C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.6.0\src\lib.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.6.0\src\client.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.6.0\src\pdu\mod.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.6.0\src\server.rs
+
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.6.0\src\lib.rs:
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.6.0\src\client.rs:
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.6.0\src\pdu\mod.rs:
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-displaycontrol-0.6.0\src\server.rs:

@@ -1,0 +1,11 @@
+D:\github_project\EvertyDesk_Lite\vendor\ironrdp-session\target\debug\deps\ironrdp_dvc-2c633e5fde20415f.d: C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.6.0\src\lib.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.6.0\src\complete_data.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.6.0\src\client.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.6.0\src\server.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.6.0\src\pdu.rs
+
+D:\github_project\EvertyDesk_Lite\vendor\ironrdp-session\target\debug\deps\libironrdp_dvc-2c633e5fde20415f.rlib: C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.6.0\src\lib.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.6.0\src\complete_data.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.6.0\src\client.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.6.0\src\server.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.6.0\src\pdu.rs
+
+D:\github_project\EvertyDesk_Lite\vendor\ironrdp-session\target\debug\deps\libironrdp_dvc-2c633e5fde20415f.rmeta: C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.6.0\src\lib.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.6.0\src\complete_data.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.6.0\src\client.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.6.0\src\server.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.6.0\src\pdu.rs
+
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.6.0\src\lib.rs:
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.6.0\src\complete_data.rs:
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.6.0\src\client.rs:
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.6.0\src\server.rs:
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\ironrdp-dvc-0.6.0\src\pdu.rs:

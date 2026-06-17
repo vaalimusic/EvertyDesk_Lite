@@ -1,0 +1,12 @@
+D:\github_project\EvertyDesk_Lite\vendor\ironrdp-session\target\debug\deps\spki-d27f9cfa3e07365e.d: C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\spki-0.8.0\src\lib.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\spki-0.8.0\src\algorithm.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\spki-0.8.0\src\error.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\spki-0.8.0\src\spki.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\spki-0.8.0\src\traits.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\spki-0.8.0\src\../README.md
+
+D:\github_project\EvertyDesk_Lite\vendor\ironrdp-session\target\debug\deps\libspki-d27f9cfa3e07365e.rlib: C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\spki-0.8.0\src\lib.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\spki-0.8.0\src\algorithm.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\spki-0.8.0\src\error.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\spki-0.8.0\src\spki.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\spki-0.8.0\src\traits.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\spki-0.8.0\src\../README.md
+
+D:\github_project\EvertyDesk_Lite\vendor\ironrdp-session\target\debug\deps\libspki-d27f9cfa3e07365e.rmeta: C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\spki-0.8.0\src\lib.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\spki-0.8.0\src\algorithm.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\spki-0.8.0\src\error.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\spki-0.8.0\src\spki.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\spki-0.8.0\src\traits.rs C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\spki-0.8.0\src\../README.md
+
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\spki-0.8.0\src\lib.rs:
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\spki-0.8.0\src\algorithm.rs:
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\spki-0.8.0\src\error.rs:
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\spki-0.8.0\src\spki.rs:
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\spki-0.8.0\src\traits.rs:
+C:\Users\VAALI\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\spki-0.8.0\src\../README.md:
