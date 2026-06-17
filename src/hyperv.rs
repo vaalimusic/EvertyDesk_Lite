@@ -2,7 +2,7 @@
 //!
 //! No extra crates — uses the `windows` crate already in the project.
 //! Screen: Hyper-V thumbnail snapshots, converted from RGB565 to RGBA.
-//! Input:  Msvm_Keyboard / Msvm_Mouse WMI methods.
+//! Input:  Msvm_Keyboard / Msvm_SyntheticMouse WMI methods.
 
 use std::{collections::HashMap, mem::ManuallyDrop, sync::mpsc, time::Duration};
 
@@ -19,7 +19,7 @@ use windows::{
                 CoCreateInstance, CoInitializeEx, CoSetProxyBlanket, CLSCTX_INPROC_SERVER,
                 COINIT_MULTITHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL,
                 RPC_C_IMP_LEVEL_IMPERSONATE, SAFEARRAY, VARIANT, VT_ARRAY, VT_BSTR, VT_I4,
-                VT_UI1, VT_UI2, VT_UI4,
+                VT_BOOL, VT_I1, VT_UI1, VT_UI2, VT_UI4,
             },
             Ole::{
                 SafeArrayAccessData, SafeArrayGetLBound, SafeArrayGetUBound,
@@ -265,6 +265,8 @@ fn hr(e: &windows::core::Error) -> String {
 #[derive(Debug, Clone)]
 pub enum WmiVal {
     Str(String),
+    Bool(bool),
+    I8(i8),
     U16(u16),
     U32(u32),
     I32(i32),
@@ -309,6 +311,14 @@ unsafe fn wmi_val_to_variant(val: &WmiVal) -> VARIANT {
             inner.vt = VT_BSTR;
             inner.Anonymous.bstrVal = ManuallyDrop::new(BSTR::from(s.as_str()));
         }
+        WmiVal::Bool(v) => {
+            inner.vt = VT_BOOL;
+            inner.Anonymous.boolVal = windows::Win32::Foundation::VARIANT_BOOL(if *v { -1 } else { 0 });
+        }
+        WmiVal::I8(v) => {
+            inner.vt = VT_I1;
+            inner.Anonymous.cVal = *v as u8;
+        }
         WmiVal::U16(v) => {
             inner.vt = VT_UI2;
             inner.Anonymous.uiVal = *v;
@@ -340,6 +350,8 @@ unsafe fn variant_to_wmi_val(var: &VARIANT) -> Option<WmiVal> {
             Some(WmiVal::Str(s))
         }
         3 => Some(WmiVal::I32(inner.Anonymous.lVal)),  // VT_I4
+        16 => Some(WmiVal::I8(inner.Anonymous.cVal as i8)),  // VT_I1
+        11 => Some(WmiVal::Bool(inner.Anonymous.boolVal.0 != 0)), // VT_BOOL
         19 => Some(WmiVal::U32(inner.Anonymous.ulVal)), // VT_UI4
         18 => Some(WmiVal::U16(inner.Anonymous.uiVal)), // VT_UI2
         v if (v & VT_ARRAY.0 != 0) && (v & 0x00FF == VT_UI1.0) => {
@@ -1138,29 +1150,169 @@ fn kbd_exec(vm_id: &str, method: &str, scan_code: u32) -> Result<(), String> {
 }
 
 /// x, y in 0–65535 (normalized to VM display).
+#[derive(Clone, Debug)]
+struct MouseDevice {
+    path: String,
+    kind: MouseDeviceKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MouseDeviceKind {
+    SyntheticAbsolute,
+    Ps2Relative,
+    LegacyAbsolute,
+}
+
+impl MouseDeviceKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SyntheticAbsolute => "Msvm_SyntheticMouse",
+            Self::Ps2Relative => "Msvm_Ps2Mouse",
+            Self::LegacyAbsolute => "Msvm_Mouse",
+        }
+    }
+}
+
+fn find_mouse_device(wmi: &Wmi, vm_id: &str) -> Option<MouseDevice> {
+    find_device_path(wmi, "Msvm_SyntheticMouse", vm_id)
+        .map(|path| MouseDevice {
+            path,
+            kind: MouseDeviceKind::SyntheticAbsolute,
+        })
+        .or_else(|| {
+            find_device_path(wmi, "Msvm_Ps2Mouse", vm_id).map(|path| MouseDevice {
+                path,
+                kind: MouseDeviceKind::Ps2Relative,
+            })
+        })
+        .or_else(|| {
+            find_device_path(wmi, "Msvm_Mouse", vm_id).map(|path| MouseDevice {
+                path,
+                kind: MouseDeviceKind::LegacyAbsolute,
+            })
+        })
+}
+
+fn check_wmi_return(method: &str, out: HashMap<String, WmiVal>) -> Result<(), String> {
+    match out.get("ReturnValue").and_then(WmiVal::as_u32) {
+        Some(0) | None => Ok(()),
+        Some(rv) => Err(format!("{method} ReturnValue={rv}")),
+    }
+}
+
+fn mouse_move_exec(
+    wmi: &Wmi,
+    mouse: &MouseDevice,
+    x: u32,
+    y: u32,
+    last_abs: &mut Option<(u32, u32)>,
+) -> Result<(), String> {
+    match mouse.kind {
+        MouseDeviceKind::SyntheticAbsolute | MouseDeviceKind::LegacyAbsolute => {
+            let out = wmi.exec_method_result(
+                &mouse.path,
+                "SetAbsolutePosition",
+                &[
+                    ("HorizontalPosition", WmiVal::I32(x.clamp(0, 65_535) as i32)),
+                    ("VerticalPosition", WmiVal::I32(y.clamp(0, 65_535) as i32)),
+                ],
+            )?;
+            *last_abs = Some((x, y));
+            check_wmi_return("SetAbsolutePosition", out)
+        }
+        MouseDeviceKind::Ps2Relative => {
+            let Some((lx, ly)) = *last_abs else {
+                *last_abs = Some((x, y));
+                return Ok(());
+            };
+            let dx = (((x as i64 - lx as i64) * 127) / 65_535).clamp(-127, 127) as i8;
+            let dy = (((y as i64 - ly as i64) * 127) / 65_535).clamp(-127, 127) as i8;
+            *last_abs = Some((x, y));
+            if dx == 0 && dy == 0 {
+                return Ok(());
+            }
+            let out = wmi.exec_method_result(
+                &mouse.path,
+                "SetRelativePosition",
+                &[
+                    ("HorizontalDelta", WmiVal::I8(dx)),
+                    ("VerticalDelta", WmiVal::I8(dy)),
+                ],
+            )?;
+            check_wmi_return("SetRelativePosition", out)
+        }
+    }
+}
+
+fn mouse_button_exec(
+    wmi: &Wmi,
+    mouse: &MouseDevice,
+    button: u32,
+    down: bool,
+) -> Result<(), String> {
+    let state_name = match mouse.kind {
+        MouseDeviceKind::SyntheticAbsolute | MouseDeviceKind::LegacyAbsolute => "IsDown",
+        MouseDeviceKind::Ps2Relative => "ButtonState",
+    };
+    let out = wmi.exec_method_result(
+        &mouse.path,
+        "SetButtonState",
+        &[
+            ("ButtonIndex", WmiVal::U32(button)),
+            (state_name, WmiVal::Bool(down)),
+        ],
+    )?;
+    check_wmi_return("SetButtonState", out)
+}
+
+fn mouse_click_button_exec(wmi: &Wmi, mouse: &MouseDevice, button: u32) -> Result<(), String> {
+    let u32_result = wmi
+        .exec_method_result(
+            &mouse.path,
+            "ClickButton",
+            &[("ButtonIndex", WmiVal::U32(button))],
+        )
+        .and_then(|out| check_wmi_return("ClickButton", out));
+    match u32_result {
+        Ok(()) => Ok(()),
+        Err(u32_err) => wmi
+            .exec_method_result(
+                &mouse.path,
+                "ClickButton",
+                &[("ButtonIndex", WmiVal::I32(button as i32))],
+            )
+            .and_then(|out| check_wmi_return("ClickButton", out))
+            .map_err(|i32_err| {
+                format!("ClickButton U32 failed: {u32_err}; I32 failed: {i32_err}")
+            }),
+    }
+}
+
+fn mouse_click_exec(wmi: &Wmi, mouse: &MouseDevice, button: u32) -> Result<(), String> {
+    if mouse_click_button_exec(wmi, mouse, button).is_ok() {
+        return Ok(());
+    }
+
+    // Some Hyper-V builds expose ClickButton but do not implement it reliably.
+    // Keep a conservative down/up fallback for those hosts and for drag paths.
+    mouse_button_exec(wmi, mouse, button, true)?;
+    std::thread::sleep(Duration::from_millis(35));
+    mouse_button_exec(wmi, mouse, button, false)
+}
+
 pub fn move_mouse(vm_id: &str, x: u32, y: u32) -> Result<(), String> {
     let wmi = Wmi::connect().ok_or_else(|| "WMI connect failed".to_owned())?;
-    let path = find_device_path(&wmi, "Msvm_Mouse", vm_id)
-        .ok_or_else(|| "Msvm_Mouse не найден".to_owned())?;
-    wmi.exec_method_result(
-        &path,
-        "SetAbsolutePosition",
-        &[
-            ("horizontalPosition", WmiVal::I32(x as i32)),
-            ("verticalPosition", WmiVal::I32(y as i32)),
-        ],
-    )
-    .map(|_| ())
+    let mouse = find_mouse_device(&wmi, vm_id)
+        .ok_or_else(|| "Hyper-V mouse device not found".to_owned())?;
+    mouse_move_exec(&wmi, &mouse, x, y, &mut None)
 }
 
 /// button: 1=left, 2=right, 3=middle.
 pub fn click_mouse(vm_id: &str, button: u32, press: bool) -> Result<(), String> {
     let wmi = Wmi::connect().ok_or_else(|| "WMI connect failed".to_owned())?;
-    let path = find_device_path(&wmi, "Msvm_Mouse", vm_id)
-        .ok_or_else(|| "Msvm_Mouse не найден".to_owned())?;
-    let method = if press { "ClickButton" } else { "ReleaseButton" };
-    wmi.exec_method_result(&path, method, &[("buttonIndex", WmiVal::I32(button as i32))])
-        .map(|_| ())
+    let mouse = find_mouse_device(&wmi, vm_id)
+        .ok_or_else(|| "Hyper-V mouse device not found".to_owned())?;
+    mouse_button_exec(&wmi, &mouse, button, press)
 }
 
 fn find_device_path(wmi: &Wmi, class: &str, vm_id: &str) -> Option<String> {
@@ -1211,7 +1363,7 @@ fn find_device_path(wmi: &Wmi, class: &str, vm_id: &str) -> Option<String> {
 /// Pre-resolve keyboard/mouse WMI paths at session start (once per session).
 struct DevicePaths {
     keyboard: Option<String>,
-    mouse: Option<String>,
+    mouse: Option<MouseDevice>,
 }
 
 impl DevicePaths {
@@ -1220,7 +1372,7 @@ impl DevicePaths {
             return (Self { keyboard: None, mouse: None }, Some("WMI connect failed".into()));
         };
         let keyboard = find_device_path(&wmi, "Msvm_Keyboard", vm_id);
-        let mouse = find_device_path(&wmi, "Msvm_Mouse", vm_id);
+        let mouse = find_mouse_device(&wmi, vm_id);
         let warn = if mouse.is_none() {
             Some("Msvm_Mouse не найден — управление мышью недоступно".into())
         } else {
@@ -1237,8 +1389,10 @@ pub enum HyperVCmd {
     ReleaseKey(u32),
     TypeText(String),
     CtrlAltDel,
+    /// Guest pixel coordinates for Msvm_SyntheticMouse / Msvm_Ps2Mouse mapping.
     MoveMouse(u32, u32),
     ClickMouse(u32, bool),
+    MouseClick(u32),
     Stop,
 }
 
@@ -1246,10 +1400,12 @@ pub struct Frame {
     pub rgba: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    pub guest_width: u32,
+    pub guest_height: u32,
 }
 
 pub struct HyperVSession {
-    pub cmd_tx: mpsc::SyncSender<HyperVCmd>,
+    pub cmd_tx: mpsc::Sender<HyperVCmd>,
     pub frame_rx: mpsc::Receiver<Frame>,
     pub status_rx: mpsc::Receiver<String>,
     /// Shared stop flag — set to true when session ends; capture-thread checks this each cycle.
@@ -1271,7 +1427,7 @@ impl HyperVSession {
     /// Разделение устраняет главную причину задержек: ранее `PressKey` ждал
     /// завершения `capture_screen()` (50–500 ms), теперь — нет.
     pub fn start(vm: VmInfo) -> Self {
-        let (cmd_tx, cmd_rx) = mpsc::sync_channel::<HyperVCmd>(64);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<HyperVCmd>();
         let (frame_tx, frame_rx) = mpsc::sync_channel::<Frame>(2);
         let (status_tx, status_rx) = mpsc::sync_channel::<String>(16);
         let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1302,6 +1458,12 @@ impl HyperVSession {
                     if let Some(w) = warn { let _ = status_tx_input.try_send(w); }
                     p
                 };
+                if let Some(mouse) = &paths.mouse {
+                    let _ = status_tx_input.try_send(format!(
+                        "Hyper-V mouse active: {}",
+                        mouse.kind.label()
+                    ));
+                }
                 if paths.keyboard.is_none() {
                     let _ = status_tx_input.try_send(
                         "⚠ Msvm_Keyboard не найден, жду Integration Services…".into()
@@ -1347,6 +1509,16 @@ impl HyperVSession {
                     batch.clear();
                 };
 
+                let mut last_mouse_abs: Option<(u32, u32)> = None;
+                let mut mouse_error_reported = false;
+                let mut mouse_move_cmds: u64 = 0;
+                let mut mouse_move_ok: u64 = 0;
+                let mut mouse_button_cmds: u64 = 0;
+                let mut mouse_button_ok: u64 = 0;
+                let mut mouse_errs: u64 = 0;
+                let mut last_mouse_diag_count: u64 = 0;
+                let mut last_mouse_diag_at = std::time::Instant::now();
+
                 loop {
                     // Ждём хотя бы одну команду (не спим попусту).
                     let first = match cmd_rx.recv() {
@@ -1363,11 +1535,42 @@ impl HyperVSession {
                         }
                     }
 
+                    // WMI mouse calls are much slower than raw pointer events. Keep only
+                    // the newest move before each non-move command so movement cannot
+                    // build an unbounded backlog while preserving move-before-click order.
+                    let mut compacted = Vec::with_capacity(pending.len());
+                    let mut latest_move: Option<(u32, u32)> = None;
+                    for cmd in pending {
+                        match cmd {
+                            HyperVCmd::MoveMouse(x, y) => latest_move = Some((x, y)),
+                            HyperVCmd::Stop => {
+                                compacted.push(HyperVCmd::Stop);
+                                latest_move = None;
+                                break;
+                            }
+                            other @ (HyperVCmd::MouseClick(_) | HyperVCmd::ClickMouse(_, _)) => {
+                                if let Some((x, y)) = latest_move.take() {
+                                    compacted.push(HyperVCmd::MoveMouse(x, y));
+                                }
+                                compacted.push(other);
+                            }
+                            other => {
+                                if let Some((x, y)) = latest_move.take() {
+                                    compacted.push(HyperVCmd::MoveMouse(x, y));
+                                }
+                                compacted.push(other);
+                            }
+                        }
+                    }
+                    if let Some((x, y)) = latest_move.take() {
+                        compacted.push(HyperVCmd::MoveMouse(x, y));
+                    }
+
                     // Обрабатываем пачку: TypeText-ы батчуем, остальное — сразу.
                     let mut text_batch = String::new();
                     let mut stop = false;
 
-                    for cmd in pending {
+                    for cmd in compacted {
                         match cmd {
                             HyperVCmd::Stop => { stop = true; break; }
 
@@ -1410,24 +1613,86 @@ impl HyperVSession {
                                 }
                             }
                             HyperVCmd::MoveMouse(x, y) => {
+                                mouse_move_cmds = mouse_move_cmds.saturating_add(1);
                                 flush_text(&mut text_batch, &wmi, &paths.keyboard);
                                 if let (Some(wmi), Some(p)) = (&wmi, &paths.mouse) {
-                                    let _ = wmi.exec_method_result(
-                                        p, "SetAbsolutePosition",
-                                        &[
-                                            ("horizontalPosition", WmiVal::I32(x as i32)),
-                                            ("verticalPosition",   WmiVal::I32(y as i32)),
-                                        ],
+                                    match mouse_move_exec(wmi, p, x, y, &mut last_mouse_abs) {
+                                        Ok(()) => {
+                                            mouse_move_ok = mouse_move_ok.saturating_add(1);
+                                            mouse_error_reported = false;
+                                        }
+                                        Err(e) if !mouse_error_reported => {
+                                            mouse_errs = mouse_errs.saturating_add(1);
+                                            mouse_error_reported = true;
+                                            let _ = status_tx_input.try_send(format!(
+                                                "Hyper-V mouse move error ({}): {e}",
+                                                p.kind.label()
+                                            ));
+                                        }
+                                        Err(_) => {}
+                                    }
+                                } else if !mouse_error_reported {
+                                    mouse_errs = mouse_errs.saturating_add(1);
+                                    mouse_error_reported = true;
+                                    let _ = status_tx_input.try_send(
+                                        "Hyper-V mouse move error: mouse device is not resolved".to_owned()
                                     );
                                 }
                             }
                             HyperVCmd::ClickMouse(b, press) => {
+                                mouse_button_cmds = mouse_button_cmds.saturating_add(1);
                                 flush_text(&mut text_batch, &wmi, &paths.keyboard);
                                 if let (Some(wmi), Some(p)) = (&wmi, &paths.mouse) {
-                                    let method = if press { "ClickButton" } else { "ReleaseButton" };
-                                    let _ = wmi.exec_method_result(
-                                        p, method,
-                                        &[("buttonIndex", WmiVal::I32(b as i32))],
+                                    if !press {
+                                        std::thread::sleep(Duration::from_millis(35));
+                                    }
+                                    match mouse_button_exec(wmi, p, b, press) {
+                                        Ok(()) => {
+                                            mouse_button_ok = mouse_button_ok.saturating_add(1);
+                                            mouse_error_reported = false;
+                                        }
+                                        Err(e) if !mouse_error_reported => {
+                                            mouse_errs = mouse_errs.saturating_add(1);
+                                            mouse_error_reported = true;
+                                            let _ = status_tx_input.try_send(format!(
+                                                "Hyper-V mouse button error ({}): {e}",
+                                                p.kind.label()
+                                            ));
+                                        }
+                                        Err(_) => {}
+                                    }
+                                } else if !mouse_error_reported {
+                                    mouse_errs = mouse_errs.saturating_add(1);
+                                    mouse_error_reported = true;
+                                    let _ = status_tx_input.try_send(
+                                        "Hyper-V mouse button error: mouse device is not resolved".to_owned()
+                                    );
+                                }
+                            }
+                            HyperVCmd::MouseClick(b) => {
+                                mouse_button_cmds = mouse_button_cmds.saturating_add(1);
+                                flush_text(&mut text_batch, &wmi, &paths.keyboard);
+                                if let (Some(wmi), Some(p)) = (&wmi, &paths.mouse) {
+                                    match mouse_click_exec(wmi, p, b) {
+                                        Ok(()) => {
+                                            mouse_button_ok = mouse_button_ok.saturating_add(1);
+                                            mouse_error_reported = false;
+                                        }
+                                        Err(e) if !mouse_error_reported => {
+                                            mouse_errs = mouse_errs.saturating_add(1);
+                                            mouse_error_reported = true;
+                                            let _ = status_tx_input.try_send(format!(
+                                                "Hyper-V mouse click error ({}): {e}",
+                                                p.kind.label()
+                                            ));
+                                        }
+                                        Err(_) => {}
+                                    }
+                                } else if !mouse_error_reported {
+                                    mouse_errs = mouse_errs.saturating_add(1);
+                                    mouse_error_reported = true;
+                                    let _ = status_tx_input.try_send(
+                                        "Hyper-V mouse click error: mouse device is not resolved".to_owned()
                                     );
                                 }
                             }
@@ -1436,6 +1701,22 @@ impl HyperVSession {
 
                     // Сбрасываем оставшийся текст-батч.
                     flush_text(&mut text_batch, &wmi, &paths.keyboard);
+                    let mouse_diag_count = mouse_move_cmds.saturating_add(mouse_button_cmds);
+                    if mouse_diag_count != last_mouse_diag_count
+                        && last_mouse_diag_at.elapsed() >= Duration::from_millis(500)
+                    {
+                        last_mouse_diag_count = mouse_diag_count;
+                        last_mouse_diag_at = std::time::Instant::now();
+                        let device = paths
+                            .mouse
+                            .as_ref()
+                            .map(|m| m.kind.label())
+                            .unwrap_or("none");
+                        let (last_x, last_y) = last_mouse_abs.unwrap_or((0, 0));
+                        let _ = status_tx_input.try_send(format!(
+                            "Hyper-V mouse diag: dev={device} move={mouse_move_ok}/{mouse_move_cmds} click={mouse_button_ok}/{mouse_button_cmds} err={mouse_errs} last={last_x}x{last_y}"
+                        ));
+                    }
                     if stop { return; }
                 }
             })
@@ -1537,6 +1818,8 @@ impl HyperVSession {
                                 rgba,
                                 width: cur_w as u32,
                                 height: cur_h as u32,
+                                guest_width: native.0 as u32,
+                                guest_height: native.1 as u32,
                             });
                         }
                         Err(err) => {
@@ -1562,7 +1845,7 @@ impl HyperVSession {
     }
 
     pub fn send(&self, cmd: HyperVCmd) {
-        let _ = self.cmd_tx.try_send(cmd);
+        let _ = self.cmd_tx.send(cmd);
     }
 
     pub fn try_recv_frame(&self) -> Option<Frame> {
@@ -1577,7 +1860,7 @@ impl HyperVSession {
         // Signal capture-thread to exit on its next loop iteration.
         self.stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
         // Signal input-thread to exit (unblocks recv()).
-        let _ = self.cmd_tx.try_send(HyperVCmd::Stop);
+        let _ = self.cmd_tx.send(HyperVCmd::Stop);
         // Dropping cmd_tx also causes input-thread recv() to return Err → exit.
     }
 }

@@ -47,7 +47,7 @@ struct Shared {
     input_note: String,
     /// Канал команд в HyperVSession (мышь/клавиатура без overhead нового WMI connect).
     #[cfg(windows)]
-    hyperv_cmd_tx: Option<std::sync::mpsc::SyncSender<crate::hyperv::HyperVCmd>>,
+    hyperv_cmd_tx: Option<std::sync::mpsc::Sender<crate::hyperv::HyperVCmd>>,
 }
 
 impl Default for Shared {
@@ -474,12 +474,14 @@ fn dispatch_mouse(vm_id: &str, ev: &crate::rustdesk_proto::MouseEvent, w: u32, h
     let button_bits = ev.mask >> 3;
     match evt_type {
         EVT_MOVE | EVT_DOWN | EVT_UP => {
-            let nx = norm(ev.x, w);
-            let ny = norm(ev.y, h);
-            let _ = tx.try_send(hyperv::HyperVCmd::MoveMouse(nx, ny));
+            let nx = ev.x.max(0) as u32;
+            let ny = ev.y.max(0) as u32;
+            let nx = nx.min(w.saturating_sub(1));
+            let ny = ny.min(h.saturating_sub(1));
+            let _ = tx.send(hyperv::HyperVCmd::MoveMouse(nx, ny));
             if evt_type == EVT_DOWN || evt_type == EVT_UP {
                 if let Some(btn) = vm_button(button_bits) {
-                    let _ = tx.try_send(hyperv::HyperVCmd::ClickMouse(btn, evt_type == EVT_DOWN));
+                    let _ = tx.send(hyperv::HyperVCmd::ClickMouse(btn, evt_type == EVT_DOWN));
                 }
             }
             note_input("мышь ок");
@@ -501,9 +503,9 @@ fn dispatch_key(vm_id: &str, ev: &crate::rustdesk_proto::KeyEvent) {
     };
 
     // Send a key via the session channel — no WMI connect overhead
-    let send_press = |vk: u32| { let _ = tx.try_send(hyperv::HyperVCmd::PressKey(vk)); };
-    let send_release = |vk: u32| { let _ = tx.try_send(hyperv::HyperVCmd::ReleaseKey(vk)); };
-    let send_text = |t: String| { let _ = tx.try_send(hyperv::HyperVCmd::TypeText(t)); };
+    let send_press = |vk: u32| { let _ = tx.send(hyperv::HyperVCmd::PressKey(vk)); };
+    let send_release = |vk: u32| { let _ = tx.send(hyperv::HyperVCmd::ReleaseKey(vk)); };
+    let send_text = |t: String| { let _ = tx.send(hyperv::HyperVCmd::TypeText(t)); };
 
     // Модификаторы (Shift/Ctrl/Alt) — жмём перед, отпускаем после.
     let mods: Vec<u32> = ev
@@ -947,7 +949,7 @@ fn send_ctrl_alt_del_hyperv(vm_id: &str) -> Result<(), String> {
     // Приоритет: активная HyperVSession (если vm_bridge используется через сессию)
     if let Ok(s) = state().lock() {
         if let Some(tx) = &s.hyperv_cmd_tx {
-            let _ = tx.try_send(crate::hyperv::HyperVCmd::CtrlAltDel);
+            let _ = tx.send(crate::hyperv::HyperVCmd::CtrlAltDel);
             return Ok(());
         }
     }

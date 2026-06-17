@@ -267,6 +267,161 @@ fn sanitize(s: &str) -> String {
 /// Рекомендуемый интервал скриншот-поллинга (медленнее Hyper-V thumbnail).
 pub const SCREENSHOT_INTERVAL: Duration = Duration::from_millis(200);
 
+// ── VRDE (VirtualBox Remote Display Extension) ────────────────────────────────
+
+/// Статус VRDE для конкретной VM.
+#[derive(Debug, Clone)]
+pub struct VrdeInfo {
+    pub enabled: bool,
+    /// Реальный порт, на котором слушает VRDE (или настроенный порт если выключено).
+    pub port: u16,
+}
+
+/// Получить VRDE-статус VM через showvminfo.
+pub fn get_vrde_info(uuid: &str) -> Option<VrdeInfo> {
+    let vbm = vboxmanage()?;
+    let out = vbm_run(&vbm, &["showvminfo", uuid, "--machinereadable"])?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut enabled = false;
+    let mut port = 3389u16;
+    for line in text.lines() {
+        if line.starts_with("vrde=") {
+            enabled = line.contains("\"on\"");
+        }
+        // vrdeports="3389" (comma-separated range, e.g. "3389-3400"); take first
+        if line.starts_with("vrdeports=") {
+            if let Some(v) = line.split('=').nth(1) {
+                let v = v.trim().trim_matches('"');
+                let first = v.split(',').next().unwrap_or(v);
+                let first = first.split('-').next().unwrap_or(first);
+                if let Ok(p) = first.parse::<u16>() {
+                    if p > 0 {
+                        port = p;
+                    }
+                }
+            }
+        }
+    }
+    Some(VrdeInfo { enabled, port })
+}
+
+/// Включить VRDE на указанном порту.
+/// Для запущенных VM использует `controlvm vrde on`, для остановленных — `modifyvm --vrde on`.
+pub fn enable_vrde(uuid: &str, port: u16, vm_running: bool) -> bool {
+    let Some(vbm) = vboxmanage() else {
+        return false;
+    };
+    let port_s = port.to_string();
+    if vm_running {
+        let r1 = vbm_run(&vbm, &["controlvm", uuid, "vrdeport", &port_s]);
+        let _ = vbm_run(
+            &vbm,
+            &["controlvm", uuid, "vrdeproperty", "Security/Method=tls"],
+        );
+        let r2 = vbm_run(&vbm, &["controlvm", uuid, "vrde", "on"]);
+        r1.map(|o| o.status.success()).unwrap_or(false)
+            && r2.map(|o| o.status.success()).unwrap_or(false)
+    } else {
+        let out = vbm_run(&vbm, &["modifyvm", uuid, "--vrde", "on", "--vrdeports", &port_s]);
+        let _ = vbm_run(
+            &vbm,
+            &["modifyvm", uuid, "--vrdeproperty", "Security/Method=tls"],
+        );
+        out.map(|o| o.status.success()).unwrap_or(false)
+    }
+}
+
+/// Текущий тип эмулируемого указателя VM ("PS/2 Mouse", "USB Tablet", ...).
+/// Берём из человекочитаемого `showvminfo` — поле "Pointing Device:" не всегда
+/// присутствует в --machinereadable на старых версиях VBoxManage.
+pub fn get_pointing_device(uuid: &str) -> Option<String> {
+    let vbm = vboxmanage()?;
+    let out = vbm_run(&vbm, &["showvminfo", uuid])?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if let Some(rest) = line.trim().strip_prefix("Pointing Device:") {
+            return Some(rest.trim().to_owned());
+        }
+    }
+    None
+}
+
+/// true если указатель абсолютный (USB Tablet/Multi-Touch) — без него RDP
+/// absolute-координаты мыши (MousePdu) не транслируются гостю корректно,
+/// т.к. эмулируемый PS/2-мышь принимает только относительные смещения.
+pub fn pointing_device_is_absolute(uuid: &str) -> Option<bool> {
+    get_pointing_device(uuid).map(|d| {
+        let d = d.to_lowercase();
+        d.contains("tablet") || d.contains("multi-touch") || d.contains("multitouch")
+    })
+}
+
+/// Переключить указатель на USB Tablet (абсолютные координаты).
+/// VBoxManage меняет тип HID-устройства мыши только у выключенной VM.
+pub fn set_pointing_device_usbtablet(uuid: &str) -> Result<(), String> {
+    let vbm = vboxmanage().ok_or_else(|| "VBoxManage не найден".to_owned())?;
+    let out = vbm_run(&vbm, &["modifyvm", uuid, "--mouse", "usbtablet"])
+        .ok_or_else(|| "modifyvm --mouse: таймаут".to_owned())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_owned())
+    }
+}
+
+/// Выключить VRDE.
+pub fn disable_vrde(uuid: &str, vm_running: bool) -> bool {
+    let Some(vbm) = vboxmanage() else {
+        return false;
+    };
+    if vm_running {
+        let out = vbm_run(&vbm, &["controlvm", uuid, "vrde", "off"]);
+        out.map(|o| o.status.success()).unwrap_or(false)
+    } else {
+        let out = vbm_run(&vbm, &["modifyvm", uuid, "--vrde", "off"]);
+        out.map(|o| o.status.success()).unwrap_or(false)
+    }
+}
+
+/// Запустить системный RDP-клиент, подключаясь к localhost:<port>.
+/// Windows: mstsc.exe, Linux: xfreerdp / rdesktop, macOS: открывает rdp:// URL.
+pub fn launch_rdp(port: u16) {
+    let addr = format!("localhost:{port}");
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new("mstsc");
+        cmd.args(["/v", &addr]);
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        let _ = cmd.spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if Command::new("xfreerdp")
+            .args([
+                &format!("/v:{addr}"),
+                "/cert:ignore",
+                "/dynamic-resolution",
+            ])
+            .spawn()
+            .is_err()
+        {
+            let _ = Command::new("rdesktop").arg(&addr).spawn();
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("open")
+            .arg(format!("rdp://{addr}"))
+            .spawn();
+    }
+}
+
 // ── Background session ────────────────────────────────────────────────────────
 
 pub enum VboxCmd {

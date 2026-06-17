@@ -1,374 +1,602 @@
-//! RDP over VMBus (Enhanced Session Mode) — Hyper-V host-side AF_HYPERV socket transport.
+//! Hyper-V Enhanced Session Mode — RDP via the host's VM-connection broker,
+//! decoded in-process with the same `ironrdp` engine used for VirtualBox VRDE.
 //!
-//! # How Enhanced Session Mode works
+//! # How it actually works (the `vmconnect.exe` mechanism)
 //!
-//! When Integration Services are installed and the host has Enhanced Session Mode enabled,
-//! the VM guest exports an RDP listener over VMBus (not over TCP). The host can connect to
-//! it directly using the Windows Hyper-V Socket API (AF_HYPERV = 34).
+//! Enhanced Session is NOT a direct hv_sock RDP listener in the guest (an
+//! earlier version of this file tried `AF_HYPERV` to the guest and timed out —
+//! os error 10060). Instead, the Hyper-V host runs a VM-connection broker
+//! (`vmms`) listening on TCP **127.0.0.1:2179**. A client:
+//!   1. opens a plain TCP connection to that port,
+//!   2. sends an `RDP_PRECONNECTION_PDU_V2` whose string payload is the target
+//!      VM's GUID, as the very first bytes — this tells the broker which VM to
+//!      route to,
+//!   3. then performs a completely standard RDP handshake; the broker proxies
+//!      it over VMBus into the guest's RDP server.
 //!
-//! Connection parameters:
-//!   - `VmId`      = the VM's GUID (Msvm_ComputerSystem.Name)
-//!   - `ServiceId` = {00000883-FACB-11E6-BD58-64006A7986D3}
-//!                   (VSock template with port 2179 = 0x883 encoded in Data1 LE)
-//!
-//! Once connected, the socket carries a standard RDP byte stream — identical to
-//! the TCP RDP stream on port 3389, but through VMBus instead.
-//!
-//! # Current state
-//!
-//! This module implements the transport layer (AF_HYPERV socket open + connect + I/O).
-//! The RDP protocol decode layer (to extract bitmap updates) is a TODO — it requires
-//! either `ironrdp` (pure Rust) or FreeRDP (C library via FFI).
-//!
-//! In the meantime, `RdpProxy` raw-forwards the VMBus byte stream over the EVRT
-//! channel to the GUI client, which is expected to decode it.
+//! So the transport is ordinary TCP+TLS (same as VRDE), the only Hyper-V-
+//! specific step is the preconnection blob. Everything after that reuses the
+//! shared `ironrdp` helpers from `vbox_rdp`.
 
 #![cfg(windows)]
 
 use std::{
-    io,
-    mem,
+    fs::{File, OpenOptions},
+    fmt,
+    io::{Read, Write},
+    net::{SocketAddr, TcpStream},
+    path::PathBuf,
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-// ── AF_HYPERV constants (from Windows SDK hvsocket.h) ─────────────────────────
+use native_tls::TlsConnector;
 
-/// Address family for Hyper-V sockets (not in the `windows` crate enum).
-pub const AF_HYPERV: u16 = 34;
-
-/// Protocol identifier for raw Hyper-V sockets.
-pub const HV_PROTOCOL_RAW: i32 = 1;
-
-/// Enhanced Session Mode RDP service GUID.
-/// Derived from the VSock port template: port 2179 (0x0883) → Data1.
-/// {00000883-FACB-11E6-BD58-64006A7986D3}
-pub const ENHANCED_SESSION_SERVICE_ID: GuidBytes = guid_bytes(
-    0x0000_0883,
-    0xFACB,
-    0x11E6,
-    [0xBD, 0x58, 0x64, 0x00, 0x6A, 0x79, 0x86, 0xD3],
-);
-
-/// GUID as a 16-byte array (Windows mixed-endian layout):
-/// Data1 LE (4) + Data2 LE (2) + Data3 LE (2) + Data4 BE (8)
-pub type GuidBytes = [u8; 16];
-
-/// Build a GuidBytes array from GUID component form at compile time.
-const fn guid_bytes(d1: u32, d2: u16, d3: u16, d4: [u8; 8]) -> GuidBytes {
-    [
-        (d1 & 0xFF) as u8,
-        ((d1 >> 8) & 0xFF) as u8,
-        ((d1 >> 16) & 0xFF) as u8,
-        ((d1 >> 24) & 0xFF) as u8,
-        (d2 & 0xFF) as u8,
-        ((d2 >> 8) & 0xFF) as u8,
-        (d3 & 0xFF) as u8,
-        ((d3 >> 8) & 0xFF) as u8,
-        d4[0], d4[1], d4[2], d4[3], d4[4], d4[5], d4[6], d4[7],
-    ]
-}
-
-/// Parse a VM GUID string (with or without braces) into GuidBytes.
-/// Format: `{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}` or without braces.
-pub fn parse_vm_guid(s: &str) -> Result<GuidBytes, String> {
-    let s = s.trim().trim_matches(|c| c == '{' || c == '}');
-    let parts: Vec<&str> = s.splitn(5, '-').collect();
-    if parts.len() != 5 {
-        return Err(format!("invalid GUID format: {s}"));
-    }
-    let d1 = u32::from_str_radix(parts[0], 16).map_err(|e| format!("d1: {e}"))?;
-    let d2 = u16::from_str_radix(parts[1], 16).map_err(|e| format!("d2: {e}"))?;
-    let d3 = u16::from_str_radix(parts[2], 16).map_err(|e| format!("d3: {e}"))?;
-    let tail = parts[3].to_owned() + parts[4];
-    if tail.len() != 16 {
-        return Err(format!("GUID d4 length wrong: {}", tail.len()));
-    }
-    let mut d4 = [0u8; 8];
-    for (i, d4_byte) in d4.iter_mut().enumerate() {
-        *d4_byte = u8::from_str_radix(&tail[i * 2..i * 2 + 2], 16)
-            .map_err(|e| format!("d4[{i}]: {e}"))?;
-    }
-    Ok(guid_bytes(d1, d2, d3, d4))
-}
-
-// ── SOCKADDR_HV raw layout ────────────────────────────────────────────────────
-
-/// Raw bytes of SOCKADDR_HV (36 bytes total):
-///   offset  0: sa_family  (u16 LE) = AF_HYPERV = 34
-///   offset  2: reserved   (u16)    = 0
-///   offset  4: VmId       (16 bytes GUID)
-///   offset 20: ServiceId  (16 bytes GUID)
-#[repr(C)]
-struct SockAddrHv {
-    family:     u16,
-    reserved:   u16,
-    vm_id:      GuidBytes,
-    service_id: GuidBytes,
-}
-
-impl SockAddrHv {
-    fn new(vm_id: GuidBytes, service_id: GuidBytes) -> Self {
-        SockAddrHv {
-            family: AF_HYPERV,
-            reserved: 0,
-            vm_id,
-            service_id,
-        }
-    }
-
-    fn as_bytes(&self) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(
-                self as *const _ as *const u8,
-                mem::size_of::<SockAddrHv>(),
-            )
-        }
-    }
-}
-
-// ── Raw WinSock API via windows crate ─────────────────────────────────────────
-
-use windows::Win32::Networking::WinSock::{
-    WSAGetLastError, WSAStartup,
-    INVALID_SOCKET, SOCKET_ERROR, SOCK_STREAM, WSADATA,
-    SEND_RECV_FLAGS,
-    closesocket, connect, recv, send,
+use ironrdp_blocking::{Framed, connect_begin, mark_as_upgraded, single_sequence_step};
+use ironrdp_connector::{
+    BitmapConfig, ClientConnector, ClientConnectorState, Config, ConnectionResult, Credentials,
+    DesktopSize,
 };
-// Re-export the raw SOCKET type.
-use windows::Win32::Networking::WinSock::SOCKET as RawSocket;
+use ironrdp_core::WriteBuf;
+use ironrdp_pdu::{
+    gcc::KeyboardType,
+    input::{
+        fast_path::{FastPathInputEvent, KeyboardFlags as FastKeyboardFlags},
+        mouse::{MousePdu, PointerFlags},
+    },
+    pcb::{PcbVersion, PreconnectionBlob},
+    rdp::capability_sets::MajorPlatformType,
+};
+use ironrdp_session::{ActiveStage, ActiveStageOutput, image::DecodedImage};
+use ironrdp_graphics::{image_processing::PixelFormat, pointer::DecodedPointer};
 
-fn wsa_init() -> io::Result<()> {
-    unsafe {
-        let mut data = mem::zeroed::<WSADATA>();
-        let result = WSAStartup(0x0202, &mut data);
-        if result != 0 {
-            return Err(io::Error::from_raw_os_error(result));
-        }
-    }
-    Ok(())
+// Reuse the generic, transport-agnostic RDP plumbing from the VirtualBox path.
+use crate::vbox_rdp::{
+    Poll, VrdeCmd, char_to_rdp_scancode, composite_cursor, is_ignorable_pdu_error,
+    is_transient_read_error, sanitize_desktop_size, send_fastpath_input,
+};
+
+/// Hyper-V VM-connection broker port on the host.
+const HYPERV_VMCONNECT_PORT: u16 = 2179;
+
+// ── Settings / handle ──────────────────────────────────────────────────────────
+
+/// Guest credentials for Enhanced Session. Empty = try a graphical-login
+/// connection first; the connect log reveals whether the broker/guest demands
+/// NLA/CredSSP.
+#[derive(Clone, Debug, Default)]
+pub struct RdpCredentials {
+    pub username: String,
+    pub password: String,
+    pub domain: String,
 }
 
-/// Open a raw AF_HYPERV SOCK_STREAM socket.
-fn open_hv_socket() -> io::Result<RawSocket> {
-    use windows::Win32::Networking::WinSock::socket;
-    let sock = unsafe {
-        socket(
-            AF_HYPERV as i32,
-            SOCK_STREAM,
-            HV_PROTOCOL_RAW,
-        )
-    };
-    if sock == INVALID_SOCKET {
-        let err = unsafe { WSAGetLastError() };
-        return Err(io::Error::from_raw_os_error(err.0));
-    }
-    Ok(sock)
-}
-
-/// Connect to a VM's Enhanced Session RDP endpoint.
-fn connect_hv(sock: RawSocket, addr: &SockAddrHv) -> io::Result<()> {
-    use windows::Win32::Networking::WinSock::SOCKADDR;
-    let bytes = addr.as_bytes();
-    let result = unsafe {
-        connect(
-            sock,
-            bytes.as_ptr() as *const SOCKADDR,
-            bytes.len() as i32,
-        )
-    };
-    if result == SOCKET_ERROR {
-        let err = unsafe { WSAGetLastError() };
-        return Err(io::Error::from_raw_os_error(err.0));
-    }
-    Ok(())
-}
-
-// ── Public session API ────────────────────────────────────────────────────────
-
-/// Commands sent from the GUI to the RDP proxy session.
-pub enum RdpCmd {
-    /// Raw bytes to send into the RDP stream (keyboard/mouse encoded by client).
-    Write(Vec<u8>),
-    /// Close the session.
-    Stop,
-}
-
-/// RDP proxy session handle.
-/// Raw-forwards the VMBus RDP byte stream in both directions.
 pub struct RdpSession {
-    /// Send raw bytes into the RDP stream (from client's RDP encoder).
-    pub write_tx: mpsc::SyncSender<RdpCmd>,
-    /// Receive raw bytes from the RDP stream (bitmap updates for client to decode).
-    pub read_rx: mpsc::Receiver<Vec<u8>>,
-    /// Human-readable status updates from the session thread.
-    pub status_rx: mpsc::Receiver<String>,
+    cmd_tx: mpsc::Sender<VrdeCmd>,
+    frame_rx: mpsc::Receiver<(u32, u32, Vec<u8>)>,
+    status_rx: mpsc::Receiver<String>,
 }
 
 impl RdpSession {
-    /// Open an Enhanced Session connection to the given VM.
-    /// `vm_guid` — the VM's identifier (Msvm_ComputerSystem.Name), e.g. `"abcdef01-..."`
-    pub fn connect(vm_guid: &str) -> Result<Self, String> {
-        let vm_id = parse_vm_guid(vm_guid)?;
+    /// Open an Enhanced Session connection to `vm_guid` (Msvm_ComputerSystem.Name).
+    pub fn connect(vm_guid: &str, creds: RdpCredentials, desktop_size: (u16, u16)) -> Result<Self, String> {
+        // Normalize to a bare lowercase GUID (no braces) for the preconnection
+        // blob — that's the form vmconnect/FreeRDP send.
+        let vm_guid = vm_guid.trim().trim_matches(|c| c == '{' || c == '}').to_lowercase();
+        if vm_guid.split('-').count() != 5 {
+            return Err(format!("invalid VM GUID: {vm_guid}"));
+        }
 
-        let (write_tx, write_rx) = mpsc::sync_channel::<RdpCmd>(64);
-        let (read_tx, read_rx) = mpsc::sync_channel::<Vec<u8>>(32);
-        let (status_tx, status_rx) = mpsc::sync_channel::<String>(16);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<VrdeCmd>();
+        let (frame_tx, frame_rx) = mpsc::sync_channel::<(u32, u32, Vec<u8>)>(2);
+        let (status_tx, status_rx) = mpsc::sync_channel::<String>(128);
 
-        let vm_guid_str = vm_guid.to_owned();
+        let short = vm_guid.chars().take(8).collect::<String>();
         thread::Builder::new()
-            .name(format!("hyperv-rdp-{}", &vm_guid_str[..8]))
+            .name(format!("hyperv-rdp-{short}"))
             .spawn(move || {
-                rdp_session_thread(vm_id, write_rx, read_tx, status_tx);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    hv_rdp_thread(vm_guid, creds, desktop_size, cmd_rx, frame_tx, status_tx);
+                }));
+                if let Err(payload) = result {
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_owned())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "non-string panic payload".to_owned());
+                    hv_log_line(&format!("HV-RDP: !!! session thread PANICKED: {msg}"));
+                }
             })
-            .map_err(|e| format!("spawn RDP thread: {e}"))?;
+            .map_err(|e| format!("spawn HV-RDP thread: {e}"))?;
 
-        Ok(RdpSession {
-            write_tx,
-            read_rx,
-            status_rx,
-        })
+        Ok(RdpSession { cmd_tx, frame_rx, status_rx })
     }
 
-    pub fn write(&self, data: Vec<u8>) {
-        let _ = self.write_tx.try_send(RdpCmd::Write(data));
+    pub fn send(&self, cmd: VrdeCmd) {
+        let _ = self.cmd_tx.send(cmd);
     }
-
     pub fn stop(self) {
-        let _ = self.write_tx.try_send(RdpCmd::Stop);
+        let _ = self.cmd_tx.send(VrdeCmd::Stop);
     }
-
-    pub fn try_recv_data(&self) -> Option<Vec<u8>> {
-        self.read_rx.try_recv().ok()
+    pub fn poll_frame(&self) -> Poll<(u32, u32, Vec<u8>)> {
+        Poll::from(self.frame_rx.try_recv())
     }
-
-    pub fn try_recv_status(&self) -> Option<String> {
-        self.status_rx.try_recv().ok()
+    pub fn poll_status(&self) -> Poll<String> {
+        Poll::from(self.status_rx.try_recv())
     }
 }
 
-// ── Session thread ────────────────────────────────────────────────────────────
+// ── Logging (separate file from the VRDE log) ───────────────────────────────────
 
-fn rdp_session_thread(
-    vm_id: GuidBytes,
-    write_rx: mpsc::Receiver<RdpCmd>,
-    read_tx: mpsc::SyncSender<Vec<u8>>,
+fn hv_log_path() -> Option<PathBuf> {
+    Some(std::env::temp_dir().join("evertydesk-hvrdp.log"))
+}
+
+fn open_hv_log() -> Option<File> {
+    OpenOptions::new().create(true).append(true).open(hv_log_path()?).ok()
+}
+
+fn hv_log(file: &mut Option<File>, args: fmt::Arguments<'_>) {
+    if let Some(f) = file.as_mut() {
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or_default();
+        let _ = writeln!(f, "[{ts}] {args}");
+        let _ = f.flush();
+    }
+}
+
+fn hv_log_line(msg: &str) {
+    let mut f = open_hv_log();
+    hv_log(&mut f, format_args!("{msg}"));
+}
+
+// ── Session thread ──────────────────────────────────────────────────────────────
+
+fn hv_rdp_thread(
+    vm_guid: String,
+    creds: RdpCredentials,
+    desktop_size: (u16, u16),
+    cmd_rx: mpsc::Receiver<VrdeCmd>,
+    frame_tx: mpsc::SyncSender<(u32, u32, Vec<u8>)>,
     status_tx: mpsc::SyncSender<String>,
 ) {
+    let mut log_file = open_hv_log();
+    hv_log(&mut log_file, format_args!("--- HV-RDP session start vm={vm_guid} ---"));
+
     macro_rules! status {
-        ($($arg:tt)*) => {
-            let _ = status_tx.try_send(format!($($arg)*));
-        };
+        ($($t:tt)*) => {{
+            let msg = format!($($t)*);
+            hv_log(&mut log_file, format_args!("{}", msg));
+            let _ = status_tx.try_send(msg);
+        }};
+    }
+    macro_rules! diag {
+        ($($t:tt)*) => {{ hv_log(&mut log_file, format_args!($($t)*)); }};
     }
 
-    if let Err(e) = wsa_init() {
-        status!("WSAStartup: {e}");
-        return;
-    }
-
-    let sock = match open_hv_socket() {
+    // ── TCP to the host VM-connection broker ─────────────────────────────────
+    let addr: SocketAddr = format!("127.0.0.1:{HYPERV_VMCONNECT_PORT}").parse().unwrap();
+    status!("HV-RDP: подключение к брокеру 127.0.0.1:{HYPERV_VMCONNECT_PORT}…");
+    let mut tcp = match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
         Ok(s) => s,
         Err(e) => {
-            status!("AF_HYPERV socket: {e}");
+            status!("HV-RDP: TCP {HYPERV_VMCONNECT_PORT}: {e} (Hyper-V роль не установлена?)");
+            return;
+        }
+    };
+    let _ = tcp.set_nodelay(true);
+
+    // ── Preconnection Blob V2: tells the broker which VM to route to ─────────
+    let pcb = PreconnectionBlob {
+        version: PcbVersion::V2,
+        id: 0,
+        v2_payload: Some(vm_guid.clone()),
+    };
+    let pcb_bytes = match ironrdp_core::encode_vec(&pcb) {
+        Ok(b) => b,
+        Err(e) => {
+            status!("HV-RDP: encode preconnection blob: {e}");
+            return;
+        }
+    };
+    if let Err(e) = tcp.write_all(&pcb_bytes) {
+        status!("HV-RDP: send preconnection blob: {e}");
+        return;
+    }
+    diag!("HV-RDP: preconnection blob отправлен ({} байт, VmId={vm_guid})", pcb_bytes.len());
+
+    let (desktop_width, desktop_height) = sanitize_desktop_size(desktop_size.0, desktop_size.1);
+
+    let config = Config {
+        desktop_size: DesktopSize { width: desktop_width, height: desktop_height },
+        desktop_scale_factor: 0,
+        enable_tls: true,
+        // Start without CredSSP/NLA; the X.224 negotiation log shows whether the
+        // guest insists on HYBRID, at which point we add it.
+        enable_credssp: false,
+        credentials: Credentials::UsernamePassword {
+            username: creds.username.clone(),
+            password: creds.password.clone(),
+        },
+        domain: if creds.domain.is_empty() { None } else { Some(creds.domain.clone()) },
+        client_build: 0x0A28_0000,
+        client_name: "EvertyDesk".to_owned(),
+        keyboard_type: KeyboardType::IbmEnhanced,
+        keyboard_subtype: 0,
+        keyboard_functional_keys_count: 12,
+        keyboard_layout: 0x0409,
+        ime_file_name: String::new(),
+        bitmap: Some(BitmapConfig {
+            lossy_compression: false,
+            color_depth: 32,
+            codecs: Default::default(),
+        }),
+        dig_product_id: String::new(),
+        client_dir: String::new(),
+        alternate_shell: String::new(),
+        work_dir: String::new(),
+        platform: MajorPlatformType::WINDOWS,
+        hardware_id: None,
+        request_data: None,
+        autologon: !creds.username.is_empty(),
+        enable_audio_playback: false,
+        performance_flags: Default::default(),
+        license_cache: None,
+        timezone_info: Default::default(),
+        compression_type: None,
+        enable_server_pointer: true,
+        pointer_software_rendering: false,
+        multitransport_flags: None,
+    };
+
+    let client_addr: SocketAddr = tcp.local_addr().unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap());
+    let mut connector = ClientConnector::new(config, client_addr);
+    let mut framed = Framed::new(tcp);
+
+    // ── X.224 negotiation ────────────────────────────────────────────────────
+    status!("HV-RDP: X.224 переговоры…");
+    let should_upgrade = match connect_begin(&mut framed, &mut connector) {
+        Ok(u) => u,
+        Err(e) => {
+            use std::error::Error as StdError;
+            let mut chain = format!("{e}");
+            let mut src: Option<&dyn StdError> = e.source();
+            while let Some(next) = src {
+                chain.push_str(&format!(" <- {next}"));
+                src = next.source();
+            }
+            status!("HV-RDP: ошибка X.224: {chain}");
             return;
         }
     };
 
-    let addr = SockAddrHv::new(vm_id, ENHANCED_SESSION_SERVICE_ID);
-    status!("Подключение к Enhanced Session RDP (VMBus)…");
-    if let Err(e) = connect_hv(sock, &addr) {
-        status!("VMBus connect: {e}");
-        unsafe { closesocket(sock) };
-        return;
-    }
-    status!("Enhanced Session: соединение установлено");
+    let needs_tls = connector.should_perform_security_upgrade();
+    diag!("HV-RDP: should_perform_security_upgrade={needs_tls}");
 
-    // Set non-blocking mode so we can poll write_rx and recv interleaved.
-    // Uses ioctlsocket(FIONBIO, 1).
-    use windows::Win32::Networking::WinSock::ioctlsocket;
-    let mut nonblock: u32 = 1;
-    unsafe {
-        ioctlsocket(sock, 0x8004667E_u32 as i32 /* FIONBIO */, &mut nonblock);
-    }
-
-    const READ_BUF: usize = 65536;
-    let mut read_buf = vec![0u8; READ_BUF];
-    let running = true;
-
-    while running {
-        // Drain write commands
-        loop {
-            match write_rx.try_recv() {
-                Ok(RdpCmd::Stop) => {
-                    status!("RDP сессия закрыта");
-                    unsafe { closesocket(sock) };
-                    return;
-                }
-                Ok(RdpCmd::Write(data)) => {
-                    let mut sent = 0;
-                    while sent < data.len() {
-                        let result = unsafe {
-                            send(sock, &data[sent..], SEND_RECV_FLAGS(0))
-                        };
-                        if result == SOCKET_ERROR {
-                            let err = unsafe { WSAGetLastError() };
-                            // WSAEWOULDBLOCK (10035) — socket not ready, retry
-                            if err.0 == 10035 {
-                                thread::sleep(Duration::from_millis(1));
-                                continue;
-                            }
-                            status!("RDP send error: {}", err.0);
-                            unsafe { closesocket(sock) };
-                            return;
-                        }
-                        sent += result as usize;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-
-        // Read available data from VMBus RDP stream
-        let n = unsafe {
-            recv(sock, &mut read_buf, SEND_RECV_FLAGS(0))
-        };
-        if n > 0 {
-            let _ = read_tx.try_send(read_buf[..n as usize].to_vec());
-        } else if n == SOCKET_ERROR {
-            let err = unsafe { WSAGetLastError() };
-            if err.0 != 10035 {
-                // Fatal error (not WSAEWOULDBLOCK)
-                status!("RDP recv error: {}", err.0);
-                unsafe { closesocket(sock) };
+    let (raw, _leftover) = framed.into_inner();
+    if needs_tls {
+        status!("HV-RDP: TLS рукопожатие…");
+        let tls_connector = match TlsConnector::builder()
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true)
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                status!("HV-RDP: TLS build: {e}");
                 return;
             }
-        } else if n == 0 {
-            // Connection closed by peer (VM shut down / IS stopped)
-            status!("VMBus: соединение закрыто гостем");
-            unsafe { closesocket(sock) };
-            return;
+        };
+        let tls_stream = match tls_connector.connect("hyperv-vm", raw) {
+            Ok(s) => s,
+            Err(e) => {
+                status!("HV-RDP: TLS ошибка: {e}");
+                return;
+            }
+        };
+        let mut tls_framed = Framed::new(tls_stream);
+        let upgraded = mark_as_upgraded(should_upgrade, &mut connector);
+        match hv_connect_finalize(upgraded, connector, &mut tls_framed) {
+            Ok(r) => run_active_session(r, tls_framed, cmd_rx, frame_tx, status_tx, log_file),
+            Err(e) => {
+                let mut f = log_file;
+                hv_log(&mut f, format_args!("HV-RDP: финализация (TLS): {e}"));
+                let _ = status_tx.try_send(format!("HV-RDP: финализация: {e}"));
+            }
         }
-
-        thread::sleep(Duration::from_millis(1));
+    } else {
+        let mut plain_framed = Framed::new(raw);
+        let upgraded = mark_as_upgraded(should_upgrade, &mut connector);
+        match hv_connect_finalize(upgraded, connector, &mut plain_framed) {
+            Ok(r) => run_active_session(r, plain_framed, cmd_rx, frame_tx, status_tx, log_file),
+            Err(e) => {
+                let mut f = log_file;
+                hv_log(&mut f, format_args!("HV-RDP: финализация (plain): {e}"));
+                let _ = status_tx.try_send(format!("HV-RDP: финализация: {e}"));
+            }
+        }
     }
-
-    unsafe { closesocket(sock) };
 }
 
-// ── Availability check ────────────────────────────────────────────────────────
-
-/// Quick probe: can we open an AF_HYPERV socket at all?
-/// Returns false if Hyper-V is not the running hypervisor or the OS is too old.
-pub fn is_hv_socket_available() -> bool {
-    if wsa_init().is_err() {
-        return false;
-    }
-    match open_hv_socket() {
-        Ok(sock) => {
-            unsafe { closesocket(sock) };
-            true
+/// Standard finalize loop (no VirtualBox empty-FontMap tolerance — a Windows
+/// guest's RDP server is spec-compliant). Returns the full error chain so the
+/// first real connect is debuggable from the log.
+fn hv_connect_finalize<S: Read + Write>(
+    _: ironrdp_blocking::Upgraded,
+    mut connector: ClientConnector,
+    framed: &mut Framed<S>,
+) -> Result<ConnectionResult, String> {
+    use std::error::Error as StdError;
+    let mut buf = WriteBuf::new();
+    loop {
+        if let Err(e) = single_sequence_step(framed, &mut connector, &mut buf) {
+            let mut chain = format!("{e}");
+            let mut src: Option<&dyn StdError> = e.source();
+            while let Some(next) = src {
+                chain.push_str(&format!(" <- {next}"));
+                src = next.source();
+            }
+            return Err(chain);
         }
-        Err(_) => false,
+        if let ClientConnectorState::Connected { result } = connector.state {
+            return Ok(result);
+        }
     }
+}
+
+fn run_active_session<S: Read + Write>(
+    connection_result: ConnectionResult,
+    mut framed: Framed<S>,
+    cmd_rx: mpsc::Receiver<VrdeCmd>,
+    frame_tx: mpsc::SyncSender<(u32, u32, Vec<u8>)>,
+    status_tx: mpsc::SyncSender<String>,
+    mut log_file: Option<File>,
+) {
+    macro_rules! status {
+        ($($t:tt)*) => {{
+            let msg = format!($($t)*);
+            hv_log(&mut log_file, format_args!("{}", msg));
+            let _ = status_tx.try_send(msg);
+        }};
+    }
+    macro_rules! diag {
+        ($($t:tt)*) => {{ hv_log(&mut log_file, format_args!($($t)*)); }};
+    }
+
+    let width = connection_result.desktop_size.width;
+    let height = connection_result.desktop_size.height;
+    status!("HV-RDP: подключено {}×{}", width, height);
+
+    let mut active = ActiveStage::new(connection_result);
+    let mut image = DecodedImage::new(PixelFormat::RgbA32, width, height);
+
+    let mut cur_x: u16 = 0;
+    let mut cur_y: u16 = 0;
+    let mut cursor_shape: Option<std::sync::Arc<DecodedPointer>> = None;
+    let mut had_update = false;
+
+    loop {
+        loop {
+            match cmd_rx.try_recv() {
+                Ok(VrdeCmd::Stop) => {
+                    status!("HV-RDP: сессия закрыта");
+                    return;
+                }
+                Ok(VrdeCmd::MouseMove { x, y }) => {
+                    cur_x = x;
+                    cur_y = y;
+                    match send_fastpath_input(
+                        &mut active,
+                        &mut image,
+                        &mut framed,
+                        &[FastPathInputEvent::MouseEvent(MousePdu {
+                            flags: PointerFlags::MOVE,
+                            number_of_wheel_rotation_units: 0,
+                            x_position: x,
+                            y_position: y,
+                        })],
+                    ) {
+                        Ok(update) => had_update |= update,
+                        Err(e) => diag!("HV-RDP input mouse move error: {e}"),
+                    }
+                    if cursor_shape.is_some() { had_update = true; }
+                }
+                Ok(VrdeCmd::MouseButton { button, down }) => {
+                    let btn = match button {
+                        0 => PointerFlags::LEFT_BUTTON,
+                        1 => PointerFlags::RIGHT_BUTTON,
+                        _ => PointerFlags::MIDDLE_BUTTON_OR_WHEEL,
+                    };
+                    let flags = if down { btn | PointerFlags::DOWN } else { btn };
+                    match send_fastpath_input(
+                        &mut active,
+                        &mut image,
+                        &mut framed,
+                        &[FastPathInputEvent::MouseEvent(MousePdu {
+                            flags,
+                            number_of_wheel_rotation_units: 0,
+                            x_position: cur_x,
+                            y_position: cur_y,
+                        })],
+                    ) {
+                        Ok(update) => had_update |= update,
+                        Err(e) => diag!("HV-RDP input mouse button error: {e}"),
+                    }
+                }
+                Ok(VrdeCmd::MouseWheel { delta }) => {
+                    match send_fastpath_input(
+                        &mut active,
+                        &mut image,
+                        &mut framed,
+                        &[FastPathInputEvent::MouseEvent(MousePdu {
+                            flags: PointerFlags::VERTICAL_WHEEL,
+                            number_of_wheel_rotation_units: delta,
+                            x_position: cur_x,
+                            y_position: cur_y,
+                        })],
+                    ) {
+                        Ok(update) => had_update |= update,
+                        Err(e) => diag!("HV-RDP input wheel error: {e}"),
+                    }
+                }
+                Ok(VrdeCmd::KeyDown { scancode, extended }) => {
+                    match send_fastpath_input(
+                        &mut active,
+                        &mut image,
+                        &mut framed,
+                        &[fast_key_event(scancode, extended, false)],
+                    ) {
+                        Ok(update) => had_update |= update,
+                        Err(e) => diag!("HV-RDP input key down error: {e}"),
+                    }
+                }
+                Ok(VrdeCmd::KeyUp { scancode, extended }) => {
+                    match send_fastpath_input(
+                        &mut active,
+                        &mut image,
+                        &mut framed,
+                        &[fast_key_event(scancode, extended, true)],
+                    ) {
+                        Ok(update) => had_update |= update,
+                        Err(e) => diag!("HV-RDP input key up error: {e}"),
+                    }
+                }
+                Ok(VrdeCmd::Text(text)) => {
+                    for ch in text.chars() {
+                        if let Some((scancode, shift, extended)) = char_to_rdp_scancode(ch) {
+                            let mut events = Vec::with_capacity(4);
+                            if shift {
+                                events.push(fast_key_event(0x2A, false, false));
+                            }
+                            events.push(fast_key_event(scancode, extended, false));
+                            events.push(fast_key_event(scancode, extended, true));
+                            if shift {
+                                events.push(fast_key_event(0x2A, false, true));
+                            }
+                            match send_fastpath_input(&mut active, &mut image, &mut framed, &events) {
+                                Ok(update) => had_update |= update,
+                                Err(e) => diag!("HV-RDP input text scancode error: {e}"),
+                            }
+                        } else {
+                            let mut units = [0u16; 2];
+                            for unit in ch.encode_utf16(&mut units).iter().copied() {
+                                match send_fastpath_input(
+                                    &mut active,
+                                    &mut image,
+                                    &mut framed,
+                                    &[
+                                        fast_unicode_event(unit, false),
+                                        fast_unicode_event(unit, true),
+                                    ],
+                                ) {
+                                    Ok(update) => had_update |= update,
+                                    Err(e) => diag!("HV-RDP input unicode error: {e}"),
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(VrdeCmd::Resize { .. }) => {}
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return,
+            }
+        }
+
+        let (action, frame) = match framed.read_pdu() {
+            Ok(f) => f,
+            Err(ref e) if is_transient_read_error(e) => {
+                if had_update {
+                    let _ = send_frame(&image, &cursor_shape, cur_x, cur_y, &frame_tx);
+                    had_update = false;
+                }
+                continue;
+            }
+            Err(e) => {
+                status!("HV-RDP: ошибка чтения: {e}");
+                return;
+            }
+        };
+
+        let outputs = match active.process(&mut image, action, &frame) {
+            Ok(o) => o,
+            Err(e) => {
+                if is_ignorable_pdu_error(&e) {
+                    continue;
+                }
+                diag!("HV-RDP PDU error: {e}");
+                continue;
+            }
+        };
+
+        for output in outputs {
+            match output {
+                ActiveStageOutput::ResponseFrame(bytes) => {
+                    let _ = framed.write_all(&bytes);
+                }
+                ActiveStageOutput::GraphicsUpdate(_) => had_update = true,
+                ActiveStageOutput::PointerBitmap(p) => {
+                    cursor_shape = Some(p);
+                    had_update = true;
+                }
+                ActiveStageOutput::PointerHidden | ActiveStageOutput::PointerDefault => {
+                    cursor_shape = None;
+                    had_update = true;
+                }
+                ActiveStageOutput::PointerPosition { .. } => had_update = true,
+                ActiveStageOutput::Terminate(reason) => {
+                    status!("HV-RDP: отключение: {reason}");
+                    return;
+                }
+                ActiveStageOutput::DeactivateAll(_) => {
+                    diag!("HV-RDP: DeactivateAll (reactivation not yet driven)");
+                }
+                _ => {}
+            }
+        }
+
+        if had_update {
+            let _ = send_frame(&image, &cursor_shape, cur_x, cur_y, &frame_tx);
+            had_update = false;
+        }
+    }
+}
+
+fn fast_key_event(scancode: u8, extended: bool, release: bool) -> FastPathInputEvent {
+    let mut flags = if release {
+        FastKeyboardFlags::RELEASE
+    } else {
+        FastKeyboardFlags::empty()
+    };
+    if extended {
+        flags |= FastKeyboardFlags::EXTENDED;
+    }
+    FastPathInputEvent::KeyboardEvent(flags, scancode)
+}
+
+fn fast_unicode_event(unit: u16, release: bool) -> FastPathInputEvent {
+    let flags = if release {
+        FastKeyboardFlags::RELEASE
+    } else {
+        FastKeyboardFlags::empty()
+    };
+    FastPathInputEvent::UnicodeKeyboardEvent(flags, unit)
+}
+
+fn send_frame(
+    image: &DecodedImage,
+    cursor_shape: &Option<std::sync::Arc<DecodedPointer>>,
+    mouse_x: u16,
+    mouse_y: u16,
+    frame_tx: &mpsc::SyncSender<(u32, u32, Vec<u8>)>,
+) -> bool {
+    let w = image.width() as usize;
+    let h = image.height() as usize;
+    let mut rgba = image.data().to_vec();
+    for px in rgba.chunks_exact_mut(4) {
+        px[3] = 255;
+    }
+    if let Some(c) = cursor_shape {
+        composite_cursor(&mut rgba, w, h, c, mouse_x, mouse_y);
+    }
+    frame_tx.try_send((w as u32, h as u32, rgba)).is_ok()
 }

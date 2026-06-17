@@ -43,6 +43,7 @@ mod ui;
 mod video;
 mod video_pipeline;
 mod videotoolbox;
+mod vbox_rdp;
 mod virtualbox;
 mod vm_bridge;
 mod vp9_mf;
@@ -730,6 +731,7 @@ fn run_gui(renderer: eframe::Renderer) -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             configure_ui_scale(&cc.egui_ctx);
+            configure_icon_fonts(&cc.egui_ctx);
             // Тема из конфига (тёмная по умолчанию).
             let theme_mode = settings::AppConfig::load_or_create().ui.theme_mode;
             theme::apply(&cc.egui_ctx, theme_mode);
@@ -1145,8 +1147,15 @@ struct EvertyDeskApp {
     /// Режим полного экрана консоли (скрывает сайдбар).
     #[cfg(windows)]
     vm_console_fullscreen: bool,
+    /// VM console receives pointer/keyboard only after an explicit click inside its canvas.
+    #[cfg(windows)]
+    vm_console_input_active: bool,
+    #[cfg(windows)]
+    vm_console_last_pointer_pos: Option<(u16, u16)>,
     #[cfg(windows)]
     hyperv_texture: Option<TextureHandle>,
+    #[cfg(windows)]
+    hyperv_guest_size: Option<(u32, u32)>,
     #[cfg(windows)]
     hyperv_status: String,
     /// Which VM is currently open in the console view (index into hyperv_vms)
@@ -1177,6 +1186,65 @@ struct EvertyDeskApp {
     /// Active Enhanced Session RDP-over-VMBus connection (for VMs with IS running).
     #[cfg(windows)]
     hyperv_rdp_session: Option<hyperv_rdp::RdpSession>,
+    /// Guest credentials for Hyper-V Enhanced Session (editable via the gear).
+    #[cfg(windows)]
+    hyperv_rdp_creds: hyperv_rdp::RdpCredentials,
+    /// VRDE-порты VirtualBox VM: uuid → активный порт. Populated when user enables VRDE.
+    #[cfg(windows)]
+    vbox_vrde_ports: std::collections::HashMap<String, u16>,
+    /// Embedded VRDE RDP session (VirtualBox 30fps in-app).
+    #[cfg(windows)]
+    vbox_vrde_session: Option<vbox_rdp::VrdeSession>,
+    #[cfg(windows)]
+    vbox_vrde_last_desktop_size: Option<(u16, u16)>,
+    /// Pending async VRDE enable request: (vm_uuid, port, enabled).
+    #[cfg(windows)]
+    vbox_vrde_enable_rx: Option<mpsc::Receiver<(String, u16, bool)>>,
+    /// Async pointing-device (PS/2 vs USB Tablet) advisory — populated separately
+    /// so the `showvminfo` probe never delays the actual VRDE connect (a blocking
+    /// pre-check here previously added enough latency that users re-clicked
+    /// "connect" before the first session settled, triggering VirtualBox's
+    /// one-client-at-a-time VRDE policy to kick the prior session repeatedly —
+    /// the perceived "black screen").
+    #[cfg(windows)]
+    vbox_mouse_warning_rx: Option<mpsc::Receiver<String>>,
+    /// Last surfaced mouse-device advisory for the active VirtualBox console.
+    #[cfg(windows)]
+    vbox_mouse_warning: Option<String>,
+    /// Port of the currently-live `vbox_vrde_session`, if any. Several UI buttons
+    /// can all trigger "(re)connect to this VM's VRDE" — without this guard each
+    /// click tore down a working session and opened a new one, and since
+    /// VirtualBox VRDE only accepts one client at a time, the brand-new
+    /// connection kicked the still-settling previous one off mid-handshake,
+    /// turning repeated clicks into a permanent black screen.
+    #[cfg(windows)]
+    vbox_vrde_active_port: Option<u16>,
+    /// User-adjustable connection settings (color depth, compression),
+    /// shown via the gear button on the VM console toolbar. Applied on the
+    /// *next* connect — changing them mid-session doesn't retroactively
+    /// alter an already-negotiated connection.
+    #[cfg(windows)]
+    vbox_vrde_settings: vbox_rdp::VrdeSettings,
+    /// Whether the settings popover is currently open.
+    #[cfg(windows)]
+    vbox_vrde_settings_open: bool,
+    /// Instant of the last frame actually applied to the texture. VirtualBox's
+    /// VRDE bulk-compression decoder occasionally desyncs mid-session (server
+    /// keeps the TCP connection open but stops sending anything new) — auto-
+    /// reconnect is the practical mitigation since this is a third-party
+    /// (ironrdp + VirtualBox VRDE) protocol-compatibility quirk, not something
+    /// fixable from the client side alone.
+    #[cfg(windows)]
+    vbox_vrde_last_frame: std::time::Instant,
+    /// Instant of the last input command actually sent into the VRDE session.
+    /// Used to distinguish "legitimately idle, nothing to update" (no frame
+    /// AND no input) from "stuck" (user is actively moving the mouse/typing
+    /// but no frame ever comes back) — only the latter should auto-reconnect.
+    #[cfg(windows)]
+    vbox_vrde_last_input: Option<std::time::Instant>,
+    /// Background scan of already-enabled VirtualBox VRDE ports.
+    #[cfg(windows)]
+    vbox_vrde_scan_rx: Option<mpsc::Receiver<std::collections::HashMap<String, u16>>>,
 
     // ── Remote agentless VM (через подключённый хост-гипервизор) ───────────────
     /// Список VM, полученный от удалённого хоста (киллер-фича).
@@ -1462,7 +1530,13 @@ impl EvertyDeskApp {
             #[cfg(windows)]
             vm_console_fullscreen: false,
             #[cfg(windows)]
+            vm_console_input_active: false,
+            #[cfg(windows)]
+            vm_console_last_pointer_pos: None,
+            #[cfg(windows)]
             hyperv_texture: None,
+            #[cfg(windows)]
+            hyperv_guest_size: None,
             #[cfg(windows)]
             hyperv_status: String::new(),
             #[cfg(windows)]
@@ -1485,6 +1559,32 @@ impl EvertyDeskApp {
             hyperv_last_refresh: None,
             #[cfg(windows)]
             hyperv_rdp_session: None,
+            #[cfg(windows)]
+            hyperv_rdp_creds: hyperv_rdp::RdpCredentials::default(),
+            #[cfg(windows)]
+            vbox_vrde_ports: std::collections::HashMap::new(),
+            #[cfg(windows)]
+            vbox_vrde_session: None,
+            #[cfg(windows)]
+            vbox_vrde_last_desktop_size: None,
+            #[cfg(windows)]
+            vbox_vrde_enable_rx: None,
+            #[cfg(windows)]
+            vbox_mouse_warning_rx: None,
+            #[cfg(windows)]
+            vbox_mouse_warning: None,
+            #[cfg(windows)]
+            vbox_vrde_active_port: None,
+            #[cfg(windows)]
+            vbox_vrde_settings: vbox_rdp::VrdeSettings::default(),
+            #[cfg(windows)]
+            vbox_vrde_settings_open: false,
+            #[cfg(windows)]
+            vbox_vrde_last_frame: std::time::Instant::now(),
+            #[cfg(windows)]
+            vbox_vrde_last_input: None,
+            #[cfg(windows)]
+            vbox_vrde_scan_rx: None,
             remote_vms: Vec::new(),
             remote_attached_vm: String::new(),
             remote_vm_status: String::new(),
@@ -3590,8 +3690,9 @@ impl EvertyDeskApp {
 
         // Use egui SidePanel so sidebar closure ends before we call self methods
         egui::SidePanel::left("vm_sidebar_panel")
-            .exact_width(SIDEBAR_W)
-            .resizable(false)
+            .default_width(SIDEBAR_W)
+            .width_range(220.0..=460.0)
+            .resizable(true)
             .show_inside(ui, |ui| {
                 ui.set_clip_rect(ui.max_rect());
 
@@ -3624,39 +3725,32 @@ impl EvertyDeskApp {
                             // Disconnect button
                             let any_sess = self.hyperv_session.is_some()
                                 || self.vbox_session.is_some()
+                                || self.vbox_vrde_session.is_some()
                                 || self.hyperv_rdp_session.is_some();
                             if any_sess
                                 && ui
-                                    .small_button("X")
+                                    .add(egui::Button::new(egui::RichText::new(egui_phosphor::regular::X).size(15.0)).min_size(egui::vec2(26.0, 24.0)))
                                     .on_hover_text("Отключиться от консоли VM")
                                     .clicked()
                             {
-                                if let Some(s) = self.hyperv_session.take() {
-                                    s.stop();
-                                }
-                                if let Some(s) = self.vbox_session.take() {
-                                    s.stop();
-                                }
-                                if let Some(s) = self.hyperv_rdp_session.take() {
-                                    s.stop();
-                                }
+                                self.stop_vm_console_sessions();
                                 self.hyperv_console_vm = None;
                                 self.hyperv_texture = None;
                                 self.hyperv_status.clear();
                                 self.hyperv_fps_display = 0.0;
                             }
                             // Refresh button
-                            let rl = if self.hyperv_loading { "..." } else { "R" };
                             if ui
                                 .add_enabled(
                                     !self.hyperv_loading,
-                                    egui::Button::new(rl).small(),
+                                    egui::Button::new(egui::RichText::new(egui_phosphor::regular::ARROWS_CLOCKWISE).size(15.0)).min_size(egui::vec2(26.0, 24.0)),
                                 )
                                 .on_hover_text("Обновить список VM")
                                 .clicked()
                             {
                                 self.hyperv_vms.clear();
                                 self.hyperv_load_rx = None;
+                                self.vbox_vrde_scan_rx = None;
                                 self.hyperv_loading = false;
                                 self.hyperv_checked = false;
                                 if self.hyperv_load_rx.is_none() {
@@ -3720,7 +3814,7 @@ impl EvertyDeskApp {
                 egui::ScrollArea::vertical()
                     .id_salt("vm_sidebar_list")
                     .show(ui, |ui| {
-                        ui.set_width(SIDEBAR_W - 8.0);
+                        ui.set_width((ui.available_width() - 8.0).max(200.0));
                         let search_lc = self.vm_search.to_lowercase();
 
                         let provider_groups = [
@@ -3791,7 +3885,7 @@ impl EvertyDeskApp {
                                     .corner_radius(egui::CornerRadius::same(6))
                                     .inner_margin(egui::Margin::symmetric(6, 4))
                                     .show(ui, |ui| {
-                                        ui.set_width(SIDEBAR_W - 20.0);
+                                        ui.set_width((ui.available_width() - 4.0).max(180.0));
 
                                         // Row 1: dot + name + preview/action buttons
                                         ui.horizontal(|ui| {
@@ -3825,42 +3919,40 @@ impl EvertyDeskApp {
                                                     let preview_lbl =
                                                         if is_active
                                                             && (self.hyperv_session.is_some()
-                                                                || self
-                                                                    .vbox_session
-                                                                    .is_some())
+                                                                || self.vbox_session.is_some()
+                                                                || self.vbox_vrde_session.is_some())
                                                         {
-                                                            "[ ]"
+                                                            egui_phosphor::regular::MONITOR
                                                         } else {
-                                                            "[>]"
+                                                            egui_phosphor::regular::MONITOR_PLAY
                                                         };
 
                                                     let pbtn = ui
                                                         .add_enabled(
-                                                            can_preview,
-                                                            egui::Button::new(preview_lbl)
-                                                                .small(),
+                                                            can_preview && vm_state.is_connectable(),
+                                                            egui::Button::new(egui::RichText::new(preview_lbl).size(15.0))
+                                                                .min_size(egui::vec2(26.0, 24.0)),
                                                         )
                                                         .on_hover_text(
                                                             "Предпросмотр экрана VM",
                                                         )
                                                         .on_disabled_hover_text(preview_tip);
 
-                                                    if pbtn.clicked() {
-                                                        if let Some(s) =
-                                                            self.hyperv_session.take()
-                                                        {
-                                                            s.stop();
-                                                        }
-                                                        if let Some(s) =
-                                                            self.vbox_session.take()
-                                                        {
-                                                            s.stop();
-                                                        }
-                                                        if let Some(s) =
-                                                            self.hyperv_rdp_session.take()
-                                                        {
-                                                            s.stop();
-                                                        }
+                                                    // Сессия для этой VM уже активна и жива — повторный клик
+                                                    // не должен пересоздавать соединение: каждое новое VRDE-
+                                                    // подключение выбивает предыдущее ("administrative tool"
+                                                    // disconnect на стороне VirtualBox), и при частых кликах
+                                                    // это превращалось в бесконечный цикл реконнектов с чёрным
+                                                    // экраном, потому что кадр не успевал прийти до следующего
+                                                    // обрыва.
+                                                    let vrde_already_connected = matches!(vm_provider, hyperv::VmProvider::VirtualBox)
+                                                        && is_active
+                                                        && self.vbox_vrde_session.is_some();
+                                                    let hyperv_already_connected = matches!(vm_provider, hyperv::VmProvider::HyperV)
+                                                        && is_active
+                                                        && self.hyperv_session.is_some();
+                                                    if pbtn.clicked() && !vrde_already_connected && !hyperv_already_connected {
+                                                        self.stop_vm_console_sessions();
                                                         self.hyperv_console_vm = Some(i);
                                                         self.hyperv_texture = None;
                                                         self.hyperv_status =
@@ -3877,13 +3969,23 @@ impl EvertyDeskApp {
                                                                 );
                                                             }
                                                             hyperv::VmProvider::VirtualBox => {
-                                                                self.vbox_session =
-                                                                    Some(virtualbox::VboxSession::start(
+                                                                // Prefer embedded VRDE/IronRDP for interactive VirtualBox console.
+                                                                if let Some(&port) = self.vbox_vrde_ports.get(&vm_id) {
+                                                                    self.start_vbox_vrde_session(port);
+                                                                } else {
+                                                                    let port = Self::vbox_vrde_port(&vm_id);
+                                                                    self.begin_vbox_vrde_connect(
                                                                         vm_id.clone(),
-                                                                    ));
+                                                                        port,
+                                                                        matches!(vm_state, hyperv::VmState::Running),
+                                                                    );
+                                                                }
                                                             }
                                                             _ => {}
                                                         }
+                                                    } else if pbtn.clicked() {
+                                                        // Уже подключены — просто переключаем фокус на консоль.
+                                                        self.hyperv_console_vm = Some(i);
                                                     }
 
                                                     // VMConnect (Hyper-V)
@@ -3893,7 +3995,7 @@ impl EvertyDeskApp {
                                                     ) && vm_state.is_connectable()
                                                     {
                                                         if ui
-                                                            .small_button("VMC")
+                                                            .add(egui::Button::new(egui::RichText::new(egui_phosphor::regular::DESKTOP).size(15.0)).min_size(egui::vec2(26.0, 24.0)))
                                                             .on_hover_text(
                                                                 "vmconnect.exe — полная клавиатура и буфер обмена",
                                                             )
@@ -3905,7 +4007,7 @@ impl EvertyDeskApp {
                                                         }
                                                     }
 
-                                                    // RDP (Enhanced Session)
+                                                    // RDP (Enhanced Session — Hyper-V)
                                                     if matches!(
                                                         vm_provider,
                                                         hyperv::VmProvider::HyperV
@@ -3916,33 +4018,19 @@ impl EvertyDeskApp {
                                                     {
                                                         let rdp_id = vm_id.clone();
                                                         if ui
-                                                            .small_button("RDP")
+                                                            .add(egui::Button::new(egui::RichText::new(egui_phosphor::regular::MONITOR_ARROW_UP).size(15.0)).min_size(egui::vec2(26.0, 24.0)))
                                                             .on_hover_text(
                                                                 "RDP over VMBus — 30-60 FPS (Integration Services активны)",
                                                             )
                                                             .clicked()
                                                         {
-                                                            if let Some(s) = self
-                                                                .hyperv_session
-                                                                .take()
-                                                            {
-                                                                s.stop();
-                                                            }
-                                                            if let Some(s) =
-                                                                self.vbox_session.take()
-                                                            {
-                                                                s.stop();
-                                                            }
-                                                            if let Some(s) = self
-                                                                .hyperv_rdp_session
-                                                                .take()
-                                                            {
-                                                                s.stop();
-                                                            }
+                                                            self.stop_vm_console_sessions();
                                                             self.hyperv_console_vm =
                                                                 Some(i);
                                                             self.hyperv_texture = None;
-                                                            match hyperv_rdp::RdpSession::connect(&rdp_id) {
+                                                            let creds = self.hyperv_rdp_creds.clone();
+                                                            let size = default_vrde_desktop_size();
+                                                            match hyperv_rdp::RdpSession::connect(&rdp_id, creds, size) {
                                                                 Ok(sess) => {
                                                                     self.hyperv_rdp_session = Some(sess);
                                                                     self.hyperv_status = "RDP: подключение...".to_owned();
@@ -3950,6 +4038,83 @@ impl EvertyDeskApp {
                                                                 Err(e) => {
                                                                     self.hyperv_status = format!("RDP: {e}");
                                                                 }
+                                                            }
+                                                        }
+                                                    }
+
+                                                    // VRDE + RDP (VirtualBox)
+                                                    if matches!(
+                                                        vm_provider,
+                                                        hyperv::VmProvider::VirtualBox
+                                                    ) && vm_state.is_connectable()
+                                                    {
+                                                        let vrde_port = self
+                                                            .vbox_vrde_ports
+                                                            .get(&vm_id)
+                                                            .copied();
+
+                                                        if let Some(port) = vrde_port {
+                                                            // Embedded IronRDP client
+                                                            if ui
+                                                                .add(egui::Button::new(egui::RichText::new(egui_phosphor::regular::MONITOR_PLAY).size(15.0)).min_size(egui::vec2(26.0, 24.0)))
+                                                                .on_hover_text(format!(
+                                                                    "IronRDP: встроенная консоль localhost:{port}"
+                                                                ))
+                                                                .clicked()
+                                                            {
+                                                                self.hyperv_console_vm = Some(i);
+                                                                self.vm_console_fullscreen = false;
+                                                                self.start_vbox_vrde_session(port);
+                                                            }
+                                                            // External RDP client fallback
+                                                            if ui
+                                                                .add(egui::Button::new(egui::RichText::new(egui_phosphor::regular::EXPORT).size(15.0)).min_size(egui::vec2(26.0, 24.0)))
+                                                                .on_hover_text(format!(
+                                                                    "mstsc: внешний RDP-клиент localhost:{port}"
+                                                                ))
+                                                                .clicked()
+                                                            {
+                                                                virtualbox::launch_rdp(port);
+                                                            }
+                                                            // Disable VRDE
+                                                            let uuid_off = vm_id.clone();
+                                                            let is_run = matches!(
+                                                                vm_state,
+                                                                hyperv::VmState::Running
+                                                            );
+                                                            if ui
+                                                                .add(egui::Button::new(egui::RichText::new(egui_phosphor::regular::PLUG).size(15.0)).min_size(egui::vec2(26.0, 24.0)))
+                                                                .on_hover_text(format!(
+                                                                    "VRDE включён (порт {port}). Нажмите для отключения"
+                                                                ))
+                                                                .clicked()
+                                                            {
+                                                                self.vbox_vrde_ports
+                                                                    .remove(&uuid_off);
+                                                                thread::spawn(move || {
+                                                                    virtualbox::disable_vrde(
+                                                                        &uuid_off, is_run,
+                                                                    );
+                                                                });
+                                                            }
+                                                        } else {
+                                                            // Enable VRDE
+                                                            let uuid_on = vm_id.clone();
+                                                            let is_run = matches!(
+                                                                vm_state,
+                                                                hyperv::VmState::Running
+                                                            );
+                                                            if ui
+                                                                .add(egui::Button::new(egui::RichText::new(egui_phosphor::regular::PLUGS_CONNECTED).size(15.0)).min_size(egui::vec2(26.0, 24.0)))
+                                                                .on_hover_text(
+                                                                    "Включить VRDE и сразу подключиться встроенным IronRDP.",
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                self.hyperv_console_vm = Some(i);
+                                                                self.vm_console_fullscreen = false;
+                                                                let port = Self::vbox_vrde_port(&uuid_on);
+                                                                self.begin_vbox_vrde_connect(uuid_on, port, is_run);
                                                             }
                                                         }
                                                     }
@@ -3984,11 +4149,61 @@ impl EvertyDeskApp {
                                                         });
                                                 }
                                             }
+                                            // VRDE badge (VirtualBox)
+                                            if matches!(vm_provider, hyperv::VmProvider::VirtualBox) {
+                                                if let Some(port) = self.vbox_vrde_ports.get(&vm_id) {
+                                                    egui::Frame::NONE
+                                                        .fill(egui::Color32::from_rgb(0x00, 0x6B, 0x3C))
+                                                        .corner_radius(egui::CornerRadius::same(3))
+                                                        .inner_margin(egui::Margin::symmetric(3, 1))
+                                                        .show(ui, |ui| {
+                                                            ui.label(egui::RichText::new(format!("VRDE:{port}")).size(9.0).color(egui::Color32::WHITE));
+                                                        });
+                                                }
+                                            }
                                             ui.with_layout(
                                                 egui::Layout::right_to_left(egui::Align::Center),
                                                 |ui| {
-                                                    // Hyper-V power controls
                                                     if matches!(vm_provider, hyperv::VmProvider::HyperV) {
+                                                        let wmi = vm_wmi_path.clone();
+                                                        match vm_state {
+                                                            hyperv::VmState::Off | hyperv::VmState::Saved => {
+                                                                if vm_icon_button(ui, egui_phosphor::regular::POWER, "Запустить VM").clicked() {
+                                                                    hyperv::request_power_action(&wmi, hyperv::VmPowerAction::Start);
+                                                                }
+                                                            }
+                                                            hyperv::VmState::Running | hyperv::VmState::Paused => {
+                                                                if vm_icon_button(ui, egui_phosphor::regular::ARROWS_CLOCKWISE, "Перезапустить VM").clicked() {
+                                                                    hyperv::request_power_action(&wmi, hyperv::VmPowerAction::Restart);
+                                                                }
+                                                                if vm_icon_button(ui, egui_phosphor::regular::STOP, "Выключить VM").clicked() {
+                                                                    hyperv::request_power_action(&wmi, hyperv::VmPowerAction::Stop);
+                                                                }
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                    }
+                                                    if matches!(vm_provider, hyperv::VmProvider::VirtualBox) {
+                                                        let uuid = vm_id.clone();
+                                                        match vm_state {
+                                                            hyperv::VmState::Off => {
+                                                                if vm_icon_button(ui, egui_phosphor::regular::POWER, "Запустить VM (headless)").clicked() {
+                                                                    virtualbox::start_vm(&uuid);
+                                                                }
+                                                            }
+                                                            hyperv::VmState::Running => {
+                                                                if vm_icon_button(ui, egui_phosphor::regular::ARROWS_CLOCKWISE, "Перезапустить VM (reset)").clicked() {
+                                                                    virtualbox::reset_vm(&uuid);
+                                                                }
+                                                                if vm_icon_button(ui, egui_phosphor::regular::STOP, "Выключить VM (poweroff)").clicked() {
+                                                                    virtualbox::stop_vm(&uuid);
+                                                                }
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                    }
+                                                    // Hyper-V power controls
+                                                    if false && matches!(vm_provider, hyperv::VmProvider::HyperV) {
                                                         let wmi = vm_wmi_path.clone();
                                                         match vm_state {
                                                             hyperv::VmState::Off | hyperv::VmState::Saved => {
@@ -4008,7 +4223,7 @@ impl EvertyDeskApp {
                                                         }
                                                     }
                                                     // VirtualBox power controls
-                                                    if matches!(vm_provider, hyperv::VmProvider::VirtualBox) {
+                                                    if false && matches!(vm_provider, hyperv::VmProvider::VirtualBox) {
                                                         let uuid = vm_id.clone();
                                                         match vm_state {
                                                             hyperv::VmState::Off => {
@@ -4175,7 +4390,7 @@ impl EvertyDeskApp {
                         ui.separator();
                     }
 
-                    // VirtualBox clipboard paste
+                    // VirtualBox toolbar buttons
                     if let Some(vsession) = &self.vbox_session {
                         if ui.small_button("Ctrl+V").on_hover_text("Вставить текст из буфера обмена").clicked() {
                             let text = clipboard_read_text();
@@ -4192,14 +4407,45 @@ impl EvertyDeskApp {
                             vsession.send(virtualbox::VboxCmd::PutScancodes(vec![], vec![0xB8]));
                             vsession.send(virtualbox::VboxCmd::PutScancodes(vec![], vec![0x9D]));
                         }
+                        // VRDE quick-launch from toolbar
+                        if let Some(idx) = self.hyperv_console_vm {
+                            if let Some(vm) = self.hyperv_vms.get(idx) {
+                                let vm_id = vm.id.clone();
+                                let is_running = matches!(vm.state, hyperv::VmState::Running);
+                                if let Some(&port) = self.vbox_vrde_ports.get(&vm_id) {
+                                    if ui.small_button(format!("IR:{port}"))
+                                        .on_hover_text(format!("Подключиться встроенным IronRDP на порту {port}"))
+                                        .clicked()
+                                    {
+                                        self.start_vbox_vrde_session(port);
+                                    }
+                                } else {
+                                    if ui.small_button("IR+")
+                                        .on_hover_text("Включить VRDE и подключиться встроенным IronRDP")
+                                        .clicked()
+                                    {
+                                        let port = Self::vbox_vrde_port(&vm_id);
+                                        self.begin_vbox_vrde_connect(vm_id.clone(), port, is_running);
+                                    }
+                                }
+                            }
+                        }
                         ui.separator();
                     }
 
                     // Fullscreen toggle (right side)
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let fs_label = if fullscreen { "[ ]" } else { "[+]" };
+                        #[cfg(windows)]
+                        if vm_icon_button(ui, egui_phosphor::regular::GEAR, "Настройки подключения (VRDE)").clicked() {
+                            self.vbox_vrde_settings_open = !self.vbox_vrde_settings_open;
+                        }
+                        let fs_label = if fullscreen {
+                            egui_phosphor::regular::CORNERS_IN
+                        } else {
+                            egui_phosphor::regular::CORNERS_OUT
+                        };
                         let fs_tip = if fullscreen { "Выйти из полного экрана" } else { "Развернуть консоль" };
-                        if ui.small_button(fs_label).on_hover_text(fs_tip).clicked() {
+                        if vm_icon_button(ui, fs_label, fs_tip).clicked() {
                             self.vm_console_fullscreen = !self.vm_console_fullscreen;
                         }
                         // Status text (right side)
@@ -4214,27 +4460,92 @@ impl EvertyDeskApp {
                 });
             });
 
-        // ── RDP Session panel ─────────────────────────────────────────────────
-        if let Some(rdp) = &self.hyperv_rdp_session {
-            while let Some(msg) = rdp.try_recv_status() {
-                self.hyperv_status = msg;
-            }
-            let mut rdp_bytes = 0usize;
-            while let Some(chunk) = rdp.try_recv_data() {
-                rdp_bytes += chunk.len();
-            }
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new("Enhanced Session (RDP over VMBus)").size(13.0).strong());
-            ui.label(egui::RichText::new(&self.hyperv_status).small().color(palette.text_muted));
-            if rdp_bytes > 0 {
-                ui.label(egui::RichText::new(format!("Получено {rdp_bytes} байт RDP")).small().color(palette.warning));
-            }
-            ui.label(egui::RichText::new("Декодер RDP не подключён. В следующей версии.").small().color(palette.text_weak));
-            return;
+        #[cfg(windows)]
+        if self.vbox_vrde_settings_open {
+            let ctx = ui.ctx().clone();
+            let mut open = self.vbox_vrde_settings_open;
+            egui::Window::new("Настройки VRDE")
+                .id(egui::Id::new("vrde_settings_window"))
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .show(&ctx, |ui| {
+                    ui.label(
+                        egui::RichText::new("Применяется при следующем подключении")
+                            .small()
+                            .color(palette.text_muted),
+                    );
+                    ui.add_space(6.0);
+
+                    ui.label("Глубина цвета:");
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(self.vbox_vrde_settings.color_depth == 16, "16 бит")
+                            .on_hover_text("Меньше данных по сети — рекомендация самой VirtualBox для RDP-клиентов")
+                            .clicked()
+                        {
+                            self.vbox_vrde_settings.color_depth = 16;
+                        }
+                        if ui
+                            .selectable_label(self.vbox_vrde_settings.color_depth == 32, "32 бита")
+                            .on_hover_text("Точные цвета, больше данных по сети")
+                            .clicked()
+                        {
+                            self.vbox_vrde_settings.color_depth = 32;
+                        }
+                    });
+
+                    ui.add_space(8.0);
+                    ui.label("Сжатие (MPPC):");
+                    ui.horizontal(|ui| {
+                        for choice in [vbox_rdp::CompressionChoice::K8, vbox_rdp::CompressionChoice::K64] {
+                            if ui
+                                .selectable_label(self.vbox_vrde_settings.compression == choice, choice.label())
+                                .clicked()
+                            {
+                                self.vbox_vrde_settings.compression = choice;
+                            }
+                        }
+                    });
+
+                    ui.add_space(10.0);
+                    if let Some(port) = self.vbox_vrde_active_port {
+                        if ui
+                            .button("Переподключиться с новыми настройками")
+                            .on_hover_text("Закроет текущую сессию и откроет новую с выбранными параметрами")
+                            .clicked()
+                        {
+                            self.vbox_vrde_active_port = None; // bypass the no-op dedup guard
+                            self.start_vbox_vrde_session(port);
+                        }
+                    }
+                });
+            self.vbox_vrde_settings_open = open;
+        }
+
+        // Pointing-device advisory (PS/2 vs USB Tablet) — separate from hyperv_status
+        // so it never gets clobbered by the busy "connecting..."/fps text above.
+        if let Some(warning) = self.vbox_mouse_warning.clone() {
+            ui.add_space(2.0);
+            egui::Frame::NONE
+                .fill(egui::Color32::from_rgba_unmultiplied(0x60, 0x40, 0x00, 0x40))
+                .corner_radius(egui::CornerRadius::same(4))
+                .inner_margin(egui::Margin::symmetric(8, 4))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("⚠ {warning}"))
+                            .small()
+                            .color(egui::Color32::from_rgb(0xFF, 0xC1, 0x07)),
+                    );
+                });
         }
 
         // ── No session: placeholder ───────────────────────────────────────────
-        if self.hyperv_session.is_none() && self.vbox_session.is_none() {
+        if self.hyperv_session.is_none()
+            && self.vbox_session.is_none()
+            && self.vbox_vrde_session.is_none()
+            && self.hyperv_rdp_session.is_none()
+        {
             let avail = ui.available_size();
             let r = ui.allocate_rect(
                 egui::Rect::from_min_size(ui.cursor().min, avail),
@@ -4257,20 +4568,76 @@ impl EvertyDeskApp {
 
         // ── Canvas (texture) ──────────────────────────────────────────────────
         let avail = ui.available_size();
+        if self.vbox_vrde_session.is_some() {
+            let desired = vrde_desktop_size_for_canvas(avail);
+            // Hysteresis: every VrdeCmd::Resize that actually changes the
+            // negotiated size makes VirtualBox issue a fresh
+            // ServerDeactivateAll (reactivation) — and reactivation is where
+            // the truncated-PDU VirtualBox quirk lives, costing multi-second
+            // recovery when it hits. `avail` jitters by a few pixels between
+            // frames (font metrics, focus-border width, etc.), and at 1.25x
+            // scale that was enough to toggle the request just past the 1920
+            // clamp boundary and back — silently triggering a reactivation
+            // cycle on nearly every frame, with no visible cause from the
+            // user's side. Only resize when the request actually moved by a
+            // meaningful amount.
+            let changed_enough = match self.vbox_vrde_last_desktop_size {
+                Some((lw, lh)) => desired.0.abs_diff(lw) > 16 || desired.1.abs_diff(lh) > 16,
+                None => true,
+            };
+            if changed_enough {
+                if let Some(vrdp) = &self.vbox_vrde_session {
+                    vrdp.send(vbox_rdp::VrdeCmd::Resize {
+                        width: desired.0,
+                        height: desired.1,
+                    });
+                }
+                self.vbox_vrde_last_desktop_size = Some(desired);
+            }
+        }
         if let Some(tex) = &self.hyperv_texture {
             let img = egui::Image::new(tex)
                 .fit_to_exact_size(avail)
+                .maintain_aspect_ratio(true)
                 .sense(egui::Sense::click_and_drag());
             let resp = ui.add(img);
 
-            if resp.clicked() || resp.secondary_clicked() {
+            let tex_size = tex.size();
+            let rect = fitted_image_rect(resp.rect, tex_size[0] as f32, tex_size[1] as f32);
+            let (vm_pointer_pressed_inside, vm_pointer_pressed_outside) = ui.input(|i| {
+                let mut inside = false;
+                let mut outside = false;
+                for ev in &i.raw.events {
+                    if let egui::Event::PointerButton {
+                        pos,
+                        pressed: true,
+                        ..
+                    } = ev
+                    {
+                        if rect.contains(*pos) {
+                            inside = true;
+                        } else {
+                            outside = true;
+                        }
+                    }
+                }
+                (inside, outside)
+            });
+
+            if vm_pointer_pressed_inside {
+                self.vm_console_input_active = true;
+                self.vm_console_last_pointer_pos = None;
                 resp.request_focus();
+            } else if vm_pointer_pressed_outside {
+                self.vm_console_input_active = false;
+                self.vm_console_last_pointer_pos = None;
             }
+
+            let vm_console_focused = self.vm_console_input_active || vm_pointer_pressed_inside;
 
             // Focus border
             {
-                let focused = resp.has_focus() || resp.clicked();
-                let border_color = if focused {
+                let border_color = if vm_console_focused {
                     palette.accent
                 } else {
                     egui::Color32::from_rgba_unmultiplied(0x80, 0x80, 0x80, 0x40)
@@ -4283,83 +4650,163 @@ impl EvertyDeskApp {
                 );
             }
 
-            let rect = resp.rect;
-
             // HyperV mouse + keyboard
             if let Some(session) = &self.hyperv_session {
-                if let Some(pos) = resp.interact_pointer_pos() {
-                    let nx = ((pos.x - rect.left()) / rect.width() * 65535.0).clamp(0.0, 65535.0) as u32;
-                    let ny = ((pos.y - rect.top()) / rect.height() * 65535.0).clamp(0.0, 65535.0) as u32;
-                    session.send(hyperv::HyperVCmd::MoveMouse(nx, ny));
-                    if resp.clicked() {
-                        session.send(hyperv::HyperVCmd::ClickMouse(1, true));
-                        session.send(hyperv::HyperVCmd::ClickMouse(1, false));
-                    }
-                    if resp.secondary_clicked() {
-                        session.send(hyperv::HyperVCmd::ClickMouse(2, true));
-                        session.send(hyperv::HyperVCmd::ClickMouse(2, false));
-                    }
-                }
-                // Scroll wheel
-                ui.input(|i| {
-                    for ev in &i.raw.events {
-                        if let egui::Event::MouseWheel { delta, .. } = ev {
-                            let vk = if delta.y > 0.0 { 0x21u32 } else { 0x22u32 };
-                            session.send(hyperv::HyperVCmd::PressKey(vk));
-                            session.send(hyperv::HyperVCmd::ReleaseKey(vk));
+                if vm_console_focused {
+                    let mut mouse_cmds = Vec::new();
+                    let mut last_pointer_pos = self.vm_console_last_pointer_pos;
+                    let mut pending_pointer_move: Option<(u32, u32)> = None;
+                    let (guest_w_px, guest_h_px) = self.hyperv_guest_size.unwrap_or((
+                        tex_size[0].max(1) as u32,
+                        tex_size[1].max(1) as u32,
+                    ));
+
+                    let to_hyperv_abs = |pos: egui::Pos2| -> Option<(u32, u32)> {
+                        if !rect.contains(pos) || rect.width() <= 0.0 || rect.height() <= 0.0 {
+                            return None;
                         }
-                    }
-                });
-                // Keyboard
-                const VK_SHIFT: u32 = 0x10;
-                ui.input(|i| {
-                    for ev in &i.raw.events {
-                        match ev {
-                            egui::Event::Text(t) => {
-                                for c in t.chars() {
-                                    match crate::vm_bridge::char_to_vk_shift(c) {
-                                        Some((vk, shift)) => {
-                                            if shift { session.send(hyperv::HyperVCmd::PressKey(VK_SHIFT)); }
-                                            session.send(hyperv::HyperVCmd::PressKey(vk));
-                                            session.send(hyperv::HyperVCmd::ReleaseKey(vk));
-                                            if shift { session.send(hyperv::HyperVCmd::ReleaseKey(VK_SHIFT)); }
+                        let guest_w = guest_w_px.max(1) as f32;
+                        let guest_h = guest_h_px.max(1) as f32;
+                        let nx = ((pos.x - rect.left()) / rect.width() * guest_w)
+                            .round()
+                            .clamp(0.0, guest_w - 1.0) as u32;
+                        let ny = ((pos.y - rect.top()) / rect.height() * guest_h)
+                            .round()
+                            .clamp(0.0, guest_h - 1.0) as u32;
+                        Some((nx, ny))
+                    };
+
+                    let flush_move = |cmds: &mut Vec<hyperv::HyperVCmd>,
+                                      last_pointer_pos: &mut Option<(u16, u16)>,
+                                      pending: &mut Option<(u32, u32)>| {
+                        if let Some((nx, ny)) = pending.take() {
+                            let pos_key = (nx as u16, ny as u16);
+                            if *last_pointer_pos != Some(pos_key) {
+                                cmds.push(hyperv::HyperVCmd::MoveMouse(nx, ny));
+                                *last_pointer_pos = Some(pos_key);
+                            }
+                        }
+                    };
+
+                    ui.input(|i| {
+                        for ev in &i.raw.events {
+                            match ev {
+                                egui::Event::PointerMoved(pos) => {
+                                    if let Some(abs) = to_hyperv_abs(*pos) {
+                                        pending_pointer_move = Some(abs);
+                                    }
+                                }
+                                egui::Event::PointerButton {
+                                    pos,
+                                    button,
+                                    pressed,
+                                    ..
+                                } => {
+                                    flush_move(
+                                        &mut mouse_cmds,
+                                        &mut last_pointer_pos,
+                                        &mut pending_pointer_move,
+                                    );
+                                    if let Some((nx, ny)) = to_hyperv_abs(*pos) {
+                                        let pos_key = (nx as u16, ny as u16);
+                                        if last_pointer_pos != Some(pos_key) {
+                                            mouse_cmds.push(hyperv::HyperVCmd::MoveMouse(nx, ny));
+                                            last_pointer_pos = Some(pos_key);
                                         }
-                                        None => {
-                                            session.send(hyperv::HyperVCmd::TypeText(c.to_string()));
+                                        if !pressed {
+                                            let btn = match button {
+                                                egui::PointerButton::Primary => Some(1),
+                                                egui::PointerButton::Secondary => Some(2),
+                                                egui::PointerButton::Middle => Some(3),
+                                                _ => None,
+                                            };
+                                            if let Some(btn) = btn {
+                                                mouse_cmds.push(hyperv::HyperVCmd::MouseClick(btn));
+                                            }
                                         }
                                     }
                                 }
+                                _ => {}
                             }
-                            egui::Event::Key { key, pressed, modifiers, .. } => {
-                                let has_combo = modifiers.ctrl || modifiers.alt || modifiers.command;
-                                let vk_opt = egui_key_to_vkcode(*key)
-                                    .or_else(|| if has_combo { egui_letter_to_vkcode(*key) } else { None });
-                                let Some(vk) = vk_opt else { continue; };
-                                let mut mods: Vec<u32> = Vec::new();
-                                if modifiers.ctrl    { mods.push(0x11); }
-                                if modifiers.alt     { mods.push(0x12); }
-                                if modifiers.shift   { mods.push(VK_SHIFT); }
-                                if modifiers.command { mods.push(0x5B); }
-                                if *pressed {
-                                    for m in &mods { session.send(hyperv::HyperVCmd::PressKey(*m)); }
-                                    session.send(hyperv::HyperVCmd::PressKey(vk));
-                                    session.send(hyperv::HyperVCmd::ReleaseKey(vk));
-                                    for m in mods.iter().rev() { session.send(hyperv::HyperVCmd::ReleaseKey(*m)); }
-                                }
-                            }
-                            _ => {}
                         }
+                    });
+
+                    flush_move(
+                        &mut mouse_cmds,
+                        &mut last_pointer_pos,
+                        &mut pending_pointer_move,
+                    );
+
+                    self.vm_console_last_pointer_pos = last_pointer_pos;
+                    for cmd in mouse_cmds {
+                        session.send(cmd);
                     }
-                });
+                }
+                if vm_console_focused {
+                    // Scroll wheel
+                    ui.input(|i| {
+                        for ev in &i.raw.events {
+                            if let egui::Event::MouseWheel { delta, .. } = ev {
+                                let vk = if delta.y > 0.0 { 0x21u32 } else { 0x22u32 };
+                                session.send(hyperv::HyperVCmd::PressKey(vk));
+                                session.send(hyperv::HyperVCmd::ReleaseKey(vk));
+                            }
+                        }
+                    });
+                    // Keyboard
+                    const VK_SHIFT: u32 = 0x10;
+                    ui.input(|i| {
+                        for ev in &i.raw.events {
+                            match ev {
+                                egui::Event::Text(t) => {
+                                    for c in t.chars() {
+                                        match crate::vm_bridge::char_to_vk_shift(c) {
+                                            Some((vk, shift)) => {
+                                                if shift { session.send(hyperv::HyperVCmd::PressKey(VK_SHIFT)); }
+                                                session.send(hyperv::HyperVCmd::PressKey(vk));
+                                                session.send(hyperv::HyperVCmd::ReleaseKey(vk));
+                                                if shift { session.send(hyperv::HyperVCmd::ReleaseKey(VK_SHIFT)); }
+                                            }
+                                            None => {
+                                                session.send(hyperv::HyperVCmd::TypeText(c.to_string()));
+                                            }
+                                        }
+                                    }
+                                }
+                                egui::Event::Key { key, pressed, modifiers, .. } => {
+                                    let has_combo = modifiers.ctrl || modifiers.alt || modifiers.command;
+                                    let vk_opt = egui_key_to_vkcode(*key)
+                                        .or_else(|| if has_combo { egui_letter_to_vkcode(*key) } else { None });
+                                    let Some(vk) = vk_opt else { continue; };
+                                    let mut mods: Vec<u32> = Vec::new();
+                                    if modifiers.ctrl    { mods.push(0x11); }
+                                    if modifiers.alt     { mods.push(0x12); }
+                                    if modifiers.shift   { mods.push(VK_SHIFT); }
+                                    if modifiers.command { mods.push(0x5B); }
+                                    if *pressed {
+                                        for m in &mods { session.send(hyperv::HyperVCmd::PressKey(*m)); }
+                                        session.send(hyperv::HyperVCmd::PressKey(vk));
+                                        session.send(hyperv::HyperVCmd::ReleaseKey(vk));
+                                        for m in mods.iter().rev() { session.send(hyperv::HyperVCmd::ReleaseKey(*m)); }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    });
+                }
             }
 
-            // VirtualBox absolute mouse + keyboard
+            // VirtualBox screenshotpng: absolute mouse + keyboard
             if let Some(vsession) = &self.vbox_session {
-                // Mouse: absolute position
-                if let Some(pos) = resp.hover_pos() {
-                    let nx = ((pos.x - rect.left()) / rect.width() * 65535.0).clamp(0.0, 65535.0) as u32;
-                    let ny = ((pos.y - rect.top()) / rect.height() * 65535.0).clamp(0.0, 65535.0) as u32;
-                    vsession.send(virtualbox::VboxCmd::MoveMouseAbs(nx, ny));
+                if vm_console_focused {
+                    if let Some(pos) = resp.hover_pos() {
+                        if rect.contains(pos) {
+                            let nx = ((pos.x - rect.left()) / rect.width() * 65535.0).clamp(0.0, 65535.0) as u32;
+                            let ny = ((pos.y - rect.top()) / rect.height() * 65535.0).clamp(0.0, 65535.0) as u32;
+                            vsession.send(virtualbox::VboxCmd::MoveMouseAbs(nx, ny));
+                        }
+                    }
                 }
                 if resp.clicked() {
                     vsession.send(virtualbox::VboxCmd::MouseButton("leftdown".to_owned()));
@@ -4369,24 +4816,218 @@ impl EvertyDeskApp {
                     vsession.send(virtualbox::VboxCmd::MouseButton("rightdown".to_owned()));
                     vsession.send(virtualbox::VboxCmd::MouseButton("rightup".to_owned()));
                 }
-                // Keyboard
-                ui.input(|i| {
-                    for ev in &i.raw.events {
-                        match ev {
-                            egui::Event::Text(t) if !t.is_empty() => {
-                                vsession.send(virtualbox::VboxCmd::PutString(t.clone()));
-                            }
-                            egui::Event::Key { key, pressed: true, .. } => {
-                                if let Some(kid) = egui_key_to_vbox_key_id(*key) {
-                                    if let Some((make, brk)) = virtualbox::special_key_to_scancodes(kid) {
-                                        vsession.send(virtualbox::VboxCmd::PutScancodes(make, brk));
+                if vm_console_focused {
+                    ui.input(|i| {
+                        for ev in &i.raw.events {
+                            match ev {
+                                egui::Event::Text(t) if !t.is_empty() => {
+                                    vsession.send(virtualbox::VboxCmd::PutString(t.clone()));
+                                }
+                                egui::Event::Key { key, pressed: true, .. } => {
+                                    if let Some(kid) = egui_key_to_vbox_key_id(*key) {
+                                        if let Some((make, brk)) = virtualbox::special_key_to_scancodes(kid) {
+                                            vsession.send(virtualbox::VboxCmd::PutScancodes(make, brk));
+                                        }
                                     }
                                 }
+                                _ => {}
                             }
-                            _ => {}
+                        }
+                    });
+                }
+            }
+
+            // Pixel-accurate mouse + keyboard for the ironRDP-driven consoles
+            // (VirtualBox VRDE and Hyper-V Enhanced Session both speak the same
+            // VrdeCmd input vocabulary, so input collection is shared and the
+            // assembled commands are dispatched to whichever session is live).
+            if self.vbox_vrde_session.is_some() || self.hyperv_rdp_session.is_some() {
+                if vm_console_focused {
+                    let mut vrde_cmds = Vec::new();
+                    let mut last_pointer_pos = self.vm_console_last_pointer_pos;
+                    let mut pending_pointer_move: Option<(u16, u16)> = None;
+
+                    ui.input(|i| {
+                        let has_text = i
+                            .raw
+                            .events
+                            .iter()
+                            .any(|ev| matches!(ev, egui::Event::Text(t) if !t.is_empty()));
+                        for ev in &i.raw.events {
+                            match ev {
+                                egui::Event::PointerMoved(pos) => {
+                                    if let Some((gx, gy)) = pointer_to_guest_pixel(
+                                        *pos,
+                                        rect,
+                                        tex_size[0] as f32,
+                                        tex_size[1] as f32,
+                                    ) {
+                                        pending_pointer_move = Some((gx, gy));
+                                    }
+                                }
+                                egui::Event::PointerButton {
+                                    pos,
+                                    button,
+                                    pressed,
+                                    ..
+                                } => {
+                                    if let Some((gx, gy)) = pending_pointer_move.take() {
+                                        let pos = (gx, gy);
+                                        if last_pointer_pos != Some(pos) {
+                                            vrde_cmds.push(vbox_rdp::VrdeCmd::MouseMove { x: gx, y: gy });
+                                            last_pointer_pos = Some(pos);
+                                        }
+                                    }
+                                    if let Some((gx, gy)) = pointer_to_guest_pixel(
+                                        *pos,
+                                        rect,
+                                        tex_size[0] as f32,
+                                        tex_size[1] as f32,
+                                    ) {
+                                        let Some(button) = egui_pointer_to_vrde_button(*button) else {
+                                            continue;
+                                        };
+                                        let pos = (gx, gy);
+                                        if last_pointer_pos != Some(pos) {
+                                            vrde_cmds.push(vbox_rdp::VrdeCmd::MouseMove { x: gx, y: gy });
+                                            last_pointer_pos = Some(pos);
+                                        }
+                                        vrde_cmds.push(vbox_rdp::VrdeCmd::MouseButton {
+                                            button,
+                                            down: *pressed,
+                                        });
+                                    }
+                                }
+                                egui::Event::Text(t) if !t.is_empty() => {
+                                    if let Some((gx, gy)) = pending_pointer_move.take() {
+                                        let pos = (gx, gy);
+                                        if last_pointer_pos != Some(pos) {
+                                            vrde_cmds.push(vbox_rdp::VrdeCmd::MouseMove { x: gx, y: gy });
+                                            last_pointer_pos = Some(pos);
+                                        }
+                                    }
+                                    for ch in t.chars() {
+                                        // VirtualBox VRDE doesn't implement Unicode keyboard
+                                        // input PDUs (confirmed: arrows/shortcuts work via
+                                        // scancode, plain letters via Unicode silently did
+                                        // nothing). Route ASCII through the scancode path that
+                                        // is known to work; only non-ASCII (Cyrillic etc., no
+                                        // US-layout scancode) falls back to Unicode.
+                                        if let Some((scancode, shift, extended)) = vbox_rdp::char_to_rdp_scancode(ch) {
+                                            if shift {
+                                                vrde_cmds.push(vbox_rdp::VrdeCmd::KeyDown { scancode: 0x2A, extended: false });
+                                            }
+                                            vrde_cmds.push(vbox_rdp::VrdeCmd::KeyDown { scancode, extended });
+                                            vrde_cmds.push(vbox_rdp::VrdeCmd::KeyUp { scancode, extended });
+                                            if shift {
+                                                vrde_cmds.push(vbox_rdp::VrdeCmd::KeyUp { scancode: 0x2A, extended: false });
+                                            }
+                                        } else {
+                                            vrde_cmds.push(vbox_rdp::VrdeCmd::Text(ch.to_string()));
+                                        }
+                                    }
+                                }
+                                egui::Event::MouseWheel { unit, delta, .. } => {
+                                    if let Some((gx, gy)) = pending_pointer_move.take() {
+                                        let pos = (gx, gy);
+                                        if last_pointer_pos != Some(pos) {
+                                            vrde_cmds.push(vbox_rdp::VrdeCmd::MouseMove { x: gx, y: gy });
+                                            last_pointer_pos = Some(pos);
+                                        }
+                                    }
+                                    // RDP wheel rotation units: Windows' WHEEL_DELTA
+                                    // (120) per notch is the de-facto standard scale.
+                                    // egui's `Line`/`Page` units don't map to a pixel
+                                    // count the way `Point` does, so just treat the
+                                    // sign consistently and scale a "line" as one
+                                    // notch, a "page" as several.
+                                    let notches = match unit {
+                                        egui::MouseWheelUnit::Point => delta.y / 40.0,
+                                        egui::MouseWheelUnit::Line => delta.y,
+                                        egui::MouseWheelUnit::Page => delta.y * 8.0,
+                                    };
+                                    if notches.abs() >= 0.01 {
+                                        // The wire format packs the magnitude into a
+                                        // single byte (see ironrdp_pdu::input::mouse::MousePdu::encode),
+                                        // so the encodable range is -255..=255 regardless
+                                        // of how large `notches` is.
+                                        let wheel_delta = (notches * 120.0).clamp(-255.0, 255.0) as i16;
+                                        if wheel_delta != 0 {
+                                            vrde_cmds.push(vbox_rdp::VrdeCmd::MouseWheel { delta: wheel_delta });
+                                        }
+                                    }
+                                }
+                                egui::Event::Key { key, pressed, modifiers, .. } => {
+                                    if let Some((gx, gy)) = pending_pointer_move.take() {
+                                        let pos = (gx, gy);
+                                        if last_pointer_pos != Some(pos) {
+                                            vrde_cmds.push(vbox_rdp::VrdeCmd::MouseMove { x: gx, y: gy });
+                                            last_pointer_pos = Some(pos);
+                                        }
+                                    }
+                                    let combo = modifiers.ctrl || modifiers.alt || modifiers.command;
+                                    if has_text && !combo && egui_key_is_plain_text(*key) {
+                                        continue;
+                                    }
+
+                                    if let Some((scancode, extended)) = egui_key_to_rdp_scancode(*key) {
+                                        let mut mods = Vec::new();
+                                        if modifiers.ctrl {
+                                            mods.push((0x1D, false));
+                                        }
+                                        if modifiers.alt {
+                                            mods.push((0x38, false));
+                                        }
+                                        if modifiers.shift {
+                                            mods.push((0x2A, false));
+                                        }
+                                        if modifiers.command {
+                                            mods.push((0x5B, true));
+                                        }
+
+                                        if *pressed {
+                                            for (m_scancode, m_extended) in &mods {
+                                                vrde_cmds.push(vbox_rdp::VrdeCmd::KeyDown {
+                                                    scancode: *m_scancode,
+                                                    extended: *m_extended,
+                                                });
+                                            }
+                                            vrde_cmds.push(vbox_rdp::VrdeCmd::KeyDown { scancode, extended });
+                                        } else {
+                                            vrde_cmds.push(vbox_rdp::VrdeCmd::KeyUp { scancode, extended });
+                                            for (m_scancode, m_extended) in mods.iter().rev() {
+                                                vrde_cmds.push(vbox_rdp::VrdeCmd::KeyUp {
+                                                    scancode: *m_scancode,
+                                                    extended: *m_extended,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    });
+                    if let Some((gx, gy)) = pending_pointer_move.take() {
+                        let pos = (gx, gy);
+                        if last_pointer_pos != Some(pos) {
+                            vrde_cmds.push(vbox_rdp::VrdeCmd::MouseMove { x: gx, y: gy });
+                            last_pointer_pos = Some(pos);
                         }
                     }
-                });
+
+                    self.vm_console_last_pointer_pos = last_pointer_pos;
+                    if !vrde_cmds.is_empty() {
+                        self.vbox_vrde_last_input = Some(std::time::Instant::now());
+                    }
+                    for cmd in vrde_cmds {
+                        if let Some(vrdp) = &self.vbox_vrde_session {
+                            vrdp.send(cmd);
+                        } else if let Some(rdp) = &self.hyperv_rdp_session {
+                            rdp.send(cmd);
+                        }
+                    }
+                }
             }
 
             // Bottom status bar
@@ -4485,6 +5126,168 @@ impl EvertyDeskApp {
                 providers: out,
                 total_vms,
             });
+        });
+    }
+
+    #[cfg(windows)]
+    fn stop_vm_console_sessions(&mut self) {
+        self.stop_vm_console_sessions_keep_focus();
+        self.vm_console_input_active = false;
+        self.vm_console_last_pointer_pos = None;
+        self.hyperv_guest_size = None;
+    }
+
+    /// Same as `stop_vm_console_sessions` but leaves keyboard/mouse focus state
+    /// untouched. Auto-reconnect (after an MPPC decoder desync) calls this:
+    /// resetting `vm_console_input_active` on every reconnect made the console
+    /// silently drop input focus on every blink, even though the user never
+    /// clicked away — input just stopped reaching the VM until they clicked
+    /// the console image again.
+    #[cfg(windows)]
+    fn stop_vm_console_sessions_keep_focus(&mut self) {
+        if let Some(s) = self.hyperv_session.take() {
+            s.stop();
+        }
+        if let Some(s) = self.vbox_session.take() {
+            s.stop();
+        }
+        if let Some(s) = self.vbox_vrde_session.take() {
+            s.stop();
+        }
+        self.vbox_vrde_last_desktop_size = None;
+        if let Some(s) = self.hyperv_rdp_session.take() {
+            s.stop();
+        }
+        self.vbox_vrde_enable_rx = None;
+        self.vbox_mouse_warning_rx = None;
+        self.vbox_mouse_warning = None;
+        self.vbox_vrde_active_port = None;
+    }
+
+    #[cfg(windows)]
+    fn vbox_vrde_port(vm_id: &str) -> u16 {
+        3390 + (vm_id
+            .bytes()
+            .fold(0u16, |a, b| a.wrapping_add(b as u16))
+            % 10)
+    }
+
+    #[cfg(windows)]
+    fn start_vbox_vrde_session(&mut self, port: u16) {
+        // Already connected to this exact port — re-clicking any of the several
+        // "connect"/"open console" buttons must not tear down a live session.
+        if self.vbox_vrde_session.is_some() && self.vbox_vrde_active_port == Some(port) {
+            return;
+        }
+        // Deliberately NOT calling the focus-resetting stop_vm_console_sessions():
+        // auto-reconnect (after a decoder desync) goes through this exact path,
+        // and resetting vm_console_input_active on every blink made the console
+        // silently stop accepting input until the user clicked it again — felt
+        // like the whole UI lost focus, not just the image freezing.
+        // Also deliberately NOT clearing hyperv_texture: that made every silent
+        // reconnect flash black for the ~100-300ms TCP+TLS+RDP handshake. Keeping
+        // the last good frame on screen during reconnect is strictly better —
+        // callers switching to a genuinely different VM already clear the
+        // texture themselves before calling this.
+        self.stop_vm_console_sessions_keep_focus();
+        self.hyperv_frame_count = 0;
+        self.hyperv_fps_display = 0.0;
+        self.hyperv_fps_window = std::time::Instant::now();
+        self.hyperv_last_frame = std::time::Instant::now();
+        self.hyperv_status = format!("VRDE/IronRDP: подключение к 127.0.0.1:{port}...");
+        let desktop_size = default_vrde_desktop_size();
+        self.vbox_vrde_last_desktop_size = Some(desktop_size);
+        self.vbox_vrde_active_port = Some(port);
+        self.vbox_vrde_last_frame = std::time::Instant::now();
+        self.vbox_vrde_last_input = None;
+        self.vbox_vrde_session = Some(vbox_rdp::VrdeSession::connect(
+            "127.0.0.1",
+            port,
+            desktop_size,
+            self.vbox_vrde_settings,
+        ));
+    }
+
+    #[cfg(windows)]
+    fn begin_vbox_vrde_connect(&mut self, vm_id: String, port: u16, vm_running: bool) {
+        // Already connected/connecting to this VM — ignore the duplicate request
+        // instead of restarting (see `vbox_vrde_active_port` doc comment).
+        if self.vbox_vrde_enable_rx.is_some()
+            || (self.vbox_vrde_session.is_some() && self.vbox_vrde_active_port == Some(port))
+        {
+            return;
+        }
+        self.stop_vm_console_sessions();
+        self.vbox_vrde_ports.insert(vm_id.clone(), port);
+        self.hyperv_texture = None;
+        self.hyperv_frame_count = 0;
+        self.hyperv_fps_display = 0.0;
+        self.hyperv_fps_window = std::time::Instant::now();
+        self.hyperv_last_frame = std::time::Instant::now();
+        self.hyperv_status = format!("VRDE: включение порта {port}...");
+
+        let (tx, rx) = mpsc::channel();
+        self.vbox_vrde_enable_rx = Some(rx);
+        self.vbox_mouse_warning = None;
+        let mouse_vm_id = vm_id.clone();
+        thread::spawn(move || {
+            // enable_vrde + send must happen first and only first — no extra
+            // VBoxManage round-trips on this path. Any added latency here makes
+            // users re-click "connect" before the session settles, and a second
+            // VRDE client connecting kicks the first one off (VirtualBox allows
+            // only one VRDE connection at a time), producing an endless
+            // reconnect loop that looks like a black screen.
+            let ok = virtualbox::enable_vrde(&vm_id, port, vm_running);
+            let _ = tx.send((vm_id, port, ok));
+        });
+
+        // Pointing-device advisory runs fully independently, on its own thread,
+        // and only ever produces a side-channel warning — never gates the connect.
+        let (warn_tx, warn_rx) = mpsc::channel();
+        self.vbox_mouse_warning_rx = Some(warn_rx);
+        thread::spawn(move || {
+            let warning = match virtualbox::pointing_device_is_absolute(&mouse_vm_id) {
+                Some(false) if !vm_running => {
+                    match virtualbox::set_pointing_device_usbtablet(&mouse_vm_id) {
+                        Ok(()) => return,
+                        Err(e) => format!("Не удалось переключить мышь на USB Tablet: {e}"),
+                    }
+                }
+                Some(false) => "VM использует PS/2-мышь (относительные координаты) — курсор \
+                     не будет двигаться по RDP. Выключите VM один раз: EvertyDesk переключит \
+                     на USB Tablet, дальше работает всегда."
+                    .to_owned(),
+                _ => return,
+            };
+            let _ = warn_tx.send(warning);
+        });
+    }
+
+    #[cfg(windows)]
+    fn start_vbox_vrde_scan(&mut self) {
+        let ids: Vec<String> = self
+            .hyperv_vms
+            .iter()
+            .filter(|vm| matches!(vm.provider, hyperv::VmProvider::VirtualBox))
+            .map(|vm| vm.id.clone())
+            .collect();
+        if ids.is_empty() {
+            self.vbox_vrde_scan_rx = None;
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel();
+        self.vbox_vrde_scan_rx = Some(rx);
+        thread::spawn(move || {
+            let mut ports = std::collections::HashMap::new();
+            for id in ids {
+                if let Some(info) = virtualbox::get_vrde_info(&id) {
+                    if info.enabled {
+                        ports.insert(id, info.port);
+                    }
+                }
+            }
+            let _ = tx.send(ports);
         });
     }
 
@@ -4642,6 +5445,53 @@ impl EvertyDeskApp {
 
     #[cfg(windows)]
     fn poll_hyperv_session(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = self.vbox_mouse_warning_rx.take() {
+            match rx.try_recv() {
+                Ok(w) => self.vbox_mouse_warning = Some(w),
+                Err(mpsc::TryRecvError::Empty) => self.vbox_mouse_warning_rx = Some(rx),
+                Err(mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+
+        if let Some(rx) = self.vbox_vrde_enable_rx.take() {
+            match rx.try_recv() {
+                Ok((vm_id, port, true)) => {
+                    self.vbox_vrde_ports.insert(vm_id, port);
+                    self.start_vbox_vrde_session(port);
+                    ctx.request_repaint();
+                }
+                Ok((vm_id, port, false)) => {
+                    self.vbox_vrde_ports.remove(&vm_id);
+                    self.hyperv_status = format!(
+                        "VRDE: не удалось включить порт {port}. Проверьте VirtualBox Extension Pack и свободен ли порт."
+                    );
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.vbox_vrde_enable_rx = Some(rx);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.hyperv_status = "VRDE: поток включения завершился без результата".to_owned();
+                    ctx.request_repaint();
+                }
+            }
+        }
+
+        if let Some(rx) = self.vbox_vrde_scan_rx.take() {
+            match rx.try_recv() {
+                Ok(ports) => {
+                    for (vm_id, port) in ports {
+                        self.vbox_vrde_ports.insert(vm_id, port);
+                    }
+                    ctx.request_repaint();
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.vbox_vrde_scan_rx = Some(rx);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+
         // Collect async VM list
         if let Some(rx) = &self.hyperv_load_rx {
             if let Ok(vms) = rx.try_recv() {
@@ -4657,6 +5507,7 @@ impl EvertyDeskApp {
                     let hv = Arc::new(hyperv::HyperVProvider::new());
                     self.provider_registry.register(hv);
                 }
+                self.start_vbox_vrde_scan();
                 ctx.request_repaint();
             }
         }
@@ -4670,6 +5521,7 @@ impl EvertyDeskApp {
                 if let Some(frame) = session.try_recv_frame() {
                     let w = frame.width as usize;
                     let h = frame.height as usize;
+                    self.hyperv_guest_size = Some((frame.guest_width, frame.guest_height));
                     if frame.rgba.len() == w * h * 4 {
                         let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &frame.rgba);
                         self.hyperv_texture = Some(ctx.load_texture(
@@ -4706,8 +5558,7 @@ impl EvertyDeskApp {
             }
         }
 
-        // Poll VirtualBox session frames
-
+        // Poll VirtualBox screenshotpng session frames (fallback when VRDE not enabled)
         if let Some(session) = &self.vbox_session {
             while let Some(msg) = session.try_recv_status() {
                 self.hyperv_status = msg;
@@ -4726,11 +5577,245 @@ impl EvertyDeskApp {
             }
         }
 
-        // Keep egui awake while a VM session is active so the channel is drained
-        // promptly — without this, egui goes idle between WMI calls and frames sit
-        // in the channel until the next user event.
-        if self.hyperv_session.is_some() || self.vbox_session.is_some() || self.hyperv_rdp_session.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(33));
+        // Poll VirtualBox VRDE session frames (30fps embedded RDP)
+        if let Some(session) = &self.vbox_vrde_session {
+            // Drain every pending status message in one pass. `Poll::Dead`
+            // here means the session thread has actually exited (e.g. the
+            // write-timeout fix catching a stalled socket write — see
+            // vbox_rdp.rs): channels only disconnect when the thread
+            // function returns, so this is a 100%-reliable, instant signal,
+            // unlike every elapsed-time-based "is it stuck" heuristic tried
+            // before (which couldn't tell "quiet because nothing changed"
+            // from "quiet because it died" without either misfiring on
+            // legitimate idle or waiting out a long timer).
+            let mut desync_now = false;
+            let mut dead = false;
+            loop {
+                match session.poll_status() {
+                    vbox_rdp::Poll::Item(msg) => {
+                        if msg == "VRDE_DESYNC" {
+                            // Decoder hit the MPPC history-buffer-overflow bug
+                            // — it never recovers on its own. Reconnect
+                            // immediately instead of waiting for the
+                            // frame-staleness timer below.
+                            desync_now = true;
+                        } else {
+                            self.hyperv_status = msg;
+                        }
+                        ctx.request_repaint();
+                    }
+                    vbox_rdp::Poll::Empty => break,
+                    vbox_rdp::Poll::Dead => {
+                        dead = true;
+                        break;
+                    }
+                }
+            }
+            if dead {
+                if let Some(port) = self.vbox_vrde_active_port {
+                    vbox_rdp::log_from_ui("VRDE: [main] reconnect trigger = session thread exited (channel disconnected)");
+                    self.hyperv_status = "VRDE: сессия завершилась, переподключаюсь...".to_owned();
+                    self.vbox_vrde_active_port = None;
+                    self.start_vbox_vrde_session(port);
+                    self.vbox_vrde_last_frame = std::time::Instant::now();
+                    ctx.request_repaint();
+                }
+            } else if desync_now {
+                // Decoder hit the MPPC history-buffer-overflow bug — it never
+                // recovers on its own. Reconnect immediately instead of waiting
+                // for the frame-staleness timer below.
+                if let Some(port) = self.vbox_vrde_active_port {
+                    vbox_rdp::log_from_ui("VRDE: [main] reconnect trigger = content-collapse (VRDE_DESYNC status from session thread)");
+                    self.hyperv_status = "VRDE: декодер застрял, переподключаюсь...".to_owned();
+                    self.vbox_vrde_active_port = None;
+                    self.start_vbox_vrde_session(port);
+                    self.vbox_vrde_last_frame = std::time::Instant::now();
+                    ctx.request_repaint();
+                }
+            } else {
+                // Drain to the newest frame rather than processing just one
+                // per UI tick: the decoder can produce frames faster than
+                // egui repaints, and taking only the oldest queued frame each
+                // time means we permanently lag behind during any burst of
+                // activity (this is exactly what `fdrops` climbing in the
+                // logs was — the channel filling up because we only ever
+                // pulled one out per tick). Always showing the latest frame
+                // and discarding the stale ones in between is strictly
+                // smoother: the skipped frames were never going to be seen
+                // anyway once a newer one exists.
+                let mut latest_frame = None;
+                loop {
+                    match session.poll_frame() {
+                        vbox_rdp::Poll::Item(frame) => latest_frame = Some(frame),
+                        vbox_rdp::Poll::Empty => break,
+                        vbox_rdp::Poll::Dead => {
+                            dead = true;
+                            break;
+                        }
+                    }
+                }
+                if dead {
+                    if let Some(port) = self.vbox_vrde_active_port {
+                        vbox_rdp::log_from_ui("VRDE: [main] reconnect trigger = session thread exited (channel disconnected, seen via frame channel)");
+                        self.hyperv_status = "VRDE: сессия завершилась, переподключаюсь...".to_owned();
+                        self.vbox_vrde_active_port = None;
+                        self.start_vbox_vrde_session(port);
+                        self.vbox_vrde_last_frame = std::time::Instant::now();
+                        ctx.request_repaint();
+                    }
+                }
+                if let Some((w, h, rgba)) = latest_frame {
+                    let (wu, hu) = (w as usize, h as usize);
+                    if rgba.len() == wu * hu * 4 {
+                        // Mark the connection as alive regardless — this also
+                        // covers a fresh reconnect's first frame(s), which are
+                        // legitimately near-empty for the brief moment before
+                        // real bitmap data streams in (the new DecodedImage
+                        // starts blank). Counting that as "activity" prevents
+                        // the staleness detector from immediately re-triggering
+                        // another reconnect on top of the one just finished.
+                        self.vbox_vrde_last_frame = std::time::Instant::now();
+
+                        // But don't actually display it: a near-empty frame
+                        // would otherwise flash black for that one frame
+                        // before the next, real-content frame arrives. Sample
+                        // a sparse grid and keep showing the previous texture
+                        // until something substantial comes in.
+                        let pixel_count = wu * hu;
+                        let substantial = if pixel_count == 0 {
+                            false
+                        } else {
+                            const SAMPLES: usize = 256;
+                            let step = (pixel_count / SAMPLES).max(1);
+                            let mut nonzero = 0usize;
+                            let mut checked = 0usize;
+                            let mut px = 0usize;
+                            while px < pixel_count {
+                                let off = px * 4;
+                                if rgba[off] != 0 || rgba[off + 1] != 0 || rgba[off + 2] != 0 {
+                                    nonzero += 1;
+                                }
+                                checked += 1;
+                                px += step;
+                            }
+                            nonzero as f64 / checked.max(1) as f64 > 0.05
+                        };
+
+                        if substantial || self.hyperv_texture.is_none() {
+                            let img = egui::ColorImage::from_rgba_unmultiplied([wu, hu], &rgba);
+                            self.hyperv_texture = Some(ctx.load_texture(
+                                "vbox_vrde_frame",
+                                img,
+                                egui::TextureOptions::LINEAR,
+                            ));
+                        }
+                        // FPS counter reuse
+                        self.hyperv_frame_count += 1;
+                        let fps_elapsed = self.hyperv_fps_window.elapsed();
+                        if fps_elapsed >= Duration::from_secs(1) {
+                            self.hyperv_fps_display = self.hyperv_frame_count as f32 / fps_elapsed.as_secs_f32();
+                            self.hyperv_frame_count = 0;
+                            self.hyperv_fps_window = std::time::Instant::now();
+                        }
+                        ctx.request_repaint();
+                    }
+                }
+                // Dropped the "stuck despite active input" heuristic, and
+                // deliberately do NOT use a short timer here either —
+                // measured directly (down to 300ms): even a perfectly healthy
+                // session has legitimate multi-hundred-ms gaps between server
+                // frames whenever the guest screen genuinely isn't changing
+                // (cursor movement alone is composited client-side, no server
+                // round-trip). Elapsed-time-since-last-frame cannot
+                // distinguish "quiet because nothing changed" from "quiet
+                // because it's broken" at ANY threshold short enough to feel
+                // responsive — both produce the exact same signal. The
+                // content-collapse detector above is evidence-based (it only
+                // fires on an actual measured drop in real pixel data) and is
+                // the correct primary signal; this is a true last-resort for
+                // a socket that goes silently dead for a very long time.
+                let stuck_regardless = self.vbox_vrde_last_frame.elapsed() > Duration::from_secs(60);
+
+                if stuck_regardless {
+                    if let Some(port) = self.vbox_vrde_active_port {
+                        vbox_rdp::log_from_ui(&format!(
+                            "VRDE: [main] reconnect trigger = stuck_regardless (60s safety net) last_frame_ms_ago={}",
+                            self.vbox_vrde_last_frame.elapsed().as_millis(),
+                        ));
+                        self.hyperv_status = "VRDE: авто-реконнект (декодер застрял)...".to_owned();
+                        self.vbox_vrde_active_port = None; // bypass the no-op dedup guard
+                        self.start_vbox_vrde_session(port);
+                        self.vbox_vrde_last_frame = std::time::Instant::now();
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        }
+
+        // Poll Hyper-V Enhanced Session (RDP over VMBus) frames — same handling
+        // as the VRDE path (it produces the same (w,h,rgba) frames + status,
+        // and dies the same way via channel disconnect).
+        if let Some(session) = &self.hyperv_rdp_session {
+            let mut dead = false;
+            loop {
+                match session.poll_status() {
+                    vbox_rdp::Poll::Item(msg) => {
+                        self.hyperv_status = msg;
+                        ctx.request_repaint();
+                    }
+                    vbox_rdp::Poll::Empty => break,
+                    vbox_rdp::Poll::Dead => {
+                        dead = true;
+                        break;
+                    }
+                }
+            }
+            if dead {
+                if let Some(s) = self.hyperv_rdp_session.take() {
+                    s.stop();
+                }
+                self.hyperv_status = "RDP: сессия завершилась".to_owned();
+                ctx.request_repaint();
+            } else {
+                let mut latest = None;
+                loop {
+                    match session.poll_frame() {
+                        vbox_rdp::Poll::Item(f) => latest = Some(f),
+                        vbox_rdp::Poll::Empty => break,
+                        vbox_rdp::Poll::Dead => {
+                            dead = true;
+                            break;
+                        }
+                    }
+                }
+                if dead {
+                    if let Some(s) = self.hyperv_rdp_session.take() {
+                        s.stop();
+                    }
+                    self.hyperv_status = "RDP: сессия завершилась".to_owned();
+                    ctx.request_repaint();
+                } else if let Some((w, h, rgba)) = latest {
+                    let (wu, hu) = (w as usize, h as usize);
+                    if rgba.len() == wu * hu * 4 {
+                        let img = egui::ColorImage::from_rgba_unmultiplied([wu, hu], &rgba);
+                        self.hyperv_texture = Some(ctx.load_texture(
+                            "hyperv_rdp_frame",
+                            img,
+                            egui::TextureOptions::LINEAR,
+                        ));
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        }
+
+        // Keep egui awake while any VM session is active
+        if self.hyperv_session.is_some()
+            || self.vbox_session.is_some()
+            || self.vbox_vrde_session.is_some()
+            || self.hyperv_rdp_session.is_some()
+        {
+            ctx.request_repaint_after(Duration::from_millis(16)); // 60fps polling
         }
     }
 
@@ -7641,6 +8726,134 @@ fn egui_key_to_vbox_key_id(key: egui::Key) -> Option<u8> {
     })
 }
 
+fn fitted_image_rect(outer: egui::Rect, image_w: f32, image_h: f32) -> egui::Rect {
+    if image_w <= 0.0 || image_h <= 0.0 || outer.width() <= 0.0 || outer.height() <= 0.0 {
+        return outer;
+    }
+
+    let image_aspect = image_w / image_h;
+    let outer_aspect = outer.width() / outer.height();
+    if outer_aspect > image_aspect {
+        let w = outer.height() * image_aspect;
+        egui::Rect::from_center_size(outer.center(), egui::vec2(w, outer.height()))
+    } else {
+        let h = outer.width() / image_aspect;
+        egui::Rect::from_center_size(outer.center(), egui::vec2(outer.width(), h))
+    }
+}
+
+fn pointer_to_guest_pixel(
+    pos: egui::Pos2,
+    image_rect: egui::Rect,
+    guest_w: f32,
+    guest_h: f32,
+) -> Option<(u16, u16)> {
+    if !image_rect.contains(pos)
+        || image_rect.width() <= 0.0
+        || image_rect.height() <= 0.0
+        || guest_w <= 0.0
+        || guest_h <= 0.0
+    {
+        return None;
+    }
+
+    let gx = ((pos.x - image_rect.left()) / image_rect.width() * guest_w)
+        .clamp(0.0, guest_w - 1.0) as u16;
+    let gy = ((pos.y - image_rect.top()) / image_rect.height() * guest_h)
+        .clamp(0.0, guest_h - 1.0) as u16;
+    Some((gx, gy))
+}
+
+fn egui_pointer_to_vrde_button(button: egui::PointerButton) -> Option<u8> {
+    Some(match button {
+        egui::PointerButton::Primary => 0,
+        egui::PointerButton::Secondary => 1,
+        egui::PointerButton::Middle => 2,
+        _ => return None,
+    })
+}
+
+fn egui_key_is_plain_text(key: egui::Key) -> bool {
+    use egui::Key::*;
+    matches!(
+        key,
+        A | B | C | D | E | F | G | H | I | J | K | L | M | N | O | P | Q | R | S | T | U
+            | V | W | X | Y | Z
+            | Num0 | Num1 | Num2 | Num3 | Num4 | Num5 | Num6 | Num7 | Num8 | Num9
+            | Space
+    )
+}
+
+fn egui_key_to_rdp_scancode(key: egui::Key) -> Option<(u8, bool)> {
+    use egui::Key::*;
+    Some(match key {
+        Escape => (0x01, false),
+        Backspace => (0x0E, false),
+        Tab => (0x0F, false),
+        Enter => (0x1C, false),
+        Insert => (0x52, true),
+        Delete => (0x53, true),
+        Home => (0x47, true),
+        End => (0x4F, true),
+        PageUp => (0x49, true),
+        PageDown => (0x51, true),
+        ArrowLeft => (0x4B, true),
+        ArrowRight => (0x4D, true),
+        ArrowUp => (0x48, true),
+        ArrowDown => (0x50, true),
+        F1 => (0x3B, false),
+        F2 => (0x3C, false),
+        F3 => (0x3D, false),
+        F4 => (0x3E, false),
+        F5 => (0x3F, false),
+        F6 => (0x40, false),
+        F7 => (0x41, false),
+        F8 => (0x42, false),
+        F9 => (0x43, false),
+        F10 => (0x44, false),
+        F11 => (0x57, false),
+        F12 => (0x58, false),
+        A => (0x1E, false),
+        B => (0x30, false),
+        C => (0x2E, false),
+        D => (0x20, false),
+        E => (0x12, false),
+        F => (0x21, false),
+        G => (0x22, false),
+        H => (0x23, false),
+        I => (0x17, false),
+        J => (0x24, false),
+        K => (0x25, false),
+        L => (0x26, false),
+        M => (0x32, false),
+        N => (0x31, false),
+        O => (0x18, false),
+        P => (0x19, false),
+        Q => (0x10, false),
+        R => (0x13, false),
+        S => (0x1F, false),
+        T => (0x14, false),
+        U => (0x16, false),
+        V => (0x2F, false),
+        W => (0x11, false),
+        X => (0x2D, false),
+        Y => (0x15, false),
+        Z => (0x2C, false),
+        Num0 => (0x0B, false),
+        Num1 => (0x02, false),
+        Num2 => (0x03, false),
+        Num3 => (0x04, false),
+        Num4 => (0x05, false),
+        Num5 => (0x06, false),
+        Num6 => (0x07, false),
+        Num7 => (0x08, false),
+        Num8 => (0x09, false),
+        Num9 => (0x0A, false),
+        Space => (0x39, false),
+        _ => return None,
+    })
+}
+
 fn key_allows_repeat(key: egui::Key) -> bool {
     matches!(
         key,
@@ -7709,6 +8922,52 @@ fn configure_ui_scale(ctx: &egui::Context) {
         .unwrap_or(default_zoom)
         .clamp(0.75, 1.75);
     ctx.set_zoom_factor(zoom);
+}
+
+fn configure_icon_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    ctx.set_fonts(fonts);
+}
+
+#[cfg(windows)]
+fn vm_icon_button(ui: &mut egui::Ui, icon: &str, tooltip: impl Into<egui::WidgetText>) -> egui::Response {
+    ui.add(
+        egui::Button::new(egui::RichText::new(icon).size(15.0))
+            .min_size(egui::vec2(26.0, 24.0)),
+    )
+    .on_hover_text(tooltip)
+}
+
+#[cfg(windows)]
+fn vm_icon_button_enabled(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    icon: &str,
+    tooltip: impl Into<egui::WidgetText>,
+) -> egui::Response {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(egui::RichText::new(icon).size(15.0))
+            .min_size(egui::vec2(26.0, 24.0)),
+    )
+    .on_hover_text(tooltip)
+}
+
+#[cfg(windows)]
+fn default_vrde_desktop_size() -> (u16, u16) {
+    (1920, 1080)
+}
+
+#[cfg(windows)]
+fn vrde_desktop_size_for_canvas(size: egui::Vec2) -> (u16, u16) {
+    let scale = 1.25;
+    let mut width = (size.x * scale).round().clamp(1920.0, 3840.0) as u16;
+    if width % 2 != 0 {
+        width = width.saturating_sub(1);
+    }
+    let height = (size.y * scale).round().clamp(1080.0, 2160.0) as u16;
+    (width.max(200), height.max(200))
 }
 
 // Тема и стиль теперь живут в `theme.rs` (дизайн-система с токенами).

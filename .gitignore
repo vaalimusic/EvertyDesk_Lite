@@ -44,3 +44,8 @@ diag_stderr.txt
 /reports/
 #/docs/
 /dist/
+
+# Reference checkout (official IronRDP viewer source, for comparison only —
+# not buildable standalone here, missing sibling crates from the upstream repo)
+/ironrdp-viewer/
+/vendor/

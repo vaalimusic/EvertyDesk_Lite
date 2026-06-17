@@ -13,7 +13,7 @@ crate-type = ["lib", "cdylib"]
 [features]
 default = ["live-h264", "live-vp9-mf", "live-nvenc-sdk", "desktop-gui", "evrt-wasapi"]
 # Desktop GUI: eframe + arboard. Excluded from Android builds.
-desktop-gui = ["dep:eframe", "dep:arboard"]
+desktop-gui = ["dep:eframe", "dep:arboard", "dep:egui-phosphor"]
 # Android клиент: собирается как cdylib с JNI-мостом, без desktop GUI.
 android-client = ["dep:jni"]
 live-h264  = ["dep:openh264"]
@@ -55,6 +55,7 @@ eframe = { version = "0.34", optional = true, default-features = false, features
     "default_fonts", # bundled fonts
     "accesskit",     # accessibility
 ] }
+egui-phosphor = { version = "0.12", optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 libc = "0.2"
 openh264 = { version = "0.9", optional = true }
@@ -73,6 +74,13 @@ dryoc = "0.7"
 
 # JNI-зависимость только для Android-сборки (по фиче android-client).
 jni = { version = "0.21", optional = true }
+ironrdp-blocking = "0.9"
+ironrdp-connector = "0.9"
+ironrdp-core = "0.2"
+ironrdp-graphics = "0.8"
+ironrdp-session = "0.9"
+ironrdp-pdu = "0.8"
+native-tls = "0.2"
 
 [target.'cfg(target_os = "android")'.dependencies]
 # Логи Android logcat
@@ -118,6 +126,26 @@ windows = { version = "0.48", features = [
     "Win32_System_Wmi",
     "Win32_System_Ole",
 ], optional = true }
+
+# ironrdp-bulk fork: self-heals from MPPC HistoryBufferOverflow (reset +
+# reprocess the same packet) instead of hard-failing the whole RDP session.
+# Needed for VirtualBox VRDE specifically — even Microsoft's own mstsc.exe
+# handles the same VRDE stream without issue, but every independent decoder
+# we tried (including the unmodified upstream ironrdp-bulk) periodically
+# desyncs against it. See vendor/ironrdp-bulk/src/mppc/mod.rs for details.
+[patch.crates-io]
+ironrdp-bulk = { path = "vendor/ironrdp-bulk" }
+# ironrdp-session fork: fixes a real out-of-bounds panic in the bitmap-apply
+# path (apply_bgr24_bitmap / apply_rgb32_bitmap / friends in image.rs).
+# `rect_fits()` only validates the declared update rectangle against image
+# bounds; it never checked that the actual bitmap payload length matched
+# that rectangle. VirtualBox VRDE occasionally sends more row data than its
+# own declared rectangle implies (yet another non-compliant-server quirk,
+# alongside the empty FontMap and truncated ShareControlHeader already
+# worked around elsewhere) — `chunks_exact` then yields extra rows, walking
+# `row_idx` straight past the validated bound and panicking the whole
+# session thread mid-frame. See vendor/ironrdp-session/src/image.rs.
+ironrdp-session = { path = "vendor/ironrdp-session" }
 
 # -----------------------------------------------------------------------
 # Dev-profile optimisation: NV12→RGBA at 1920×1080×30 fps is ~620M ops/s
