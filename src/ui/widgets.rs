@@ -264,11 +264,11 @@ pub(crate) fn compact_text_input(
         crate::theme::palette().surface
     };
     let stroke = if is_focused {
-        egui::Stroke::new(1.8, egui::Color32::from_rgb(0x5F, 0x86, 0xB8))
+        egui::Stroke::new(1.8, crate::theme::palette().accent)
     } else if response.hovered() {
-        egui::Stroke::new(1.6, egui::Color32::from_rgb(0x7F, 0x98, 0xB8))
+        egui::Stroke::new(1.6, crate::theme::palette().border_strong)
     } else {
-        egui::Stroke::new(1.5, crate::theme::palette().text_muted)
+        egui::Stroke::new(1.5, crate::theme::palette().border)
     };
     ui.painter()
         .rect_filled(rect, egui::CornerRadius::same(10), fill);
@@ -285,7 +285,7 @@ pub(crate) fn compact_text_input(
             .hint_text(hint)
             .password(password)
             .desired_width(f32::INFINITY)
-            .text_color(egui::Color32::from_rgb(0x0B, 0x10, 0x1A))
+            .text_color(crate::theme::palette().text)
             .font(
                 font_size
                     .map(egui::FontId::proportional)

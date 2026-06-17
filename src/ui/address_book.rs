@@ -68,8 +68,12 @@ impl EvertyDeskApp {
                 if !self.contact_search.is_empty()
                     && ui
                         .add(
-                            egui::Button::new(tr(lang, "Очистить", "Clear"))
-                                .min_size(egui::vec2(82.0, 34.0)),
+                            egui::Button::new(format!(
+                                "{}  {}",
+                                egui_phosphor::regular::X,
+                                tr(lang, "Очистить", "Clear")
+                            ))
+                            .min_size(egui::vec2(92.0, 34.0)),
                         )
                         .clicked()
                 {
@@ -106,8 +110,12 @@ impl EvertyDeskApp {
                 if ui
                     .add_enabled(
                         self.config.ui.address_book_signed_in,
-                        egui::Button::new(tr(lang, "Обновить", "Refresh"))
-                            .min_size(egui::vec2(96.0, 34.0)),
+                        egui::Button::new(format!(
+                            "{}  {}",
+                            egui_phosphor::regular::ARROWS_CLOCKWISE,
+                            tr(lang, "Обновить", "Refresh")
+                        ))
+                        .min_size(egui::vec2(108.0, 34.0)),
                     )
                     .clicked()
                 {
@@ -480,7 +488,7 @@ impl EvertyDeskApp {
                             "Sign in to the address book first.",
                         ))
                         .size(12.0)
-                        .color(egui::Color32::from_rgb(0xA0, 0x5A, 0x1B)),
+                        .color(crate::theme::palette().warning),
                     );
                 }
             });
@@ -586,10 +594,19 @@ impl EvertyDeskApp {
                 );
                 ui.add_space(4.0);
                 ui.horizontal_wrapped(|ui| {
+                    let t = crate::theme::palette();
                     if ui
                         .add(
-                            egui::Button::new(tr(lang, "Подключиться", "Connect"))
-                                .min_size(egui::vec2(118.0, 34.0)),
+                            egui::Button::new(
+                                egui::RichText::new(format!(
+                                    "{}  {}",
+                                    egui_phosphor::regular::PLUGS_CONNECTED,
+                                    tr(lang, "Подключиться", "Connect")
+                                ))
+                                .color(t.accent_fg),
+                            )
+                            .fill(t.accent)
+                            .min_size(egui::vec2(132.0, 34.0)),
                         )
                         .clicked()
                     {
@@ -750,7 +767,7 @@ fn compact_panel_frame() -> egui::Frame {
         .fill(crate::theme::palette().surface)
         .stroke(egui::Stroke::new(
             1.0,
-            crate::theme::palette().surface_sunken,
+            crate::theme::palette().border,
         ))
         .corner_radius(egui::CornerRadius::same(8))
         .inner_margin(egui::Margin::symmetric(12, 10))
@@ -873,10 +890,19 @@ fn draw_contact_tile(
                 },
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let t = crate::theme::palette();
                 if ui
                     .add(
-                        egui::Button::new(tr(lang, "Подключить", "Connect"))
-                            .min_size(egui::vec2(92.0, 28.0)),
+                        egui::Button::new(
+                            egui::RichText::new(format!(
+                                "{}  {}",
+                                egui_phosphor::regular::PLUGS_CONNECTED,
+                                tr(lang, "Подключить", "Connect")
+                            ))
+                            .color(t.accent_fg),
+                        )
+                        .fill(t.accent)
+                        .min_size(egui::vec2(104.0, 28.0)),
                     )
                     .clicked()
                 {
@@ -899,7 +925,7 @@ fn contact_tile_frame(online: bool) -> egui::Frame {
             if online {
                 crate::theme::palette().success
             } else {
-                crate::theme::palette().surface_sunken
+                crate::theme::palette().border
             },
         ))
         .corner_radius(egui::CornerRadius::same(8))

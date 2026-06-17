@@ -6692,7 +6692,7 @@ impl EvertyDeskApp {
                         egui::RichText::new(format!("{total} VM · {running} запущено"))
                             .size(13.0)
                             .strong()
-                            .color(egui::Color32::from_rgb(0xE6, 0xED, 0xF3)),
+                            .color(crate::theme::palette().text),
                     );
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
@@ -6718,7 +6718,7 @@ impl EvertyDeskApp {
                     ui.label(
                         egui::RichText::new(&self.remote_vm_status)
                             .size(11.5)
-                            .color(egui::Color32::from_rgb(0x9A, 0xC9, 0xB8)),
+                            .color(crate::theme::palette().success),
                     );
                 }
                 ui.separator();
@@ -6742,7 +6742,7 @@ impl EvertyDeskApp {
                     // Группируем по провайдеру: Hyper-V, затем VirtualBox.
                     for (prefix, title, color) in [
                         ("hyperv:", "HYPER-V", crate::theme::palette().info),
-                        ("vbox:", "VIRTUALBOX", egui::Color32::from_rgb(0xE8, 0x8A, 0x2E)),
+                        ("vbox:", "VIRTUALBOX", crate::theme::palette().warning),
                     ] {
                         let group: Vec<&RemoteVmEntry> =
                             vms.iter().filter(|v| v.id.starts_with(prefix)).collect();
@@ -6788,13 +6788,18 @@ impl EvertyDeskApp {
             .capability_graph
             .as_ref()
             .map(|g| g.recommended_mode.badge_rgb());
+        let t = crate::theme::palette();
+        // Активная VM подсвечивается акцентной подложкой + рамкой; остальные —
+        // на приподнятой поверхности. Адаптивно к тёмной/светлой теме.
+        let (card_fill, card_stroke) = if is_attached {
+            (crate::theme::accent_tint(&t, 0.14), egui::Stroke::new(1.2, t.accent))
+        } else {
+            (t.surface_raised, egui::Stroke::new(1.0, t.border))
+        };
         egui::Frame::NONE
-            .fill(if is_attached {
-                egui::Color32::from_rgb(0x1C, 0x33, 0x2A)
-            } else {
-                egui::Color32::from_rgb(0x16, 0x24, 0x36)
-            })
-            .corner_radius(egui::CornerRadius::same(8))
+            .fill(card_fill)
+            .stroke(card_stroke)
+            .corner_radius(egui::CornerRadius::same(crate::theme::radius::LG))
             .inner_margin(egui::Margin::same(11))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -6808,7 +6813,7 @@ impl EvertyDeskApp {
                             egui::RichText::new(name)
                                 .strong()
                                 .size(14.0)
-                                .color(crate::theme::palette().surface_raised),
+                                .color(t.text),
                         );
                         ui.horizontal(|ui| {
                             // Чип провайдера
@@ -6851,13 +6856,28 @@ impl EvertyDeskApp {
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
                             if is_attached {
-                                ui.label(
-                                    egui::RichText::new("подключено")
-                                        .size(11.0)
-                                        .color(crate::theme::palette().success),
-                                );
+                                // Бейдж «подключено» с акцентной подложкой.
+                                egui::Frame::NONE
+                                    .fill(crate::theme::accent_tint(&t, 0.18))
+                                    .corner_radius(egui::CornerRadius::same(crate::theme::radius::SM))
+                                    .inner_margin(egui::Margin::symmetric(8, 3))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new("● подключено")
+                                                .size(11.0)
+                                                .strong()
+                                                .color(t.accent),
+                                        );
+                                    });
                             } else if ui
-                                .add_enabled(vm.connectable, egui::Button::new("Подключиться"))
+                                .add_enabled(
+                                    vm.connectable,
+                                    egui::Button::new(
+                                        egui::RichText::new("Подключиться").color(t.accent_fg),
+                                    )
+                                    .fill(t.accent)
+                                    .corner_radius(egui::CornerRadius::same(crate::theme::radius::MD)),
+                                )
                                 .clicked()
                             {
                                 self.remote_attached_vm = vm_id.clone();
@@ -6985,8 +7005,9 @@ impl EvertyDeskApp {
                 if self.remote_ctrl_vm_id == vm_id && self.remote_checkpoint_panel_open {
                     ui.add_space(6.0);
                     egui::Frame::NONE
-                        .fill(egui::Color32::from_rgb(0x10, 0x1E, 0x30))
-                        .corner_radius(egui::CornerRadius::same(6))
+                        .fill(crate::theme::palette().surface_sunken)
+                        .stroke(egui::Stroke::new(1.0, crate::theme::palette().border))
+                        .corner_radius(egui::CornerRadius::same(crate::theme::radius::MD))
                         .inner_margin(egui::Margin::same(8))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
@@ -7057,21 +7078,25 @@ impl EvertyDeskApp {
 
                 // ── Rescue input panel ────────────────────────────────────────
                 if self.remote_ctrl_vm_id == vm_id && self.remote_rescue_panel_open {
+                    let t = crate::theme::palette();
                     ui.add_space(6.0);
                     egui::Frame::NONE
-                        .fill(egui::Color32::from_rgb(0x20, 0x10, 0x10))
-                        .corner_radius(egui::CornerRadius::same(6))
+                        .fill(crate::theme::tint(t.danger, 0.10))
+                        .stroke(egui::Stroke::new(1.0, crate::theme::tint(t.danger, 0.35)))
+                        .corner_radius(egui::CornerRadius::same(crate::theme::radius::MD))
                         .inner_margin(egui::Margin::same(8))
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            ui.label(egui::RichText::new("🛟 BasicRescue — ввод").strong().size(12.0));
+                            ui.label(egui::RichText::new("🛟 BasicRescue — ввод").strong().size(12.0).color(t.text));
                             ui.add_space(4.0);
                             ui.horizontal(|ui| {
                                 // Ctrl+Alt+Del
                                 if ui
                                     .add(
-                                        egui::Button::new("⌨ Ctrl+Alt+Del")
-                                            .fill(egui::Color32::from_rgb(0x8B, 0x00, 0x00)),
+                                        egui::Button::new(
+                                            egui::RichText::new("⌨ Ctrl+Alt+Del").color(t.accent_fg),
+                                        )
+                                        .fill(t.danger),
                                     )
                                     .on_hover_text("Отправить Ctrl+Alt+Del в VM")
                                     .clicked()

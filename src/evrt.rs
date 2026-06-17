@@ -65,6 +65,7 @@ pub const TYPE_AUDIO_FRAME: u8 = 6;
 pub const TYPE_ENHANCEMENT_CONFIG: u8 = 7;
 pub const TYPE_ENHANCEMENT_FRAME: u8 = 8;
 pub const TYPE_ROI_METADATA: u8 = 9;
+pub const TYPE_FEC: u8 = 10;
 
 // ─── флаги ────────────────────────────────────────────────────────────────────
 
@@ -495,6 +496,175 @@ fn packetize_with_limit(
     packets
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// FEC — Forward Error Correction (XOR-parity, в духе WebRTC ULPFEC)
+//
+// На каждые до FEC_GROUP_SIZE data-пакетов кадра строится 1 FEC-пакет: XOR их
+// payload + XOR их длин. Если в группе потерян РОВНО ОДИН data-пакет, приёмник
+// восстанавливает его без ретрансмиссии:
+//     lost_payload = fec.xor_payload XOR (остальные payload группы)
+//     lost_len     = fec.xor_len     XOR (длины остальных)
+//
+// Это убирает «фриз до следующего IDR» при единичных потерях — самый частый
+// паттерн потерь на Wi-Fi/мобильной сети. Накладные расходы ~1/8 трафика.
+//
+// FEC payload layout (после 24-байтного EVRT-заголовка типа TYPE_FEC):
+//   [0..2]  base_index : u16  — packet_index первого покрытого data-пакета
+//   [2]     group_size : u8   — сколько data-пакетов покрыто (1..=GROUP_SIZE)
+//   [3..5]  xor_len    : u16  — XOR длин payload покрытых пакетов
+//   [5..]   xor_payload       — XOR payload (каждый дополнен нулями до max в группе)
+// В заголовке FEC-пакета: frame_id = кадр; packet_index = индекс FEC-группы;
+// packet_count = всего FEC-групп кадра.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Сколько data-пакетов покрывает один FEC-пакет.
+pub const FEC_GROUP_SIZE: usize = 8;
+const FEC_HEADER_LEN: usize = 5; // base_index(2) + group_size(1) + xor_len(2)
+
+/// Распарсенные метаданные FEC-пакета.
+#[derive(Debug, Clone)]
+pub struct FecMeta {
+    pub frame_id: u32,
+    pub base_index: u16,
+    pub group_size: u8,
+    pub xor_len: u16,
+    pub xor_payload: Vec<u8>,
+}
+
+/// Построить FEC-пакеты для набора data-чанков (исходные payload до заголовка).
+/// `flags` копируется из кадра (для совместимости — например key-frame бит).
+pub fn build_fec_packets(
+    frame_id: u32,
+    presentation_time_us: u64,
+    flags: u16,
+    chunks: &[&[u8]],
+    session_token: Option<&str>,
+) -> Vec<Vec<u8>> {
+    if chunks.is_empty() {
+        return Vec::new();
+    }
+    let total_groups = chunks.len().div_ceil(FEC_GROUP_SIZE);
+    if total_groups > MAX_FRAME_PACKET_COUNT {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(total_groups);
+
+    for (gi, group) in chunks.chunks(FEC_GROUP_SIZE).enumerate() {
+        let base_index = (gi * FEC_GROUP_SIZE) as u16;
+        let max_len = group.iter().map(|c| c.len()).max().unwrap_or(0);
+        // FEC payload не должен превышать лимит датаграммы.
+        let max_payload = if session_token.is_some_and(valid_session_token) {
+            MAX_AUTH_PAYLOAD_SIZE
+        } else {
+            MAX_PAYLOAD_SIZE
+        };
+        if FEC_HEADER_LEN + max_len > max_payload {
+            // Группа слишком большая для одной FEC-датаграммы — пропускаем
+            // (data-пакеты всё равно уйдут; FEC просто не покроет эту группу).
+            continue;
+        }
+
+        let mut xor_payload = vec![0u8; max_len];
+        let mut xor_len: u16 = 0;
+        for chunk in group {
+            for (i, &b) in chunk.iter().enumerate() {
+                xor_payload[i] ^= b;
+            }
+            xor_len ^= chunk.len() as u16;
+        }
+
+        let mut fec_payload = Vec::with_capacity(FEC_HEADER_LEN + max_len);
+        fec_payload.extend_from_slice(&base_index.to_be_bytes());
+        fec_payload.push(group.len() as u8);
+        fec_payload.extend_from_slice(&xor_len.to_be_bytes());
+        fec_payload.extend_from_slice(&xor_payload);
+
+        out.push(build_packet_authenticated(
+            TYPE_FEC,
+            flags,
+            frame_id,
+            gi as u16,
+            total_groups as u16,
+            presentation_time_us,
+            &fec_payload,
+            session_token,
+        ));
+    }
+    out
+}
+
+/// Разобрать payload FEC-пакета в метаданные.
+pub fn parse_fec_payload(frame_id: u32, payload: &[u8]) -> Option<FecMeta> {
+    if payload.len() < FEC_HEADER_LEN {
+        return None;
+    }
+    let base_index = u16::from_be_bytes([payload[0], payload[1]]);
+    let group_size = payload[2];
+    if group_size == 0 || group_size as usize > FEC_GROUP_SIZE {
+        return None;
+    }
+    let xor_len = u16::from_be_bytes([payload[3], payload[4]]);
+    let xor_payload = payload[FEC_HEADER_LEN..].to_vec();
+    Some(FecMeta {
+        frame_id,
+        base_index,
+        group_size,
+        xor_len,
+        xor_payload,
+    })
+}
+
+/// Восстановить единственный потерянный пакет группы.
+///
+/// `present` — присутствующие пакеты группы как (packet_index, payload).
+/// Если в группе [base_index .. base_index+group_size) ровно один отсутствует,
+/// возвращает (packet_index, recovered_payload). Иначе None (восстановить XOR
+/// можно только при ровно одной потере).
+pub fn fec_recover_one(fec: &FecMeta, present: &[(u16, &[u8])]) -> Option<(u16, Vec<u8>)> {
+    let base = fec.base_index;
+    let end = base.saturating_add(fec.group_size as u16);
+
+    // Какие индексы группы присутствуют.
+    let mut seen = [false; FEC_GROUP_SIZE];
+    let mut present_in_group = 0usize;
+    for &(idx, _) in present {
+        if idx >= base && idx < end {
+            let off = (idx - base) as usize;
+            if off < FEC_GROUP_SIZE && !seen[off] {
+                seen[off] = true;
+                present_in_group += 1;
+            }
+        }
+    }
+    // Восстановление возможно только при ровно одной недостаче.
+    if present_in_group + 1 != fec.group_size as usize {
+        return None;
+    }
+    // Находим отсутствующий offset.
+    let missing_off = (0..fec.group_size as usize).find(|&o| !seen[o])?;
+    let missing_index = base + missing_off as u16;
+
+    // XOR: recovered = fec.xor ^ (все присутствующие payload группы).
+    let mut recovered = fec.xor_payload.clone();
+    let mut len_acc = fec.xor_len;
+    for &(idx, payload) in present {
+        if idx >= base && idx < end {
+            for (i, &b) in payload.iter().enumerate() {
+                if i < recovered.len() {
+                    recovered[i] ^= b;
+                }
+            }
+            len_acc ^= payload.len() as u16;
+        }
+    }
+    let recovered_len = len_acc as usize;
+    if recovered_len > recovered.len() {
+        return None; // повреждённый FEC
+    }
+    recovered.truncate(recovered_len);
+    Some((missing_index, recovered))
+}
+
 fn auth_tag(session_token: &str, packet_body: &[u8]) -> [u8; AUTH_TAG_SIZE] {
     let mac = hmac_sha256(session_token.as_bytes(), packet_body);
     let mut tag = [0u8; AUTH_TAG_SIZE];
@@ -833,6 +1003,57 @@ fn parse_feedback(s: &str) -> Option<ReceiverFeedback> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fec_recovers_single_loss_in_group() {
+        // Три data-чанка разной длины.
+        let c0: Vec<u8> = vec![1, 2, 3, 4];
+        let c1: Vec<u8> = vec![10, 20, 30];
+        let c2: Vec<u8> = vec![100, 99, 98, 97, 96];
+        let chunks: Vec<&[u8]> = vec![&c0, &c1, &c2];
+
+        let fec_pkts = build_fec_packets(7, 1000, FLAG_KEY_FRAME, &chunks, None);
+        assert_eq!(fec_pkts.len(), 1); // одна группа
+
+        let parsed = parse(&fec_pkts[0], fec_pkts[0].len()).unwrap();
+        assert_eq!(parsed.packet_type, TYPE_FEC);
+        let meta = parse_fec_payload(parsed.frame_id, &parsed.payload).unwrap();
+
+        // Потерян c1 (index 1). Присутствуют c0, c2.
+        let present: Vec<(u16, &[u8])> = vec![(0, &c0), (2, &c2)];
+        let (idx, recovered) = fec_recover_one(&meta, &present).unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(recovered, c1);
+    }
+
+    #[test]
+    fn fec_no_recovery_with_two_losses() {
+        let c0: Vec<u8> = vec![1, 2, 3];
+        let c1: Vec<u8> = vec![4, 5, 6];
+        let c2: Vec<u8> = vec![7, 8, 9];
+        let chunks: Vec<&[u8]> = vec![&c0, &c1, &c2];
+        let fec_pkts = build_fec_packets(1, 0, 0, &chunks, None);
+        let parsed = parse(&fec_pkts[0], fec_pkts[0].len()).unwrap();
+        let meta = parse_fec_payload(parsed.frame_id, &parsed.payload).unwrap();
+        // Потеряны двое — восстановление невозможно.
+        let present: Vec<(u16, &[u8])> = vec![(0, &c0)];
+        assert!(fec_recover_one(&meta, &present).is_none());
+    }
+
+    #[test]
+    fn fec_recovers_first_packet() {
+        let c0: Vec<u8> = vec![9, 9, 9, 9, 9, 9];
+        let c1: Vec<u8> = vec![1, 1];
+        let chunks: Vec<&[u8]> = vec![&c0, &c1];
+        let fec_pkts = build_fec_packets(2, 0, 0, &chunks, None);
+        let parsed = parse(&fec_pkts[0], fec_pkts[0].len()).unwrap();
+        let meta = parse_fec_payload(parsed.frame_id, &parsed.payload).unwrap();
+        // Потерян c0 (первый).
+        let present: Vec<(u16, &[u8])> = vec![(1, &c1)];
+        let (idx, recovered) = fec_recover_one(&meta, &present).unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(recovered, c0);
+    }
 
     #[test]
     fn roundtrip_video_frame() {
