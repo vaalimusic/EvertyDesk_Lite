@@ -1055,6 +1055,15 @@ struct EvertyDeskApp {
     remote_input_focused: bool,
     remote_modifiers_down: RemoteModifierState,
     last_mouse_pos: Option<(i32, i32)>,
+    /// True between a mouse-press that landed *inside* the remote screen and its
+    /// release. Mouse events are read from the global egui event stream, so a
+    /// click on a toolbar/status-bar button also shows up here; without this
+    /// gate a release outside the screen would still fire a MouseUp into the
+    /// guest at the last in-screen position (which manifested as "clicking
+    /// Детали presses Start in the guest"). Press outside → ignored; release is
+    /// only forwarded if the press was armed inside, which still lets a real
+    /// drag that ends off-screen complete correctly.
+    remote_pointer_armed: bool,
     remote_displays: Vec<RemoteDisplay>,
     selected_display: i32,
     auto_refresh: bool,
@@ -1468,6 +1477,7 @@ impl EvertyDeskApp {
             remote_input_focused: false,
             remote_modifiers_down: RemoteModifierState::default(),
             last_mouse_pos: None,
+            remote_pointer_armed: false,
             remote_displays: Vec::new(),
             selected_display: 0,
             auto_refresh,
@@ -6803,6 +6813,11 @@ impl EvertyDeskApp {
             if remote_icon_button(ui, ph::CORNERS_OUT, "Полный экран (F11)").clicked() {
                 self.set_remote_fullscreen(ctx, !self.remote_fullscreen);
             }
+            // Метрики/диагностика — открывает перемещаемое плавающее окно
+            // поверх экрана (заменяет прежнюю нижнюю панель).
+            if remote_icon_toggle(ui, ph::GAUGE, self.show_stream_info, "Метрики потока (плавающее окно)").clicked() {
+                self.show_stream_info = !self.show_stream_info;
+            }
 
             // ── Правая группа: профиль AV, VM, меню (заполняет пространство) ──
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -7292,111 +7307,17 @@ impl EvertyDeskApp {
             self.remote_session_toolbar_ui(ui, ctx, false);
         });
 
-        egui::Panel::bottom("software-remote-statusbar").show(ctx, |ui| {
-            ui.add_space(3.0);
-            ui.horizontal(|ui| {
-                ui.add_space(4.0);
-                // Разрешение
-                if self.remote_size[0] > 0 {
-                    let _ = stat_pill(
-                        ui,
-                        None,
-                        &format!("{}×{}", self.remote_size[0], self.remote_size[1]),
-                        crate::theme::palette().text_muted,
-                    );
-                    ui.add_space(6.0);
-                }
-                // FPS
-                let (fps_dot, _) = health_dot(self.display_fps);
-                let _ = stat_pill(
-                    ui,
-                    Some(fps_dot),
-                    &format!("{:.0} fps", self.display_fps),
-                    crate::theme::palette().surface_raised,
-                );
-                ui.add_space(6.0);
-                // Кодек
-                let (codec_label, codec_color) = match self.last_frame_codec.as_str() {
-                    "H264" | "H265" | "AV1" | "VP9" => (
-                        self.last_frame_codec.as_str(),
-                        crate::theme::palette().accent,
-                    ),
-                    "PNG" => ("PNG", crate::theme::palette().warning),
-                    _ => ("—", crate::theme::palette().text_muted),
-                };
-                let _ = stat_pill(ui, None, codec_label, codec_color);
-                ui.add_space(6.0);
-                // Задержка
-                if let Some(ms) = self.latency_ms {
-                    let lat_color = if ms <= 40 {
-                        crate::theme::palette().accent
-                    } else if ms <= 90 {
-                        crate::theme::palette().warning
-                    } else {
-                        crate::theme::palette().danger
-                    };
-                    let _ = stat_pill(ui, None, &format!("{ms} ms"), lat_color);
-                    ui.add_space(6.0);
-                }
-                // EVRT бейдж
-                if self.evrt_active {
-                    let pressure_color = match self.evrt_pressure.as_str() {
-                        "critical" => crate::theme::palette().danger,
-                        "high" => crate::theme::palette().warning,
-                        _ => crate::theme::palette().accent,
-                    };
-                    let _ = stat_pill(ui, Some(pressure_color), "⚡ EVRT", pressure_color);
-                    ui.add_space(6.0);
-                }
-
-                // Справа: кнопка деталей + индикатор ввода
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_space(4.0);
-                    if self.screenshot_pending {
-                        ui.spinner();
-                        ui.add_space(6.0);
-                    }
-                    let info_btn = ui.add(
-                        egui::Button::new(egui::RichText::new("ℹ Детали").size(11.5).color(
-                            if self.show_stream_info {
-                                crate::theme::palette().accent
-                            } else {
-                                crate::theme::palette().text_muted
-                            },
-                        ))
-                        .frame(false),
-                    );
-                    if info_btn.clicked() {
-                        self.show_stream_info = !self.show_stream_info;
-                    }
-                    ui.add_space(8.0);
-                    // Краткое здоровье потока
-                    let _ = stat_pill(
-                        ui,
-                        Some(stream_health_color(&self.stream_health)),
-                        &self.stream_health,
-                        crate::theme::palette().text_muted,
-                    );
-                    if self.remote_input_focused {
-                        ui.add_space(6.0);
-                        let _ = stat_pill(
-                            ui,
-                            Some(egui::Color32::from_rgb(0x2D, 0xA0, 0xE6)),
-                            "ввод захвачен [Esc]",
-                            egui::Color32::from_rgb(0x7A, 0xC0, 0xF0),
-                        );
-                    }
-                });
-            });
-            ui.add_space(3.0);
-        });
-
-        // ── Окно детальной диагностики ────────────────────────────────────────
+        // ── Плавающее перемещаемое окно с метриками (вместо нижней панели) ────
         self.stream_info_window(ctx);
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            self.remote_screen_ui(ui);
-        });
+        // No frame margin — the remote screen + its letterbox backdrop should
+        // reach the panel edges (toolbar above, status bar below) with no app
+        // background showing through.
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(0x07, 0x0A, 0x0F)))
+            .show(ctx, |ui| {
+                self.remote_screen_ui(ui);
+            });
     }
 
     /// Красивое окно с детальной диагностикой стрима (по кнопке ℹ Детали).
@@ -7405,12 +7326,15 @@ impl EvertyDeskApp {
             return;
         }
         let mut open = self.show_stream_info;
-        egui::Window::new(self.text("Диагностика потока", "Stream diagnostics"))
+        // No anchor → the window is freely draggable over the remote screen
+        // (the user asked for a movable floating panel instead of a fixed
+        // bottom bar). egui remembers its position by id between frames.
+        egui::Window::new(self.text("Метрики потока", "Stream metrics"))
             .open(&mut open)
-            .resizable(false)
-            .collapsible(false)
-            .default_width(380.0)
-            .anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, -56.0])
+            .resizable(true)
+            .collapsible(true)
+            .default_width(300.0)
+            .default_pos(egui::pos2(80.0, 90.0))
             .show(ctx, |ui| {
                 let green = crate::theme::palette().accent;
                 let white = egui::Color32::from_rgb(0x1A, 0x1F, 0x2A);
@@ -7647,198 +7571,14 @@ impl EvertyDeskApp {
                 self.remote_session_toolbar_ui(ui, ctx, true);
             });
 
-            // ── Status bar (bottom) ─────────────────────────────────────────────────
-            egui::Panel::bottom("remote-statusbar").show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    // Resolution
-                    if self.remote_size[0] > 0 {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{}×{}",
-                                self.remote_size[0], self.remote_size[1]
-                            ))
-                            .monospace()
-                            .size(11.0),
-                        );
-                        ui.separator();
-                    }
-                    // FPS
-                    let fps_color = if self.display_fps >= 20.0 {
-                        egui::Color32::from_rgb(80, 200, 100)
-                    } else if self.display_fps >= 8.0 {
-                        egui::Color32::from_rgb(220, 180, 60)
-                    } else {
-                        egui::Color32::from_rgb(220, 80, 80)
-                    };
-                    ui.label(
-                        egui::RichText::new(format!("{:.1} fps", self.display_fps))
-                            .monospace()
-                            .size(11.0)
-                            .color(fps_color),
-                    );
-                    ui.separator();
-                    let input_color = if self.stream_input_fps >= 20.0 {
-                        egui::Color32::from_rgb(80, 200, 100)
-                    } else if self.stream_input_fps >= 8.0 {
-                        egui::Color32::from_rgb(220, 180, 60)
-                    } else {
-                        egui::Color32::from_rgb(220, 80, 80)
-                    };
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "in {:.1}/s {} kbps",
-                            self.stream_input_fps, self.stream_input_kbps
-                        ))
-                        .monospace()
-                        .size(11.0)
-                        .color(input_color),
-                    )
-                    .on_hover_text("Входящие live-video пакеты до декодера");
-                    ui.separator();
-                    // Codec badge: color shows quality:
-                    //   H264 green  = live video, low latency
-                    //   PNG  amber  = screenshot mode, higher latency
-                    //   none gray   = no frames yet
-                    let (codec_label, codec_color, codec_tip) = match self.last_frame_codec.as_str()
-                    {
-                        "H264" => (
-                            "H264",
-                            egui::Color32::from_rgb(80, 220, 110),
-                            "Live H264 video, lowest latency",
-                        ),
-                        "H265" | "AV1" | "VP9" => (
-                            self.last_frame_codec.as_str(),
-                            egui::Color32::from_rgb(80, 220, 110),
-                            "Live video",
-                        ),
-                        "PNG" => (
-                            "PNG",
-                            egui::Color32::from_rgb(220, 180, 60),
-                            "Screenshot fallback, higher latency",
-                        ),
-                        _ => ("no frame", crate::theme::palette().text_muted, "No frames received yet"),
-                    };
-                    ui.label(
-                        egui::RichText::new(codec_label)
-                            .strong()
-                            .size(12.5)
-                            .color(codec_color),
-                    )
-                    .on_hover_text(codec_tip);
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new(crate::video::build_codec_label())
-                            .monospace()
-                            .size(11.0)
-                            .color(egui::Color32::from_rgb(145, 160, 175)),
-                    )
-                    .on_hover_text("Codecs compiled into this EvertyDesk Lite build");
-                    ui.separator();
-                    // Latency
-                    if let Some(ms) = self.latency_ms {
-                        let lat_color = if ms < 50 {
-                            egui::Color32::from_rgb(80, 200, 100)
-                        } else if ms < 150 {
-                            egui::Color32::from_rgb(220, 180, 60)
-                        } else {
-                            egui::Color32::from_rgb(220, 80, 80)
-                        };
-                        ui.label(
-                            egui::RichText::new(format!("{ms} ms"))
-                                .monospace()
-                                .size(11.0)
-                                .color(lat_color),
-                        );
-                        ui.separator();
-                    }
-                    if self.frame_bytes > 0 {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} KB  q:{}ms  dec:{}ms",
-                                self.frame_bytes / 1024,
-                                self.frame_queue_ms,
-                                self.frame_decode_ms
-                            ))
-                            .monospace()
-                            .size(11.0)
-                            .color(egui::Color32::from_rgb(150, 160, 170)),
-                        )
-                        .on_hover_text("Размер кадра, ожидание в очереди и время декодирования");
-                        ui.separator();
-                    }
-                    if self.frame_dropped > 0 {
-                        ui.label(
-                            egui::RichText::new(format!("drop {}", self.frame_dropped))
-                                .monospace()
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(220, 110, 80)),
-                        )
-                        .on_hover_text("Сколько старых кадров было сброшено, чтобы догнать поток");
-                        ui.separator();
-                    }
-                    ui.label(
-                        egui::RichText::new(&self.stream_health)
-                            .size(11.0)
-                            .color(stream_health_color(&self.stream_health)),
-                    )
-                    .on_hover_text("Автоматическая оценка состояния видеопотока");
-                    ui.separator();
-                    if let Some(status) = &self.clipboard_status {
-                        ui.label(
-                            egui::RichText::new(status)
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(150, 160, 170)),
-                        );
-                        ui.separator();
-                    }
-                    if let Some(status) = &self.screenshot_status {
-                        ui.label(
-                            egui::RichText::new(status)
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(150, 160, 170)),
-                        );
-                        ui.separator();
-                    }
-                    if let Some(status) = &self.log_status {
-                        ui.label(
-                            egui::RichText::new(status)
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(150, 160, 170)),
-                        );
-                        ui.separator();
-                    }
-                    if let Some(status) = &self.report_status {
-                        ui.label(
-                            egui::RichText::new(status)
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(150, 160, 170)),
-                        );
-                        ui.separator();
-                    }
-                    // Input focus indicator
-                    if self.remote_input_focused {
-                        ui.label(
-                            egui::RichText::new("⌨ ввод захвачен  [Esc = отпустить]")
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(45, 160, 230)),
-                        );
-                    } else {
-                        ui.label(
-                            egui::RichText::new("наведите мышь → ввод")
-                                .size(11.0)
-                                .color(crate::theme::palette().text_muted),
-                        );
-                    }
-                    // Pending indicator
-                    if self.screenshot_pending {
-                        ui.spinner();
-                    }
-                });
-            });
+            // ── Плавающее перемещаемое окно с метриками (вместо нижней панели) ──
+            self.stream_info_window(ctx);
 
-            egui::CentralPanel::default().show(ctx, |ui| {
-                self.remote_screen_ui(ui);
-            });
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(0x07, 0x0A, 0x0F)))
+                .show(ctx, |ui| {
+                    self.remote_screen_ui(ui);
+                });
         });
     }
 
@@ -7846,15 +7586,19 @@ impl EvertyDeskApp {
         let available_size = ui.available_size_before_wrap();
         let available_width = available_size.x.max(1.0);
         let Some(texture) = self.remote_texture.clone() else {
-            ui.allocate_ui(
-                egui::vec2(available_width, available_size.y.max(360.0)),
-                |ui| {
-                    ui.centered_and_justified(|ui| {
-                        ui.spinner();
-                        ui.label("Ожидание первого кадра…");
-                    });
-                },
-            );
+            let full_rect = ui.available_rect_before_wrap();
+            ui.painter().rect_filled(full_rect, 0.0, egui::Color32::from_rgb(0x07, 0x0A, 0x0F));
+            ui.allocate_new_ui(egui::UiBuilder::new().max_rect(full_rect), |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space((full_rect.height() * 0.5 - 28.0).max(0.0));
+                    ui.spinner();
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("Ожидание первого кадра…")
+                            .color(crate::theme::palette().text_muted),
+                    );
+                });
+            });
             return;
         };
 
@@ -7905,11 +7649,30 @@ impl EvertyDeskApp {
         } else {
             egui::CursorIcon::Default
         };
+
+        // Fill the entire viewport with a dark backdrop and center the remote
+        // image inside it. Previously the image was laid out top-left and the
+        // leftover area was just empty app background — at any aspect ratio
+        // that doesn't match the window you'd get a bright blank strip that
+        // read as "broken layout". A centered image over a flat near-black
+        // backdrop reads as an intentional monitor letterbox, which is the
+        // expected look for a remote-desktop viewer.
+        let full_rect = ui.available_rect_before_wrap();
+        ui.painter().rect_filled(
+            full_rect,
+            0.0,
+            egui::Color32::from_rgb(0x07, 0x0A, 0x0F),
+        );
+        let img_min = full_rect.min
+            + egui::vec2(
+                ((full_rect.width() - size.x) * 0.5).max(0.0),
+                ((full_rect.height() - size.y) * 0.5).max(0.0),
+            );
+        let img_rect = egui::Rect::from_min_size(img_min, size);
         let response = ui
-            .add(
-                egui::Image::new(&texture)
-                    .fit_to_exact_size(size)
-                    .sense(egui::Sense::click_and_drag()),
+            .put(
+                img_rect,
+                egui::Image::new(&texture).sense(egui::Sense::click_and_drag()),
             )
             .on_hover_cursor(hover_cursor);
 
@@ -7945,6 +7708,28 @@ impl EvertyDeskApp {
                 egui::Stroke::new(2.0, border_color),
                 egui::StrokeKind::Inside,
             );
+
+            // Compact "input captured" pill in the top-left corner of the
+            // screen — the bottom status bar that used to host this is gone.
+            let painter = ui.painter();
+            let pad = egui::vec2(8.0, 4.0);
+            let text = "⌨ ввод захвачен · Esc";
+            let font = egui::FontId::proportional(11.5);
+            let galley = painter.layout_no_wrap(
+                text.to_owned(),
+                font,
+                egui::Color32::from_rgb(0xCF, 0xE8, 0xFA),
+            );
+            let pill_rect = egui::Rect::from_min_size(
+                response.rect.min + egui::vec2(8.0, 8.0),
+                galley.size() + pad * 2.0,
+            );
+            painter.rect_filled(
+                pill_rect,
+                4.0,
+                egui::Color32::from_rgba_unmultiplied(0x12, 0x3A, 0x55, 0xE0),
+            );
+            painter.galley(pill_rect.min + pad, galley, egui::Color32::WHITE);
         }
 
         // Draw remote cursor overlay on top of the video for all codecs.
@@ -8006,8 +7791,22 @@ impl EvertyDeskApp {
                             ..
                         } => {
                             let inside = response.rect.contains(*pos);
-                            if *pressed && !inside {
-                                continue;
+                            if *pressed {
+                                // Press outside the remote screen (e.g. a click
+                                // on the status-bar "Детали" button) must not
+                                // touch the guest at all.
+                                if !inside {
+                                    continue;
+                                }
+                                self.remote_pointer_armed = true;
+                            } else {
+                                // Release: only forward if the matching press
+                                // armed inside the screen (covers drag-off-screen);
+                                // otherwise it's the tail of an out-of-screen UI click.
+                                if !self.remote_pointer_armed {
+                                    continue;
+                                }
+                                self.remote_pointer_armed = false;
                             }
                             let (x, y) = if inside {
                                 let local = *pos - response.rect.min;
@@ -8044,9 +7843,18 @@ impl EvertyDeskApp {
                             }
                         }
                         egui::Event::MouseWheel { unit, delta, .. } => {
-                            if let Some((x, y)) = self.wheel_delta(*unit, *delta) {
-                                self.send_command(SessionCommand::MouseWheel { x, y });
-                                self.request_visual_refresh_after_input();
+                            // Only scroll the guest when the pointer is actually
+                            // over the remote screen (not over the status bar).
+                            let over_screen = ui
+                                .ctx()
+                                .input(|i| i.pointer.hover_pos())
+                                .map(|p| response.rect.contains(p))
+                                .unwrap_or(false);
+                            if over_screen {
+                                if let Some((x, y)) = self.wheel_delta(*unit, *delta) {
+                                    self.send_command(SessionCommand::MouseWheel { x, y });
+                                    self.request_visual_refresh_after_input();
+                                }
                             }
                         }
                         _ => {}
