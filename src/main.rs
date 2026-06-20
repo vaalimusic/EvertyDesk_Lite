@@ -1801,6 +1801,12 @@ impl EvertyDeskApp {
                 self.connected = true;
                 self.remote_viewer_open = self.connect_kind == ConnectKind::Screen;
                 self.remote_viewer_window_spawned = false;
+                // Adaptive view by default: the remote desktop always scales to
+                // fit the session window (the user can still switch to 1:1 with
+                // the fit toggle during the session). Without this a saved 1:1
+                // preference renders the desktop at native size, overflowing the
+                // window and breaking maximize on macOS.
+                self.fit_to_window = true;
                 self.shell_window_open = self.connect_kind == ConnectKind::Shell;
                 self.progress = 100;
                 self.connection_state = ConnectionState::RelayReady {
@@ -7733,6 +7739,7 @@ impl EvertyDeskApp {
         let mut builder = egui::ViewportBuilder::default()
             .with_title(title)
             .with_resizable(true)
+            .with_maximize_button(true)
             .with_min_inner_size([720.0, 480.0]);
         if !self.remote_viewer_window_spawned {
             builder = builder.with_inner_size(remote_viewer_initial_size(self.remote_size));

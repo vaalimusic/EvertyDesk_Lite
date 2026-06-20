@@ -3630,6 +3630,15 @@ fn decode_frame_loop(
         eprintln!("[decoder] {}", mf_status.label());
     }
 
+    // macOS: hardware HEVC decode via VideoToolbox. Without this an H265 stream
+    // from a Windows/NVENC host (no MF on macOS) cannot be decoded at all.
+    let mut h265_vt = if crate::videotoolbox::videotoolbox_h264_decoder_available() {
+        eprintln!("[decoder] macOS VideoToolbox H265 decoder ready");
+        Some(crate::videotoolbox::VideoToolboxH264Decoder::new_hevc())
+    } else {
+        None
+    };
+
     while let Ok(first) = frame_rx.recv() {
         let mut batch = vec![first];
         while let Ok(next) = frame_rx.try_recv() {
@@ -3673,6 +3682,7 @@ fn decode_frame_loop(
             match decode_one_frame(
                 frame,
                 &mut h264_vt,
+                &mut h265_vt,
                 &mut h264,
                 &mut vp8,
                 &mut vp9,
@@ -3806,6 +3816,7 @@ fn decoder_needs_more_packets(err: &str) -> bool {
 fn decode_one_frame(
     frame: DecoderInput,
     h264_vt: &mut Option<crate::videotoolbox::VideoToolboxH264Decoder>,
+    h265_vt: &mut Option<crate::videotoolbox::VideoToolboxH264Decoder>,
     #[cfg(feature = "live-h264")] h264: &mut Option<openh264::decoder::Decoder>,
     #[cfg(not(feature = "live-h264"))] _h264: &mut (),
     #[cfg(feature = "live-vpx")] vp8: &mut Option<VpxDecoder>,
@@ -3977,22 +3988,46 @@ fn decode_one_frame(
             width,
             height,
             ..
-        } => decode_mf_video_rgba(
-            h265_mf,
-            crate::mf_video::MfVideoCodec::H265,
-            width,
-            height,
-            frames,
-        )
-        .map(|decoded| {
-            decoded.map(|(width, height, rgba)| SessionEvent::Frame {
-                sid,
-                codec: "H265".to_owned(),
+        } => {
+            // macOS VideoToolbox hardware HEVC first (the only HEVC decoder on
+            // macOS); Media Foundation is the Windows fallback.
+            if let Some(decoder) = h265_vt.as_mut() {
+                match decoder.decode_packets(frames.frames.iter().map(|frame| frame.data.clone())) {
+                    Ok(Some((width, height, rgba))) => {
+                        return Ok(Some(SessionEvent::Frame {
+                            sid,
+                            codec: "H265".to_owned(),
+                            width,
+                            height,
+                            rgba,
+                        }));
+                    }
+                    Ok(None) => return Ok(None),
+                    Err(err) if decoder_needs_more_packets(&err) => return Ok(None),
+                    Err(err) => {
+                        eprintln!("[decoder] VideoToolbox H265 error, disabling: {err}");
+                        *h265_vt = None;
+                    }
+                }
+            }
+
+            decode_mf_video_rgba(
+                h265_mf,
+                crate::mf_video::MfVideoCodec::H265,
                 width,
                 height,
-                rgba,
+                frames,
+            )
+            .map(|decoded| {
+                decoded.map(|(width, height, rgba)| SessionEvent::Frame {
+                    sid,
+                    codec: "H265".to_owned(),
+                    width,
+                    height,
+                    rgba,
+                })
             })
-        }),
+        }
         DecoderInput::Av1 {
             sid,
             frames,
