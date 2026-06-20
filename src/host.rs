@@ -342,6 +342,21 @@ fn run_host_loop(
     // already present.
     setup_udp_firewall(&events);
 
+    // On macOS, host mode needs Screen Recording + Accessibility permission.
+    // Surface a clear hint if either is missing — otherwise capture is blank or
+    // remote input silently does nothing.
+    #[cfg(target_os = "macos")]
+    {
+        let (ok, hints) = macos_cgevent::preflight_permissions();
+        if ok {
+            host_log(&events, "macOS: Screen Recording + Accessibility доступ есть ✓".to_owned());
+        } else {
+            for hint in hints {
+                host_log(&events, hint);
+            }
+        }
+    }
+
     loop {
         if stop.load(Ordering::Relaxed) {
             let _ = events.send(HostEvent::StateChanged(HostState::Idle));
@@ -1816,75 +1831,104 @@ fn client_video_support(login: &crate::rustdesk_proto::LoginRequest) -> ClientVi
     }
 }
 
-fn choose_mf_encoder_codec(
-    encoder_preference: EncoderPreference,
-    codec_preference: CodecPreference,
-    client: ClientVideoSupport,
-) -> Option<crate::nvenc::NvencCodec> {
-    if encoder_preference == EncoderPreference::Software {
-        return None;
-    }
-    let available = crate::mf_encode::mf_encoder_codecs();
-    if available.is_empty() {
-        return None;
-    }
+// ═══════════════════════════════════════════════════════════════════════════════
+// Codec negotiation — pick the best codec both ends can actually handle
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Every backend (NVENC / Media Foundation / VideoToolbox) feeds its real, live
+// capabilities into one ranking brain instead of each hardcoding "H264 first".
+// The cascade in `MultiEncoder::encode` then tries the fastest backend first,
+// and because every backend independently maximises the *same* quality-ranked,
+// capability-gated score, the session latches onto the best codec available
+// end-to-end — without ever risking an unusable path.
 
-    let mut candidates = Vec::new();
-    match codec_preference {
-        CodecPreference::H265 => candidates.push(crate::nvenc::NvencCodec::H265),
-        CodecPreference::H264 => candidates.push(crate::nvenc::NvencCodec::H264),
-        CodecPreference::Auto => {
-            // ★ H264 ПЕРВЫМ: аппаратный H264 MFT есть на всех GPU и быстрый.
-            //   H265 часто только софтверный MFT (190мс/кадр!) → откат на OpenH264.
-            //   RustDesk тоже использует H264 в Auto. H265 — только по явному запросу
-            //   и только если есть аппаратный энкодер.
-            candidates.push(crate::nvenc::NvencCodec::H264);
-            if crate::mf_encode::mf_encoder_status().has_hardware_h265() {
-                candidates.push(crate::nvenc::NvencCodec::H265);
-            }
-        }
-        CodecPreference::Av1 | CodecPreference::Vp9 => {
-            candidates.push(crate::nvenc::NvencCodec::H264);
-        }
+/// Compression quality at equal bitrate — higher is better. AV1 ≻ H265 ≻ H264.
+/// (VP9 would slot at 2 once an encoder exists; it has no `NvencCodec` variant.)
+fn codec_quality_rank(codec: crate::nvenc::NvencCodec) -> u32 {
+    match codec {
+        crate::nvenc::NvencCodec::Av1 => 4,
+        crate::nvenc::NvencCodec::H265 => 3,
+        crate::nvenc::NvencCodec::H264 => 1,
     }
-
-    candidates
-        .into_iter()
-        .find(|codec| available.contains(codec) && client_can_decode_hardware(client, *codec))
 }
 
-fn choose_videotoolbox_codec(
+/// Does the client's advertised `prefer` hint name this exact codec?
+fn client_prefers_codec(prefer: PreferCodec, codec: crate::nvenc::NvencCodec) -> bool {
+    matches!(
+        (prefer, codec),
+        (PreferCodec::Av1, crate::nvenc::NvencCodec::Av1)
+            | (PreferCodec::H265, crate::nvenc::NvencCodec::H265)
+            | (PreferCodec::H264, crate::nvenc::NvencCodec::H264)
+    )
+}
+
+/// Translate the user's explicit codec choice into a target, or `None` for the
+/// fully-automatic path. VP9 has no `NvencCodec` encoder, so it negotiates like
+/// Auto (and the VP9 stream path is handled separately when present).
+fn explicit_codec_target(codec_preference: CodecPreference) -> Option<crate::nvenc::NvencCodec> {
+    match codec_preference {
+        CodecPreference::H264 => Some(crate::nvenc::NvencCodec::H264),
+        CodecPreference::H265 => Some(crate::nvenc::NvencCodec::H265),
+        CodecPreference::Av1 => Some(crate::nvenc::NvencCodec::Av1),
+        CodecPreference::Vp9 | CodecPreference::Auto => None,
+    }
+}
+
+/// Pick the codec a single backend should target, given the codecs it can
+/// produce right now (`available`, each tagged `hardware`), the user's choice,
+/// and what the client can decode.
+///
+/// The clever conditions, in order:
+///   1. **Decodability** — never target a codec the client cannot decode.
+///   2. **Hardware-only high-end** — H265/AV1 only when hardware-encoded;
+///      software realtime HEVC/AV1 is unusable (≈200 ms/frame), so it's filtered
+///      out entirely. This is what makes Auto *both* safe and optimal without a
+///      blanket "H264 first" rule.
+/// Authority order, highest first:
+///   3. **Host user's explicit choice** — a non-Auto pick dominates when
+///      achievable, with H264 kept as a universal safety net so a session
+///      always streams.
+///   4. **Client's `prefer` hint** — when the client names a concrete codec
+///      (e.g. it *can* decode HEVC but its decoder is software and it would
+///      rather receive H264), honour it over raw quality ranking.
+///   5. **Quality ranking** — when both ends are on Auto, take the best codec
+///      (AV1 ≻ H265 ≻ H264), tie-broken by hardware acceleration.
+fn negotiate_backend_codec(
+    available: &[(crate::nvenc::NvencCodec, bool)],
     encoder_preference: EncoderPreference,
     codec_preference: CodecPreference,
     client: ClientVideoSupport,
 ) -> Option<crate::nvenc::NvencCodec> {
-    if encoder_preference == EncoderPreference::Software {
+    if encoder_preference == EncoderPreference::Software || available.is_empty() {
         return None;
     }
-    let available = crate::videotoolbox::videotoolbox_codecs();
-    if available.is_empty() {
-        return None;
-    }
+    let explicit = explicit_codec_target(codec_preference);
 
-    let mut candidates = Vec::new();
-    match codec_preference {
-        CodecPreference::H265 => candidates.push(crate::nvenc::NvencCodec::H265),
-        CodecPreference::H264 => candidates.push(crate::nvenc::NvencCodec::H264),
-        CodecPreference::Auto => {
-            push_client_preferred_codec(&mut candidates, client.prefer);
-            candidates.extend([
-                crate::nvenc::NvencCodec::H264,
-                crate::nvenc::NvencCodec::H265,
-            ]);
-        }
-        CodecPreference::Av1 | CodecPreference::Vp9 => {
-            candidates.push(crate::nvenc::NvencCodec::H264);
-        }
-    }
-
-    candidates
-        .into_iter()
-        .find(|codec| available.contains(codec) && client_can_decode_hardware(client, *codec))
+    available
+        .iter()
+        .copied()
+        // 1. client must be able to decode it
+        .filter(|(codec, _)| client_can_decode_hardware(client, *codec))
+        // 2. high-end codecs only with hardware encode
+        .filter(|(codec, hardware)| *hardware || *codec == crate::nvenc::NvencCodec::H264)
+        // 3. explicit choice narrows to that codec, keeping H264 as the net
+        .filter(|(codec, _)| {
+            explicit.map_or(true, |want| *codec == want || *codec == crate::nvenc::NvencCodec::H264)
+        })
+        .max_by_key(|(codec, hardware)| {
+            let mut score = codec_quality_rank(*codec) * 1_000;
+            if Some(*codec) == explicit {
+                score += 1_000_000; // host's explicit pick beats everything
+            }
+            if client_prefers_codec(client.prefer, *codec) {
+                score += 10_000; // client's concrete prefer overrides raw quality
+            }
+            if *hardware {
+                score += 200; // tie-break toward hardware at equal codec
+            }
+            score
+        })
+        .map(|(codec, _)| codec)
 }
 
 fn choose_nvenc_codec(
@@ -1892,48 +1936,48 @@ fn choose_nvenc_codec(
     codec_preference: CodecPreference,
     client: ClientVideoSupport,
 ) -> Option<crate::nvenc::NvencCodec> {
-    if encoder_preference == EncoderPreference::Software {
-        return None;
-    }
-    let available = crate::nvenc::nvenc_encoder_codecs();
-    if available.is_empty() {
-        return None;
-    }
-
-    let mut candidates = Vec::new();
-    match codec_preference {
-        CodecPreference::Av1 => candidates.push(crate::nvenc::NvencCodec::Av1),
-        CodecPreference::H265 => candidates.push(crate::nvenc::NvencCodec::H265),
-        CodecPreference::H264 => candidates.push(crate::nvenc::NvencCodec::H264),
-        CodecPreference::Auto => {
-            push_client_preferred_codec(&mut candidates, client.prefer);
-            candidates.extend([
-                crate::nvenc::NvencCodec::Av1,
-                crate::nvenc::NvencCodec::H265,
-                crate::nvenc::NvencCodec::H264,
-            ]);
-        }
-        CodecPreference::Vp9 => candidates.push(crate::nvenc::NvencCodec::H264),
-    }
-
-    candidates
+    // Every NVENC-reported codec is hardware-accelerated.
+    let available: Vec<_> = crate::nvenc::nvenc_encoder_codecs()
         .into_iter()
-        .find(|codec| available.contains(codec) && client_can_decode_hardware(client, *codec))
+        .map(|codec| (codec, true))
+        .collect();
+    negotiate_backend_codec(&available, encoder_preference, codec_preference, client)
 }
 
-fn push_client_preferred_codec(
-    candidates: &mut Vec<crate::nvenc::NvencCodec>,
-    prefer: PreferCodec,
-) {
-    let codec = match prefer {
-        PreferCodec::Av1 => Some(crate::nvenc::NvencCodec::Av1),
-        PreferCodec::H265 => Some(crate::nvenc::NvencCodec::H265),
-        PreferCodec::H264 => Some(crate::nvenc::NvencCodec::H264),
-        _ => None,
-    };
-    if let Some(codec) = codec {
-        candidates.push(codec);
-    }
+fn choose_mf_encoder_codec(
+    encoder_preference: EncoderPreference,
+    codec_preference: CodecPreference,
+    client: ClientVideoSupport,
+) -> Option<crate::nvenc::NvencCodec> {
+    // Media Foundation may expose software-only MFTs; tag each codec with its
+    // real hardware flag so gate #2 can drop slow software HEVC.
+    let status = crate::mf_encode::mf_encoder_status();
+    let available: Vec<_> = crate::mf_encode::mf_encoder_codecs()
+        .into_iter()
+        .map(|codec| {
+            let hardware = match codec {
+                crate::nvenc::NvencCodec::H264 => status.has_hardware_h264(),
+                crate::nvenc::NvencCodec::H265 => status.has_hardware_h265(),
+                crate::nvenc::NvencCodec::Av1 => false,
+            };
+            (codec, hardware)
+        })
+        .collect();
+    negotiate_backend_codec(&available, encoder_preference, codec_preference, client)
+}
+
+fn choose_videotoolbox_codec(
+    encoder_preference: EncoderPreference,
+    codec_preference: CodecPreference,
+    client: ClientVideoSupport,
+) -> Option<crate::nvenc::NvencCodec> {
+    // VideoToolbox encode is hardware-backed (Apple Silicon media engine /
+    // Intel Quick Sync).
+    let available: Vec<_> = crate::videotoolbox::videotoolbox_codecs()
+        .into_iter()
+        .map(|codec| (codec, true))
+        .collect();
+    negotiate_backend_codec(&available, encoder_preference, codec_preference, client)
 }
 
 fn client_can_decode_hardware(client: ClientVideoSupport, codec: crate::nvenc::NvencCodec) -> bool {
@@ -2222,6 +2266,138 @@ fn bgra_to_yuv420_into(out: &mut YuvFrame, w: usize, h: usize, bgra: &[u8]) {
     let dst_w = out.width;
     let dst_h = out.height;
     crate::colorconv::bgra_to_i420(&mut out.y, &mut out.u, &mut out.v, w, h, dst_w, dst_h, bgra);
+}
+
+#[cfg(test)]
+mod codec_negotiation_tests {
+    use super::*;
+    use crate::nvenc::NvencCodec;
+
+    fn client(h264: bool, h265: bool, av1: bool, prefer: PreferCodec) -> ClientVideoSupport {
+        ClientVideoSupport {
+            h264,
+            h265,
+            av1,
+            prefer,
+        }
+    }
+
+    fn negotiate(
+        available: &[(NvencCodec, bool)],
+        codec: CodecPreference,
+        client: ClientVideoSupport,
+    ) -> Option<NvencCodec> {
+        negotiate_backend_codec(available, EncoderPreference::Auto, codec, client)
+    }
+
+    #[test]
+    fn auto_picks_hevc_when_both_have_hardware() {
+        let available = [(NvencCodec::H264, true), (NvencCodec::H265, true)];
+        let got = negotiate(
+            &available,
+            CodecPreference::Auto,
+            client(true, true, false, PreferCodec::Auto),
+        );
+        assert_eq!(got, Some(NvencCodec::H265));
+    }
+
+    #[test]
+    fn auto_picks_av1_over_hevc_when_decodable() {
+        let available = [
+            (NvencCodec::H264, true),
+            (NvencCodec::H265, true),
+            (NvencCodec::Av1, true),
+        ];
+        let got = negotiate(
+            &available,
+            CodecPreference::Auto,
+            client(true, true, true, PreferCodec::Auto),
+        );
+        assert_eq!(got, Some(NvencCodec::Av1));
+    }
+
+    #[test]
+    fn auto_falls_to_h264_when_client_cannot_decode_hevc() {
+        let available = [(NvencCodec::H264, true), (NvencCodec::H265, true)];
+        let got = negotiate(
+            &available,
+            CodecPreference::Auto,
+            client(true, false, false, PreferCodec::Auto),
+        );
+        assert_eq!(got, Some(NvencCodec::H264));
+    }
+
+    #[test]
+    fn auto_rejects_software_only_hevc() {
+        // HEVC present but software-only → gate #2 drops it, H264 wins.
+        let available = [(NvencCodec::H264, true), (NvencCodec::H265, false)];
+        let got = negotiate(
+            &available,
+            CodecPreference::Auto,
+            client(true, true, false, PreferCodec::Auto),
+        );
+        assert_eq!(got, Some(NvencCodec::H264));
+    }
+
+    #[test]
+    fn client_prefer_h264_overrides_quality() {
+        // Client can decode HEVC but explicitly prefers H264 (e.g. its HEVC
+        // decode is software) → honour the client.
+        let available = [(NvencCodec::H264, true), (NvencCodec::H265, true)];
+        let got = negotiate(
+            &available,
+            CodecPreference::Auto,
+            client(true, true, false, PreferCodec::H264),
+        );
+        assert_eq!(got, Some(NvencCodec::H264));
+    }
+
+    #[test]
+    fn host_explicit_choice_beats_client_prefer() {
+        // Host admin explicitly chose H265; client prefers H264 but can decode
+        // H265 → host wins.
+        let available = [(NvencCodec::H264, true), (NvencCodec::H265, true)];
+        let got = negotiate(
+            &available,
+            CodecPreference::H265,
+            client(true, true, false, PreferCodec::H264),
+        );
+        assert_eq!(got, Some(NvencCodec::H265));
+    }
+
+    #[test]
+    fn explicit_hevc_falls_to_h264_when_client_cannot_decode() {
+        // Explicit H265 but client can't decode it → universal H264 safety net.
+        let available = [(NvencCodec::H264, true), (NvencCodec::H265, true)];
+        let got = negotiate(
+            &available,
+            CodecPreference::H265,
+            client(true, false, false, PreferCodec::Auto),
+        );
+        assert_eq!(got, Some(NvencCodec::H264));
+    }
+
+    #[test]
+    fn software_preference_disables_hardware_backends() {
+        let available = [(NvencCodec::H264, true), (NvencCodec::H265, true)];
+        let got = negotiate_backend_codec(
+            &available,
+            EncoderPreference::Software,
+            CodecPreference::Auto,
+            client(true, true, false, PreferCodec::Auto),
+        );
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn empty_backend_yields_nothing() {
+        let got = negotiate(
+            &[],
+            CodecPreference::Auto,
+            client(true, true, true, PreferCodec::Auto),
+        );
+        assert_eq!(got, None);
+    }
 }
 
 #[cfg(test)]
@@ -2804,9 +2980,15 @@ fn release_stuck_input() {
 
 #[cfg(all(
     not(target_os = "linux"),
+    not(target_os = "macos"),
     not(all(target_os = "windows", feature = "live-vp9-mf"))
 ))]
 fn release_stuck_input() {}
+
+#[cfg(target_os = "macos")]
+fn release_stuck_input() {
+    macos_cgevent::release_stuck_input();
+}
 
 #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
 fn inject_mouse(ev: crate::rustdesk_proto::MouseEvent) {
@@ -2948,9 +3130,20 @@ fn release_stuck_input() {
 
 #[cfg(all(
     not(target_os = "linux"),
+    not(target_os = "macos"),
     not(all(target_os = "windows", feature = "live-vp9-mf"))
 ))]
 fn inject_mouse(_ev: crate::rustdesk_proto::MouseEvent) {}
+
+#[cfg(target_os = "macos")]
+fn inject_mouse(ev: crate::rustdesk_proto::MouseEvent) {
+    macos_cgevent::inject_mouse(ev);
+}
+
+#[cfg(target_os = "macos")]
+fn inject_key(ev: crate::rustdesk_proto::KeyEvent) {
+    macos_cgevent::inject_key(ev);
+}
 
 #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
 fn inject_key(ev: crate::rustdesk_proto::KeyEvent) {
@@ -3079,6 +3272,7 @@ fn inject_key(ev: crate::rustdesk_proto::KeyEvent) {
 
 #[cfg(all(
     not(target_os = "linux"),
+    not(target_os = "macos"),
     not(all(target_os = "windows", feature = "live-vp9-mf"))
 ))]
 fn inject_key(_ev: crate::rustdesk_proto::KeyEvent) {}
@@ -3713,6 +3907,447 @@ mod linux_xtest {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// macOS host input injection — Quartz Event Services (CGEvent)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Mouse and keyboard events from the remote client are replayed on the local
+// Mac via CGEventPost(kCGHIDEventTap). The host process must hold Accessibility
+// permission (System Settings → Privacy & Security → Accessibility); without it
+// macOS silently drops the posted events. Screen capture additionally needs
+// Screen Recording permission.
+#[cfg(target_os = "macos")]
+mod macos_cgevent {
+    use std::cell::Cell;
+    use std::ffi::c_void;
+
+    type CGEventRef = *mut c_void;
+    type CGEventSourceRef = *mut c_void;
+    type CGDisplayModeRef = *mut c_void;
+    type CGDirectDisplayID = u32;
+    type CGFloat = f64;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGPoint {
+        x: CGFloat,
+        y: CGFloat,
+    }
+
+    // CGEventType
+    const K_LEFT_MOUSE_DOWN: u32 = 1;
+    const K_LEFT_MOUSE_UP: u32 = 2;
+    const K_RIGHT_MOUSE_DOWN: u32 = 3;
+    const K_RIGHT_MOUSE_UP: u32 = 4;
+    const K_MOUSE_MOVED: u32 = 5;
+    const K_LEFT_MOUSE_DRAGGED: u32 = 6;
+    const K_RIGHT_MOUSE_DRAGGED: u32 = 7;
+    const K_OTHER_MOUSE_DOWN: u32 = 25;
+    const K_OTHER_MOUSE_UP: u32 = 26;
+    const K_OTHER_MOUSE_DRAGGED: u32 = 27;
+
+    // CGMouseButton
+    const BTN_LEFT: u32 = 0;
+    const BTN_RIGHT: u32 = 1;
+    const BTN_CENTER: u32 = 2;
+
+    // CGEventTapLocation
+    const K_HID_EVENT_TAP: u32 = 0;
+
+    // CGScrollEventUnit
+    const K_SCROLL_UNIT_LINE: u32 = 1;
+
+    // CGEventFlags (modifier masks)
+    const FLAG_SHIFT: u64 = 0x0002_0000;
+    const FLAG_CONTROL: u64 = 0x0004_0000;
+    const FLAG_ALTERNATE: u64 = 0x0008_0000;
+    const FLAG_COMMAND: u64 = 0x0010_0000;
+
+    // Protocol mouse event sub-types (mask & 0x7)
+    const EVT_MOVE: i32 = 0;
+    const EVT_DOWN: i32 = 1;
+    const EVT_UP: i32 = 2;
+    const EVT_WHEEL: i32 = 3;
+    // Protocol mouse buttons (mask >> 3)
+    const MB_LEFT: i32 = 1;
+    const MB_RIGHT: i32 = 2;
+    const MB_MIDDLE: i32 = 4;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventCreateMouseEvent(
+            source: CGEventSourceRef,
+            mouse_type: u32,
+            point: CGPoint,
+            button: u32,
+        ) -> CGEventRef;
+        fn CGEventCreateKeyboardEvent(
+            source: CGEventSourceRef,
+            keycode: u16,
+            key_down: bool,
+        ) -> CGEventRef;
+        fn CGEventCreateScrollWheelEvent(
+            source: CGEventSourceRef,
+            units: u32,
+            wheel_count: u32,
+            ...
+        ) -> CGEventRef;
+        fn CGEventKeyboardSetUnicodeString(
+            event: CGEventRef,
+            length: usize,
+            unicode_string: *const u16,
+        );
+        fn CGEventSetFlags(event: CGEventRef, flags: u64);
+        fn CGEventPost(tap: u32, event: CGEventRef);
+
+        fn CGMainDisplayID() -> CGDirectDisplayID;
+        fn CGDisplayCopyDisplayMode(display: CGDirectDisplayID) -> CGDisplayModeRef;
+        fn CGDisplayModeGetWidth(mode: CGDisplayModeRef) -> usize;
+        fn CGDisplayModeGetPixelWidth(mode: CGDisplayModeRef) -> usize;
+        fn CGDisplayModeRelease(mode: CGDisplayModeRef);
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFRelease(cf: *const c_void);
+    }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        // Screen Recording permission (macOS 10.15+). Preflight reports current
+        // state without prompting; Request shows the system prompt once.
+        fn CGPreflightScreenCaptureAccess() -> bool;
+        fn CGRequestScreenCaptureAccess() -> bool;
+    }
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        // Accessibility permission — required for CGEventPost to take effect.
+        fn AXIsProcessTrusted() -> bool;
+    }
+
+    /// Check the two macOS permissions host mode depends on and report clear,
+    /// actionable hints to the host console. Triggers the Screen Recording
+    /// system prompt once (harmless if already granted). Accessibility cannot be
+    /// prompted without a focused app, so we only point the user at the setting.
+    pub fn preflight_permissions() -> (bool, Vec<String>) {
+        let mut hints = Vec::new();
+        let (screen_ok, ax_ok) = unsafe {
+            let screen = CGPreflightScreenCaptureAccess();
+            if !screen {
+                // Ask once; the prompt appears on first run.
+                let _ = CGRequestScreenCaptureAccess();
+            }
+            (screen, AXIsProcessTrusted())
+        };
+        if !screen_ok {
+            hints.push(
+                "⚠ Нет доступа к записи экрана. System Settings → Privacy & Security → \
+                 Screen Recording → включи EvertyDesk Lite, затем перезапусти."
+                    .to_owned(),
+            );
+        }
+        if !ax_ok {
+            hints.push(
+                "⚠ Нет доступа Accessibility — мышь/клавиатура от клиента не сработают. \
+                 System Settings → Privacy & Security → Accessibility → включи \
+                 EvertyDesk Lite."
+                    .to_owned(),
+            );
+        }
+        (screen_ok && ax_ok, hints)
+    }
+
+    /// Non-prompting permission status for the GUI: `(screen_recording,
+    /// accessibility)`. Cheap — safe to poll every frame; never shows a dialog.
+    pub fn permission_status() -> (bool, bool) {
+        unsafe { (CGPreflightScreenCaptureAccess(), AXIsProcessTrusted()) }
+    }
+
+    thread_local! {
+        // Last cursor position in display *points*, so button events that arrive
+        // without coordinates (x=y=0) land where the cursor actually is.
+        static LAST_POS: Cell<(f64, f64)> = const { Cell::new((0.0, 0.0)) };
+    }
+
+    /// Retina scale: the captured frame is in native pixels, but CGEvent works
+    /// in points. `points = pixels * (mode_width / mode_pixel_width)`.
+    fn pixel_to_point_scale() -> f64 {
+        unsafe {
+            let mode = CGDisplayCopyDisplayMode(CGMainDisplayID());
+            if mode.is_null() {
+                return 1.0;
+            }
+            let points = CGDisplayModeGetWidth(mode) as f64;
+            let pixels = CGDisplayModeGetPixelWidth(mode) as f64;
+            CGDisplayModeRelease(mode);
+            if pixels > 0.0 && points > 0.0 {
+                points / pixels
+            } else {
+                1.0
+            }
+        }
+    }
+
+    fn post(event: CGEventRef) {
+        if event.is_null() {
+            return;
+        }
+        unsafe {
+            CGEventPost(K_HID_EVENT_TAP, event);
+            CFRelease(event);
+        }
+    }
+
+    fn post_mouse(mouse_type: u32, point: CGPoint, button: u32) {
+        let ev = unsafe {
+            CGEventCreateMouseEvent(std::ptr::null_mut(), mouse_type, point, button)
+        };
+        post(ev);
+    }
+
+    pub fn inject_mouse(ev: crate::rustdesk_proto::MouseEvent) {
+        let evt_type = ev.mask & 0x7;
+        let button = ev.mask >> 3;
+        let scale = pixel_to_point_scale();
+
+        // Resolve target point: use supplied pixel coords (scaled to points)
+        // when present, otherwise fall back to the last known position.
+        let point = if ev.x != 0 || ev.y != 0 {
+            let p = CGPoint {
+                x: ev.x as f64 * scale,
+                y: ev.y as f64 * scale,
+            };
+            LAST_POS.with(|c| c.set((p.x, p.y)));
+            p
+        } else {
+            let (x, y) = LAST_POS.with(|c| c.get());
+            CGPoint { x, y }
+        };
+
+        match evt_type {
+            EVT_MOVE => post_mouse(K_MOUSE_MOVED, point, BTN_LEFT),
+            EVT_DOWN | EVT_UP => {
+                let down = evt_type == EVT_DOWN;
+                let (mtype, cg_btn) = match button {
+                    MB_LEFT => (
+                        if down { K_LEFT_MOUSE_DOWN } else { K_LEFT_MOUSE_UP },
+                        BTN_LEFT,
+                    ),
+                    MB_RIGHT => (
+                        if down { K_RIGHT_MOUSE_DOWN } else { K_RIGHT_MOUSE_UP },
+                        BTN_RIGHT,
+                    ),
+                    MB_MIDDLE => (
+                        if down { K_OTHER_MOUSE_DOWN } else { K_OTHER_MOUSE_UP },
+                        BTN_CENTER,
+                    ),
+                    _ => return,
+                };
+                post_mouse(mtype, point, cg_btn);
+            }
+            EVT_WHEEL => {
+                // Protocol wheel deltas are in client units; one notch ≈ ±1 line.
+                if ev.y != 0 {
+                    let delta = (ev.y.signum() * ((ev.y.abs() / 40).max(1))).clamp(-10, 10);
+                    let scroll = unsafe {
+                        CGEventCreateScrollWheelEvent(
+                            std::ptr::null_mut(),
+                            K_SCROLL_UNIT_LINE,
+                            1,
+                            delta,
+                        )
+                    };
+                    post(scroll);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn inject_key(ev: crate::rustdesk_proto::KeyEvent) {
+        let flags = modifier_flags(&ev.modifiers);
+        match ev.union {
+            Some(crate::rustdesk_proto::key_event::Union::ControlKey(ck)) => {
+                let Some(keycode) = control_key_to_mac_keycode(ck) else {
+                    return;
+                };
+                if ev.press {
+                    post_key(keycode, true, flags);
+                    post_key(keycode, false, flags);
+                } else {
+                    post_key(keycode, ev.down, flags);
+                }
+            }
+            Some(crate::rustdesk_proto::key_event::Union::Unicode(ch)) => {
+                let Some(c) = char::from_u32(ch) else { return };
+                // When a non-shift modifier is held (Cmd/Ctrl/Alt), route through
+                // a real keycode so OS shortcuts (⌘C, ⌘V, …) fire. Otherwise type
+                // the literal character — layout-independent, handles Cyrillic etc.
+                let has_command_modifier = ev
+                    .modifiers
+                    .iter()
+                    .any(|m| *m != crate::rustdesk_proto::ControlKey::Shift as i32);
+                if has_command_modifier {
+                    if let Some(keycode) = ascii_to_mac_keycode(c) {
+                        post_key(keycode, true, flags);
+                        post_key(keycode, false, flags);
+                        return;
+                    }
+                }
+                post_unicode(c);
+            }
+            None => {}
+        }
+    }
+
+    fn post_key(keycode: u16, key_down: bool, flags: u64) {
+        let ev = unsafe { CGEventCreateKeyboardEvent(std::ptr::null_mut(), keycode, key_down) };
+        if ev.is_null() {
+            return;
+        }
+        if flags != 0 {
+            unsafe { CGEventSetFlags(ev, flags) };
+        }
+        post(ev);
+    }
+
+    fn post_unicode(c: char) {
+        let mut buf = [0u16; 2];
+        let utf16 = c.encode_utf16(&mut buf);
+        let units: Vec<u16> = utf16.iter().copied().collect();
+        unsafe {
+            let down = CGEventCreateKeyboardEvent(std::ptr::null_mut(), 0, true);
+            if !down.is_null() {
+                CGEventKeyboardSetUnicodeString(down, units.len(), units.as_ptr());
+                post(down);
+            }
+            let up = CGEventCreateKeyboardEvent(std::ptr::null_mut(), 0, false);
+            if !up.is_null() {
+                CGEventKeyboardSetUnicodeString(up, units.len(), units.as_ptr());
+                post(up);
+            }
+        }
+    }
+
+    fn modifier_flags(modifiers: &[i32]) -> u64 {
+        use crate::rustdesk_proto::ControlKey;
+        let mut flags = 0u64;
+        for m in modifiers {
+            if *m == ControlKey::Shift as i32 {
+                flags |= FLAG_SHIFT;
+            } else if *m == ControlKey::Control as i32 {
+                flags |= FLAG_CONTROL;
+            } else if *m == ControlKey::Alt as i32 {
+                flags |= FLAG_ALTERNATE;
+            } else if *m == ControlKey::Meta as i32 {
+                flags |= FLAG_COMMAND;
+            }
+        }
+        flags
+    }
+
+    pub fn release_stuck_input() {
+        // Release any held modifier keys and mouse buttons so a dropped session
+        // never leaves the Mac with a stuck ⌘/⇧/button.
+        for keycode in [55u16, 56, 58, 59, 57] {
+            post_key(keycode, false, 0);
+        }
+        let (x, y) = LAST_POS.with(|c| c.get());
+        let point = CGPoint { x, y };
+        post_mouse(K_LEFT_MOUSE_UP, point, BTN_LEFT);
+        post_mouse(K_RIGHT_MOUSE_UP, point, BTN_RIGHT);
+        post_mouse(K_OTHER_MOUSE_UP, point, BTN_CENTER);
+    }
+
+    /// Map a RustDesk ControlKey to a macOS virtual keycode (kVK_*).
+    fn control_key_to_mac_keycode(ck: i32) -> Option<u16> {
+        use crate::rustdesk_proto::ControlKey;
+        Some(match ck {
+            x if x == ControlKey::Alt as i32 => 58,
+            x if x == ControlKey::Backspace as i32 => 51,
+            x if x == ControlKey::CapsLock as i32 => 57,
+            x if x == ControlKey::Control as i32 => 59,
+            x if x == ControlKey::Delete as i32 => 117,
+            x if x == ControlKey::DownArrow as i32 => 125,
+            x if x == ControlKey::End as i32 => 119,
+            x if x == ControlKey::Escape as i32 => 53,
+            x if x == ControlKey::F1 as i32 => 122,
+            x if x == ControlKey::F2 as i32 => 120,
+            x if x == ControlKey::F3 as i32 => 99,
+            x if x == ControlKey::F4 as i32 => 118,
+            x if x == ControlKey::F5 as i32 => 96,
+            x if x == ControlKey::F6 as i32 => 97,
+            x if x == ControlKey::F7 as i32 => 98,
+            x if x == ControlKey::F8 as i32 => 100,
+            x if x == ControlKey::F9 as i32 => 101,
+            x if x == ControlKey::F10 as i32 => 109,
+            x if x == ControlKey::F11 as i32 => 103,
+            x if x == ControlKey::F12 as i32 => 111,
+            x if x == ControlKey::Home as i32 => 115,
+            x if x == ControlKey::Insert as i32 => 114,
+            x if x == ControlKey::LeftArrow as i32 => 123,
+            x if x == ControlKey::Meta as i32 => 55,
+            x if x == ControlKey::PageDown as i32 => 121,
+            x if x == ControlKey::PageUp as i32 => 116,
+            x if x == ControlKey::Return as i32 => 36,
+            x if x == ControlKey::NumpadEnter as i32 => 76,
+            x if x == ControlKey::RightArrow as i32 => 124,
+            x if x == ControlKey::Shift as i32 => 56,
+            x if x == ControlKey::Space as i32 => 49,
+            x if x == ControlKey::Tab as i32 => 48,
+            x if x == ControlKey::UpArrow as i32 => 126,
+            _ => return None,
+        })
+    }
+
+    /// Map an ASCII letter/digit to its kVK_ANSI_* virtual keycode so that
+    /// modifier shortcuts (⌘C, ⌃A, …) reach the right key. Layout-dependent —
+    /// only used for the shortcut path; plain text goes through post_unicode.
+    fn ascii_to_mac_keycode(c: char) -> Option<u16> {
+        let lower = c.to_ascii_lowercase();
+        Some(match lower {
+            'a' => 0,
+            'b' => 11,
+            'c' => 8,
+            'd' => 2,
+            'e' => 14,
+            'f' => 3,
+            'g' => 5,
+            'h' => 4,
+            'i' => 34,
+            'j' => 38,
+            'k' => 40,
+            'l' => 37,
+            'm' => 46,
+            'n' => 45,
+            'o' => 31,
+            'p' => 35,
+            'q' => 12,
+            'r' => 15,
+            's' => 1,
+            't' => 17,
+            'u' => 32,
+            'v' => 9,
+            'w' => 13,
+            'x' => 7,
+            'y' => 16,
+            'z' => 6,
+            '0' => 29,
+            '1' => 18,
+            '2' => 19,
+            '3' => 20,
+            '4' => 21,
+            '5' => 23,
+            '6' => 22,
+            '7' => 26,
+            '8' => 28,
+            '9' => 25,
+            _ => return None,
+        })
+    }
+}
+
 /// Map RustDesk ControlKey enum value to Windows VK_ code.
 #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
 fn control_key_to_vk(ck: i32) -> u16 {
@@ -4325,6 +4960,13 @@ fn hostname() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "EvertyDesk".to_owned())
+}
+
+/// macOS host permission status for the GUI: `(screen_recording, accessibility)`.
+/// Cheap, non-prompting — safe to poll each frame.
+#[cfg(target_os = "macos")]
+pub fn macos_permission_status() -> (bool, bool) {
+    macos_cgevent::permission_status()
 }
 
 // ─── Pub-обёртки для evrt_session ─────────────────────────────────────────────

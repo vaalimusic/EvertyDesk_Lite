@@ -27,6 +27,7 @@ mod macos {
     type VTDecompressionSessionRef = *mut c_void;
 
     const K_CM_VIDEO_CODEC_TYPE_H264: OSType = 0x6176_6331; // 'avc1'
+    const K_CM_VIDEO_CODEC_TYPE_HEVC: OSType = 0x6876_6331; // 'hvc1'
     const K_CV_PIXEL_FORMAT_TYPE_32_BGRA: OSType = 0x4247_5241; // 'BGRA'
     const K_CF_NUMBER_SINT32_TYPE: i32 = 3;
     const K_CM_TIME_FLAGS_VALID: u32 = 1;
@@ -166,6 +167,23 @@ mod macos {
             parameter_set_count_out: *mut usize,
             nal_unit_header_length_out: *mut i32,
         ) -> OSStatus;
+        fn CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+            allocator: CFAllocatorRef,
+            parameter_set_count: usize,
+            parameter_set_pointers: *const *const u8,
+            parameter_set_sizes: *const usize,
+            nal_unit_header_length: i32,
+            extensions: CFDictionaryRef,
+            format_description_out: *mut CMFormatDescriptionRef,
+        ) -> OSStatus;
+        fn CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+            video_desc: CMFormatDescriptionRef,
+            parameter_set_index: usize,
+            parameter_set_pointer_out: *mut *const u8,
+            parameter_set_size_out: *mut usize,
+            parameter_set_count_out: *mut usize,
+            nal_unit_header_length_out: *mut i32,
+        ) -> OSStatus;
     }
 
     #[link(name = "CoreVideo", kind = "framework")]
@@ -221,6 +239,7 @@ mod macos {
         static kVTCompressionPropertyKey_RealTime: CFStringRef;
         static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
         static kVTProfileLevel_H264_Baseline_AutoLevel: CFStringRef;
+        static kVTProfileLevel_HEVC_Main_AutoLevel: CFStringRef;
         static kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: CFStringRef;
         static kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: CFStringRef;
 
@@ -278,6 +297,7 @@ mod macos {
     }
 
     struct PacketSink {
+        codec: NvencCodec,
         packets: Mutex<Vec<NvencPacket>>,
     }
 
@@ -306,9 +326,9 @@ mod macos {
             fps: u32,
             bitrate: u32,
         ) -> Result<Self, String> {
-            if codec != NvencCodec::H264 {
+            if codec != NvencCodec::H264 && codec != NvencCodec::H265 {
                 return Err(format!(
-                    "VideoToolbox direct backend currently exposes H264 only, requested {}",
+                    "VideoToolbox backend supports H264/H265 only, requested {}",
                     codec.label()
                 ));
             }
@@ -426,15 +446,20 @@ mod macos {
             bitrate: u32,
         ) -> Result<Self, String> {
             let mut sink = Box::new(PacketSink {
+                codec,
                 packets: Mutex::new(Vec::new()),
             });
+            let codec_type = match codec {
+                NvencCodec::H265 => K_CM_VIDEO_CODEC_TYPE_HEVC,
+                _ => K_CM_VIDEO_CODEC_TYPE_H264,
+            };
             let encoder_spec = create_hardware_encoder_specification();
             let mut session = ptr::null_mut();
             let status = VTCompressionSessionCreate(
                 ptr::null(),
                 width as i32,
                 height as i32,
-                K_CM_VIDEO_CODEC_TYPE_H264,
+                codec_type,
                 encoder_spec,
                 ptr::null(),
                 ptr::null(),
@@ -471,10 +496,14 @@ mod macos {
                 (fps * 2) as i32,
             );
             set_i32_property(session, kVTCompressionPropertyKey_MaxFrameDelayCount, 1);
+            let profile = match codec {
+                NvencCodec::H265 => kVTProfileLevel_HEVC_Main_AutoLevel,
+                _ => kVTProfileLevel_H264_Baseline_AutoLevel,
+            };
             let _ = VTSessionSetProperty(
                 session as CFTypeRef,
                 kVTCompressionPropertyKey_ProfileLevel,
-                kVTProfileLevel_H264_Baseline_AutoLevel as CFTypeRef,
+                profile as CFTypeRef,
             );
 
             let status = VTCompressionSessionPrepareToEncodeFrames(session);
@@ -517,11 +546,14 @@ mod macos {
     }
 
     pub fn videotoolbox_codecs() -> Vec<NvencCodec> {
-        vec![NvencCodec::H264]
+        vec![NvencCodec::H264, NvencCodec::H265]
     }
 
     pub fn videotoolbox_encoder_names() -> Option<Vec<String>> {
-        Some(vec!["H264 VideoToolbox".to_owned()])
+        Some(vec![
+            "H264 VideoToolbox".to_owned(),
+            "H265 VideoToolbox".to_owned(),
+        ])
     }
 
     pub fn videotoolbox_h264_decoder_available() -> bool {
@@ -529,8 +561,10 @@ mod macos {
     }
 
     pub struct VideoToolboxH264Decoder {
+        codec: NvencCodec,
         session: VTDecompressionSessionRef,
         sink: Box<DecodeSink>,
+        vps: Vec<u8>,
         sps: Vec<u8>,
         pps: Vec<u8>,
     }
@@ -539,11 +573,24 @@ mod macos {
 
     impl VideoToolboxH264Decoder {
         pub fn new() -> Self {
+            Self::with_codec(NvencCodec::H264)
+        }
+
+        /// HEVC/H265 hardware decoder backed by the same VideoToolbox session
+        /// machinery — HEVC parses NAL types differently and carries an extra
+        /// VPS parameter set.
+        pub fn new_hevc() -> Self {
+            Self::with_codec(NvencCodec::H265)
+        }
+
+        fn with_codec(codec: NvencCodec) -> Self {
             Self {
+                codec,
                 session: ptr::null_mut(),
                 sink: Box::new(DecodeSink {
                     frame: Mutex::new(None),
                 }),
+                vps: Vec::new(),
                 sps: Vec::new(),
                 pps: Vec::new(),
             }
@@ -577,37 +624,45 @@ mod macos {
                 return Ok(None);
             }
 
+            let is_hevc = self.codec == NvencCodec::H265;
             let mut sample = Vec::new();
             let mut parameter_sets_changed = false;
             for nal in nals {
                 if nal.is_empty() {
                     continue;
                 }
-                match nal[0] & 0x1f {
-                    7 => {
+                match classify_nal(nal[0], is_hevc) {
+                    NalKind::Vps => {
+                        if self.vps.as_slice() != nal {
+                            self.vps.clear();
+                            self.vps.extend_from_slice(nal);
+                            parameter_sets_changed = true;
+                        }
+                    }
+                    NalKind::Sps => {
                         if self.sps.as_slice() != nal {
                             self.sps.clear();
                             self.sps.extend_from_slice(nal);
                             parameter_sets_changed = true;
                         }
                     }
-                    8 => {
+                    NalKind::Pps => {
                         if self.pps.as_slice() != nal {
                             self.pps.clear();
                             self.pps.extend_from_slice(nal);
                             parameter_sets_changed = true;
                         }
                     }
-                    9 => {}
-                    _ => append_avcc_nal(&mut sample, nal)?,
+                    NalKind::AccessUnitDelimiter => {}
+                    NalKind::Other => append_avcc_nal(&mut sample, nal)?,
                 }
             }
 
             if sample.is_empty() {
                 return Ok(None);
             }
-            if self.sps.is_empty() || self.pps.is_empty() {
-                return Err("VideoToolbox H264 decoder needs more packets".to_owned());
+            if self.sps.is_empty() || self.pps.is_empty() || (is_hevc && self.vps.is_empty()) {
+                return Err("VideoToolbox decoder needs more packets".to_owned());
             }
             if self.session.is_null() || parameter_sets_changed {
                 unsafe {
@@ -622,7 +677,8 @@ mod macos {
                 .take();
 
             unsafe {
-                let sample_buffer = create_h264_sample_buffer(&sample, &self.sps, &self.pps)?;
+                let sample_buffer =
+                    create_sample_buffer(self.codec, &sample, &self.vps, &self.sps, &self.pps)?;
                 let mut info_flags = 0;
                 let status = VTDecompressionSessionDecodeFrame(
                     self.session,
@@ -648,7 +704,7 @@ mod macos {
                 .lock()
                 .map_err(|_| "VideoToolbox decode sink poisoned".to_owned())?
                 .take()
-                .ok_or_else(|| "VideoToolbox H264 decoder needs more packets".to_owned())
+                .ok_or_else(|| "VideoToolbox decoder needs more packets".to_owned())
                 .map(Some)
         }
 
@@ -659,7 +715,8 @@ mod macos {
                 self.session = ptr::null_mut();
             }
 
-            let format = create_h264_format_description(&self.sps, &self.pps)?;
+            let format =
+                create_format_description(self.codec, &self.vps, &self.sps, &self.pps)?;
             let decoder_spec = create_hardware_decoder_specification();
             let (attrs, attrs_value) = create_bgra_pixel_buffer_attributes();
             let callback = VTDecompressionOutputCallbackRecord {
@@ -753,35 +810,84 @@ mod macos {
         Ok(pixel_buffer)
     }
 
-    unsafe fn create_h264_format_description(
+    /// Classification of a NAL unit by its header byte. H264 uses the low 5 bits
+    /// of byte 0; HEVC uses bits 6..1 of byte 0 (`(b0 >> 1) & 0x3f`).
+    enum NalKind {
+        Vps,
+        Sps,
+        Pps,
+        AccessUnitDelimiter,
+        Other,
+    }
+
+    fn classify_nal(header_byte: u8, is_hevc: bool) -> NalKind {
+        if is_hevc {
+            match (header_byte >> 1) & 0x3f {
+                32 => NalKind::Vps,
+                33 => NalKind::Sps,
+                34 => NalKind::Pps,
+                35 => NalKind::AccessUnitDelimiter,
+                _ => NalKind::Other,
+            }
+        } else {
+            match header_byte & 0x1f {
+                7 => NalKind::Sps,
+                8 => NalKind::Pps,
+                9 => NalKind::AccessUnitDelimiter,
+                _ => NalKind::Other,
+            }
+        }
+    }
+
+    unsafe fn create_format_description(
+        codec: NvencCodec,
+        vps: &[u8],
         sps: &[u8],
         pps: &[u8],
     ) -> Result<CMFormatDescriptionRef, String> {
-        let parameter_sets = [sps.as_ptr(), pps.as_ptr()];
-        let parameter_set_sizes = [sps.len(), pps.len()];
         let mut format = ptr::null();
-        let status = CMVideoFormatDescriptionCreateFromH264ParameterSets(
-            ptr::null(),
-            parameter_sets.len(),
-            parameter_sets.as_ptr(),
-            parameter_set_sizes.as_ptr(),
-            4,
-            &mut format,
-        );
+        let status = if codec == NvencCodec::H265 {
+            // HEVC parameter sets must be ordered VPS, SPS, PPS.
+            let parameter_sets = [vps.as_ptr(), sps.as_ptr(), pps.as_ptr()];
+            let parameter_set_sizes = [vps.len(), sps.len(), pps.len()];
+            CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                ptr::null(),
+                parameter_sets.len(),
+                parameter_sets.as_ptr(),
+                parameter_set_sizes.as_ptr(),
+                4,
+                ptr::null(),
+                &mut format,
+            )
+        } else {
+            let parameter_sets = [sps.as_ptr(), pps.as_ptr()];
+            let parameter_set_sizes = [sps.len(), pps.len()];
+            CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                ptr::null(),
+                parameter_sets.len(),
+                parameter_sets.as_ptr(),
+                parameter_set_sizes.as_ptr(),
+                4,
+                &mut format,
+            )
+        };
         if status != 0 || format.is_null() {
             return Err(format!(
-                "CMVideoFormatDescriptionCreateFromH264ParameterSets status={status}"
+                "CMVideoFormatDescriptionCreateFrom{}ParameterSets status={status}",
+                if codec == NvencCodec::H265 { "HEVC" } else { "H264" }
             ));
         }
         Ok(format)
     }
 
-    unsafe fn create_h264_sample_buffer(
+    unsafe fn create_sample_buffer(
+        codec: NvencCodec,
         avcc_sample: &[u8],
+        vps: &[u8],
         sps: &[u8],
         pps: &[u8],
     ) -> Result<CMSampleBufferRef, String> {
-        let format = create_h264_format_description(sps, pps)?;
+        let format = create_format_description(codec, vps, sps, pps)?;
         let mut block = ptr::null();
         let status = CMBlockBufferCreateWithMemoryBlock(
             ptr::null(),
@@ -1073,15 +1179,16 @@ mod macos {
             return;
         }
         let sink = &*(output_callback_refcon as *const PacketSink);
-        if let Some(packet) = h264_packet_from_sample_buffer(sample_buffer) {
+        if let Some(packet) = packet_from_sample_buffer(sample_buffer, sink.codec) {
             if let Ok(mut packets) = sink.packets.lock() {
                 packets.push(packet);
             }
         }
     }
 
-    unsafe fn h264_packet_from_sample_buffer(
+    unsafe fn packet_from_sample_buffer(
         sample_buffer: CMSampleBufferRef,
+        codec: NvencCodec,
     ) -> Option<NvencPacket> {
         if CMSampleBufferDataIsReady(sample_buffer) == 0 {
             return None;
@@ -1096,7 +1203,7 @@ mod macos {
         let mut nal_length_size = 4usize;
         let mut bytes = Vec::new();
         if !format.is_null() {
-            let (parameter_sets, length_size) = h264_parameter_sets(format);
+            let (parameter_sets, length_size) = parameter_sets(format, codec);
             if length_size > 0 {
                 nal_length_size = length_size;
             }
@@ -1118,26 +1225,26 @@ mod macos {
         if !append_avcc_payload_as_annex_b(&avcc, nal_length_size, &mut bytes) {
             return None;
         }
-        Some(NvencPacket {
-            codec: NvencCodec::H264,
-            bytes,
-            key,
-        })
+        Some(NvencPacket { codec, bytes, key })
     }
 
-    unsafe fn h264_parameter_sets(format: CMFormatDescriptionRef) -> (Vec<Vec<u8>>, usize) {
+    /// Extract the codec parameter sets (SPS/PPS for H264, VPS/SPS/PPS for HEVC)
+    /// from a format description, plus the NAL length-prefix size. The getter
+    /// differs per codec; the index walk is identical.
+    unsafe fn parameter_sets(
+        format: CMFormatDescriptionRef,
+        codec: NvencCodec,
+    ) -> (Vec<Vec<u8>>, usize) {
+        let getter = match codec {
+            NvencCodec::H265 => CMVideoFormatDescriptionGetHEVCParameterSetAtIndex,
+            _ => CMVideoFormatDescriptionGetH264ParameterSetAtIndex,
+        };
+
         let mut count = 0usize;
         let mut header_len = 4i32;
         let mut first_ptr = ptr::null();
         let mut first_len = 0usize;
-        let status = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-            format,
-            0,
-            &mut first_ptr,
-            &mut first_len,
-            &mut count,
-            &mut header_len,
-        );
+        let status = getter(format, 0, &mut first_ptr, &mut first_len, &mut count, &mut header_len);
         if status != 0 || count == 0 {
             return (Vec::new(), 4);
         }
@@ -1151,7 +1258,7 @@ mod macos {
             let mut len_out = 0usize;
             let mut ignored_count = 0usize;
             let mut ignored_header_len = header_len;
-            if CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+            if getter(
                 format,
                 index,
                 &mut ptr_out,
@@ -1313,6 +1420,10 @@ mod fallback {
 
     impl VideoToolboxH264Decoder {
         pub fn new() -> Self {
+            Self
+        }
+
+        pub fn new_hevc() -> Self {
             Self
         }
 

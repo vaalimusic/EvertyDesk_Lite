@@ -72,6 +72,10 @@ mod inner {
                 format!("Media Foundation encode: {}", codecs.join(", "))
             }
         }
+        /// Есть ли аппаратный H264 энкодер (не софтверный MFT).
+        pub fn has_hardware_h264(&self) -> bool {
+            self.hardware_h264
+        }
         /// Есть ли аппаратный H265 энкодер (не софтверный MFT).
         pub fn has_hardware_h265(&self) -> bool {
             self.hardware_h265
@@ -844,6 +848,10 @@ mod fallback {
     impl MfEncoderStatus {
         pub fn label(&self) -> String {
             "Media Foundation encode: Windows only".to_owned()
+        }
+        /// Нет аппаратного H264 на не-Windows сборках.
+        pub fn has_hardware_h264(&self) -> bool {
+            false
         }
         /// Нет аппаратного H265 на не-Windows сборках.
         pub fn has_hardware_h265(&self) -> bool {

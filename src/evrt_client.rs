@@ -497,6 +497,15 @@ fn evrt_decode_loop(
     let mut h265_mf: Option<crate::mf_video::MfVideoDecoder> = None;
     let mf_status = crate::mf_video::mf_video_decode_status();
 
+    // macOS: hardware HEVC decode via VideoToolbox. Same availability gate as
+    // the H264 VT decoder (true only on macOS).
+    let mut h265_vt = if crate::videotoolbox::videotoolbox_h264_decoder_available() {
+        Some(crate::videotoolbox::VideoToolboxH264Decoder::new_hevc())
+    } else {
+        None
+    };
+    let mut h265_vt_fail = 0u32;
+
     loop {
         // Взять кадр из очереди
         let Some((bytes, _is_key, _pts)) = queue.dequeue(&stop) else {
@@ -515,9 +524,15 @@ fn evrt_decode_loop(
                 &mut h264_sw,
                 &mut vt_fail_streak,
             ),
-            "H265" | "HEVC" => {
-                decode_h265_frame(&bytes, width, height, &mut h265_mf, mf_status.h265)
-            }
+            "H265" | "HEVC" => decode_h265_frame(
+                &bytes,
+                width,
+                height,
+                &mut h265_vt,
+                &mut h265_vt_fail,
+                &mut h265_mf,
+                mf_status.h265,
+            ),
             _ => decode_h264_frame(
                 &bytes,
                 width,
@@ -607,11 +622,31 @@ fn decode_h265_frame(
     bytes: &[u8],
     width: u32,
     height: u32,
+    vt: &mut Option<crate::videotoolbox::VideoToolboxH264Decoder>,
+    vt_failures: &mut u32,
     mf_dec: &mut Option<crate::mf_video::MfVideoDecoder>,
     mf_avail: bool,
 ) -> Option<(Vec<u8>, usize, usize)> {
     use crate::mf_video::MfVideoCodec;
 
+    const VT_FAIL_LIMIT: u32 = 5;
+
+    // macOS VideoToolbox hardware HEVC — preferred when present.
+    if let Some(ref mut dec) = vt {
+        if *vt_failures < VT_FAIL_LIMIT {
+            match dec.decode_packets(std::iter::once(bytes.to_vec())) {
+                Ok(Some((w, h, rgba))) => {
+                    *vt_failures = 0;
+                    return Some((rgba, w, h));
+                }
+                Ok(None) | Err(_) => {
+                    *vt_failures += 1;
+                }
+            }
+        }
+    }
+
+    // Windows Media Foundation HEVC fallback.
     if !mf_avail {
         return None;
     }

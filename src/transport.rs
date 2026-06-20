@@ -2597,16 +2597,20 @@ fn preferred_codec(
     vp9_capable: bool,
 ) -> PreferCodec {
     match codec_preference {
+        // Explicit client choice → advertise that concrete codec (the host
+        // honours it as a strong preference over raw quality ranking).
         CodecPreference::Av1 if av1_capable => PreferCodec::Av1,
         CodecPreference::H265 if h265_capable => PreferCodec::H265,
         CodecPreference::H264 if h264_capable => PreferCodec::H264,
         CodecPreference::Vp9 if vp9_capable => PreferCodec::Vp9,
-        CodecPreference::Auto if h264_capable => PreferCodec::H264,
-        CodecPreference::Auto if h265_capable => PreferCodec::H265,
-        CodecPreference::Auto if av1_capable => PreferCodec::Av1,
-        CodecPreference::Auto if vp9_capable => PreferCodec::Vp9,
-        _ if h264_capable => PreferCodec::H264,
+        // Auto → advertise Auto so the host's capability-aware brain picks the
+        // best codec both ends can hardware-handle. Advertising a concrete codec
+        // here would override that and pin the session to it.
+        CodecPreference::Auto => PreferCodec::Auto,
+        // Explicit choice not decodable on this machine → fall back to whatever
+        // we *can* decode, best-first.
         _ if h265_capable => PreferCodec::H265,
+        _ if h264_capable => PreferCodec::H264,
         _ if av1_capable => PreferCodec::Av1,
         _ if vp9_capable => PreferCodec::Vp9,
         _ => PreferCodec::Auto,
@@ -4990,47 +4994,38 @@ mod tests {
     }
 
     #[test]
-    fn auto_codec_prefers_low_latency_h264_when_available() {
-        assert_eq!(
-            preferred_codec(CodecPreference::Auto, true, false, false, true) as i32,
-            PreferCodec::H264 as i32
-        );
-        assert_eq!(
-            preferred_codec(CodecPreference::Auto, false, false, false, true) as i32,
-            PreferCodec::Vp9 as i32
-        );
+    fn auto_codec_defers_to_host_capability_brain() {
+        // On Auto the client advertises Auto regardless of its own decode mix —
+        // the host's capability-aware negotiation picks the best codec both ends
+        // can hardware-handle. Advertising a concrete codec here would pin it.
+        for (h264, h265, av1, vp9) in [
+            (true, false, false, true),
+            (true, true, false, true),
+            (true, true, true, true),
+            (false, true, true, true),
+            (false, false, true, true),
+        ] {
+            assert_eq!(
+                preferred_codec(CodecPreference::Auto, h264, h265, av1, vp9) as i32,
+                PreferCodec::Auto as i32,
+            );
+        }
     }
 
     #[test]
-    fn auto_codec_prefers_h264_for_interactive_stability() {
-        assert_eq!(
-            preferred_codec(CodecPreference::Auto, true, true, false, true) as i32,
-            PreferCodec::H264 as i32
-        );
-        assert_eq!(
-            preferred_codec(CodecPreference::Auto, true, true, true, true) as i32,
-            PreferCodec::H264 as i32
-        );
-        assert_eq!(
-            preferred_codec(CodecPreference::Auto, false, true, true, true) as i32,
-            PreferCodec::H265 as i32
-        );
-        assert_eq!(
-            preferred_codec(CodecPreference::Auto, false, false, true, true) as i32,
-            PreferCodec::Av1 as i32
-        );
-    }
-
-    #[test]
-    fn explicit_codec_preference_falls_back_to_supported_decoder() {
+    fn explicit_codec_preference_falls_back_to_best_supported() {
+        // H265 requested but undecodable here → fall back to H264 (only option).
         assert_eq!(
             preferred_codec(CodecPreference::H265, true, false, false, true) as i32,
             PreferCodec::H264 as i32
         );
+        // AV1 requested but undecodable → fall back to the *best* available
+        // decoder, which is H265 (new "latch onto the best" philosophy).
         assert_eq!(
             preferred_codec(CodecPreference::Av1, true, true, false, true) as i32,
-            PreferCodec::H264 as i32
+            PreferCodec::H265 as i32
         );
+        // VP9 requested but undecodable, only H264 available → H264.
         assert_eq!(
             preferred_codec(CodecPreference::Vp9, true, false, false, false) as i32,
             PreferCodec::H264 as i32

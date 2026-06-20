@@ -66,7 +66,10 @@ pub fn h264_available() -> bool {
 }
 
 pub fn h265_available() -> bool {
+    // Windows Media Foundation HEVC, or macOS VideoToolbox HEVC (same gate as
+    // the VT H264 decoder — true only on macOS).
     crate::mf_video::h265_decode_available()
+        || crate::videotoolbox::videotoolbox_h264_decoder_available()
 }
 
 pub fn av1_available() -> bool {

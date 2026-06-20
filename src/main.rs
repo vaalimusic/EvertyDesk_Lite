@@ -6169,6 +6169,18 @@ impl EvertyDeskApp {
             });
         });
 
+        // macOS: surface a friendly setup card when Screen Recording or
+        // Accessibility permission is missing — without them the host shows a
+        // blank screen or ignores remote input. Disappears once both are on.
+        #[cfg(target_os = "macos")]
+        {
+            let (screen_ok, ax_ok) = crate::host::macos_permission_status();
+            if !(screen_ok && ax_ok) {
+                ui.add_space(24.0);
+                self.macos_permission_card(ui, screen_ok, ax_ok);
+            }
+        }
+
         ui.add_space(24.0);
 
         card_frame().show(ui, |ui| {
@@ -6331,6 +6343,183 @@ impl EvertyDeskApp {
                             }
                         });
                 });
+        });
+    }
+
+    /// macOS-only: friendly setup card guiding the user to grant the two
+    /// permissions host mode needs. Each missing permission gets a one-click
+    /// button that opens the exact System Settings pane.
+    #[cfg(target_os = "macos")]
+    fn macos_permission_card(&mut self, ui: &mut egui::Ui, screen_ok: bool, ax_ok: bool) {
+        use egui_phosphor::regular as ph;
+        let p = crate::theme::palette();
+
+        let frame = egui::Frame::NONE
+            .fill(p.surface)
+            .stroke(egui::Stroke::new(1.0, p.warning))
+            .corner_radius(egui::CornerRadius::same(14))
+            .inner_margin(egui::Margin::same(20));
+
+        frame.show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+
+            // ── Header ───────────────────────────────────────────────────────
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(ph::WARNING).size(22.0).color(p.warning));
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(self.text(
+                            "Осталось выдать два разрешения",
+                            "Two permissions still needed",
+                        ))
+                        .size(17.0)
+                        .strong()
+                        .color(p.text),
+                    );
+                    ui.label(
+                        egui::RichText::new(self.text(
+                            "Чтобы другие могли видеть экран этого Mac и управлять им",
+                            "So others can see and control this Mac's screen",
+                        ))
+                        .size(13.0)
+                        .color(p.text_weak),
+                    );
+                });
+            });
+
+            ui.add_space(16.0);
+
+            // ── Row 1: Screen Recording ──────────────────────────────────────
+            self.macos_permission_row(
+                ui,
+                ph::VIDEO_CAMERA,
+                self.text("Запись экрана", "Screen Recording"),
+                self.text(
+                    "Передаёт изображение рабочего стола",
+                    "Streams the desktop image to the client",
+                ),
+                screen_ok,
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+            );
+
+            ui.add_space(10.0);
+
+            // ── Row 2: Accessibility ─────────────────────────────────────────
+            self.macos_permission_row(
+                ui,
+                ph::CURSOR_CLICK,
+                self.text("Универсальный доступ", "Accessibility"),
+                self.text(
+                    "Позволяет управлять мышью и клавиатурой",
+                    "Lets the remote control mouse & keyboard",
+                ),
+                ax_ok,
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+            );
+
+            ui.add_space(14.0);
+            ui.separator();
+            ui.add_space(10.0);
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new(ph::ARROWS_CLOCKWISE)
+                        .size(13.0)
+                        .color(p.text_weak),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(self.text(
+                        "Поставьте галочку напротив «EvertyDesk Lite» и перезапустите приложение.",
+                        "Tick the box next to \"EvertyDesk Lite\", then restart the app.",
+                    ))
+                    .size(12.5)
+                    .color(p.text_weak),
+                );
+            });
+        });
+    }
+
+    /// One row of the macOS permission card: icon + title/description, and on
+    /// the right either a green "Готово" badge or an "Открыть настройки" button.
+    #[cfg(target_os = "macos")]
+    fn macos_permission_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        icon: &str,
+        title: &'static str,
+        desc: &'static str,
+        granted: bool,
+        settings_url: &str,
+    ) {
+        use egui_phosphor::regular as ph;
+        let p = crate::theme::palette();
+
+        let row = egui::Frame::NONE
+            .fill(p.surface_sunken)
+            .stroke(egui::Stroke::new(1.0, p.border))
+            .corner_radius(egui::CornerRadius::same(10))
+            .inner_margin(egui::Margin::symmetric(14, 12));
+
+        row.show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(icon)
+                        .size(22.0)
+                        .color(if granted { p.success } else { p.accent }),
+                );
+                ui.add_space(12.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(title)
+                            .size(15.0)
+                            .strong()
+                            .color(p.text),
+                    );
+                    ui.label(egui::RichText::new(desc).size(12.5).color(p.text_weak));
+                });
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if granted {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{}  {}",
+                                ph::CHECK_CIRCLE,
+                                self.text("Готово", "Granted")
+                            ))
+                            .size(13.5)
+                            .strong()
+                            .color(p.success),
+                        );
+                    } else {
+                        let btn = egui::Button::new(
+                            egui::RichText::new(format!(
+                                "{}  {}",
+                                ph::ARROW_SQUARE_OUT,
+                                self.text("Открыть настройки", "Open Settings")
+                            ))
+                            .size(13.5)
+                            .strong()
+                            .color(p.accent_fg),
+                        )
+                        .fill(p.accent)
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .min_size(egui::vec2(0.0, 36.0));
+                        if ui
+                            .add(btn)
+                            .on_hover_text(self.text(
+                                "Откроет System Settings на нужном разделе",
+                                "Opens System Settings at the right pane",
+                            ))
+                            .clicked()
+                        {
+                            let _ = std::process::Command::new("open").arg(settings_url).spawn();
+                        }
+                    }
+                });
+            });
         });
     }
 
