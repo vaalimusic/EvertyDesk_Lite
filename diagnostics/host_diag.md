@@ -1,14 +1,14 @@
 # Хост-диагностика EvertyDesk Lite (живая)
 
-Обновлено: unix 1781705553
+Обновлено: unix 1781963356
 
 ## Энкодер
-backend=NVENC encode_ms=6 encode_avg_ms=6 capture_avg_ms=81 capture_max_ms=88 slot_avg_ms=0 change_avg_ms=0 actual_fps=8.5 sent=17 skipped=0 interval_ms=2005 res=2560x1440 fps=30 build=05:51:41
+backend=NVENC encode_ms=6 encode_avg_ms=5 capture_avg_ms=65 capture_max_ms=73 slot_avg_ms=0 change_avg_ms=0 actual_fps=10.0 sent=20 skipped=0 interval_ms=2001 res=2560x1440 fps=30 build=13:43:11
 
 ## Кадры за последний интервал
-- interval_ms: 2005
-- actual_fps: 8.5
-- sent: 17
+- interval_ms: 2001
+- actual_fps: 10.0
+- sent: 20
 - skipped (статика): 0
 
 > Это пишет САМ ХОСТ из encode_loop. Если файл свежий (unix растёт) и
