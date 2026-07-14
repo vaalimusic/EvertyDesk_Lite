@@ -481,7 +481,9 @@ fn evrt_decode_loop(
     delta_ms: Arc<AtomicI32>,
     decoded_frames: Arc<AtomicU64>,
 ) {
-    // ── Инициализация декодеров (те же что в decode_frame_loop) ──────────────
+    // ── Инициализация декодеров ───────────────────────────────────────────────
+    let mut evrtck_dec = crate::evrtck::EvrtckDecoder::new();
+
     #[cfg(feature = "live-h264")]
     let mut h264_sw = openh264::decoder::Decoder::new().ok();
     #[cfg(not(feature = "live-h264"))]
@@ -516,6 +518,22 @@ fn evrt_decode_loop(
 
         // Декодировать в зависимости от кодека
         let maybe_event = match codec.to_ascii_uppercase().as_str() {
+            "EVRTCK" => {
+                use crate::evrtck::EvrtckPacket;
+                let pkt = EvrtckPacket {
+                    frame_id: 0,
+                    width,
+                    height,
+                    data: bytes.to_vec(),
+                };
+                match evrtck_dec.decode(&pkt) {
+                    Ok(rgba) => Some((rgba.to_vec(), width as usize, height as usize)),
+                    Err(e) => {
+                        evrt_log(&events, format!("EVRTCK decode error: {e}"));
+                        None
+                    }
+                }
+            }
             "H264" => decode_h264_frame(
                 &bytes,
                 width,

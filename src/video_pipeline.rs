@@ -588,7 +588,13 @@ fn encode_loop(
     evrt_active: Arc<Mutex<Option<SocketAddr>>>,
     idr_rx: Receiver<()>,
 ) {
-    use crate::host::{h264_target_bitrate_bps_pub, MultiEncoder};
+    use crate::host::{h264_target_bitrate_bps_pub, EncodedOutput, MultiEncoder};
+    use crate::evrtck::EvrtckEncoder;
+
+    thread_local! {
+        static EVRTCK_ENC: std::cell::RefCell<Option<EvrtckEncoder>> =
+            std::cell::RefCell::new(None);
+    }
 
     log(
         &events,
@@ -901,9 +907,25 @@ fn encode_loop(
             eff_bps = eff_bps.min(cap_bps);
         }
 
-        // ── Кодирование через единый каскад ───────────────────────────────────
+        // ── Кодирование: EVRTCK (lossless тайлы) когда EVRT активен, иначе H264 ─
         let encode_started = Instant::now();
-        let Some(out) = encoder.encode(enc_w, enc_h, fps, eff_bps, bgra, want_idr) else {
+        let evrtck_out = if evrt_on {
+            EVRTCK_ENC.with(|cell| {
+                let mut enc = cell.borrow_mut();
+                if enc.as_ref().map(|e| e.width() != enc_w as usize || e.height() != enc_h as usize).unwrap_or(true) {
+                    *enc = Some(EvrtckEncoder::new(enc_w as usize, enc_h as usize));
+                }
+                let pkt = enc.as_mut().unwrap().encode(bgra, frame_id);
+                if pkt.data.len() <= 500 * 1024 {
+                    Some(EncodedOutput { bytes: pkt.data, key: want_idr, sps_pps: None, codec: "evrtck" })
+                } else {
+                    None // слишком большой — фолбэк на H264
+                }
+            })
+        } else {
+            None
+        };
+        let Some(out) = evrtck_out.or_else(|| encoder.encode(enc_w, enc_h, fps, eff_bps, bgra, want_idr)) else {
             continue;
         };
         let encode_dur = encode_started.elapsed();
