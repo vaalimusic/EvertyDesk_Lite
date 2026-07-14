@@ -18,6 +18,7 @@ mod crypto;
 mod diagnostics;
 mod evrt;
 mod evrt_audio;
+mod evrtck;
 mod evrt_client;
 mod evrt_session;
 mod frame_queue;
