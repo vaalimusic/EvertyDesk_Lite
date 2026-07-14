@@ -335,7 +335,7 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
                                 // ROI используется для оптимизации рендеринга.
                                 // Сейчас просто принимаем — можно добавить
                                 // подсветку изменённой области в UI.
-                                let _ = evrt::RoiRect::from_json(&pkt.payload);
+                                let _ = evrt::RoiRect::from_bytes(&pkt.payload);
                             }
                             _ => {}
                         }

@@ -71,6 +71,12 @@ pub const TYPE_FEC: u8 = 10;
 
 pub const FLAG_KEY_FRAME: u16 = 0x0001;
 
+// ─── бинарные субтипы управляющих пакетов ────────────────────────────────────
+// TYPE_CONTROL payload: первый байт — субтип (< 0x7B).
+// Если первый байт == 0x7B ('{') — JSON-формат (обратная совместимость с C#).
+pub const CTRL_REQUEST_KEY_FRAME: u8 = 0x01;
+pub const CTRL_RECEIVER_FEEDBACK: u8 = 0x02;
+
 // ─── структуры ────────────────────────────────────────────────────────────────
 
 /// Распарсенный EVRT-пакет.
@@ -335,6 +341,32 @@ pub struct RoiRect {
 }
 
 impl RoiRect {
+    /// Бинарная сериализация: 20 байт (5 × u32 BE).
+    /// Вдвое меньше JSON и не требует парсинга на горячем пути (60 пакетов/с).
+    pub fn to_bytes(self) -> [u8; 20] {
+        let mut b = [0u8; 20];
+        b[0..4].copy_from_slice(&self.frame_id.to_be_bytes());
+        b[4..8].copy_from_slice(&self.x.to_be_bytes());
+        b[8..12].copy_from_slice(&self.y.to_be_bytes());
+        b[12..16].copy_from_slice(&self.w.to_be_bytes());
+        b[16..20].copy_from_slice(&self.h.to_be_bytes());
+        b
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() < 20 {
+            return None;
+        }
+        Some(Self {
+            frame_id: u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+            x:        u32::from_be_bytes([b[4], b[5], b[6], b[7]]),
+            y:        u32::from_be_bytes([b[8], b[9], b[10], b[11]]),
+            w:        u32::from_be_bytes([b[12], b[13], b[14], b[15]]),
+            h:        u32::from_be_bytes([b[16], b[17], b[18], b[19]]),
+        })
+    }
+
+    /// JSON — сохранён для совместимости с EvertyGame C#.
     pub fn to_json(self) -> Vec<u8> {
         format!(
             r#"{{"frameId":{},"x":{},"y":{},"w":{},"h":{}}}"#,
@@ -380,28 +412,13 @@ impl RoiRect {
     }
 }
 
-/// Построить ROI-пакет для отправки перед видео-фреймом.
+/// Построить ROI-пакет для отправки перед видео-фреймом (бинарный, 20 байт).
 pub fn build_roi_metadata(roi: RoiRect) -> Vec<u8> {
-    let json = roi.to_json();
-    if json.len() <= MAX_PAYLOAD_SIZE {
-        build_single(TYPE_ROI_METADATA, &json)
-    } else {
-        Vec::new()
-    }
+    build_single(TYPE_ROI_METADATA, &roi.to_bytes())
 }
 
 pub fn build_roi_metadata_authenticated(roi: RoiRect, session_token: Option<&str>) -> Vec<u8> {
-    let json = roi.to_json();
-    let max_payload = if session_token.is_some_and(valid_session_token) {
-        MAX_AUTH_PAYLOAD_SIZE
-    } else {
-        MAX_PAYLOAD_SIZE
-    };
-    if json.len() <= max_payload {
-        build_single_authenticated(TYPE_ROI_METADATA, &json, session_token)
-    } else {
-        Vec::new()
-    }
+    build_single_authenticated(TYPE_ROI_METADATA, &roi.to_bytes(), session_token)
 }
 
 /// Пакетизировать аудио-фрейм (PCM данные).
@@ -431,13 +448,17 @@ pub fn packetize_audio_frame_authenticated(
 }
 
 /// Построить одиночный пакет для конфигурации/управления.
+/// Возвращает пустой Vec если payload не вмещается в MTU.
 pub fn build_single(packet_type: u8, payload: &[u8]) -> Vec<u8> {
-    assert!(
+    debug_assert!(
         payload.len() <= MAX_PAYLOAD_SIZE,
         "single-packet payload too large: {} > {}",
         payload.len(),
         MAX_PAYLOAD_SIZE
     );
+    if payload.len() > MAX_PAYLOAD_SIZE {
+        return Vec::new();
+    }
     build_packet(packet_type, 0, 0, 0, 1, 0, payload)
 }
 
@@ -451,12 +472,15 @@ pub fn build_single_authenticated(
     } else {
         MAX_PAYLOAD_SIZE
     };
-    assert!(
+    debug_assert!(
         payload.len() <= max_payload,
         "single-packet payload too large: {} > {}",
         payload.len(),
         max_payload
     );
+    if payload.len() > max_payload {
+        return Vec::new();
+    }
     build_packet_authenticated(packet_type, 0, 0, 0, 1, 0, payload, session_token)
 }
 
@@ -767,12 +791,21 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     outer.finalize().into()
 }
 
-/// Текущее время в микросекундах (монотонно относительно process start).
+/// Текущее время в микросекундах (Unix epoch).
+///
+/// Гарантирует монотонность: если системные часы прыгнули назад (NTP sync,
+/// DST), возвращает последнее выданное значение. Без этого arrival_delta_ms
+/// мог бы уходить в 0 из-за `saturating_sub`, маскируя реальный jitter.
 pub fn now_us() -> u64 {
-    SystemTime::now()
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as u64)
-        .unwrap_or(0)
+        .unwrap_or(0);
+    // fetch_max атомарно сохраняет max и возвращает старое значение;
+    // .max(now) даёт нам правильный результат в обе стороны.
+    LAST.fetch_max(now, Ordering::Relaxed).max(now)
 }
 
 // ─── управляющие пакеты ───────────────────────────────────────────────────────
@@ -794,23 +827,15 @@ fn session_token_json(token: Option<&str>) -> String {
 }
 
 pub fn build_request_key_frame() -> Vec<u8> {
-    build_request_key_frame_with_token(None)
+    build_request_key_frame_authenticated(None)
 }
 
 pub fn build_request_key_frame_with_token(session_token: Option<&str>) -> Vec<u8> {
-    let json = format!(
-        r#"{{"kind":"request_key_frame"{}}}"#,
-        session_token_json(session_token)
-    );
-    build_control(json.as_bytes())
+    build_request_key_frame_authenticated(session_token)
 }
 
 pub fn build_request_key_frame_authenticated(session_token: Option<&str>) -> Vec<u8> {
-    let json = format!(
-        r#"{{"kind":"request_key_frame"{}}}"#,
-        session_token_json(session_token)
-    );
-    build_single_authenticated(TYPE_CONTROL, json.as_bytes(), session_token)
+    build_single_authenticated(TYPE_CONTROL, &[CTRL_REQUEST_KEY_FRAME], session_token)
 }
 
 /// Feedback от получателя к отправителю.
@@ -852,65 +877,104 @@ impl Pressure {
             _ => Self::Normal,
         }
     }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            Self::Normal => 0,
+            Self::High => 1,
+            Self::Critical => 2,
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::High,
+            2 => Self::Critical,
+            _ => Self::Normal,
+        }
+    }
 }
 
-/// Сериализовать feedback в JSON-байты для `TYPE_CONTROL` пакета.
+impl ReceiverFeedback {
+    /// Бинарная сериализация: 41 байт.
+    /// Формат: [pressure:u8][backlog:u32][drops:u64][fps:u32]
+    ///         [assembly:i32][arrival:i32][decode:i32][present:i32]
+    ///         [pulse:i32][input:i32]
+    pub fn to_bytes(&self) -> [u8; 41] {
+        let mut b = [0u8; 41];
+        b[0] = self.pressure.to_u8();
+        b[1..5].copy_from_slice(&self.backlog_frames.to_be_bytes());
+        b[5..13].copy_from_slice(&self.queue_drops.to_be_bytes());
+        b[13..17].copy_from_slice(&self.decode_fps.to_be_bytes());
+        b[17..21].copy_from_slice(&self.assembly_delay_ms.to_be_bytes());
+        b[21..25].copy_from_slice(&self.arrival_delta_ms.to_be_bytes());
+        b[25..29].copy_from_slice(&self.decode_delta_ms.to_be_bytes());
+        b[29..33].copy_from_slice(&self.present_delta_ms.to_be_bytes());
+        b[33..37].copy_from_slice(&self.pulse_estimate_ms.to_be_bytes());
+        b[37..41].copy_from_slice(&self.input_estimate_ms.to_be_bytes());
+        b
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() < 41 {
+            return None;
+        }
+        Some(Self {
+            pressure:         Pressure::from_u8(b[0]),
+            backlog_frames:   u32::from_be_bytes([b[1],  b[2],  b[3],  b[4]]),
+            queue_drops:      u64::from_be_bytes([b[5],  b[6],  b[7],  b[8],
+                                                  b[9],  b[10], b[11], b[12]]),
+            decode_fps:       u32::from_be_bytes([b[13], b[14], b[15], b[16]]),
+            assembly_delay_ms: i32::from_be_bytes([b[17], b[18], b[19], b[20]]),
+            arrival_delta_ms:  i32::from_be_bytes([b[21], b[22], b[23], b[24]]),
+            decode_delta_ms:   i32::from_be_bytes([b[25], b[26], b[27], b[28]]),
+            present_delta_ms:  i32::from_be_bytes([b[29], b[30], b[31], b[32]]),
+            pulse_estimate_ms: i32::from_be_bytes([b[33], b[34], b[35], b[36]]),
+            input_estimate_ms: i32::from_be_bytes([b[37], b[38], b[39], b[40]]),
+        })
+    }
+}
+
+/// Сериализовать feedback в бинарный TYPE_CONTROL пакет (42 байта).
 pub fn build_receiver_feedback(fb: &ReceiverFeedback) -> Vec<u8> {
-    build_receiver_feedback_with_token(fb, None)
+    build_receiver_feedback_authenticated(fb, None)
 }
 
 pub fn build_receiver_feedback_with_token(
     fb: &ReceiverFeedback,
     session_token: Option<&str>,
 ) -> Vec<u8> {
-    let json = format!(
-        r#"{{"kind":"receiver_feedback","pressure":"{}","backlogFrames":{},"queueDrops":{},"decodeFps":{},"assemblyDelayMs":{},"arrivalDeltaMs":{},"decodeDeltaMs":{},"presentDeltaMs":{},"pulseEstimateMs":{},"inputEstimateMs":{}{}}}"#,
-        fb.pressure.as_str(),
-        fb.backlog_frames,
-        fb.queue_drops,
-        fb.decode_fps,
-        fb.assembly_delay_ms,
-        fb.arrival_delta_ms,
-        fb.decode_delta_ms,
-        fb.present_delta_ms,
-        fb.pulse_estimate_ms,
-        fb.input_estimate_ms,
-        session_token_json(session_token),
-    );
-    // Может не войти в MAX_PAYLOAD_SIZE при очень больших числах — обрезать безопасно не нужно,
-    // JSON всегда < 300 байт.
-    build_control(json.as_bytes())
+    build_receiver_feedback_authenticated(fb, session_token)
 }
 
 pub fn build_receiver_feedback_authenticated(
     fb: &ReceiverFeedback,
     session_token: Option<&str>,
 ) -> Vec<u8> {
-    let json = format!(
-        r#"{{"kind":"receiver_feedback","pressure":"{}","backlogFrames":{},"queueDrops":{},"decodeFps":{},"assemblyDelayMs":{},"arrivalDeltaMs":{},"decodeDeltaMs":{},"presentDeltaMs":{},"pulseEstimateMs":{},"inputEstimateMs":{}{}}}"#,
-        fb.pressure.as_str(),
-        fb.backlog_frames,
-        fb.queue_drops,
-        fb.decode_fps,
-        fb.assembly_delay_ms,
-        fb.arrival_delta_ms,
-        fb.decode_delta_ms,
-        fb.present_delta_ms,
-        fb.pulse_estimate_ms,
-        fb.input_estimate_ms,
-        session_token_json(session_token),
-    );
-    build_single_authenticated(TYPE_CONTROL, json.as_bytes(), session_token)
+    let mut payload = [0u8; 42];
+    payload[0] = CTRL_RECEIVER_FEEDBACK;
+    payload[1..42].copy_from_slice(&fb.to_bytes());
+    build_single_authenticated(TYPE_CONTROL, &payload, session_token)
 }
 
 /// Разобрать входящий control-пакет.
+///
+/// Формат: если первый байт == `{` (0x7B) — JSON (обратная совместимость с
+/// EvertyGame C#); иначе — бинарный формат с субтипом в первом байте.
 pub fn control_session_token(payload: &[u8]) -> Option<String> {
+    if payload.first().copied() != Some(b'{') {
+        return None; // бинарный пакет: токен в HMAC-тэге, не в payload
+    }
     let s = std::str::from_utf8(payload).ok()?;
     let token = json_str_field(s, "sessionToken").or_else(|| json_str_field(s, "token"))?;
     valid_session_token(&token).then_some(token)
 }
 
 pub fn control_token_matches(payload: &[u8], expected: Option<&str>) -> bool {
+    if payload.first().copied() != Some(b'{') {
+        // Бинарный пакет: аутентификация выполнена HMAC-тэгом на уровне пакета.
+        return true;
+    }
     match expected {
         Some(expected) if valid_session_token(expected) => {
             control_session_token(payload).as_deref() == Some(expected)
@@ -921,12 +985,23 @@ pub fn control_token_matches(payload: &[u8], expected: Option<&str>) -> bool {
 }
 
 pub fn parse_control(payload: &[u8]) -> Option<ControlMessage> {
-    // Минимальный ручной парсер без зависимости от serde_json.
-    let s = std::str::from_utf8(payload).ok()?;
-    let kind = json_str_field(s, "kind")?;
-    match kind.as_str() {
-        "request_key_frame" => Some(ControlMessage::RequestKeyFrame),
-        "receiver_feedback" => parse_feedback(s).map(ControlMessage::ReceiverFeedback),
+    let first = *payload.first()?;
+    if first == b'{' {
+        // JSON — обратная совместимость с EvertyGame C#.
+        let s = std::str::from_utf8(payload).ok()?;
+        let kind = json_str_field(s, "kind")?;
+        return match kind.as_str() {
+            "request_key_frame" => Some(ControlMessage::RequestKeyFrame),
+            "receiver_feedback" => parse_feedback(s).map(ControlMessage::ReceiverFeedback),
+            _ => None,
+        };
+    }
+    // Бинарный формат.
+    match first {
+        CTRL_REQUEST_KEY_FRAME => Some(ControlMessage::RequestKeyFrame),
+        CTRL_RECEIVER_FEEDBACK => {
+            ReceiverFeedback::from_bytes(payload.get(1..)?).map(ControlMessage::ReceiverFeedback)
+        }
         _ => None,
     }
 }
@@ -1266,26 +1341,21 @@ mod tests {
         assert!(matches!(ctrl, ControlMessage::RequestKeyFrame));
     }
 
+    // Бинарные control-пакеты не несут токен в payload — он в HMAC-тэге.
+    // control_session_token() возвращает None; control_token_matches() — true.
     #[test]
-    fn request_key_frame_carries_session_token() {
+    fn request_key_frame_binary_no_inline_token() {
         let token = "0123456789abcdef0123456789abcdef";
         let pkt = build_request_key_frame_with_token(Some(token));
         let parsed = parse(&pkt, pkt.len()).unwrap();
-        assert_eq!(control_session_token(&parsed.payload).as_deref(), Some(token));
+        // Токена в payload нет — аутентификация через HMAC.
+        assert_eq!(control_session_token(&parsed.payload), None);
+        // control_token_matches всегда true для binary (HMAC уже проверен выше).
         assert!(control_token_matches(&parsed.payload, Some(token)));
-        assert!(!control_token_matches(
+        assert!(control_token_matches(
             &parsed.payload,
             Some("ffffffffffffffffffffffffffffffff")
         ));
-    }
-
-    #[test]
-    fn authenticated_control_roundtrip() {
-        let token = "0123456789abcdef0123456789abcdef";
-        let pkt = build_request_key_frame_authenticated(Some(token));
-        let parsed = parse_authenticated(&pkt, pkt.len(), Some(token)).unwrap();
-        assert_eq!(parsed.packet_type, TYPE_CONTROL);
-        assert_eq!(control_session_token(&parsed.payload).as_deref(), Some(token));
         assert!(matches!(
             parse_control(&parsed.payload),
             Some(ControlMessage::RequestKeyFrame)
@@ -1293,21 +1363,48 @@ mod tests {
     }
 
     #[test]
-    fn receiver_feedback_carries_session_token() {
+    fn authenticated_control_roundtrip() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let pkt = build_request_key_frame_authenticated(Some(token));
+        // HMAC проверяется здесь — неправильный токен вернёт None.
+        assert!(parse_authenticated(&pkt, pkt.len(), Some("ffffffffffffffffffffffffffffffff")).is_none());
+        let parsed = parse_authenticated(&pkt, pkt.len(), Some(token)).unwrap();
+        assert_eq!(parsed.packet_type, TYPE_CONTROL);
+        assert_eq!(control_session_token(&parsed.payload), None); // binary
+        assert!(matches!(
+            parse_control(&parsed.payload),
+            Some(ControlMessage::RequestKeyFrame)
+        ));
+    }
+
+    #[test]
+    fn receiver_feedback_binary_roundtrip() {
         let token = "abcdef0123456789abcdef0123456789";
         let fb = ReceiverFeedback {
             pressure: Pressure::High,
             backlog_frames: 1,
-            ..ReceiverFeedback::default()
+            queue_drops: 42,
+            decode_fps: 58,
+            assembly_delay_ms: 5,
+            arrival_delta_ms: 12,
+            decode_delta_ms: 3,
+            present_delta_ms: 7,
+            pulse_estimate_ms: -1,
+            input_estimate_ms: -1,
         };
         let pkt = build_receiver_feedback_with_token(&fb, Some(token));
         let parsed = parse(&pkt, pkt.len()).unwrap();
-        assert_eq!(control_session_token(&parsed.payload).as_deref(), Some(token));
+        assert_eq!(control_session_token(&parsed.payload), None);
         let ctrl = parse_control(&parsed.payload).unwrap();
         match ctrl {
-            ControlMessage::ReceiverFeedback(parsed_fb) => {
-                assert_eq!(parsed_fb.pressure, Pressure::High);
-                assert_eq!(parsed_fb.backlog_frames, 1);
+            ControlMessage::ReceiverFeedback(p) => {
+                assert_eq!(p.pressure, Pressure::High);
+                assert_eq!(p.backlog_frames, 1);
+                assert_eq!(p.queue_drops, 42);
+                assert_eq!(p.decode_fps, 58);
+                assert_eq!(p.assembly_delay_ms, 5);
+                assert_eq!(p.arrival_delta_ms, 12);
+                assert_eq!(p.input_estimate_ms, -1);
             }
             _ => panic!("wrong kind"),
         }

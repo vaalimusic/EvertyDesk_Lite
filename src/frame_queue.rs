@@ -1004,15 +1004,17 @@ impl AdaptiveRelief {
             return Some(new_step);
         }
 
-        // Восстановление
+        // Восстановление.
+        // input_estimate_ms < 0 означает «не измерено» (клиент ещё не
+        // реализовал эту метрику) — не блокируем recovery по неизвестному
+        // значению.
         if self.step > 0
             && self.recovery_score >= 10
             && fb.pressure == Normal
             && (fb.decode_fps == 0 || fb.decode_fps >= target_fps.saturating_sub(1))
             && fb.present_delta_ms >= 0
             && fb.present_delta_ms <= 16
-            && fb.input_estimate_ms >= 0
-            && fb.input_estimate_ms <= 45
+            && (fb.input_estimate_ms < 0 || fb.input_estimate_ms <= 45)
         {
             let new_step = self.step - 1;
             self.pending_step = Some(new_step);
