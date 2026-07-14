@@ -458,6 +458,11 @@ impl FrameAssembly {
     }
 
     fn join(self) -> Vec<u8> {
+        // Большинство аудио-кадров и короткие I-кадры умещаются в один пакет —
+        // возвращаем его напрямую без лишнего выделения и копирования.
+        if self.packet_count == 1 {
+            return self.parts.into_iter().next().flatten().unwrap_or_default();
+        }
         let mut out = Vec::with_capacity(self.buffered_bytes);
         for part in self.parts {
             if let Some(p) = part {
@@ -645,6 +650,18 @@ impl ChannelReassembler {
                 return None;
             }
         }
+        // Та же проверка окна переупорядочивания, что и в on_packet: FEC для
+        // кадров за пределами окна уже не поможет (кадр дропнут), а хранение
+        // метаданных приводит к утечке pending_fec.
+        if let Some(seen) = self.latest_frame_id_seen {
+            if pkt
+                .frame_id
+                .saturating_add(REASSEMBLY_REORDER_WINDOW_FRAMES)
+                < seen
+            {
+                return None;
+            }
+        }
         let Some(meta) = crate::evrt::parse_fec_payload(pkt.frame_id, &pkt.payload) else {
             return None;
         };
@@ -756,6 +773,8 @@ impl ChannelReassembler {
     }
 
     fn drop_frame(&mut self, frame_id: u32) -> bool {
+        // FEC-метаданные дропнутого кадра больше не нужны.
+        self.pending_fec.remove(&frame_id);
         if let Some(assembly) = self.frames.remove(&frame_id) {
             self.buffered_bytes = self
                 .buffered_bytes
@@ -768,6 +787,9 @@ impl ChannelReassembler {
     }
 
     fn drop_older_than(&mut self, frame_id: u32) -> usize {
+        // Чистим FEC-метаданные для всех кадров старше watermark'а — иначе
+        // pending_fec растёт без ограничений на lossy соединении.
+        self.pending_fec.retain(|id, _| *id >= frame_id);
         let dropped = self
             .frames
             .keys()
