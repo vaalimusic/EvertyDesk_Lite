@@ -23,6 +23,8 @@ pub mod crypto;
 pub mod evrt;
 pub mod evrt_audio;
 pub mod evrtck;
+#[cfg(feature = "gpu-accel")]
+pub mod evrtck_wgpu;
 pub mod evrt_client;
 pub mod evrt_session;
 pub mod frame_queue;

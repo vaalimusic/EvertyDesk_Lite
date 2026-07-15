@@ -19,6 +19,8 @@ mod diagnostics;
 mod evrt;
 mod evrt_audio;
 mod evrtck;
+#[cfg(feature = "gpu-accel")]
+mod evrtck_wgpu;
 mod evrt_client;
 mod evrt_session;
 mod frame_queue;

@@ -27,7 +27,8 @@ mod inner {
                 MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
                 MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO, MFT_REGISTER_TYPE_INFO,
                 MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
-                MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
+                MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+                MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
                 MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
             },
             System::Com::{
@@ -495,6 +496,9 @@ mod inner {
         out_type.SetUINT64(&MF_MT_FRAME_RATE, pack_ratio(fps, 1))?;
         out_type.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_ratio(1, 1))?;
         out_type.SetUINT32(&MF_MT_AVG_BITRATE, bitrate)?;
+        // MFVideoInterlace_Progressive = 2: required by H264/H265 MFT on most GPU drivers.
+        // Without this, SetOutputType returns MF_E_INVALIDMEDIATYPE (0xC00D36E6).
+        out_type.SetUINT32(&MF_MT_INTERLACE_MODE, 2)?;
         transform.SetOutputType(0, &out_type, 0)?;
 
         let in_type = MFCreateMediaType()?;

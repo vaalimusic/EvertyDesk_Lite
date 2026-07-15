@@ -359,6 +359,8 @@ pub fn run(cfg: PipelineConfig) {
                 if let Ok(mut g) = evrt_active.lock() {
                     *g = Some(addr);
                 }
+                // Новый EVRT клиент — немедленный IDR чтобы декодер получил полный кадр.
+                let _ = global_idr_tx.send(());
                 log(&events, format!("Pipeline: EVRT активен → {addr}"));
             }
             Ok(PipelineCmd::EvrtSessionEnded) => {
@@ -636,6 +638,7 @@ fn encode_loop(
     let mut tele = PipelineTelemetry::new(encoder.backend_label());
     let mut last_tele_at = Instant::now();
     let mut backend_logged = false;
+    let mut evrtck_logged = false;
     const TELE_INTERVAL: Duration = Duration::from_secs(10);
 
     // ★ Периодическая отправка телеметрии хоста КЛИЕНТУ (для --diagnose).
@@ -734,8 +737,17 @@ fn encode_loop(
     let mut last_idr: Instant = Instant::now();
     let mut force_recovery_key = true;
     let mut next_frame_due: Instant = Instant::now();
-    const IDR_MIN: Duration = Duration::from_millis(1_200);
+    // Safety counter for the evrt_tx Disconnected path: if evrt_active isn't
+    // cleared within ~3 frames the loop would spin. Bail out after that.
+    let mut evrt_disconnect_spins: u8 = 0;
+    // H264/H265: 1200ms — частые IDR для recovery при потере пакетов.
+    // EVRTCK: 10s — FEC покрывает потери; IDR = полный кадр = дорого.
+    const IDR_MIN_H264: Duration = Duration::from_millis(1_200);
+    const IDR_MIN_EVRTCK: Duration = Duration::from_secs(10);
+    let mut current_idr_min = IDR_MIN_H264;
     const SPIN: Duration = Duration::from_micros(1_500);
+    // Отслеживаем переход EVRTCK inactive→active: нужен IDR при первом подключении.
+    let mut was_evrt_on = false;
 
     // VM-режим: отслеживаем frame_seq из vm_bridge.
     // Когда WMI прислал новый кадр (seq изменился) — обходим change_detector
@@ -744,7 +756,24 @@ fn encode_loop(
     let mut last_vm_seq: u64 = 0;
 
     while !stop.load(Ordering::Relaxed) {
-        if software_profile_active {
+        // Вычисляем evrt_on один раз в начале итерации — используется
+        // везде ниже (fps-cap, want_idr, dispatch, bitrate-cap).
+        let evrt_on = evrt_active.lock().map(|g| g.is_some()).unwrap_or(false);
+        current_idr_min = if evrt_on { IDR_MIN_EVRTCK } else { IDR_MIN_H264 };
+
+        // Любой переход кодека требует IDR на принимающей стороне:
+        // • H264→EVRTCK: клиент должен получить полный первый кадр (не дельту).
+        // • EVRTCK→H264: H264-референс был заморожен всё время пока шёл EVRTCK;
+        //   первый P-frame будет дельтой против очень старого референса (потенциально
+        //   МБ), поэтому принудительный IDR нужен и здесь.
+        if evrt_on != was_evrt_on {
+            force_recovery_key = true;
+        }
+        was_evrt_on = evrt_on;
+
+        // Когда EVRTCK активен — не применяем software fps/quality caps:
+        // мы не используем H264 encoder, и 30fps EVRTCK должен работать полную скорость.
+        if software_profile_active && !evrt_on {
             let current = target_fps.load(Ordering::Relaxed);
             let software_fps = software_encoder_target_fps(current);
             if current != software_fps {
@@ -775,9 +804,15 @@ fn encode_loop(
             next_frame_due = Instant::now() + frame_interval;
         }
 
-        // IDR по таймеру/запросу
-        let periodic_key =
-            force_recovery_key || idr_rx.try_recv().is_ok() || last_idr.elapsed() > IDR_MIN;
+        // IDR по таймеру/запросу.
+        // External IDR requests (from RefreshVideoDisplay) are subject to current_idr_min
+        // just like the periodic timer: for EVRTCK this prevents a 1 MB IDR storm when
+        // H264 TCP decode errors trigger repeated RefreshVideoDisplay commands.
+        let external_idr = idr_rx.try_recv().is_ok();
+        while idr_rx.try_recv().is_ok() {} // drain burst — multiple requests count as one
+        let periodic_key = force_recovery_key
+            || (external_idr && last_idr.elapsed() >= current_idr_min)
+            || last_idr.elapsed() > current_idr_min;
 
         // Захват
         let cap_started = Instant::now();
@@ -861,9 +896,15 @@ fn encode_loop(
             continue;
         }
 
-        let mut want_idr = decision.force_key || periodic_key;
+        // EVRTCK: не используем decision.force_key, который содержит idle_refresh
+        // (каждые 2 сек при статичном экране → 1 МБ IDR зря). EVRTCK — lossless delta
+        // codec, refresh не нужен. Изменения разрешения обрабатываются ниже через
+        // recreation EvrtckEncoder (который ставит pending_keyframe сам).
+        let mut want_idr = if evrt_on { periodic_key } else { decision.force_key || periodic_key };
 
-        if software_profile_active {
+        // Downscale для software encoder: не применяем когда EVRTCK активен,
+        // т.к. мы не используем H264 и смена downscale_to не должна форсить IDR.
+        if software_profile_active && !evrt_on {
             let next_downscale = software_encoder_downscale_target(enc_w, enc_h);
             if downscale_to != next_downscale {
                 downscale_to = next_downscale;
@@ -893,7 +934,6 @@ fn encode_loop(
         //   EVRT активен (прямой UDP по LAN) → полный битрейт, сеть быстрая.
         //   EVRT НЕ активен (TCP relay) → relay тянет ~5-8 Мбит/с, выше — захлёб.
         //   RustDesk целится в 3-6 Мбит/с на relay; делаем так же.
-        let evrt_on = evrt_active.lock().map(|g| g.is_some()).unwrap_or(false);
         if !evrt_on {
             const RELAY_MAX_BPS: u32 = 5_000_000; // безопасно для hbbr relay
             eff_bps = eff_bps.min(RELAY_MAX_BPS);
@@ -907,25 +947,30 @@ fn encode_loop(
             eff_bps = eff_bps.min(cap_bps);
         }
 
-        // ── Кодирование: EVRTCK (lossless тайлы) когда EVRT активен, иначе H264 ─
+        // ── Кодирование: EVRT активен → EVRTCK всегда (параллельный, без H264) ─
         let encode_started = Instant::now();
-        let evrtck_out = if evrt_on {
-            EVRTCK_ENC.with(|cell| {
+        let Some(out) = (if evrt_on {
+            Some(EVRTCK_ENC.with(|cell| {
                 let mut enc = cell.borrow_mut();
                 if enc.as_ref().map(|e| e.width() != enc_w as usize || e.height() != enc_h as usize).unwrap_or(true) {
-                    *enc = Some(EvrtckEncoder::new(enc_w as usize, enc_h as usize));
+                    let mut fresh = EvrtckEncoder::new(enc_w as usize, enc_h as usize);
+                    fresh.request_keyframe(); // сигнализируем клиенту сбросить prev-буфер
+                    *enc = Some(fresh);
+                }
+                // IDR = сбросить prev в 0 → все тайлы dirty → клиент получает полный кадр.
+                if want_idr {
+                    enc.as_mut().unwrap().request_keyframe();
                 }
                 let pkt = enc.as_mut().unwrap().encode(bgra, frame_id);
-                if pkt.data.len() <= 500 * 1024 {
-                    Some(EncodedOutput { bytes: pkt.data, key: want_idr, sps_pps: None, codec: "evrtck" })
-                } else {
-                    None // слишком большой — фолбэк на H264
+                if !evrtck_logged {
+                    evrtck_logged = true;
+                    log(&events, format!("EVRTCK encode: first frame id={frame_id} idr={want_idr} bytes={}", pkt.data.len()));
                 }
-            })
+                EncodedOutput { bytes: pkt.data, key: want_idr, sps_pps: None, codec: "evrtck" }
+            }))
         } else {
-            None
-        };
-        let Some(out) = evrtck_out.or_else(|| encoder.encode(enc_w, enc_h, fps, eff_bps, bgra, want_idr)) else {
+            encoder.encode(enc_w, enc_h, fps, eff_bps, bgra, want_idr)
+        }) else {
             continue;
         };
         let encode_dur = encode_started.elapsed();
@@ -1142,23 +1187,35 @@ fn encode_loop(
         // EVRT не активен: все кадры → TCP
         // (evrt_on уже вычислен выше для cap битрейта)
         if evrt_on {
-            // EVRT primary: все кадры → EVRT, IDR → TCP для синхронизации
+            // EVRT primary: все кадры → EVRT UDP. НЕ шлём видео по TCP — клиент
+            // всё равно не может декодировать H264 (OpenH264 Native:4 ошибки), а
+            // эти ошибки триггерят RefreshVideoDisplay → IDR-шторм ~1 MB/запрос.
+            // TCP relay остаётся только для control-сообщений (telemetry, shell).
             match evrt_tx.try_send(frame.clone()) {
-                Ok(()) => {}
-                Err(mpsc::TrySendError::Full(_)) => {
-                    force_recovery_key = true;
-                    apply_tcp_backpressure(&bitrate_scale_milli);
-                }
-                Err(mpsc::TrySendError::Disconnected(_)) => break,
-            }
-            if is_idr {
-                match send_tcp_video_frame(&tcp_tx, &stop, frame) {
-                    TcpVideoSend::Sent => force_recovery_key = false,
-                    TcpVideoSend::Dropped => {
-                        force_recovery_key = true;
-                        apply_tcp_backpressure(&bitrate_scale_milli);
+                Ok(()) => {
+                    evrt_disconnect_spins = 0;
+                    if is_idr {
+                        force_recovery_key = false;
                     }
-                    TcpVideoSend::Disconnected => break,
+                }
+                Err(mpsc::TrySendError::Full(_)) => {
+                    // Канал занят: evrt_session ещё отправляет крупный IDR (100 Мбит/с ≈ 80мс/МБ).
+                    // НЕ форсим новый IDR — это создаёт каскад: Full → IDR → Full → IDR.
+                    // Просто дропаем этот кадр: клиент видит последний декодированный кадр
+                    // до тех пор, пока текущий IDR не долетит.
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    // evrt_send_loop clears evrt_active=None when the session ends,
+                    // so the next iteration normally sees evrt_on=false and
+                    // falls back to H264. Force IDR so the client gets a clean frame.
+                    force_recovery_key = true;
+                    evrt_disconnect_spins += 1;
+                    if evrt_disconnect_spins >= 3 {
+                        // evrt_active wasn't cleared — evrt_send_loop may have panicked.
+                        // Break to avoid spinning; the process watchdog will restart.
+                        break;
+                    }
+                    continue;
                 }
             }
         } else {

@@ -508,6 +508,9 @@ fn evrt_decode_loop(
     };
     let mut h265_vt_fail = 0u32;
 
+    evrt_log(&events, format!("evrt_decode_loop: codec={codec} {width}x{height}"));
+    let mut diag_frames = 0u32;
+
     loop {
         // Взять кадр из очереди
         let Some((bytes, _is_key, _pts)) = queue.dequeue(&stop) else {
@@ -519,18 +522,36 @@ fn evrt_decode_loop(
         // Декодировать в зависимости от кодека
         let maybe_event = match codec.to_ascii_uppercase().as_str() {
             "EVRTCK" => {
-                use crate::evrtck::EvrtckPacket;
-                let pkt = EvrtckPacket {
-                    frame_id: 0,
-                    width,
-                    height,
-                    data: bytes.to_vec(),
+                // Parse w/h from wire header before decode to avoid borrow conflict.
+                // Wire: magic(4)+ver(1)+flags(1)+frame_id(4)+w(4)+h(4) → offsets 10..18
+                let (ew, eh) = if bytes.len() >= 18 {
+                    (
+                        u32::from_le_bytes(bytes[10..14].try_into().unwrap()) as usize,
+                        u32::from_le_bytes(bytes[14..18].try_into().unwrap()) as usize,
+                    )
+                } else {
+                    (0, 0)
                 };
-                match evrtck_dec.decode(&pkt) {
-                    Ok(rgba) => Some((rgba.to_vec(), width as usize, height as usize)),
-                    Err(e) => {
-                        evrt_log(&events, format!("EVRTCK decode error: {e}"));
-                        None
+                let flags = bytes.get(5).copied().unwrap_or(0);
+                if diag_frames < 5 {
+                    evrt_log(&events, format!(
+                        "EVRTCK frame#{diag_frames}: len={} magic={:?} flags={flags} w={ew} h={eh}",
+                        bytes.len(),
+                        bytes.get(0..4).map(|b| b.to_vec()).unwrap_or_default(),
+                    ));
+                    diag_frames += 1;
+                }
+                // FLAG_NOP (0x02): screen unchanged — skip render, decoder state needs no update.
+                if flags & crate::evrtck::FLAG_NOP != 0 {
+                    None
+                } else {
+                    match evrtck_dec.decode_wire(&bytes) {
+                        Ok(rgba) => Some((rgba.to_vec(), ew, eh)),
+                        Err(e) => {
+                            evrt_log(&events, format!("EVRTCK decode error: {e} magic={:?}",
+                                bytes.get(0..4).map(|b| b.to_vec()).unwrap_or_default()));
+                            None
+                        }
                     }
                 }
             }

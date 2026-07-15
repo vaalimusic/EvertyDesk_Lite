@@ -118,7 +118,7 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
     );
 
     let session_cfg = SessionConfig {
-        codec: choose_codec(&config),
+        codec: "EVRTCK".to_owned(),
         preset: if config.display.fsr_quality.is_enabled() {
             "GAME".into()
         } else {
@@ -158,27 +158,39 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
     let mut buf = vec![0u8; evrt::MAX_PACKET_SIZE + 64];
     let deadline = Instant::now() + Duration::from_secs(5);
 
+    let mut ctrl_wait_pkts = 0u32;
     loop {
         if stop.load(Ordering::Relaxed) {
+            evrt_log(&events, format!("EVRT TYPE_CTRL wait: stop set after {ctrl_wait_pkts} pkts"));
             return Err("stopped before client connected".into());
         }
         if Instant::now() > deadline {
+            evrt_log(&events, format!("EVRT TYPE_CTRL wait: TIMEOUT after {ctrl_wait_pkts} pkts — client {peer_addr} silent"));
             return Err(format!("client {peer_addr} did not respond"));
         }
         match socket.recv_from(&mut buf) {
             Ok((len, src)) if src == peer_addr => {
-                let confirmed = evrt::parse_authenticated(&buf, len, session_token.as_deref()).is_some_and(|pkt| {
+                ctrl_wait_pkts += 1;
+                let parsed = evrt::parse_authenticated(&buf, len, session_token.as_deref());
+                let ptype = parsed.as_ref().map(|p| p.packet_type);
+                let confirmed = parsed.is_some_and(|pkt| {
                     pkt.packet_type == evrt::TYPE_CONTROL
                         && evrt::control_token_matches(&pkt.payload, session_token.as_deref())
                         && evrt::parse_control(&pkt.payload).is_some()
                 });
                 if confirmed {
-                    evrt_log(&events, "EVRT: client confirmed".into());
+                    evrt_log(&events, format!("EVRT: client confirmed after {ctrl_wait_pkts} pkts"));
                     break;
                 }
+                evrt_log(&events, format!("EVRT TYPE_CTRL wait: pkt#{ctrl_wait_pkts} len={len} ptype={ptype:?} auth={} — not confirmed",
+                    session_token.is_some()));
                 send_udp(&socket, &cfg_pkt, peer_addr)?; // retry
             }
-            Ok(_) | Err(_) => {
+            Ok((len, src)) => {
+                evrt_log(&events, format!("EVRT TYPE_CTRL wait: pkt from wrong src={src} (expected {peer_addr}) len={len}"));
+                send_udp(&socket, &cfg_pkt, peer_addr)?; // retry
+            }
+            Err(_) => {
                 send_udp(&socket, &cfg_pkt, peer_addr)?; // retry
             }
         }
@@ -262,9 +274,22 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
     // ── Главный цикл: берём кадры из pipeline → пакетизируем → UDP ───────────
     let mut relief = AdaptiveRelief::new(true);
     let mut last_keepalive = Instant::now();
-    let mut pacing_bps = bitrate.max(1);
+    // EVRTCK — lossless LAN codec; keyframes are 5-10 MB, so we must pace at
+    // LAN speed (1 Gbps) rather than the H264-derived network bitrate (3-5 Mbps)
+    // which would take 10+ seconds per keyframe and trigger the client idle timeout.
+    let is_evrtck = session_cfg.codec.eq_ignore_ascii_case("EVRTCK");
+    // EVRTCK keyframes are 5-10 MB (lossless), so pacing must be fast enough to
+    // deliver them before the 6s idle timeout, but slow enough not to overflow the
+    // client's 4 MB kernel UDP buffer (4MB / 1200 bytes = ~3495 packets max in-flight).
+    // At 100 Mbps: 6.7 MB in ~535 ms. Receiver processes at ~120 MB/s → no overflow.
+    let mut pacing_bps: u32 = if is_evrtck { 100_000_000 } else { bitrate.max(1) };
     let mut pacer = UdpPacer::new();
     let mut waiting_for_idr = true;
+    // For EVRTCK: rate-limit client-triggered IDR requests. Each IDR is ~1 MB;
+    // H264 decode errors on the TCP path can cause a RefreshVideoDisplay storm
+    // that would otherwise generate a new 1 MB keyframe every 200 ms.
+    let mut last_kf_request = Instant::now() - Duration::from_secs(60);
+    const IDR_RATELIMIT_EVRTCK: Duration = Duration::from_millis(500);
 
     // FEC включён по умолчанию; отключается через EVERTYDESK_FEC=0 (диагностика).
     let fec_enabled = std::env::var("EVERTYDESK_FEC")
@@ -280,22 +305,29 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
 
     while !stop.load(Ordering::Relaxed) {
         // ── Feedback от клиента ───────────────────────────────────────────────
-        while let Ok(fb) = fb_rx.try_recv() {
-            let cur_fps = target_fps.load(Ordering::Relaxed);
-            if let Some(step) = relief.on_feedback(&fb, cur_fps) {
-                let scale_milli = relief
-                    .apply_pending_milli()
-                    .unwrap_or_else(|| AdaptiveRelief::bitrate_scale_milli(step));
-                bitrate_scale_milli.store(scale_milli, Ordering::Relaxed);
-                evrt_log(
-                    &events,
-                    format!(
-                        "EVRT adaptive relief step={} scale={}pct pressure={}",
-                        relief.current_step(),
-                        scale_milli / 10,
-                        fb.pressure.as_str(),
-                    ),
-                );
+        // EVRTCK is a lossless delta codec — bitrate/fps scaling has no meaning.
+        // Applying adaptive relief would reduce bitrate_scale_milli and generate
+        // spurious log noise without any benefit. Drain feedback but don't act on it.
+        if is_evrtck {
+            while fb_rx.try_recv().is_ok() {}
+        } else {
+            while let Ok(fb) = fb_rx.try_recv() {
+                let cur_fps = target_fps.load(Ordering::Relaxed);
+                if let Some(step) = relief.on_feedback(&fb, cur_fps) {
+                    let scale_milli = relief
+                        .apply_pending_milli()
+                        .unwrap_or_else(|| AdaptiveRelief::bitrate_scale_milli(step));
+                    bitrate_scale_milli.store(scale_milli, Ordering::Relaxed);
+                    evrt_log(
+                        &events,
+                        format!(
+                            "EVRT adaptive relief step={} scale={}pct pressure={}",
+                            relief.current_step(),
+                            scale_milli / 10,
+                            fb.pressure.as_str(),
+                        ),
+                    );
+                }
             }
         }
 
@@ -305,8 +337,15 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
             kf_requested = true;
         }
         if kf_requested && !waiting_for_idr {
-            waiting_for_idr = true;
-            let _ = idr_request_tx.send(());
+            // For EVRTCK, rate-limit to IDR_RATELIMIT_EVRTCK: H264 decode errors
+            // on the TCP relay can spam RefreshVideoDisplay → RequestKeyFrame,
+            // causing a ~1 MB IDR storm. Non-EVRTCK codecs: send immediately.
+            let allowed = !is_evrtck || last_kf_request.elapsed() >= IDR_RATELIMIT_EVRTCK;
+            if allowed {
+                waiting_for_idr = true;
+                last_kf_request = Instant::now();
+                let _ = idr_request_tx.send(());
+            }
         }
 
         // ── Keepalive SessionConfig ───────────────────────────────────────────
@@ -319,7 +358,8 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
                 quality_milli.load(Ordering::Relaxed),
             );
             let cur_bps = scale_bitrate_bps(cur_bps, bitrate_scale_milli.load(Ordering::Relaxed));
-            pacing_bps = cur_bps.max(1);
+            // EVRTCK: keep 100 Mbps pacing regardless of H264-derived bitrate.
+            pacing_bps = if is_evrtck { 100_000_000 } else { cur_bps.max(1) };
             let upd = SessionConfig {
                 fps: cur_fps,
                 bitrate: cur_bps,
@@ -350,6 +390,7 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
 
         if frame.is_idr {
             waiting_for_idr = false;
+            evrt_log(&events, format!("EVRT: sending IDR frame id={} bytes={} → {peer_addr}", frame.frame_id, frame.bytes.len()));
             // CodecConfig (SPS/PPS) перед IDR
             if let Some(ref sps_pps) = frame.sps_pps {
                 let config_packet =
