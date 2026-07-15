@@ -53,6 +53,10 @@ pub const TILE_SIZE: usize = 32;
 /// Roughly equivalent to a ~256×256 source frame (64 tiles of 32×32).
 const RAYON_THRESHOLD: usize = 64;
 
+/// Minimum zero-run length to justify a ZRLE ZeroRun token (3-byte overhead).
+/// Runs of ≥4 zeros save ≥1 byte vs including them as literals.
+const ZRLE_MIN_RUN: usize = 4;
+
 const MODE_SOLID: u8 = 1;
 const MODE_DELTA: u8 = 2;
 /// XOR delta compressed with zstd level-1. Better than ZRLE on non-sparse data (keyframes).
@@ -186,7 +190,16 @@ impl EvrtckEncoderBackend for CpuEvrtckEncoder {
         let is_kf = self.pending_keyframe;
         self.pending_keyframe = false;
         let (data, stats) = encode_frame(bgra, &self.prev, self.width, self.height, frame_id, is_kf);
-        self.prev.copy_from_slice(bgra);
+        // Skip memcpy on NOP frames (bgra == prev, copy would do nothing). Always
+        // copy on keyframes so the next P-frame diffs against the correct baseline.
+        if stats.dirty_tiles > 0 || is_kf {
+            self.prev.copy_from_slice(bgra);
+        }
+        // Auto-escalate: if this P-frame was overwhelmingly dirty, force a keyframe
+        // next turn to reset the XOR baseline and improve future delta compression.
+        if !is_kf && stats.total_tiles > 0 && stats.dirty_tiles * 10 >= stats.total_tiles * 9 {
+            self.pending_keyframe = true;
+        }
         let pkt = EvrtckPacket {
             frame_id,
             width: self.width as u32,
@@ -205,6 +218,7 @@ impl EvrtckEncoderBackend for CpuEvrtckEncoder {
     fn height(&self) -> usize { self.height }
 
     fn dirty_ratio(&self, bgra: &[u8]) -> f32 {
+        if bgra == self.prev { return 0.0; }
         let tiles_x = tiles_in_dim(self.width);
         let tiles_y = tiles_in_dim(self.height);
         let total = tiles_x * tiles_y;
@@ -380,14 +394,14 @@ pub(crate) fn encode_frame(
     let tile_results: Vec<Option<(Vec<u8>, u8)>> = if is_keyframe {
         (0..tile_count)
             .into_par_iter()
-            .map(|idx| Some(encode_tile_buf(rgba, prev, width, height, idx % tiles_x, idx / tiles_x)))
+            .map(|idx| Some(encode_tile_buf(rgba, prev, width, height, idx % tiles_x, idx / tiles_x, true)))
             .collect()
     } else if tile_count < RAYON_THRESHOLD {
         // Very small resolution (< ~256×256) — sequential encode, rayon overhead not worth it.
         (0..tile_count)
             .map(|idx| {
                 if tile_is_dirty(rgba, prev, width, height, idx % tiles_x, idx / tiles_x) {
-                    Some(encode_tile_buf(rgba, prev, width, height, idx % tiles_x, idx / tiles_x))
+                    Some(encode_tile_buf(rgba, prev, width, height, idx % tiles_x, idx / tiles_x, false))
                 } else {
                     None
                 }
@@ -399,7 +413,7 @@ pub(crate) fn encode_frame(
             .into_par_iter()
             .map(|idx| {
                 if tile_is_dirty(rgba, prev, width, height, idx % tiles_x, idx / tiles_x) {
-                    Some(encode_tile_buf(rgba, prev, width, height, idx % tiles_x, idx / tiles_x))
+                    Some(encode_tile_buf(rgba, prev, width, height, idx % tiles_x, idx / tiles_x, false))
                 } else {
                     None
                 }
@@ -426,7 +440,10 @@ pub(crate) fn encode_frame(
     }
 
     // Assemble final packet.
-    let mut out = Vec::with_capacity(20 + map_bytes + dirty_count as usize * 72);
+    // Capacity estimate: keyframe tiles compress to ~200 bytes each (zstd on raw RGBA);
+    // P-frame dirty tiles average ~30 bytes each (ZRLE on sparse XOR delta).
+    let bytes_per_tile = if is_keyframe { 200 } else { 30 };
+    let mut out = Vec::with_capacity(20 + map_bytes + dirty_count as usize * bytes_per_tile);
     out.extend_from_slice(MAGIC);
     out.push(VERSION);
     out.push(if is_keyframe { FLAG_KEYFRAME } else { 0 });
@@ -484,13 +501,13 @@ pub(crate) fn encode_pframe_from_dirty_indices(
 
     if dirty_indices.len() < RAYON_THRESHOLD {
         for &idx in &dirty_indices {
-            tile_results[idx] = Some(encode_tile_buf(rgba, prev, width, height, idx % tiles_x, idx / tiles_x));
+            tile_results[idx] = Some(encode_tile_buf(rgba, prev, width, height, idx % tiles_x, idx / tiles_x, false));
         }
     } else {
         let encoded: Vec<(usize, Vec<u8>, u8)> = dirty_indices
             .into_par_iter()
             .map(|idx| {
-                let (data, mode) = encode_tile_buf(rgba, prev, width, height, idx % tiles_x, idx / tiles_x);
+                let (data, mode) = encode_tile_buf(rgba, prev, width, height, idx % tiles_x, idx / tiles_x, false);
                 (idx, data, mode)
             })
             .collect();
@@ -558,11 +575,22 @@ pub(crate) fn tile_is_dirty(
     let y0 = ty * TILE_SIZE;
     let x1 = (x0 + TILE_SIZE).min(width);
     let y1 = (y0 + TILE_SIZE).min(height);
-    for y in y0..y1 {
-        let base = (y * width + x0) * 4;
-        let end = base + (x1 - x0) * 4;
-        if rgba[base..end] != prev[base..end] {
-            return true;
+    // Non-edge tiles (most common): row width is a compile-time constant (128 bytes),
+    // allowing LLVM to emit a fixed-size vectorised comparison without dynamic length.
+    if x1 - x0 == TILE_SIZE {
+        for y in y0..y1 {
+            let base = (y * width + x0) * 4;
+            if rgba[base..base + TILE_SIZE * 4] != prev[base..base + TILE_SIZE * 4] {
+                return true;
+            }
+        }
+    } else {
+        for y in y0..y1 {
+            let base = (y * width + x0) * 4;
+            let end = base + (x1 - x0) * 4;
+            if rgba[base..end] != prev[base..end] {
+                return true;
+            }
         }
     }
     false
@@ -570,6 +598,11 @@ pub(crate) fn tile_is_dirty(
 
 /// Encode one dirty tile, returning (encoded_bytes, mode).
 /// Called in parallel — no shared mutable state.
+///
+/// Codec selection:
+///   Keyframe tiles → zstd level-1 on raw RGBA (better on dense data).
+///   P-frame tiles  → ZRLE on XOR delta (optimised for mostly-zero buffers).
+///                    Falls back to zstd when ZRLE ratio exceeds 75 % of raw.
 fn encode_tile_buf(
     rgba: &[u8],
     prev: &[u8],
@@ -577,6 +610,7 @@ fn encode_tile_buf(
     height: usize,
     tx: usize,
     ty: usize,
+    is_keyframe: bool,
 ) -> (Vec<u8>, u8) {
     let x0 = tx * TILE_SIZE;
     let y0 = ty * TILE_SIZE;
@@ -586,74 +620,88 @@ fn encode_tile_buf(
     let th = y1 - y0;
     let pixel_bytes = tw * th * 4;
 
-    // Gather tile pixels, converting BGRA capture format → RGBA for wire/decode.
-    // Both tile and tile_prev are swapped consistently, so XOR delta is correct.
-    let mut tile = Vec::with_capacity(pixel_bytes);
-    let mut tile_prev = Vec::with_capacity(pixel_bytes);
-    for y in y0..y1 {
-        let base = (y * width + x0) * 4;
-        for x in 0..tw {
-            let o = base + x * 4;
-            tile.push(rgba[o + 2]);      // R ← B
-            tile.push(rgba[o + 1]);      // G
-            tile.push(rgba[o]);          // B ← R
-            tile.push(rgba[o + 3]);      // A
-            tile_prev.push(prev[o + 2]);
-            tile_prev.push(prev[o + 1]);
-            tile_prev.push(prev[o]);
-            tile_prev.push(prev[o + 3]);
-        }
-    }
-
-    if let Some(color) = try_solid(&tile) {
+    // Fast solid check on raw BGRA — no gather buffer needed.
+    // Compares pixels as u32 words; short-circuits at the first differing pixel.
+    let base0 = (y0 * width + x0) * 4;
+    let first = u32::from_ne_bytes(rgba[base0..base0 + 4].try_into().unwrap());
+    let is_solid = (y0..y1).all(|y| {
+        let row = (y * width + x0) * 4;
+        rgba[row..row + tw * 4]
+            .chunks_exact(4)
+            .all(|p| u32::from_ne_bytes(p.try_into().unwrap()) == first)
+    });
+    if is_solid {
+        let p = &rgba[base0..base0 + 4]; // BGRA source
         let mut out = Vec::with_capacity(5);
         out.push(MODE_SOLID);
-        out.extend_from_slice(&color);
+        out.push(p[2]); // R ← BGRA.B-position = R channel
+        out.push(p[1]); // G
+        out.push(p[0]); // B ← BGRA.R-position = B channel
+        out.push(p[3]); // A
         return (out, MODE_SOLID);
     }
 
-    // XOR delta — u64-wide XOR lets compiler emit AVX2 VXORPS automatically.
-    let mut delta = vec![0u8; pixel_bytes];
-    let words = pixel_bytes / 8;
-    for i in 0..words {
-        let off = i * 8;
-        let a = u64::from_ne_bytes(tile[off..off + 8].try_into().unwrap());
-        let b = u64::from_ne_bytes(tile_prev[off..off + 8].try_into().unwrap());
-        delta[off..off + 8].copy_from_slice(&(a ^ b).to_ne_bytes());
-    }
-    for i in (words * 8)..pixel_bytes {
-        delta[i] = tile[i] ^ tile_prev[i];
-    }
-
-    let compressed_zrle = zrle_encode(&delta);
-    // zstd level-1 compresses raw pixel data ~2× better than ZRLE on keyframe tiles.
-    // For sparse XOR deltas (P-frames, mostly zeros) ZRLE usually wins.
-    let compressed_zstd = zstd::encode_all(delta.as_slice(), 1).unwrap_or_default();
-    let (mode, compressed) = if !compressed_zstd.is_empty()
-        && compressed_zstd.len() < compressed_zrle.len()
-    {
-        (MODE_ZSTD, compressed_zstd)
+    if is_keyframe {
+        // Gather RGBA (BGRA→RGBA swap). prev is all-zero after request_keyframe(),
+        // so delta == tile — we compress tile directly.
+        let mut tile = Vec::with_capacity(pixel_bytes);
+        for y in y0..y1 {
+            let row = (y * width + x0) * 4;
+            for x in 0..tw {
+                let o = row + x * 4;
+                tile.push(rgba[o + 2]); // R
+                tile.push(rgba[o + 1]); // G
+                tile.push(rgba[o]);     // B
+                tile.push(rgba[o + 3]); // A
+            }
+        }
+        let compressed = zstd::encode_all(tile.as_slice(), 1).unwrap_or_default();
+        let mut out = Vec::with_capacity(5 + compressed.len());
+        out.push(MODE_ZSTD);
+        out.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        out.extend_from_slice(&compressed);
+        (out, MODE_ZSTD)
     } else {
-        (MODE_DELTA, compressed_zrle)
-    };
-    let mut out = Vec::with_capacity(5 + compressed.len());
-    out.push(mode);
-    out.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
-    out.extend_from_slice(&compressed);
-    (out, mode)
-}
-
-fn try_solid(tile: &[u8]) -> Option<[u8; 4]> {
-    let mut chunks = tile.chunks_exact(4);
-    let first = chunks.next()?;
-    let color = [first[0], first[1], first[2], first[3]];
-    for chunk in chunks {
-        if chunk != color { return None; }
+        // Compute XOR delta inline with BGRA→RGBA swap — eliminates tile_prev buffer
+        // and the separate XOR pass. One gather+XOR loop instead of three.
+        let mut delta = Vec::with_capacity(pixel_bytes);
+        for y in y0..y1 {
+            let row = (y * width + x0) * 4;
+            for x in 0..tw {
+                let o = row + x * 4;
+                delta.push(rgba[o + 2] ^ prev[o + 2]); // R
+                delta.push(rgba[o + 1] ^ prev[o + 1]); // G
+                delta.push(rgba[o]     ^ prev[o]);      // B
+                delta.push(rgba[o + 3] ^ prev[o + 3]); // A
+            }
+        }
+        let zrle = zrle_encode(&delta);
+        // Fall back to zstd when ZRLE ratio is poor (non-sparse XOR — dense P-frame).
+        if zrle.len() * 4 > pixel_bytes * 3 {
+            let z = zstd::encode_all(delta.as_slice(), 1).unwrap_or_default();
+            if !z.is_empty() && z.len() < zrle.len() {
+                let mut out = Vec::with_capacity(5 + z.len());
+                out.push(MODE_ZSTD);
+                out.extend_from_slice(&(z.len() as u32).to_le_bytes());
+                out.extend_from_slice(&z);
+                return (out, MODE_ZSTD);
+            }
+        }
+        let mut out = Vec::with_capacity(5 + zrle.len());
+        out.push(MODE_DELTA);
+        out.extend_from_slice(&(zrle.len() as u32).to_le_bytes());
+        out.extend_from_slice(&zrle);
+        (out, MODE_DELTA)
     }
-    Some(color)
 }
 
 // ── Core: decode ─────────────────────────────────────────────────────────────
+
+/// Decoded pixel data for one dirty tile.
+enum TilePixels {
+    Solid([u8; 4]),
+    Delta(Vec<u8>),
+}
 
 fn decode_frame(data: &[u8], frame: &mut Vec<u8>, width: usize, height: usize) -> Result<(), EvrtckError> {
     let mut pos = 0usize;
@@ -703,66 +751,115 @@ fn decode_frame(data: &[u8], frame: &mut Vec<u8>, width: usize, height: usize) -
     }
 
     let map_bytes = read_u16!() as usize;
-    let tile_map = read_bytes!(map_bytes).to_vec();
+    // Borrow tile_map directly from data — no allocation needed.
+    let tile_map = read_bytes!(map_bytes);
 
     let tiles_x = tiles_in_dim(width);
     let tiles_y = tiles_in_dim(height);
+    let tile_count = tiles_x * tiles_y;
 
-    for ty in 0..tiles_y {
-        for tx in 0..tiles_x {
-            let idx = ty * tiles_x + tx;
-            let dirty = (tile_map.get(idx / 8).copied().unwrap_or(0) >> (idx % 8)) & 1 == 1;
-            if !dirty { continue; }
+    // Phase 1: scan the byte stream, recording the position and metadata of each
+    // dirty tile without decompressing. O(stream) sequential, no allocation per tile.
+    // Fields: (x0, y0, x1, y1, mode, enc_start, enc_end)
+    let mut dirty: Vec<(usize, usize, usize, usize, u8, usize, usize)> = Vec::new();
 
-            need!(1);
-            let mode = data[pos];
-            pos += 1;
+    for idx in 0..tile_count {
+        let tx = idx % tiles_x;
+        let ty = idx / tiles_x;
+        let dirty_bit = (tile_map.get(idx / 8).copied().unwrap_or(0) >> (idx % 8)) & 1 == 1;
+        if !dirty_bit { continue; }
 
-            let x0 = tx * TILE_SIZE;
-            let y0 = ty * TILE_SIZE;
-            let x1 = (x0 + TILE_SIZE).min(width);
-            let y1 = (y0 + TILE_SIZE).min(height);
+        need!(1);
+        let mode = data[pos]; pos += 1;
 
-            match mode {
-                MODE_SOLID => {
-                    let color = read_bytes!(4);
-                    for y in y0..y1 {
-                        for x in x0..x1 {
-                            let off = (y * width + x) * 4;
-                            frame[off..off + 4].copy_from_slice(color);
-                        }
+        let x0 = tx * TILE_SIZE;
+        let y0 = ty * TILE_SIZE;
+        let x1 = (x0 + TILE_SIZE).min(width);
+        let y1 = (y0 + TILE_SIZE).min(height);
+
+        match mode {
+            MODE_SOLID => {
+                need!(4);
+                dirty.push((x0, y0, x1, y1, mode, pos, pos + 4));
+                pos += 4;
+            }
+            MODE_DELTA | MODE_ZSTD => {
+                let enc_len = read_u32!() as usize;
+                need!(enc_len);
+                dirty.push((x0, y0, x1, y1, mode, pos, pos + enc_len));
+                pos += enc_len;
+            }
+            m => return Err(EvrtckError::InvalidTileMode(m)),
+        }
+    }
+
+    // Phase 2: decompress dirty tiles — in parallel when there are enough to amortise
+    // rayon spawn cost. Each tile is independent; order is preserved by collect().
+    let decoded: Vec<Result<TilePixels, EvrtckError>> = if dirty.len() < RAYON_THRESHOLD {
+        dirty.iter().map(|&(_, _, _, _, mode, enc_start, enc_end)| {
+            decompress_tile(data, enc_start, enc_end, mode)
+        }).collect()
+    } else {
+        dirty.par_iter().map(|&(_, _, _, _, mode, enc_start, enc_end)| {
+            decompress_tile(data, enc_start, enc_end, mode)
+        }).collect()
+    };
+
+    // Phase 3: apply decoded pixels to the frame buffer sequentially (tiles are
+    // non-overlapping, but safe Rust can't express disjoint mutable borrows here).
+    for (&(x0, y0, x1, y1, _, _, _), pixels_result) in dirty.iter().zip(decoded.into_iter()) {
+        match pixels_result? {
+            TilePixels::Solid(color) => {
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let off = (y * width + x) * 4;
+                        frame[off..off + 4].copy_from_slice(&color);
                     }
                 }
-                MODE_DELTA | MODE_ZSTD => {
-                    let enc_len = read_u32!() as usize;
-                    let enc = read_bytes!(enc_len);
-                    let delta = if mode == MODE_ZSTD {
-                        zstd::decode_all(enc).map_err(|_| EvrtckError::InvalidDelta)?
-                    } else {
-                        zrle_decode(enc).ok_or(EvrtckError::InvalidDelta)?
-                    };
-
-                    let expected = (x1 - x0) * (y1 - y0) * 4;
-                    if delta.len() < expected { return Err(EvrtckError::InvalidDelta); }
-
-                    let mut di = 0;
-                    for y in y0..y1 {
-                        for x in x0..x1 {
-                            let off = (y * width + x) * 4;
-                            frame[off]     ^= delta[di];
-                            frame[off + 1] ^= delta[di + 1];
-                            frame[off + 2] ^= delta[di + 2];
-                            frame[off + 3] ^= delta[di + 3];
-                            di += 4;
-                        }
+            }
+            TilePixels::Delta(delta) => {
+                let expected = (x1 - x0) * (y1 - y0) * 4;
+                if delta.len() != expected {
+                    return Err(EvrtckError::InvalidDelta);
+                }
+                let mut di = 0;
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let off = (y * width + x) * 4;
+                        frame[off]     ^= delta[di];
+                        frame[off + 1] ^= delta[di + 1];
+                        frame[off + 2] ^= delta[di + 2];
+                        frame[off + 3] ^= delta[di + 3];
+                        di += 4;
                     }
                 }
-                m => return Err(EvrtckError::InvalidTileMode(m)),
             }
         }
     }
 
     Ok(())
+}
+
+fn decompress_tile(data: &[u8], enc_start: usize, enc_end: usize, mode: u8)
+    -> Result<TilePixels, EvrtckError>
+{
+    match mode {
+        MODE_SOLID => {
+            let d = &data[enc_start..enc_end];
+            Ok(TilePixels::Solid([d[0], d[1], d[2], d[3]]))
+        }
+        MODE_DELTA => {
+            zrle_decode(&data[enc_start..enc_end])
+                .ok_or(EvrtckError::InvalidDelta)
+                .map(TilePixels::Delta)
+        }
+        MODE_ZSTD => {
+            zstd::decode_all(&data[enc_start..enc_end])
+                .map_err(|_| EvrtckError::InvalidDelta)
+                .map(TilePixels::Delta)
+        }
+        _ => unreachable!(), // validated in phase 1
+    }
 }
 
 // ── ZRLE — Zero-Run Length Encoding ──────────────────────────────────────────
@@ -791,7 +888,7 @@ fn zrle_encode(src: &[u8]) -> Vec<u8> {
         while i < src.len() && src[i] == 0 { i += 1; }
         let zeros = i - z_start;
 
-        if zeros >= 4 || (zeros > 0 && i == src.len()) {
+        if zeros >= ZRLE_MIN_RUN || (zeros > 0 && i == src.len()) {
             let mut rem = zeros;
             while rem > 0 {
                 let n = rem.min(65535) as u16;
@@ -815,7 +912,7 @@ fn zrle_encode(src: &[u8]) -> Vec<u8> {
                     z += 8;
                 }
                 while i + z < src.len() && src[i + z] == 0 { z += 1; }
-                if z >= 4 { break; }
+                if z >= ZRLE_MIN_RUN { break; }
             }
             i += 1;
         }
@@ -835,7 +932,8 @@ fn zrle_encode(src: &[u8]) -> Vec<u8> {
 }
 
 fn zrle_decode(src: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
+    // Pre-allocate for the common case of a full TILE_SIZE×TILE_SIZE tile.
+    let mut out = Vec::with_capacity(TILE_SIZE * TILE_SIZE * 4);
     let mut i = 0;
     while i < src.len() {
         let tag = *src.get(i)?;
