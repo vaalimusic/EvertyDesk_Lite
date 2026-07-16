@@ -10111,15 +10111,17 @@ fn configure_icon_fonts(ctx: &egui::Context) {
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
     ctx.set_fonts(fonts);
 
-    // Adjust the text-style sizes to match Segoe UI's optical metrics.
+    // Text style sizes: 15px body gives ab_glyph more pixels to work with for
+    // anti-aliasing; at 14px the coverage mask is coarse enough to look aliased
+    // especially after video capture + lossless EVRTCK transmission.
     let mut style = (*ctx.global_style()).clone();
     style.text_styles = {
         use egui::{FontFamily::Proportional, FontId, TextStyle::*};
         [
-            (Heading,   FontId::new(17.0, Proportional)),
-            (Body,      FontId::new(14.0, Proportional)),
-            (Button,    FontId::new(14.0, Proportional)),
-            (Small,     FontId::new(12.0, Proportional)),
+            (Heading,   FontId::new(18.0, Proportional)),
+            (Body,      FontId::new(15.0, Proportional)),
+            (Button,    FontId::new(15.0, Proportional)),
+            (Small,     FontId::new(13.0, Proportional)),
             (Monospace, FontId::new(13.0, egui::FontFamily::Monospace)),
         ]
         .into()
@@ -10136,19 +10138,15 @@ fn load_system_font_windows(fonts: &mut egui::FontDefinitions) {
     ];
     for path in &candidates {
         if let Ok(data) = std::fs::read(path) {
-            let fd = std::sync::Arc::new(
-                egui::FontData::from_owned(data).tweak(egui::FontTweak {
-                    scale: 1.0,
-                    // Nudge baseline slightly up so Segoe UI sits optically
-                    // centred in egui's line boxes (it sits a touch low by default).
-                    y_offset_factor: -0.10,
-                    y_offset: 0.0,
-                    // Force hinting ON: Segoe UI is hinted for LCD rendering and
-                    // looks significantly smoother with hinting than without.
-                    hinting_override: Some(true),
-                    ..Default::default()
-                }),
-            );
+            // Pure defaults: no y_offset, no hinting override, scale 1.0.
+            //
+            // hinting_override: None  — let ab_glyph auto-hint. Forcing hinting
+            // ON (Some(true)) snaps outlines to pixel grid and actually REMOVES
+            // antialiasing at small sizes, which is the opposite of what we want.
+            //
+            // y_offset_factor: 0.0 — any non-zero shift moves the glyph to a
+            // sub-pixel position that confuses the AA coverage computation.
+            let fd = std::sync::Arc::new(egui::FontData::from_owned(data));
             fonts.font_data.insert("SegoeUI".to_owned(), fd);
             fonts
                 .families
@@ -10158,15 +10156,16 @@ fn load_system_font_windows(fonts: &mut egui::FontDefinitions) {
             return;
         }
     }
-    // Segoe not found — apply scale tweak to egui's bundled Ubuntu Light.
+    // Segoe not found — apply atlas-scale tweak to egui's bundled Ubuntu Light.
     tweak_default_font_scale(fonts);
 }
 
 fn tweak_default_font_scale(fonts: &mut egui::FontDefinitions) {
+    // Render Ubuntu Light at 1.1× in the font atlas then display at 1.0×.
+    // ab_glyph gets more coverage pixels to blend → smoother AA output.
     if let Some(fd) = fonts.font_data.get_mut("Ubuntu-Light") {
         replace_font_tweak(fd, egui::FontTweak {
             scale: 1.1,
-            hinting_override: Some(true),
             ..Default::default()
         });
     }
