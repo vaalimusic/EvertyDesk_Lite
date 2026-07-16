@@ -3,6 +3,12 @@
     windows_subsystem = "windows"
 )]
 
+// mimalloc: returns freed memory to the OS promptly (system allocator on
+// Windows holds onto committed virtual memory indefinitely after free).
+// Reduces apparent RAM in Task Manager on long-running host sessions.
+#[global_allocator]
+static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod address_book;
 mod capability_engine;
 mod theme;
@@ -270,7 +276,34 @@ fn install_panic_logger() {
     }));
 }
 
+fn num_cpus_for_encode() -> usize {
+    // On servers with many cores, cap at 8: encoding 4K tiles scales well up
+    // to ~8 threads and gains little beyond that, while fewer threads means
+    // lower peak RAM (each rayon worker holds a zstd CCtx ≈ 256 KB).
+    let cpus = num_cpus();
+    cpus.min(8).max(1)
+}
+
+fn num_cpus() -> usize {
+    // std::thread::available_parallelism() was stabilised in Rust 1.59.
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
 fn main() -> eframe::Result<()> {
+    // Cap rayon thread pool: on many-core servers (32-128 cores) EVRTCK
+    // keyframe encoding would otherwise saturate ALL cores. 8 threads give
+    // full benefit of parallelism (encode latency ≈ 8× speedup vs single-
+    // thread) without monopolising the machine.
+    let evrtck_threads = std::env::var("EVERTYDESK_ENCODE_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| num_cpus_for_encode());
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(evrtck_threads)
+        .build_global();
+
     install_panic_logger();
     let cleanup = diagnostics::cleanup_default_artifacts();
     if cleanup.removed_total() > 0 || cleanup.errors > 0 {

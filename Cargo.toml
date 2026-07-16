@@ -78,6 +78,7 @@ zstd = { version = "0.13", default-features = false }
 # handshake: Ed25519 sign, crypto_box (X25519+XSalsa20), secretbox.
 dryoc = "0.7"
 rayon = "1"
+mimalloc = { version = "0.1", default-features = false }
 
 # JNI-зависимость только для Android-сборки (по фиче android-client).
 jni = { version = "0.21", optional = true }
