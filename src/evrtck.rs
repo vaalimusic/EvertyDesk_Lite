@@ -363,57 +363,48 @@ pub(crate) fn encode_frame(
     // One memcmp of the whole buffer (~0.15 ms at 1080p) vs tile scan (~3.2 ms).
     // Fires whenever the screen is static — very common in typical desktop use.
     if !is_keyframe && rgba == prev {
-        let mut out = Vec::with_capacity(20);
-        out.extend_from_slice(MAGIC);
-        out.push(VERSION);
-        out.push(FLAG_NOP);
-        out.extend_from_slice(&frame_id.to_le_bytes());
-        out.extend_from_slice(&(width as u32).to_le_bytes());
-        out.extend_from_slice(&(height as u32).to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        return (out, FrameStats {
+        return (nop_packet_data(frame_id, width, height), FrameStats {
             total_tiles: tile_count as u32,
-            dirty_tiles: 0,
-            solid_tiles: 0,
-            delta_tiles: 0,
             encoded_bytes: 20,
+            ..Default::default()
         });
     }
 
-    // Encode strategy:
+    // Encode strategy — result is a SPARSE list of dirty tiles only.
     //
-    // Keyframe: every tile is encoded — one rayon pass, no dirty check needed.
+    // Each entry: (tile_idx, encoded_bytes, mode). Using filter_map keeps the
+    // result O(dirty) not O(total): on a 15%-dirty 1080p frame we get ~506
+    // entries instead of 3375, saving allocations and the two post-encode scans.
     //
-    // P-frame: one rayon pass that does dirty check + encode together. This is
-    // faster than a separate sequential dirty scan because:
-    //   1. No extra full-frame scan pass (~2.5 ms at 1080p).
-    //   2. Rayon spreads dirty-check work across cores in the same sweep.
-    //
-    // Sequential fallback only when tile_count is tiny (< RAYON_THRESHOLD), where
-    // rayon spawn overhead (~0.3 ms) would dwarf the encode work itself.
-    let tile_results: Vec<Option<(Vec<u8>, u8)>> = if is_keyframe {
+    // Keyframe: all tiles encoded in one rayon pass.
+    // P-frame rayon: combined dirty-check + encode in a single filter_map pass.
+    // P-frame sequential: same but without rayon (< RAYON_THRESHOLD tiles).
+    let dirty_tiles: Vec<(usize, Vec<u8>, u8)> = if is_keyframe {
         (0..tile_count)
             .into_par_iter()
-            .map(|idx| Some(encode_tile_buf(rgba, prev, width, height, idx % tiles_x, idx / tiles_x, true)))
+            .map(|idx| {
+                let (data, mode) = encode_tile_buf(rgba, prev, width, height, idx % tiles_x, idx / tiles_x, true);
+                (idx, data, mode)
+            })
             .collect()
     } else if tile_count < RAYON_THRESHOLD {
-        // Very small resolution (< ~256×256) — sequential encode, rayon overhead not worth it.
         (0..tile_count)
-            .map(|idx| {
+            .filter_map(|idx| {
                 if tile_is_dirty(rgba, prev, width, height, idx % tiles_x, idx / tiles_x) {
-                    Some(encode_tile_buf(rgba, prev, width, height, idx % tiles_x, idx / tiles_x, false))
+                    let (data, mode) = encode_tile_buf(rgba, prev, width, height, idx % tiles_x, idx / tiles_x, false);
+                    Some((idx, data, mode))
                 } else {
                     None
                 }
             })
             .collect()
     } else {
-        // Single rayon pass: dirty check + encode in parallel, no pre-scan overhead.
         (0..tile_count)
             .into_par_iter()
-            .map(|idx| {
+            .filter_map(|idx| {
                 if tile_is_dirty(rgba, prev, width, height, idx % tiles_x, idx / tiles_x) {
-                    Some(encode_tile_buf(rgba, prev, width, height, idx % tiles_x, idx / tiles_x, false))
+                    let (data, mode) = encode_tile_buf(rgba, prev, width, height, idx % tiles_x, idx / tiles_x, false);
+                    Some((idx, data, mode))
                 } else {
                     None
                 }
@@ -421,29 +412,24 @@ pub(crate) fn encode_frame(
             .collect()
     };
 
-    // Build dirty-map and collect stats.
+    // Build dirty-map and stats from compact dirty list — O(dirty) not O(total).
     let map_bytes = (tile_count + 7) / 8;
     let mut tile_map = vec![0u8; map_bytes];
-    let mut dirty_count = 0u32;
     let mut solid_count = 0u32;
     let mut delta_count = 0u32;
-    for (i, result) in tile_results.iter().enumerate() {
-        if let Some((_, mode)) = result {
-            tile_map[i / 8] |= 1 << (i % 8);
-            dirty_count += 1;
-            match *mode {
-                MODE_SOLID => solid_count += 1,
-                MODE_DELTA | MODE_ZSTD => delta_count += 1,
-                _ => {}
-            }
+    for &(idx, _, mode) in &dirty_tiles {
+        tile_map[idx / 8] |= 1 << (idx % 8);
+        match mode {
+            MODE_SOLID => solid_count += 1,
+            _ => delta_count += 1,
         }
     }
+    let dirty_count = dirty_tiles.len() as u32;
 
-    // Assemble final packet.
-    // Capacity estimate: keyframe tiles compress to ~200 bytes each (zstd on raw RGBA);
-    // P-frame dirty tiles average ~30 bytes each (ZRLE on sparse XOR delta).
+    // Assemble final packet. Capacity estimate: keyframe ~200 B/tile (zstd raw RGBA),
+    // P-frame ~30 B/tile (ZRLE sparse XOR delta).
     let bytes_per_tile = if is_keyframe { 200 } else { 30 };
-    let mut out = Vec::with_capacity(20 + map_bytes + dirty_count as usize * bytes_per_tile);
+    let mut out = Vec::with_capacity(20 + map_bytes + dirty_tiles.len() * bytes_per_tile);
     out.extend_from_slice(MAGIC);
     out.push(VERSION);
     out.push(if is_keyframe { FLAG_KEYFRAME } else { 0 });
@@ -452,10 +438,8 @@ pub(crate) fn encode_frame(
     out.extend_from_slice(&(height as u32).to_le_bytes());
     out.extend_from_slice(&(map_bytes as u16).to_le_bytes());
     out.extend_from_slice(&tile_map);
-    for result in &tile_results {
-        if let Some((encoded, _)) = result {
-            out.extend_from_slice(encoded);
-        }
+    for (_, data, _) in &dirty_tiles {
+        out.extend_from_slice(data);
     }
 
     let stats = FrameStats {
@@ -497,55 +481,46 @@ pub(crate) fn encode_pframe_from_dirty_indices(
     let tiles_x = tiles_in_dim(width);
     let tile_count = tiles_in_dim(width) * tiles_in_dim(height);
 
-    let mut tile_results = vec![None::<(Vec<u8>, u8)>; tile_count];
-
-    if dirty_indices.len() < RAYON_THRESHOLD {
-        for &idx in &dirty_indices {
-            tile_results[idx] = Some(encode_tile_buf(rgba, prev, width, height, idx % tiles_x, idx / tiles_x, false));
-        }
+    // dirty_indices must be in ascending (raster) order; rayon collect preserves it.
+    let dirty_tiles: Vec<(usize, Vec<u8>, u8)> = if dirty_indices.len() < RAYON_THRESHOLD {
+        dirty_indices.iter().map(|&idx| {
+            let (data, mode) = encode_tile_buf(rgba, prev, width, height, idx % tiles_x, idx / tiles_x, false);
+            (idx, data, mode)
+        }).collect()
     } else {
-        let encoded: Vec<(usize, Vec<u8>, u8)> = dirty_indices
+        dirty_indices
             .into_par_iter()
             .map(|idx| {
                 let (data, mode) = encode_tile_buf(rgba, prev, width, height, idx % tiles_x, idx / tiles_x, false);
                 (idx, data, mode)
             })
-            .collect();
-        for (idx, data, mode) in encoded {
-            tile_results[idx] = Some((data, mode));
-        }
-    }
+            .collect()
+    };
 
     let map_bytes = (tile_count + 7) / 8;
     let mut tile_map = vec![0u8; map_bytes];
-    let mut dirty_count = 0u32;
     let mut solid_count = 0u32;
     let mut delta_count = 0u32;
-    for (i, result) in tile_results.iter().enumerate() {
-        if let Some((_, mode)) = result {
-            tile_map[i / 8] |= 1 << (i % 8);
-            dirty_count += 1;
-            match *mode {
-                MODE_SOLID => solid_count += 1,
-                MODE_DELTA | MODE_ZSTD => delta_count += 1,
-                _ => {}
-            }
+    for &(idx, _, mode) in &dirty_tiles {
+        tile_map[idx / 8] |= 1 << (idx % 8);
+        match mode {
+            MODE_SOLID => solid_count += 1,
+            _ => delta_count += 1,
         }
     }
+    let dirty_count = dirty_tiles.len() as u32;
 
-    let mut out = Vec::with_capacity(20 + map_bytes + dirty_count as usize * 72);
+    let mut out = Vec::with_capacity(20 + map_bytes + dirty_tiles.len() * 30);
     out.extend_from_slice(MAGIC);
     out.push(VERSION);
-    out.push(0); // P-frame flag
+    out.push(0); // P-frame
     out.extend_from_slice(&frame_id.to_le_bytes());
     out.extend_from_slice(&(width as u32).to_le_bytes());
     out.extend_from_slice(&(height as u32).to_le_bytes());
     out.extend_from_slice(&(map_bytes as u16).to_le_bytes());
     out.extend_from_slice(&tile_map);
-    for result in &tile_results {
-        if let Some((encoded, _)) = result {
-            out.extend_from_slice(encoded);
-        }
+    for (_, data, _) in &dirty_tiles {
+        out.extend_from_slice(data);
     }
 
     let stats = FrameStats {
@@ -808,30 +783,36 @@ fn decode_frame(data: &[u8], frame: &mut Vec<u8>, width: usize, height: usize) -
     // Phase 3: apply decoded pixels to the frame buffer sequentially (tiles are
     // non-overlapping, but safe Rust can't express disjoint mutable borrows here).
     for (&(x0, y0, x1, y1, _, _, _), pixels_result) in dirty.iter().zip(decoded.into_iter()) {
+        let tw4 = (x1 - x0) * 4;
         match pixels_result? {
             TilePixels::Solid(color) => {
+                // Pre-fill one row on the stack, then copy_from_slice per frame row.
+                // Replaces O(w×h) per-pixel stores with O(h) vectorised row copies.
+                let mut row_buf = [0u8; TILE_SIZE * 4];
+                for chunk in row_buf[..tw4].chunks_exact_mut(4) {
+                    chunk.copy_from_slice(&color);
+                }
+                let row_pat = &row_buf[..tw4];
                 for y in y0..y1 {
-                    for x in x0..x1 {
-                        let off = (y * width + x) * 4;
-                        frame[off..off + 4].copy_from_slice(&color);
-                    }
+                    let rs = (y * width + x0) * 4;
+                    frame[rs..rs + tw4].copy_from_slice(row_pat);
                 }
             }
             TilePixels::Delta(delta) => {
-                let expected = (x1 - x0) * (y1 - y0) * 4;
+                let expected = tw4 * (y1 - y0);
                 if delta.len() != expected {
                     return Err(EvrtckError::InvalidDelta);
                 }
+                // Row-level zip gives LLVM a clear SIMD opportunity (AVX2: 32 B/cycle XOR).
                 let mut di = 0;
                 for y in y0..y1 {
-                    for x in x0..x1 {
-                        let off = (y * width + x) * 4;
-                        frame[off]     ^= delta[di];
-                        frame[off + 1] ^= delta[di + 1];
-                        frame[off + 2] ^= delta[di + 2];
-                        frame[off + 3] ^= delta[di + 3];
-                        di += 4;
+                    let rs = (y * width + x0) * 4;
+                    let frame_row = &mut frame[rs..rs + tw4];
+                    let delta_row = &delta[di..di + tw4];
+                    for (f, d) in frame_row.iter_mut().zip(delta_row) {
+                        *f ^= d;
                     }
+                    di += tw4;
                 }
             }
         }
@@ -849,9 +830,7 @@ fn decompress_tile(data: &[u8], enc_start: usize, enc_end: usize, mode: u8)
             Ok(TilePixels::Solid([d[0], d[1], d[2], d[3]]))
         }
         MODE_DELTA => {
-            zrle_decode(&data[enc_start..enc_end])
-                .ok_or(EvrtckError::InvalidDelta)
-                .map(TilePixels::Delta)
+            zrle_decode(&data[enc_start..enc_end]).map(TilePixels::Delta)
         }
         MODE_ZSTD => {
             zstd::decode_all(&data[enc_start..enc_end])
@@ -931,32 +910,32 @@ fn zrle_encode(src: &[u8]) -> Vec<u8> {
     out
 }
 
-fn zrle_decode(src: &[u8]) -> Option<Vec<u8>> {
+fn zrle_decode(src: &[u8]) -> Result<Vec<u8>, EvrtckError> {
     // Pre-allocate for the common case of a full TILE_SIZE×TILE_SIZE tile.
     let mut out = Vec::with_capacity(TILE_SIZE * TILE_SIZE * 4);
     let mut i = 0;
     while i < src.len() {
-        let tag = *src.get(i)?;
+        let tag = *src.get(i).ok_or(EvrtckError::InvalidDelta)?;
         i += 1;
         match tag {
             0x00 => {
-                if i + 2 > src.len() { return None; }
+                if i + 2 > src.len() { return Err(EvrtckError::InvalidDelta); }
                 let count = u16::from_le_bytes([src[i], src[i + 1]]) as usize;
                 i += 2;
                 out.resize(out.len() + count, 0);
             }
             0x01 => {
-                if i + 2 > src.len() { return None; }
+                if i + 2 > src.len() { return Err(EvrtckError::InvalidDelta); }
                 let len = u16::from_le_bytes([src[i], src[i + 1]]) as usize;
                 i += 2;
-                if i + len > src.len() { return None; }
+                if i + len > src.len() { return Err(EvrtckError::InvalidDelta); }
                 out.extend_from_slice(&src[i..i + len]);
                 i += len;
             }
-            _ => return None,
+            _ => return Err(EvrtckError::InvalidDelta),
         }
     }
-    Some(out)
+    Ok(out)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
