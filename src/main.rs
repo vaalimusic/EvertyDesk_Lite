@@ -802,8 +802,20 @@ fn load_app_icon() -> Option<egui::IconData> {
     })
 }
 
+/// Stores the GPU adapter description logged at startup.
+/// Read by update_egui() on the first frame to surface it in the in-app log.
+static GPU_STARTUP_INFO: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 fn run_gui(renderer: eframe::Renderer) -> eframe::Result<()> {
-    let wgpu_opts = eframe::egui_wgpu::WgpuConfiguration::default();
+    // PresentMode::Fifo = vsync / waitable: the OS schedules Present() at
+    // the display's refresh rate and blocks until then. On servers with Aspeed
+    // AST2x00 or Microsoft WARP the default AutoVsync can spin without
+    // blocking, burning CPU at 100%. Fifo forces a proper wait even on
+    // headless/BMC adapters.
+    let wgpu_opts = eframe::egui_wgpu::WgpuConfiguration {
+        present_mode: eframe::wgpu::PresentMode::Fifo,
+        ..Default::default()
+    };
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(APP_NAME)
@@ -840,22 +852,9 @@ fn run_gui(renderer: eframe::Renderer) -> eframe::Result<()> {
             );
 
             // ── GPU / renderer diagnostics ────────────────────────────────────
-            // Log which GPU and backend wgpu selected. Critical for diagnosing
-            // 100% CPU on servers with BMC graphics (Aspeed AST2x00, Matrox,
-            // WARP software renderer): those paths can spin in Present() even
-            // when the UI is idle at 1 fps.
             if let Some(wgpu) = &cc.wgpu_render_state {
                 let info = wgpu.adapter.get_info();
-                eprintln!(
-                    "[GPU] backend={:?}  adapter=\"{}\"  vendor=0x{:04X}  device=0x{:04X}",
-                    info.backend, info.name, info.vendor, info.device
-                );
 
-                // Server BMC adapters and the D3D12/Vulkan WARP software
-                // renderer cause pathological CPU usage in wgpu's Present loop.
-                // Detect them by name and warn; the user should restart with
-                // EVERTYDESK_SOFTWARE=1 (OpenGL software renderer) or use
-                // headless host mode (no GUI at all).
                 let name_lower = info.name.to_ascii_lowercase();
                 let is_server_gpu = name_lower.contains("aspeed")
                     || name_lower.contains("ast2")
@@ -864,22 +863,18 @@ fn run_gui(renderer: eframe::Renderer) -> eframe::Result<()> {
                     || name_lower.contains("warp")
                     || name_lower.contains("microsoft basic render");
 
+                let mut msg = format!(
+                    "[GPU] backend={:?}  adapter=\"{}\"  vendor=0x{:04X}  device=0x{:04X}",
+                    info.backend, info.name, info.vendor, info.device
+                );
                 if is_server_gpu {
-                    eprintln!(
-                        "[GPU] ⚠ Server/software GPU detected: \"{}\"",
-                        info.name
-                    );
-                    eprintln!(
-                        "[GPU] ⚠ wgpu Present() on this adapter is CPU-heavy even at 1 fps."
-                    );
-                    eprintln!(
-                        "[GPU] ⚠ Auto-enabling server mode: UI capped to 2 fps, hover animations off."
-                    );
-                    eprintln!(
-                        "[GPU] ⚠ For zero GPU overhead use headless mode: evertydesk-lite.exe --host"
-                    );
+                    msg.push_str("  ⚠ SERVER-GPU: server mode ON, vsync=Fifo");
                     activate_server_mode();
                 }
+
+                // Store for display in the in-app log on the first update frame.
+                // (eprintln! is invisible on Windows GUI builds.)
+                let _ = GPU_STARTUP_INFO.set(msg);
             }
 
             Ok(Box::new(EvertyDeskApp::new()))
@@ -935,6 +930,20 @@ fn run_headless_host() {
                 }
             }
         }
+    }
+}
+
+/// Append a line to %APPDATA%\EvertyDesk Lite\perf.log.
+/// Visible even on Windows GUI builds (no console). Silently ignored on failure.
+fn perf_log(msg: &str) {
+    use std::io::Write;
+    let Some(appdata) = std::env::var_os("APPDATA") else { return };
+    let dir = std::path::Path::new(&appdata).join("EvertyDesk Lite");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("perf.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let ts = unix_timestamp_secs();
+        let _ = writeln!(f, "{ts}  {msg}");
     }
 }
 
@@ -2800,19 +2809,29 @@ fn start_hung_window_guardian() {
 impl EvertyDeskApp {
     #[allow(deprecated)]
     fn update_egui(&mut self, ctx: &egui::Context) {
+        // ── First-frame init ─────────────────────────────────────────────────
+        // Log GPU adapter info in the visible in-app event list (eprintln! is
+        // invisible on Windows GUI builds because there is no console window).
+        if self.perf_frame_count == 0 {
+            if let Some(gpu_msg) = GPU_STARTUP_INFO.get() {
+                self.log(gpu_msg.clone());
+                perf_log(gpu_msg);
+            }
+        }
+
         // ── UI render-rate counter ────────────────────────────────────────────
-        // Log how often this function is called so we can see if egui is
-        // spinning faster than expected (should be ~1 fps when idle host).
         self.perf_frame_count += 1;
         let perf_elapsed = self.perf_window_start.elapsed();
         if perf_elapsed >= Duration::from_secs(10) {
             let fps = self.perf_frame_count as f64 / perf_elapsed.as_secs_f64();
             let idle = !self.connected && !self.busy && !self.host_check_busy;
-            eprintln!(
-                "[perf] UI render: {:.1} fps (idle={}) — expected ~1 fps when host idle, \
-                 ~30 fps when streaming",
-                fps, idle
+            let msg = format!(
+                "[perf] UI render: {:.1} fps (idle={}, server_mode={}) \
+                 — expected ~1 fps idle, ~30 fps streaming",
+                fps, idle, server_mode_active()
             );
+            self.log(msg.clone());
+            perf_log(&msg);
             self.perf_frame_count = 0;
             self.perf_window_start = Instant::now();
         }
