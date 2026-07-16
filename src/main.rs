@@ -1033,6 +1033,12 @@ struct EvertyDeskApp {
     host_status: String,
     host_video_status: Option<String>,
     last_error: Option<String>,
+    /// When the last error was set — used to auto-clear it after 8s.
+    last_error_at: Option<Instant>,
+    /// Auto-reconnect after a dropped (not auth-failure) session.
+    auto_reconnect: bool,
+    /// Scheduled instant to call connect() again (None = no pending reconnect).
+    reconnect_after: Option<Instant>,
     connection_state: ConnectionState,
     worker: Option<Receiver<WorkerEvent>>,
     session_tx: Option<mpsc::Sender<SessionCommand>>,
@@ -1455,6 +1461,9 @@ impl EvertyDeskApp {
             host_video_status: None,
             status: "Готово".to_owned(),
             last_error: None,
+            last_error_at: None,
+            auto_reconnect: true,
+            reconnect_after: None,
             connection_state: ConnectionState::Idle,
             worker: None,
             session_tx: None,
@@ -1671,6 +1680,8 @@ impl EvertyDeskApp {
         }
 
         self.last_error = None;
+        self.last_error_at = None;
+        self.reconnect_after = None;
         self.busy = true;
         self.connected = false;
         self.remote_viewer_open = false;
@@ -2214,8 +2225,19 @@ impl EvertyDeskApp {
                 self.connection_state = ConnectionState::Failed(err.clone());
                 self.remote_modifiers_down = RemoteModifierState::default();
                 self.last_error = Some(err.clone());
-                self.status = friendly_error(&err);
+                self.last_error_at = Some(Instant::now());
+                self.status = friendly_error(&err, self.ui_lang);
                 self.log(format!("Error: {err}"));
+                // Auto-reconnect unless this is an auth or "ID not found" error
+                // (those require user action before a retry will succeed).
+                let is_permanent = err.contains("Wrong Password")
+                    || err.contains("ID does not exist")
+                    || err.contains("Введите")
+                    || err.contains("Enter ");
+                if self.auto_reconnect && !is_permanent && !self.remote_id.is_empty() {
+                    self.reconnect_after =
+                        Some(Instant::now() + std::time::Duration::from_secs(10));
+                }
             }
             SessionEvent::Closed => {
                 self.busy = false;
@@ -2289,6 +2311,7 @@ impl EvertyDeskApp {
         self.cursor_texture = None;
         self.cursor_pos = None;
         self.latency_ms = None;
+        self.reconnect_after = None;
         self.status = status.to_owned();
         self.log(status.to_owned());
     }
@@ -2298,7 +2321,7 @@ impl EvertyDeskApp {
             return "Подключение...".to_owned();
         }
         if let Some(error) = &self.last_error {
-            return friendly_error(error);
+            return friendly_error(error, self.ui_lang);
         }
         if self.connected {
             return "Подключено".to_owned();
@@ -2407,7 +2430,8 @@ impl EvertyDeskApp {
 
     fn set_error(&mut self, message: &str) {
         self.last_error = Some(message.to_owned());
-        self.status = friendly_error(message);
+        self.last_error_at = Some(Instant::now());
+        self.status = friendly_error(message, self.ui_lang);
         self.connection_state = ConnectionState::Failed(message.to_owned());
         self.log(format!("Error: {message}"));
     }
@@ -2527,6 +2551,16 @@ fn start_hung_window_guardian() {
 impl EvertyDeskApp {
     #[allow(deprecated)]
     fn update_egui(&mut self, ctx: &egui::Context) {
+        // Update window title to reflect active session host.
+        {
+            let title = if self.connected && !self.remote_id.is_empty() {
+                format!("{} — {APP_NAME}", self.remote_id)
+            } else {
+                APP_NAME.to_owned()
+            };
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        }
+
         if ctx.input(|i| i.viewport().close_requested()) {
             self.shutdown();
             // Start the watchdog NOW, before eframe begins WGPU/D3D teardown.
@@ -2536,6 +2570,25 @@ impl EvertyDeskApp {
             // which first terminates the stuck GPU thread, then runs DLL cleanup
             // without contention — no deadlock.
             arm_shutdown_watchdog();
+        }
+
+        // Auto-clear stale errors after 8 seconds.
+        if let Some(at) = self.last_error_at {
+            if at.elapsed().as_secs() >= 8 && !self.connected && !self.busy {
+                self.last_error = None;
+                self.last_error_at = None;
+            }
+        }
+
+        // Auto-reconnect: attempt to reconnect after the scheduled delay.
+        if let Some(at) = self.reconnect_after {
+            if at <= Instant::now() && !self.busy && !self.connected {
+                self.reconnect_after = None;
+                self.connect();
+            } else {
+                // Keep repainting so the countdown seconds update in the UI.
+                ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            }
         }
 
         self.poll_worker();
@@ -2880,11 +2933,42 @@ impl EvertyDeskApp {
                 egui::Color32::from_rgb(240, 120, 120),
                 self.visible_status(),
             );
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .button(tr(self.ui_lang, "🔄 Повторить", "🔄 Retry"))
+                    .clicked()
+                {
+                    self.reconnect_after = None;
+                    self.connect();
+                }
+                if let Some(at) = self.reconnect_after {
+                    let secs = at
+                        .checked_duration_since(Instant::now())
+                        .map(|d| d.as_secs() + 1)
+                        .unwrap_or(0);
+                    let countdown_text = match self.ui_lang {
+                        UiLang::Ru => format!("Авто-переподключение через {secs}с…"),
+                        UiLang::En => format!("Auto-reconnect in {secs}s…"),
+                    };
+                    ui.label(countdown_text);
+                    if ui
+                        .small_button(tr(self.ui_lang, "Отмена", "Cancel"))
+                        .clicked()
+                    {
+                        self.reconnect_after = None;
+                    }
+                }
+            });
         } else {
             ui.label(self.visible_status());
         }
         if self.connected && !self.remote_viewer_open {
-            ui.label("Окно экрана закрыто. Нажмите Экран, чтобы открыть его снова.");
+            ui.label(tr(
+                self.ui_lang,
+                "Окно экрана закрыто. Нажмите Экран, чтобы открыть его снова.",
+                "Screen window is closed. Click Screen to open it again.",
+            ));
         }
 
         if !self.events.is_empty() {
@@ -7761,7 +7845,9 @@ impl EvertyDeskApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 return;
             }
-            if ctx.input(|input| input.key_pressed(egui::Key::F11)) {
+            // Only toggle local fullscreen when keyboard is NOT captured by the remote.
+            // When captured, F11 is forwarded to the remote via handle_remote_keyboard.
+            if !self.remote_input_focused && ctx.input(|input| input.key_pressed(egui::Key::F11)) {
                 self.remote_fullscreen = !self.remote_fullscreen;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.remote_fullscreen));
             }
@@ -7912,7 +7998,7 @@ impl EvertyDeskApp {
             // screen — the bottom status bar that used to host this is gone.
             let painter = ui.painter();
             let pad = egui::vec2(8.0, 4.0);
-            let text = "⌨ ввод захвачен · Esc";
+            let text = tr(self.ui_lang, "⌨ ввод захвачен · Ctrl+Esc", "⌨ input captured · Ctrl+Esc");
             let font = egui::FontId::proportional(11.5);
             let galley = painter.layout_no_wrap(
                 text.to_owned(),
@@ -8092,26 +8178,29 @@ impl EvertyDeskApp {
                     modifiers,
                     ..
                 } => {
-                    // Ctrl+Escape releases keyboard capture
+                    // Ctrl+Escape: release keyboard capture without forwarding to remote.
                     if key == egui::Key::Escape && modifiers.ctrl {
                         self.remote_input_focused = false;
                         self.release_remote_modifiers();
                         continue;
                     }
-                    // Escape alone also releases (press Ctrl to send real Escape to remote)
-                    if key == egui::Key::Escape && !has_command_modifier(modifiers) {
-                        self.remote_input_focused = false;
-                        self.release_remote_modifiers();
-                        continue;
-                    }
+                    // Bare Escape: forward to remote (vi, game menus, dialogs all need it).
+                    // Use Ctrl+Escape to release keyboard capture.
                     // Allow key-repeat only for navigation/edit keys (arrows, backspace, delete,
                     // page-up/down, home, end). Other keys skip repeat to avoid duplicates.
                     if repeat && !key_allows_repeat(key) {
                         continue;
                     }
                     if has_command_modifier(modifiers) && egui_key_to_text(key).is_some() {
+                        // Send letter keys with active modifiers explicitly so
+                        // Ctrl+C/V/X/Z/A actually reach the remote as shortcuts,
+                        // not as bare text characters.
                         let text = egui_key_to_text(key).unwrap();
-                        self.send_command(SessionCommand::KeyText(text));
+                        let mut mods = Vec::new();
+                        if modifiers.ctrl || modifiers.command { mods.push(ControlKey::Control); }
+                        if modifiers.alt { mods.push(ControlKey::Alt); }
+                        if modifiers.shift { mods.push(ControlKey::Shift); }
+                        self.send_command(SessionCommand::KeyTextWithModifiers { text, modifiers: mods });
                         self.request_visual_refresh_after_input();
                     } else if let Some(control_key) = egui_key_to_control_key(key) {
                         self.send_command(SessionCommand::KeyControl(control_key));
@@ -9541,17 +9630,31 @@ fn remember_history(history: &mut Vec<ConnectionHistoryEntry>, id: &str) {
     history.truncate(20);
 }
 
-fn friendly_error(error: &str) -> String {
+fn friendly_error(error: &str, lang: UiLang) -> String {
     if error.contains("Wrong Password") {
-        "Неверный пароль. Проверьте пароль на удаленном ПК.".to_owned()
+        tr(lang, "Неверный пароль. Проверьте пароль на удаленном ПК.", "Wrong password. Check the password on the remote PC.").to_owned()
     } else if error.contains("Offline:") || error.contains("Rendezvous refused: Offline") {
-        "Удаленный ID сейчас не в сети.".to_owned()
+        tr(lang, "Удаленный ID сейчас не в сети.", "Remote ID is currently offline.").to_owned()
     } else if error.contains("ID does not exist") {
-        "Такой ID не найден на сервере.".to_owned()
-    } else if error.contains("Введите ID") || error.contains("Введите пароль") {
+        tr(lang, "Такой ID не найден на сервере.", "This ID was not found on the server.").to_owned()
+    } else if error.contains("Введите ID") || error.contains("Enter ID") {
+        error.to_owned()
+    } else if error.contains("Введите пароль") || error.contains("Enter password") {
         error.to_owned()
     } else if error.contains("Background task stopped unexpectedly") {
-        "Соединение неожиданно остановилось.".to_owned()
+        tr(lang, "Соединение неожиданно остановилось.", "Connection stopped unexpectedly.").to_owned()
+    } else if error.contains("tls") || error.contains("TLS") || error.contains("certificate") {
+        tr(lang, "Ошибка TLS/сертификата. Проверьте настройки сервера.", "TLS/certificate error. Check your server settings.").to_owned()
+    } else if error.contains("timed out") || error.contains("timeout") || error.contains("Connection timed out") {
+        tr(lang, "Таймаут подключения. Проверьте сеть или попробуйте ещё раз.", "Connection timed out. Check your network or try again.").to_owned()
+    } else if error.contains("Connection refused") || error.contains("connection refused") {
+        tr(lang, "Сервер недоступен. Проверьте адрес и порт.", "Server refused the connection. Check the address and port.").to_owned()
+    } else if error.contains("relay") || error.contains("Relay") {
+        tr(lang, "Сервер-ретранслятор недоступен. Попробуйте позже.", "Relay server is unreachable. Try again later.").to_owned()
+    } else if error.contains("Protocol") || error.contains("protocol") || error.contains("version mismatch") {
+        tr(lang, "Несовместимая версия протокола.", "Protocol version mismatch.").to_owned()
+    } else if error.contains("Network unreachable") || error.contains("No route to host") {
+        tr(lang, "Нет сети. Проверьте подключение к интернету.", "No network. Check your internet connection.").to_owned()
     } else {
         error.to_owned()
     }
