@@ -257,6 +257,26 @@ impl EvertyDeskApp {
                         "Show connection details on main page",
                     ),
                 );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    use crate::settings::CoordinateMode;
+                    ui.label(tr(selected_lang, "Режим координат мыши", "Mouse coordinate mode"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        for (mode, label_ru, label_en) in [
+                            (CoordinateMode::Auto, "Авто", "Auto"),
+                            (CoordinateMode::Absolute, "Абсолютный", "Absolute"),
+                            (CoordinateMode::Local, "Локальный", "Local"),
+                        ] {
+                            let label = match selected_lang {
+                                crate::UiLang::Ru => label_ru,
+                                crate::UiLang::En => label_en,
+                            };
+                            if language_button(ui, label, draft.ui.coordinate_mode == mode).clicked() {
+                                draft.ui.coordinate_mode = mode;
+                            }
+                        }
+                    });
+                });
             });
 
             ui.add_space(8.0);
