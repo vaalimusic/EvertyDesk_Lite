@@ -806,14 +806,23 @@ fn load_app_icon() -> Option<egui::IconData> {
 /// Read by update_egui() on the first frame to surface it in the in-app log.
 static GPU_STARTUP_INFO: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// Set to true when Microsoft Basic Render Driver (WARP D3D12) is detected.
+/// WARP does full CPU rendering: even simple egui frames take 10-50ms of CPU.
+/// We use a much larger repaint interval (5 s instead of 0.5 s) to minimise
+/// CPU spend. The recommended fix is to use --host / headless mode instead.
+static IS_WARP_ADAPTER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn run_gui(renderer: eframe::Renderer) -> eframe::Result<()> {
-    // PresentMode::Fifo = vsync / waitable: the OS schedules Present() at
-    // the display's refresh rate and blocks until then. On servers with Aspeed
-    // AST2x00 or Microsoft WARP the default AutoVsync can spin without
-    // blocking, burning CPU at 100%. Fifo forces a proper wait even on
-    // headless/BMC adapters.
+    // AutoNoVsync: tries Mailbox (no-wait, returns immediately after queuing
+    // the frame), falls back to Immediate. This keeps Present() non-blocking
+    // on all adapters including Microsoft Basic Render Driver (WARP D3D12) and
+    // Aspeed AST2x00 BMC, so the render loop can actually sleep between frames
+    // instead of being trapped inside a 143ms "virtual vsync" that WARP imposes
+    // on PresentMode::Fifo. The frame rate is then controlled entirely by
+    // egui's request_repaint_after timer (500 ms or 5000 ms depending on GPU).
     let wgpu_opts = eframe::egui_wgpu::WgpuConfiguration {
-        present_mode: eframe::wgpu::PresentMode::Fifo,
+        present_mode: eframe::wgpu::PresentMode::AutoNoVsync,
         ..Default::default()
     };
 
@@ -856,19 +865,26 @@ fn run_gui(renderer: eframe::Renderer) -> eframe::Result<()> {
                 let info = wgpu.adapter.get_info();
 
                 let name_lower = info.name.to_ascii_lowercase();
-                let is_server_gpu = name_lower.contains("aspeed")
+                let is_warp = name_lower.contains("microsoft basic render")
+                    || name_lower.contains("warp");
+                let is_server_gpu = is_warp
+                    || name_lower.contains("aspeed")
                     || name_lower.contains("ast2")
                     || name_lower.contains("matrox")
-                    || name_lower.contains("g200")
-                    || name_lower.contains("warp")
-                    || name_lower.contains("microsoft basic render");
+                    || name_lower.contains("g200");
 
                 let mut msg = format!(
                     "[GPU] backend={:?}  adapter=\"{}\"  vendor=0x{:04X}  device=0x{:04X}",
                     info.backend, info.name, info.vendor, info.device
                 );
-                if is_server_gpu {
-                    msg.push_str("  ⚠ SERVER-GPU: server mode ON, vsync=Fifo");
+                if is_warp {
+                    IS_WARP_ADAPTER.store(true, std::sync::atomic::Ordering::Relaxed);
+                    msg.push_str(
+                        "  ⚠ WARP/no-GPU: CPU-rendered, repaint=5s. Use --host for zero overhead."
+                    );
+                    activate_server_mode();
+                } else if is_server_gpu {
+                    msg.push_str("  ⚠ SERVER-GPU: server mode ON");
                     activate_server_mode();
                 }
 
@@ -1181,6 +1197,8 @@ struct EvertyDeskApp {
     perf_frame_count: u32,
     /// When the current 10-second perf window started.
     perf_window_start: Instant,
+    /// True after we have logged GPU startup info once (prevents repeats).
+    gpu_info_logged: bool,
     password: String,
     show_password: bool,
     show_host_password: bool,
@@ -1723,6 +1741,7 @@ impl EvertyDeskApp {
             coordinate_mode,
             perf_frame_count: 0,
             perf_window_start: Instant::now(),
+            gpu_info_logged: false,
             screenshot_count: 0,
             live_frame_count: 0,
             screenshot_frame_count: 0,
@@ -2810,12 +2829,13 @@ impl EvertyDeskApp {
     #[allow(deprecated)]
     fn update_egui(&mut self, ctx: &egui::Context) {
         // ── First-frame init ─────────────────────────────────────────────────
-        // Log GPU adapter info in the visible in-app event list (eprintln! is
-        // invisible on Windows GUI builds because there is no console window).
-        if self.perf_frame_count == 0 {
+        // Log GPU adapter info exactly once in the visible in-app event list.
+        // (eprintln! is invisible on Windows GUI builds — no console window.)
+        if !self.gpu_info_logged {
             if let Some(gpu_msg) = GPU_STARTUP_INFO.get() {
                 self.log(gpu_msg.clone());
                 perf_log(gpu_msg);
+                self.gpu_info_logged = true;
             }
         }
 
@@ -2968,12 +2988,21 @@ impl EvertyDeskApp {
             {
                 33 // ~30fps while an interactive operation is pending.
             } else {
-                // Server mode (EVERTYDESK_SERVER_MODE=1 or detected server GPU):
-                // slow the idle repaint to 2 fps. The UI still responds to mouse
-                // events instantly (winit wakes for any OS event), but we don't
-                // hammer a BMC/WARP GPU with 1-second timer wakeups that cost
-                // disproportionate CPU on those adapters.
-                if server_mode_active() { 500 } else { 1000 }
+                // WARP (no GPU): each egui frame is pure CPU work via D3D12
+                // software rasteriser. 5-second repaint = ~0.2fps idle = minimal
+                // CPU. The UI still responds instantly to mouse/keyboard events
+                // because winit wakes on every OS input event regardless.
+                // Proper fix: run as --host (headless, zero render overhead).
+                //
+                // Other server GPUs (Aspeed, Matrox, etc.): 500ms is enough
+                // to keep the UI responsive without hammering BMC adapters.
+                if IS_WARP_ADAPTER.load(std::sync::atomic::Ordering::Relaxed) {
+                    5000
+                } else if server_mode_active() {
+                    500
+                } else {
+                    1000
+                }
             };
             ctx.request_repaint_after(Duration::from_millis(repaint_ms));
         }
