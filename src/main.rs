@@ -1039,6 +1039,8 @@ struct EvertyDeskApp {
     auto_reconnect: bool,
     /// Scheduled instant to call connect() again (None = no pending reconnect).
     reconnect_after: Option<Instant>,
+    /// When the toolbar was last hovered/triggered (for fullscreen auto-hide).
+    toolbar_last_active: Instant,
     connection_state: ConnectionState,
     worker: Option<Receiver<WorkerEvent>>,
     session_tx: Option<mpsc::Sender<SessionCommand>>,
@@ -1464,6 +1466,7 @@ impl EvertyDeskApp {
             last_error_at: None,
             auto_reconnect: true,
             reconnect_after: None,
+            toolbar_last_active: Instant::now(),
             connection_state: ConnectionState::Idle,
             worker: None,
             session_tx: None,
@@ -7627,9 +7630,22 @@ impl EvertyDeskApp {
             self.wheel_accum = egui::Vec2::ZERO;
         }
 
-        egui::Panel::top("software-remote-toolbar").show(ctx, |ui| {
-            self.remote_session_toolbar_ui(ui, ctx, false);
-        });
+        // In fullscreen, auto-hide the toolbar after 2s — reveal on mouse near top.
+        let show_toolbar = !self.remote_fullscreen || {
+            let near_top = ctx.input(|i| {
+                i.pointer.latest_pos()
+                    .map(|p| p.y < 56.0)
+                    .unwrap_or(false)
+            });
+            if near_top { self.toolbar_last_active = Instant::now(); }
+            self.toolbar_last_active.elapsed().as_secs_f32() < 2.0
+        };
+        if show_toolbar {
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            egui::Panel::top("software-remote-toolbar").show(ctx, |ui| {
+                self.remote_session_toolbar_ui(ui, ctx, false);
+            });
+        }
 
         // ── Плавающее перемещаемое окно с метриками (вместо нижней панели) ────
         self.stream_info_window(ctx);
@@ -7894,9 +7910,22 @@ impl EvertyDeskApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.remote_fullscreen));
             }
 
-            egui::Panel::top("remote-toolbar").show(ctx, |ui| {
-                self.remote_session_toolbar_ui(ui, ctx, true);
-            });
+            // In fullscreen, auto-hide the toolbar after 2s — reveal on mouse near top.
+            let show_toolbar = !self.remote_fullscreen || {
+                let near_top = ctx.input(|i| {
+                    i.pointer.latest_pos()
+                        .map(|p| p.y < 56.0)
+                        .unwrap_or(false)
+                });
+                if near_top { self.toolbar_last_active = Instant::now(); }
+                self.toolbar_last_active.elapsed().as_secs_f32() < 2.0
+            };
+            if show_toolbar {
+                ctx.request_repaint_after(std::time::Duration::from_millis(500));
+                egui::Panel::top("remote-toolbar").show(ctx, |ui| {
+                    self.remote_session_toolbar_ui(ui, ctx, true);
+                });
+            }
 
             // ── Плавающее перемещаемое окно с метриками (вместо нижней панели) ──
             self.stream_info_window(ctx);
@@ -8245,7 +8274,10 @@ impl EvertyDeskApp {
                         // not as bare text characters.
                         let text = egui_key_to_text(key).unwrap();
                         let mut mods = Vec::new();
-                        if modifiers.ctrl || modifiers.command { mods.push(ControlKey::Control); }
+                        if modifiers.ctrl { mods.push(ControlKey::Control); }
+                        // egui uses `command` for the OS command key (Win on Windows,
+                        // Cmd on macOS). Forward it as Meta so Win+key reaches remote.
+                        if modifiers.command { mods.push(ControlKey::Meta); }
                         if modifiers.alt { mods.push(ControlKey::Alt); }
                         if modifiers.shift { mods.push(ControlKey::Shift); }
                         self.send_command(SessionCommand::KeyTextWithModifiers { text, modifiers: mods });
