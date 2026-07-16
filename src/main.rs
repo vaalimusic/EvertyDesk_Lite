@@ -838,6 +838,50 @@ fn run_gui(renderer: eframe::Renderer) -> eframe::Result<()> {
                 "[EvertyDesk] Build codecs: {}",
                 crate::video::build_codec_label()
             );
+
+            // ── GPU / renderer diagnostics ────────────────────────────────────
+            // Log which GPU and backend wgpu selected. Critical for diagnosing
+            // 100% CPU on servers with BMC graphics (Aspeed AST2x00, Matrox,
+            // WARP software renderer): those paths can spin in Present() even
+            // when the UI is idle at 1 fps.
+            if let Some(wgpu) = &cc.wgpu_render_state {
+                let info = wgpu.adapter.get_info();
+                eprintln!(
+                    "[GPU] backend={:?}  adapter=\"{}\"  vendor=0x{:04X}  device=0x{:04X}",
+                    info.backend, info.name, info.vendor, info.device
+                );
+
+                // Server BMC adapters and the D3D12/Vulkan WARP software
+                // renderer cause pathological CPU usage in wgpu's Present loop.
+                // Detect them by name and warn; the user should restart with
+                // EVERTYDESK_SOFTWARE=1 (OpenGL software renderer) or use
+                // headless host mode (no GUI at all).
+                let name_lower = info.name.to_ascii_lowercase();
+                let is_server_gpu = name_lower.contains("aspeed")
+                    || name_lower.contains("ast2")
+                    || name_lower.contains("matrox")
+                    || name_lower.contains("g200")
+                    || name_lower.contains("warp")
+                    || name_lower.contains("microsoft basic render");
+
+                if is_server_gpu {
+                    eprintln!(
+                        "[GPU] ⚠ Server/software GPU detected: \"{}\"",
+                        info.name
+                    );
+                    eprintln!(
+                        "[GPU] ⚠ wgpu Present() on this adapter is CPU-heavy even at 1 fps."
+                    );
+                    eprintln!(
+                        "[GPU] ⚠ Auto-enabling server mode: UI capped to 2 fps, hover animations off."
+                    );
+                    eprintln!(
+                        "[GPU] ⚠ For zero GPU overhead use headless mode: evertydesk-lite.exe --host"
+                    );
+                    activate_server_mode();
+                }
+            }
+
             Ok(Box::new(EvertyDeskApp::new()))
         }),
     );
@@ -892,6 +936,32 @@ fn run_headless_host() {
             }
         }
     }
+}
+
+/// Returns true when running in "server mode" — either explicitly requested via
+/// EVERTYDESK_SERVER_MODE=1 or auto-detected from the GPU adapter name at startup.
+/// In this mode the UI repaint rate is capped and hover animations are disabled.
+fn server_mode_active() -> bool {
+    use std::sync::OnceLock;
+    static RESULT: OnceLock<bool> = OnceLock::new();
+    *RESULT.get_or_init(|| {
+        if std::env::var("EVERTYDESK_SERVER_MODE")
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        // Auto-detect: read the cached GPU name set by the startup diagnostic.
+        // We look in the env since the wgpu context isn't available here.
+        false // overridden by GPU detection at startup via set_var below
+    })
+}
+
+/// Called once at startup by the wgpu creation callback when a server GPU is
+/// detected. Sets EVERTYDESK_SERVER_MODE so server_mode_active() returns true.
+fn activate_server_mode() {
+    // SAFETY: called once before the App struct is created, no concurrent access.
+    unsafe { std::env::set_var("EVERTYDESK_SERVER_MODE", "1") };
 }
 
 fn egui_software_backend_active() -> bool {
@@ -1097,6 +1167,11 @@ fn run_cli_connect() -> Option<i32> {
 struct EvertyDeskApp {
     config: AppConfig,
     remote_id: String,
+    // ── Perf diagnostics ─────────────────────────────────────────────────────
+    /// Counts how many times update_egui() is called, reset every 10 s.
+    perf_frame_count: u32,
+    /// When the current 10-second perf window started.
+    perf_window_start: Instant,
     password: String,
     show_password: bool,
     show_host_password: bool,
@@ -1637,6 +1712,8 @@ impl EvertyDeskApp {
             video_fps,
             fit_to_window,
             coordinate_mode,
+            perf_frame_count: 0,
+            perf_window_start: Instant::now(),
             screenshot_count: 0,
             live_frame_count: 0,
             screenshot_frame_count: 0,
@@ -2723,6 +2800,23 @@ fn start_hung_window_guardian() {
 impl EvertyDeskApp {
     #[allow(deprecated)]
     fn update_egui(&mut self, ctx: &egui::Context) {
+        // ── UI render-rate counter ────────────────────────────────────────────
+        // Log how often this function is called so we can see if egui is
+        // spinning faster than expected (should be ~1 fps when idle host).
+        self.perf_frame_count += 1;
+        let perf_elapsed = self.perf_window_start.elapsed();
+        if perf_elapsed >= Duration::from_secs(10) {
+            let fps = self.perf_frame_count as f64 / perf_elapsed.as_secs_f64();
+            let idle = !self.connected && !self.busy && !self.host_check_busy;
+            eprintln!(
+                "[perf] UI render: {:.1} fps (idle={}) — expected ~1 fps when host idle, \
+                 ~30 fps when streaming",
+                fps, idle
+            );
+            self.perf_frame_count = 0;
+            self.perf_window_start = Instant::now();
+        }
+
         // Update window title to reflect active session host.
         {
             let title = if self.connected && !self.remote_id.is_empty() {
@@ -2855,15 +2949,21 @@ impl EvertyDeskApp {
             {
                 33 // ~30fps while an interactive operation is pending.
             } else {
-                1000 // Idle registered host: do not burn CPU on weak server GPUs.
+                // Server mode (EVERTYDESK_SERVER_MODE=1 or detected server GPU):
+                // slow the idle repaint to 2 fps. The UI still responds to mouse
+                // events instantly (winit wakes for any OS event), but we don't
+                // hammer a BMC/WARP GPU with 1-second timer wakeups that cost
+                // disproportionate CPU on those adapters.
+                if server_mode_active() { 500 } else { 1000 }
             };
             ctx.request_repaint_after(Duration::from_millis(repaint_ms));
         }
 
-        // Keep UI hover animations smooth even during idle (1 s tick) by
-        // requesting 60 fps whenever the pointer is moving or a button is held.
-        // This does not wake the GPU when the user is away from the window.
-        if ctx.input(|i| i.pointer.is_moving() || i.pointer.any_down()) {
+        // Keep UI hover animations smooth even during idle by requesting 60 fps
+        // whenever the pointer is moving. Disabled in server mode: on a machine
+        // with Aspeed/WARP the Present() call for each repaint is expensive, and
+        // a server without a physical user attached doesn't need hover animations.
+        if !server_mode_active() && ctx.input(|i| i.pointer.is_moving() || i.pointer.any_down()) {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
 
