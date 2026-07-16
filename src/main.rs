@@ -83,6 +83,28 @@ use ui::widgets::*;
 const APP_NAME: &str = "EvertyDesk Lite";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_SESSION_LOG_LINES: usize = 4_000;
+
+#[derive(Clone, Debug)]
+struct SessionSummary {
+    peer_id: String,
+    duration_secs: u64,
+    avg_kbps: u64,
+}
+
+fn version_is_newer(latest: &str, current: &str) -> bool {
+    fn parse(v: &str) -> Option<(u32, u32, u32)> {
+        let v = v.trim().trim_start_matches('v');
+        let mut parts = v.splitn(3, '.');
+        let major: u32 = parts.next()?.parse().ok()?;
+        let minor: u32 = parts.next()?.parse().ok()?;
+        let patch: u32 = parts.next().and_then(|p| p.split('-').next()).and_then(|p| p.parse().ok()).unwrap_or(0);
+        Some((major, minor, patch))
+    }
+    match (parse(current), parse(latest)) {
+        (Some(cur), Some(lat)) => lat > cur,
+        _ => false,
+    }
+}
 const SESSION_LOG_TRIM_LINES: usize = 500;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1004,6 +1026,7 @@ struct EvertyDeskApp {
     password: String,
     show_password: bool,
     show_host_password: bool,
+    whitelist_new_id: String,
     connect_kind: ConnectKind,
     shell_window_open: bool,
     shell_output: String,
@@ -1023,6 +1046,9 @@ struct EvertyDeskApp {
     new_contact_id: String,
     new_contact_note: String,
     contact_search: String,
+    contact_tag_filter: String,
+    contact_tag_new: String,
+    history_search: String,
     address_book_status: Option<String>,
     show_address_book_auth: bool,
     show_new_contact_dialog: bool,
@@ -1037,6 +1063,7 @@ struct EvertyDeskApp {
     last_error_at: Option<Instant>,
     /// Auto-reconnect after a dropped (not auth-failure) session.
     auto_reconnect: bool,
+    reconnect_attempts: u32,
     /// Scheduled instant to call connect() again (None = no pending reconnect).
     reconnect_after: Option<Instant>,
     /// When the toolbar was last hovered/triggered (for fullscreen auto-hide).
@@ -1047,6 +1074,8 @@ struct EvertyDeskApp {
     busy: bool,
     host_check_busy: bool,
     connected: bool,
+    session_started_at: Option<Instant>,
+    last_session_summary: Option<SessionSummary>,
     remote_viewer_open: bool,
     remote_viewer_window_spawned: bool,
     remote_fullscreen: bool,
@@ -1066,8 +1095,22 @@ struct EvertyDeskApp {
     remote_input_focused: bool,
     /// When true, all input (mouse+keyboard) is suppressed — view-only mode.
     view_only: bool,
+    /// User opted to wait for the remote peer to come online (retry on "ID does not exist").
+    wait_for_peer: bool,
+    /// How many "wait for peer" retry attempts have been made.
+    wait_peer_attempt: u32,
+    /// Result of last server ping: None = not run, Some(Ok(ms)) = success, Some(Err) = failed.
+    ping_result: Option<Result<u32, String>>,
+    /// Receiver for the background ping task.
+    ping_rx: Option<mpsc::Receiver<Result<u32, String>>>,
     /// Shows the keyboard shortcut reference popup.
     show_shortcuts_help: bool,
+    /// Latest available version string if newer than current, None otherwise.
+    update_available: Option<String>,
+    /// True if the version check background task is running.
+    version_check_running: bool,
+    /// Receives the result of the background version check.
+    version_rx: Option<mpsc::Receiver<Option<String>>>,
     remote_modifiers_down: RemoteModifierState,
     last_mouse_pos: Option<(i32, i32)>,
     /// True between a mouse-press that landed *inside* the remote screen and its
@@ -1438,6 +1481,7 @@ impl EvertyDeskApp {
             password: String::new(),
             show_password: false,
             show_host_password: false,
+            whitelist_new_id: String::new(),
             connect_kind: ConnectKind::Screen,
             shell_window_open: false,
             shell_output: String::new(),
@@ -1457,6 +1501,9 @@ impl EvertyDeskApp {
             new_contact_id: String::new(),
             new_contact_note: String::new(),
             contact_search: String::new(),
+            contact_tag_filter: String::new(),
+            contact_tag_new: String::new(),
+            history_search: String::new(),
             address_book_status: None,
             show_address_book_auth: false,
             show_new_contact_dialog: false,
@@ -1469,6 +1516,7 @@ impl EvertyDeskApp {
             last_error: None,
             last_error_at: None,
             auto_reconnect: true,
+            reconnect_attempts: 0,
             reconnect_after: None,
             toolbar_last_active: Instant::now(),
             connection_state: ConnectionState::Idle,
@@ -1477,6 +1525,8 @@ impl EvertyDeskApp {
             busy: false,
             host_check_busy: false,
             connected: false,
+            session_started_at: None,
+            last_session_summary: None,
             remote_viewer_open: false,
             remote_viewer_window_spawned: false,
             remote_fullscreen: false,
@@ -1496,6 +1546,13 @@ impl EvertyDeskApp {
             remote_input_focused: false,
             view_only: false,
             show_shortcuts_help: false,
+            update_available: None,
+            version_check_running: false,
+            version_rx: None,
+            wait_for_peer: false,
+            wait_peer_attempt: 0,
+            ping_result: None,
+            ping_rx: None,
             remote_modifiers_down: RemoteModifierState::default(),
             last_mouse_pos: None,
             remote_pointer_armed: false,
@@ -1691,8 +1748,10 @@ impl EvertyDeskApp {
         self.last_error = None;
         self.last_error_at = None;
         self.reconnect_after = None;
+        self.reconnect_attempts = 0;
         self.busy = true;
         self.connected = false;
+        self.session_started_at = None;
         self.remote_viewer_open = false;
         self.remote_viewer_window_spawned = false;
         self.shell_window_open = false;
@@ -1822,6 +1881,10 @@ impl EvertyDeskApp {
             SessionEvent::Connected(info) => {
                 self.busy = false;
                 self.connected = true;
+                self.session_started_at = Some(Instant::now());
+                self.wait_for_peer = false;
+                self.wait_peer_attempt = 0;
+                self.reconnect_attempts = 0;
                 self.remote_viewer_open = self.connect_kind == ConnectKind::Screen;
                 self.remote_viewer_window_spawned = false;
                 // Adaptive view by default: the remote desktop always scales to
@@ -2237,20 +2300,46 @@ impl EvertyDeskApp {
                 self.last_error_at = Some(Instant::now());
                 self.status = friendly_error(&err, self.ui_lang);
                 self.log(format!("Error: {err}"));
-                // Auto-reconnect unless this is an auth or "ID not found" error
-                // (those require user action before a retry will succeed).
-                let is_permanent = err.contains("Wrong Password")
-                    || err.contains("ID does not exist")
+                let is_id_not_found = err.contains("ID does not exist");
+                let is_auth_error = err.contains("Wrong Password")
                     || err.contains("Введите")
                     || err.contains("Enter ");
-                if self.auto_reconnect && !is_permanent && !self.remote_id.is_empty() {
+                let is_permanent = is_id_not_found || is_auth_error;
+                if !is_permanent && self.auto_reconnect && !self.remote_id.is_empty() {
+                    // Exponential backoff: 5s, 10s, 20s, 40s (max).
+                    self.reconnect_attempts += 1;
+                    let delay = (5u64 * (1u64 << (self.reconnect_attempts - 1).min(3))).min(40);
                     self.reconnect_after =
-                        Some(Instant::now() + std::time::Duration::from_secs(10));
+                        Some(Instant::now() + std::time::Duration::from_secs(delay));
+                } else if is_id_not_found && self.wait_for_peer && !self.remote_id.is_empty() {
+                    // User is waiting for the remote peer to open the app.
+                    const MAX_WAIT_ATTEMPTS: u32 = 20; // 20 × 15s = 5 min
+                    self.wait_peer_attempt += 1;
+                    if self.wait_peer_attempt <= MAX_WAIT_ATTEMPTS {
+                        self.reconnect_after =
+                            Some(Instant::now() + std::time::Duration::from_secs(15));
+                    } else {
+                        // Give up after 5 minutes.
+                        self.wait_for_peer = false;
+                        self.wait_peer_attempt = 0;
+                    }
                 }
             }
             SessionEvent::Closed => {
+                // Capture session summary before clearing state.
+                if let Some(started) = self.session_started_at {
+                    let dur = started.elapsed().as_secs();
+                    if dur > 0 {
+                        self.last_session_summary = Some(SessionSummary {
+                            peer_id: self.remote_id.clone(),
+                            duration_secs: dur,
+                            avg_kbps: self.stream_input_kbps,
+                        });
+                    }
+                }
                 self.busy = false;
                 self.connected = false;
+                self.session_started_at = None;
                 self.remote_viewer_open = false;
                 self.remote_viewer_window_spawned = false;
                 self.remote_fullscreen = false;
@@ -2613,6 +2702,35 @@ impl EvertyDeskApp {
             }
         }
 
+        // Launch version check once at startup.
+        if !self.version_check_running {
+            self.start_version_check();
+        }
+        // Poll ping result.
+        if let Some(rx) = self.ping_rx.take() {
+            match rx.try_recv() {
+                Ok(result) => { self.ping_result = Some(result); }
+                Err(mpsc::TryRecvError::Empty) => { self.ping_rx = Some(rx); }
+                Err(mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+
+        // Poll version check result.
+        if let Some(rx) = self.version_rx.take() {
+            match rx.try_recv() {
+                Ok(latest) => {
+                    self.version_check_running = false;
+                    self.update_available = latest;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.version_rx = Some(rx);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.version_check_running = false;
+                }
+            }
+        }
+
         self.poll_worker();
         self.poll_terminal_ai();
         self.maybe_request_terminal_auto_ai();
@@ -2880,24 +2998,131 @@ impl EvertyDeskApp {
             self.connect_ui_commercial(ui);
             return;
         }
+
+        // Quick-connect tabs from pinned history entries.
+        struct PinnedEntry { rid: String, note: String, last_unix: u64, count: u32 }
+        let pinned: Vec<PinnedEntry> = self
+            .config.ui.history.iter()
+            .filter(|e| e.pinned)
+            .map(|e| PinnedEntry {
+                rid: e.remote_id.clone(),
+                note: e.note.clone(),
+                last_unix: e.last_connected_unix,
+                count: e.connect_count,
+            })
+            .collect();
+        if !pinned.is_empty() {
+            // Ctrl+1…9 to jump to nth pinned entry
+            let ctrl_pressed = ui.input(|i| i.modifiers.ctrl);
+            if ctrl_pressed && !self.busy {
+                for (idx, entry) in pinned.iter().enumerate().take(9) {
+                    let key = egui::Key::from_name(&(idx + 1).to_string());
+                    if let Some(key) = key {
+                        if ui.input(|i| i.key_pressed(key)) {
+                            if self.connected { self.disconnect_session("Отключено"); }
+                            self.remote_id = entry.rid.clone();
+                            self.last_error = None;
+                        }
+                    }
+                }
+            }
+
+            ui.add_space(2.0);
+            ui.horizontal_wrapped(|ui| {
+                for (idx, entry) in pinned.iter().enumerate() {
+                    let is_active = self.connected && self.remote_id == entry.rid;
+                    let label = if entry.note.is_empty() { entry.rid.as_str() } else { entry.note.as_str() };
+                    let shortcut = if idx < 9 { format!(" [Ctrl+{}]", idx + 1) } else { String::new() };
+                    let tab_text = egui::RichText::new(format!("{} {}", if is_active { "🟢" } else { "⬜" }, label))
+                        .size(12.0);
+                    let btn = ui.add(egui::Button::new(tab_text).selected(is_active));
+                    if btn.clicked() && !self.busy {
+                        if self.connected { self.disconnect_session("Отключено"); }
+                        self.remote_id = entry.rid.clone();
+                        self.last_error = None;
+                        self.status = tr(self.ui_lang, "Готово", "Ready").to_owned();
+                    }
+                    // Tooltip: ID + last connected date + shortcut
+                    let last_str = if entry.last_unix > 0 {
+                        let elapsed = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs().saturating_sub(entry.last_unix))
+                            .unwrap_or(0);
+                        if elapsed < 3600 {
+                            tr(self.ui_lang, "< 1 часа назад", "< 1 hour ago").to_owned()
+                        } else if elapsed < 86400 {
+                            format!("{} {}", elapsed / 3600, tr(self.ui_lang, "ч назад", "h ago"))
+                        } else {
+                            format!("{} {}", elapsed / 86400, tr(self.ui_lang, "дн назад", "d ago"))
+                        }
+                    } else {
+                        String::new()
+                    };
+                    let tip = format!(
+                        "{}{}\n{} {}\n{}",
+                        entry.rid,
+                        shortcut,
+                        tr(self.ui_lang, "Подключений:", "Connections:"),
+                        entry.count,
+                        last_str
+                    );
+                    btn.on_hover_text(tip);
+                }
+                if ui.small_button(tr(self.ui_lang, "⭐ Управление", "⭐ Manage")).clicked() {
+                    self.mode = AppMode::History;
+                }
+            });
+            ui.add_space(4.0);
+            ui.separator();
+        }
+
         ui.add_space(6.0);
-        ui.label("ID удаленного ПК");
+        ui.horizontal(|ui| {
+            ui.label(tr(self.ui_lang, "ID удалённого ПК", "Remote PC ID"));
+            // Recent connections dropdown
+            let recent: Vec<(String, String)> = self.config.ui.history
+                .iter()
+                .take(8)
+                .map(|e| (e.remote_id.clone(), e.note.clone()))
+                .collect();
+            if !recent.is_empty() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.menu_button(tr(self.ui_lang, "▾ Недавние", "▾ Recent"), |ui| {
+                        ui.set_min_width(200.0);
+                        for (rid, note) in &recent {
+                            let label = if note.is_empty() {
+                                format_peer_id(rid)
+                            } else {
+                                format!("{} — {}", format_peer_id(rid), note)
+                            };
+                            if ui.selectable_label(self.remote_id == *rid, label).clicked() {
+                                self.remote_id = rid.clone();
+                                self.last_error = None;
+                                self.status = tr(self.ui_lang, "Готово", "Ready").to_owned();
+                                ui.close();
+                            }
+                        }
+                    });
+                });
+            }
+        });
         let remote_id_response = ui.add_enabled(
             !self.connected && !self.busy,
             egui::TextEdit::singleline(&mut self.remote_id).desired_width(f32::INFINITY),
         );
         ui.add_space(8.0);
-        ui.label("Пароль");
+        ui.label(tr(self.ui_lang, "Пароль", "Password"));
         let password_response = ui.add_enabled(
             !self.connected && !self.busy,
             egui::TextEdit::singleline(&mut self.password)
                 .password(!self.show_password)
                 .desired_width(f32::INFINITY),
         );
-        ui.small(
-            "Можно оставить пустым, если удаленный RustDesk разрешает подтверждение без пароля.",
-        );
-        ui.checkbox(&mut self.show_password, "Показать пароль");
+        ui.small(tr(self.ui_lang,
+            "Оставьте пустым, если удалённый ПК разрешает подтверждение без пароля.",
+            "Leave empty if the remote PC allows approval without a password.",
+        ));
+        ui.checkbox(&mut self.show_password, tr(self.ui_lang, "Показать пароль", "Show password"));
         if remote_id_response.changed() || password_response.changed() {
             self.last_error = None;
             if !self.connected && !self.busy {
@@ -2910,7 +3135,7 @@ impl EvertyDeskApp {
             if ui
                 .add_enabled(
                     !self.busy && !self.connected,
-                    egui::Button::new("Подключиться").min_size(egui::vec2(150.0, 32.0)),
+                    egui::Button::new(tr(self.ui_lang, "Подключиться", "Connect")).min_size(egui::vec2(150.0, 32.0)),
                 )
                 .clicked()
             {
@@ -2919,11 +3144,40 @@ impl EvertyDeskApp {
             if ui
                 .add_enabled(
                     self.connected || self.busy,
-                    egui::Button::new("Отключиться").min_size(egui::vec2(140.0, 32.0)),
+                    egui::Button::new(tr(self.ui_lang, "Отключиться", "Disconnect")).min_size(egui::vec2(140.0, 32.0)),
                 )
                 .clicked()
             {
                 self.disconnect_session("Отключено");
+            }
+            // Ping button + result indicator
+            let ping_busy = self.ping_rx.is_some();
+            let ping_label = if ping_busy {
+                tr(self.ui_lang, "⏳ Пинг…", "⏳ Pinging…")
+            } else {
+                tr(self.ui_lang, "🔍 Проверить связь", "🔍 Test connection")
+            };
+            if ui.add_enabled(!ping_busy, egui::Button::new(ping_label)).clicked() {
+                self.start_ping();
+            }
+            if let Some(ref result) = self.ping_result {
+                match result {
+                    Ok(ms) => {
+                        ui.label(
+                            egui::RichText::new(format!("🟢 {ms}ms"))
+                                .color(egui::Color32::from_rgb(0x4C, 0xBF, 0x7A))
+                                .size(12.0),
+                        );
+                    }
+                    Err(e) => {
+                        ui.label(
+                            egui::RichText::new(format!("🔴 {e}"))
+                                .color(egui::Color32::from_rgb(0xF0, 0x6A, 0x6A))
+                                .size(12.0),
+                        )
+                        .on_hover_text(tr(self.ui_lang, "Сервер недоступен", "Server unreachable"));
+                    }
+                }
             }
             if ui
                 .add_enabled(
@@ -2962,23 +3216,63 @@ impl EvertyDeskApp {
                     .clicked()
                 {
                     self.reconnect_after = None;
+                    self.wait_for_peer = false;
+                    self.wait_peer_attempt = 0;
                     self.connect();
                 }
+
+                // "Wait for peer" — shown when peer ID not found
+                let is_id_not_found = self.last_error.as_deref()
+                    .map(|e| e.contains("ID does not exist"))
+                    .unwrap_or(false);
+                if is_id_not_found && !self.wait_for_peer {
+                    if ui.button(tr(self.ui_lang, "🕐 Ждать", "🕐 Wait for them"))
+                        .on_hover_text(tr(
+                            self.ui_lang,
+                            "Повторять каждые 15с до 5 минут, пока удалённый не откроет программу",
+                            "Retry every 15s for up to 5 min until the remote opens the app",
+                        ))
+                        .clicked()
+                    {
+                        self.wait_for_peer = true;
+                        self.wait_peer_attempt = 0;
+                        self.reconnect_after = Some(Instant::now() + std::time::Duration::from_secs(15));
+                    }
+                }
+
                 if let Some(at) = self.reconnect_after {
                     let secs = at
                         .checked_duration_since(Instant::now())
                         .map(|d| d.as_secs() + 1)
                         .unwrap_or(0);
-                    let countdown_text = match self.ui_lang {
-                        UiLang::Ru => format!("Авто-переподключение через {secs}с…"),
-                        UiLang::En => format!("Auto-reconnect in {secs}s…"),
+                    let countdown_text = if self.wait_for_peer {
+                        let attempt = self.wait_peer_attempt + 1;
+                        match self.ui_lang {
+                            UiLang::Ru => format!("Ожидание… попытка {attempt}/20 через {secs}с"),
+                            UiLang::En => format!("Waiting… attempt {attempt}/20 in {secs}s"),
+                        }
+                    } else {
+                        let n = self.reconnect_attempts;
+                        match self.ui_lang {
+                            UiLang::Ru => format!("Попытка {n} · переподключение через {secs}с…"),
+                            UiLang::En => format!("Attempt {n} · reconnecting in {secs}s…"),
+                        }
                     };
                     ui.label(countdown_text);
+                    if ui
+                        .small_button(tr(self.ui_lang, "Сейчас", "Now"))
+                        .on_hover_text(tr(self.ui_lang, "Переподключить сейчас, не ждать", "Reconnect now, don't wait"))
+                        .clicked()
+                    {
+                        self.reconnect_after = Some(Instant::now());
+                    }
                     if ui
                         .small_button(tr(self.ui_lang, "Отмена", "Cancel"))
                         .clicked()
                     {
                         self.reconnect_after = None;
+                        self.wait_for_peer = false;
+                        self.wait_peer_attempt = 0;
                     }
                 }
             });
@@ -2991,6 +3285,65 @@ impl EvertyDeskApp {
                 "Окно экрана закрыто. Нажмите Экран, чтобы открыть его снова.",
                 "Screen window is closed. Click Screen to open it again.",
             ));
+        }
+
+        // Session summary (last closed session stats).
+        if let Some(ref summary) = self.last_session_summary.clone() {
+            if !self.connected && !self.busy {
+                ui.add_space(8.0);
+                let dur = summary.duration_secs;
+                let dur_str = if dur >= 3600 {
+                    format!("{:02}:{:02}:{:02}", dur / 3600, (dur % 3600) / 60, dur % 60)
+                } else {
+                    format!("{:02}:{:02}", dur / 60, dur % 60)
+                };
+                let bw_str = if summary.avg_kbps >= 1000 {
+                    format!("{:.1}M", summary.avg_kbps as f32 / 1000.0)
+                } else {
+                    format!("{}K", summary.avg_kbps)
+                };
+                let peer_short = format_peer_id(&summary.peer_id);
+                let stats_text = match self.ui_lang {
+                    UiLang::Ru => format!("⏱ Сеанс {peer_short}: {dur_str} · {bw_str}ps"),
+                    UiLang::En => format!("⏱ Session {peer_short}: {dur_str} · {bw_str}ps"),
+                };
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(stats_text)
+                            .size(11.5)
+                            .color(crate::theme::palette().text_weak),
+                    );
+                    if ui.small_button("✕").clicked() {
+                        self.last_session_summary = None;
+                    }
+                });
+            }
+        }
+
+        // Update available banner.
+        if let Some(version) = self.update_available.clone() {
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(4.0);
+            let dismiss_text = tr(self.ui_lang, "Скрыть", "Dismiss");
+            let banner_text = match self.ui_lang {
+                UiLang::Ru => format!("🆕 Доступна версия {version}. Обновите приложение."),
+                UiLang::En => format!("🆕 Version {version} is available. Please update."),
+            };
+            let mut dismiss = false;
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(&banner_text)
+                        .color(egui::Color32::from_rgb(0x85, 0xB7, 0xEB))
+                        .size(12.0),
+                );
+                if ui.small_button(dismiss_text).clicked() {
+                    dismiss = true;
+                }
+            });
+            if dismiss {
+                self.update_available = None;
+            }
         }
 
         if !self.events.is_empty() {
@@ -3112,6 +3465,31 @@ impl EvertyDeskApp {
 
         let spacer = (ui.available_height() - 50.0).max(10.0);
         ui.add_space(spacer);
+
+        // Theme toggle button (moon/sun)
+        {
+            use crate::theme::ThemeMode;
+            let (icon, tip) = match self.config.ui.theme_mode {
+                ThemeMode::Dark => ("☀", self.text("Переключить на светлую тему", "Switch to light theme")),
+                ThemeMode::Light => ("🌙", self.text("Переключить на тёмную тему", "Switch to dark theme")),
+                ThemeMode::System => ("⚙", self.text("Авто тема — нажмите для смены", "Auto theme — click to change")),
+            };
+            if ui
+                .add(egui::Button::new(egui::RichText::new(icon).size(18.0)).frame(false))
+                .on_hover_text(tip)
+                .clicked()
+            {
+                self.config.ui.theme_mode = match self.config.ui.theme_mode {
+                    ThemeMode::Dark => ThemeMode::Light,
+                    ThemeMode::Light => ThemeMode::Dark,
+                    ThemeMode::System => ThemeMode::Dark,
+                };
+                crate::theme::apply(ui.ctx(), self.config.ui.theme_mode);
+                let _ = self.config.save();
+            }
+        }
+
+        ui.add_space(4.0);
         let settings_label = self.text("Настройки", "Settings");
         if nav_icon_button(
             ui,
@@ -5996,7 +6374,43 @@ impl EvertyDeskApp {
             .size(13.0)
             .color(crate::theme::palette().text_weak),
         );
-        ui.add_space(16.0);
+        ui.add_space(12.0);
+
+        // Auto-prune entries older than 90 days (not pinned).
+        {
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let cutoff = now_unix.saturating_sub(90 * 24 * 3600);
+            self.config.ui.history.retain(|e| e.pinned || e.last_connected_unix >= cutoff);
+        }
+
+        // Search bar.
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.history_search)
+                    .hint_text(tr(self.ui_lang, "Поиск по ID или заметке…", "Search by ID or note…"))
+                    .desired_width(260.0),
+            );
+            if !self.history_search.is_empty()
+                && ui.small_button("✕").on_hover_text(tr(self.ui_lang, "Очистить", "Clear")).clicked()
+            {
+                self.history_search.clear();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{}: {}",
+                        tr(self.ui_lang, "Записей", "Records"),
+                        self.config.ui.history.len()
+                    ))
+                    .size(12.0)
+                    .color(crate::theme::palette().text_weak),
+                );
+            });
+        });
+        ui.add_space(12.0);
 
         if self.config.ui.history.is_empty() {
             card_frame().show(ui, |ui| {
@@ -6005,12 +6419,42 @@ impl EvertyDeskApp {
             return;
         }
 
+        // Pinned entries first, then by last_connected descending.
+        self.config.ui.history.sort_by(|a, b| {
+            b.pinned.cmp(&a.pinned)
+                .then(b.last_connected_unix.cmp(&a.last_connected_unix))
+        });
+
+        let query = self.history_search.trim().to_lowercase();
+
         let mut connect_to: Option<String> = None;
         let mut remove_id: Option<String> = None;
+        let mut toggle_pin: Option<String> = None;
+        let mut add_contact_id: Option<String> = None;
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         egui::ScrollArea::vertical().show(ui, |ui| {
             for entry in &mut self.config.ui.history {
+                if !query.is_empty() {
+                    let haystack = format!("{} {}", entry.remote_id, entry.note).to_lowercase();
+                    if !haystack.contains(&query) {
+                        continue;
+                    }
+                }
                 card_frame().show(ui, |ui| {
                     ui.horizontal(|ui| {
+                        // Pin star indicator
+                        let pin_icon = if entry.pinned { "⭐" } else { "☆" };
+                        let pin_tip = if entry.pinned {
+                            tr(self.ui_lang, "Открепить", "Unpin")
+                        } else {
+                            tr(self.ui_lang, "Закрепить наверху", "Pin to top")
+                        };
+                        if ui.small_button(pin_icon).on_hover_text(pin_tip).clicked() {
+                            toggle_pin = Some(entry.remote_id.clone());
+                        }
                         ui.vertical(|ui| {
                             ui.label(
                                 egui::RichText::new(format_peer_id(&entry.remote_id))
@@ -6018,10 +6462,34 @@ impl EvertyDeskApp {
                                     .strong()
                                     .color(crate::theme::palette().text),
                             );
+                            // Relative last-connected time
+                            let ago_secs = now_unix.saturating_sub(entry.last_connected_unix);
+                            let ago_str = if ago_secs < 60 {
+                                tr(self.ui_lang, "только что", "just now").to_owned()
+                            } else if ago_secs < 3600 {
+                                let m = ago_secs / 60;
+                                match self.ui_lang {
+                                    UiLang::Ru => format!("{m} мин назад"),
+                                    UiLang::En => format!("{m}m ago"),
+                                }
+                            } else if ago_secs < 86400 {
+                                let h = ago_secs / 3600;
+                                match self.ui_lang {
+                                    UiLang::Ru => format!("{h} ч назад"),
+                                    UiLang::En => format!("{h}h ago"),
+                                }
+                            } else {
+                                let d = ago_secs / 86400;
+                                match self.ui_lang {
+                                    UiLang::Ru => format!("{d} дн назад"),
+                                    UiLang::En => format!("{d}d ago"),
+                                }
+                            };
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "{}: {}",
-                                    tr(self.ui_lang, "Подключений", "Connections"),
+                                    "{} · {} {}",
+                                    ago_str,
+                                    tr(self.ui_lang, "Подключений", "Sessions"),
                                     entry.connect_count
                                 ))
                                 .size(12.0)
@@ -6037,6 +6505,19 @@ impl EvertyDeskApp {
                                 .clicked()
                             {
                                 connect_to = Some(entry.remote_id.clone());
+                            }
+                            // Add to contacts — only if not already there
+                            let norm = normalize_remote_id(&entry.remote_id);
+                            let already_contact = self.config.ui.contacts.iter()
+                                .any(|c| normalize_remote_id(&c.remote_id) == norm);
+                            if !already_contact {
+                                if ui
+                                    .small_button("★")
+                                    .on_hover_text(tr(self.ui_lang, "Добавить в контакты", "Add to contacts"))
+                                    .clicked()
+                                {
+                                    add_contact_id = Some(entry.remote_id.clone());
+                                }
                             }
                         });
                     });
@@ -6059,12 +6540,28 @@ impl EvertyDeskApp {
             }
         });
 
+        if let Some(id) = toggle_pin {
+            if let Some(e) = self.config.ui.history.iter_mut().find(|e| e.remote_id == id) {
+                e.pinned = !e.pinned;
+            }
+        }
         if let Some(id) = remove_id {
             self.config.ui.history.retain(|entry| entry.remote_id != id);
-            self.config.save();
-        } else {
-            self.config.save();
         }
+        if let Some(id) = add_contact_id {
+            // Add a local contact entry (note: not synced to address book server).
+            let note = self.config.ui.history.iter()
+                .find(|e| e.remote_id == id)
+                .map(|e| e.note.clone())
+                .unwrap_or_default();
+            self.config.ui.contacts.push(crate::settings::ContactEntry {
+                name: String::new(),
+                remote_id: id,
+                note,
+                ..Default::default()
+            });
+        }
+        self.config.save();
         if let Some(id) = connect_to {
             self.remote_id = id;
             self.mode = AppMode::Connect;
@@ -6284,6 +6781,32 @@ impl EvertyDeskApp {
                         self.host_pending_peer = None;
                     }
                 });
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                // "Always allow" — добавить в белый список и принять.
+                let always_txt = self.text("✅ Всегда разрешать", "✅ Always allow");
+                let always_hint = self.text(
+                    "Добавить в белый список — больше не будет спрашивать",
+                    "Add to whitelist — won't ask again",
+                );
+                if ui
+                    .button(egui::RichText::new(always_txt).size(12.0))
+                    .on_hover_text(always_hint)
+                    .clicked()
+                {
+                    let norm = normalize_remote_id(&peer_id);
+                    if !self.config.security.whitelist.iter().any(|w| normalize_remote_id(w) == norm) {
+                        self.config.security.whitelist.push(peer_id.clone());
+                        let _ = self.config.save();
+                    }
+                    if let Some(svc) = &self.host_service {
+                        svc.approve_incoming(&peer_id, true);
+                    }
+                    self.host_pending_peer = None;
+                }
             });
     }
 
@@ -6738,8 +7261,26 @@ impl EvertyDeskApp {
                     "[{}] Запрос подтверждения от {peer_id}",
                     timestamp_hms()
                 ));
-                self.host_pending_peer = Some(peer_id.clone());
-                self.host_status = format!("Требуется подтверждение: {peer_id}");
+                let norm = normalize_remote_id(&peer_id);
+                let whitelisted = self
+                    .config
+                    .security
+                    .whitelist
+                    .iter()
+                    .any(|w| normalize_remote_id(w) == norm);
+                if whitelisted {
+                    self.host_log.push(format!(
+                        "[{}] {peer_id} в белом списке — авто-подтверждение",
+                        timestamp_hms()
+                    ));
+                    if let Some(svc) = &self.host_service {
+                        svc.approve_incoming(&peer_id, true);
+                    }
+                    self.host_status = format!("Auto-approved: {peer_id}");
+                } else {
+                    self.host_pending_peer = Some(peer_id.clone());
+                    self.host_status = format!("Требуется подтверждение: {peer_id}");
+                }
             }
             HostEvent::SessionStarted { peer_id } => {
                 self.host_log
@@ -6789,6 +7330,46 @@ impl EvertyDeskApp {
             let _ = tx.send(WorkerEvent::HostServerCheck(result));
         });
         self.worker = Some(rx);
+    }
+
+    // ── Server ping ───────────────────────────────────────────────────────────
+
+    fn start_ping(&mut self) {
+        if self.ping_rx.is_some() {
+            return; // already running
+        }
+        self.ping_result = None;
+        let server = self.config.server.clone();
+        let (tx, rx) = mpsc::channel::<Result<u32, String>>();
+        self.ping_rx = Some(rx);
+        thread::spawn(move || {
+            let t0 = Instant::now();
+            let result = crate::transport::TransportClient::check_id_server(&server)
+                .map(|_| t0.elapsed().as_millis() as u32)
+                .map_err(|e| e);
+            let _ = tx.send(result);
+        });
+    }
+
+    // ── Update checker ────────────────────────────────────────────────────────
+
+    fn start_version_check(&mut self) {
+        if self.version_check_running {
+            return;
+        }
+        self.version_check_running = true;
+        let (tx, rx) = mpsc::channel::<Option<String>>();
+        self.version_rx = Some(rx);
+        thread::spawn(move || {
+            let latest = ureq::get("https://desk.everty.ru/api/client-version")
+                .timeout(std::time::Duration::from_secs(10))
+                .call()
+                .ok()
+                .and_then(|resp| resp.into_json::<serde_json::Value>().ok())
+                .and_then(|json| json.get("version")?.as_str().map(|s| s.to_owned()))
+                .filter(|v| version_is_newer(v, APP_VERSION));
+            let _ = tx.send(latest);
+        });
     }
 
     // ── Settings window ───────────────────────────────────────────────────────
@@ -6934,7 +7515,32 @@ impl EvertyDeskApp {
     }
 
     fn remote_video_profile_menu_ui(&mut self, ui: &mut egui::Ui) {
-        ui.label("Частота кадров");
+        // Quick presets row
+        ui.horizontal(|ui| {
+            if ui.button(tr(self.ui_lang, "🎯 Поддержка", "🎯 Support"))
+                .on_hover_text(tr(self.ui_lang, "15 fps · авто кодек (поддержка и офис)", "15 fps · auto codec (support & office)"))
+                .clicked()
+            {
+                self.set_remote_video_profile(15, CodecPreference::Auto);
+                ui.close();
+            }
+            if ui.button(tr(self.ui_lang, "⚖️ Баланс", "⚖️ Balance"))
+                .on_hover_text(tr(self.ui_lang, "30 fps · авто кодек", "30 fps · auto codec"))
+                .clicked()
+            {
+                self.set_remote_video_profile(30, CodecPreference::Auto);
+                ui.close();
+            }
+            if ui.button(tr(self.ui_lang, "🎮 Игры", "🎮 Game"))
+                .on_hover_text(tr(self.ui_lang, "60 fps · H264 (минимальная задержка)", "60 fps · H264 (lowest latency)"))
+                .clicked()
+            {
+                self.set_remote_video_profile(60, CodecPreference::H264);
+                ui.close();
+            }
+        });
+        ui.separator();
+        ui.label(tr(self.ui_lang, "Частота кадров", "Frame rate"));
         ui.horizontal_wrapped(|ui| {
             for fps in [15, 20, 30, 60] {
                 if ui
@@ -6948,7 +7554,7 @@ impl EvertyDeskApp {
         });
 
         ui.separator();
-        ui.label("Кодек");
+        ui.label(tr(self.ui_lang, "Кодек", "Codec"));
         for codec in [
             CodecPreference::Auto,
             CodecPreference::H264,
@@ -6957,8 +7563,8 @@ impl EvertyDeskApp {
             CodecPreference::Vp9,
         ] {
             let label = match codec {
-                CodecPreference::Av1 if !crate::video::av1_available() => "AV1 (эксп.)",
-                CodecPreference::H265 if !crate::video::h265_available() => "H265 (если доступен)",
+                CodecPreference::Av1 if !crate::video::av1_available() => tr(self.ui_lang, "AV1 (эксп.)", "AV1 (exp.)"),
+                CodecPreference::H265 if !crate::video::h265_available() => tr(self.ui_lang, "H265 (если доступен)", "H265 (if available)"),
                 _ => codec.label(),
             };
             if ui
@@ -7028,30 +7634,30 @@ impl EvertyDeskApp {
             self.request_visual_refresh_after_input();
             ui.close();
         }
-        if ui.button("Заблокировать экран").clicked() {
+        if ui.button(tr(self.ui_lang, "Заблокировать экран", "Lock screen")).clicked() {
             self.send_command(SessionCommand::KeyControl(ControlKey::LockScreen));
             self.request_visual_refresh_after_input();
             ui.close();
         }
 
         ui.separator();
-        if ui.button("Сохранить лог").clicked() {
+        if ui.button(tr(self.ui_lang, "Сохранить лог", "Save log")).clicked() {
             self.save_session_log_file();
             ui.close();
         }
-        if ui.button("Собрать отчёт").clicked() {
+        if ui.button(tr(self.ui_lang, "Собрать отчёт", "Save report")).clicked() {
             self.save_support_report();
             ui.close();
         }
 
         ui.separator();
         if let Some((x, y)) = self.last_mouse_pos {
-            ui.label(format!("Мышь: {x}, {y}"));
+            ui.label(format!("{}: {x}, {y}", tr(self.ui_lang, "Мышь", "Mouse")));
         }
         if let Some(age) = self.last_screenshot_age_ms() {
-            ui.label(format!("Возраст кадра: {age} мс"));
+            ui.label(format!("{}: {age} ms", tr(self.ui_lang, "Возраст кадра", "Frame age")));
         }
-        ui.label(format!("Событий ввода: {}", self.input_events_sent));
+        ui.label(format!("{}: {}", tr(self.ui_lang, "Событий ввода", "Input events"), self.input_events_sent));
     }
 
     fn refresh_remote_screen(&mut self) {
@@ -7172,6 +7778,24 @@ impl EvertyDeskApp {
                 ui.menu_button(egui::RichText::new(ph::DOTS_THREE).size(16.0), |ui| {
                     self.remote_more_menu_ui(ui)
                 });
+
+                // Session timer: HH:MM:SS or MM:SS
+                if let Some(started) = self.session_started_at {
+                    let secs = started.elapsed().as_secs();
+                    let timer_str = if secs >= 3600 {
+                        format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+                    } else {
+                        format!("{:02}:{:02}", secs / 60, secs % 60)
+                    };
+                    ui.label(
+                        egui::RichText::new(format!("{} {timer_str}", ph::TIMER))
+                            .size(12.0)
+                            .color(t.text_weak)
+                            .monospace(),
+                    )
+                    .on_hover_text(self.text("Время сеанса", "Session duration"));
+                    ctx.request_repaint_after(std::time::Duration::from_secs(1));
+                }
                 if remote_icon_toggle(
                     ui,
                     ph::DESKTOP,
@@ -7185,23 +7809,32 @@ impl EvertyDeskApp {
                         self.send_command(SessionCommand::ListVms);
                     }
                 }
-                // Профиль кодека/FPS/задержки — компактный бейдж-меню.
+                // Профиль кодека/FPS/задержки/трафика — компактный бейдж-меню.
                 let quality_badge = {
                     let codec = self.config.display.codec.label();
                     let fps = self.video_fps;
                     let lat = self.latency_ms.map(|ms| format!(" · {ms}ms")).unwrap_or_default();
+                    let bw = if self.stream_input_kbps > 0 {
+                        if self.stream_input_kbps >= 1000 {
+                            format!(" · {:.1}M", self.stream_input_kbps as f32 / 1000.0)
+                        } else {
+                            format!(" · {}K", self.stream_input_kbps)
+                        }
+                    } else {
+                        String::new()
+                    };
                     let lat_color = self.latency_ms.map(|ms| {
                         if ms < 80 { egui::Color32::from_rgb(0x4C, 0xBF, 0x7A) }
                         else if ms < 200 { egui::Color32::from_rgb(0xFF, 0xB7, 0x47) }
                         else { egui::Color32::from_rgb(0xF0, 0x6A, 0x6A) }
                     }).unwrap_or(t.text);
-                    egui::RichText::new(format!("{}  {} · {}fps{}", ph::SLIDERS_HORIZONTAL, codec, fps, lat))
+                    egui::RichText::new(format!("{}  {} · {}fps{}{}", ph::SLIDERS_HORIZONTAL, codec, fps, lat, bw))
                         .size(12.5)
                         .color(lat_color)
                 };
                 ui.menu_button(quality_badge, |ui| self.remote_video_profile_menu_ui(ui))
                     .response
-                    .on_hover_text(self.text("Кодек · FPS · Задержка", "Codec · FPS · Latency"));
+                    .on_hover_text(self.text("Кодек · FPS · Задержка · Трафик (вход)", "Codec · FPS · Latency · Bandwidth (in)"));
             });
         });
     }
@@ -7717,6 +8350,9 @@ impl EvertyDeskApp {
                     ("Мышь внутри экрана → клик", "Click inside screen", "Захватить ввод клавиатуры", "Capture keyboard input"),
                     ("глаз ☞ тулбар", "Eye ☞ toolbar", "Режим «только просмотр»", "Toggle view-only mode"),
                     ("Камера ☞ тулбар", "Camera ☞ toolbar", "Сохранить кадр PNG", "Save frame as PNG"),
+                    ("⏱ таймер ☞ тулбар", "⏱ timer ☞ toolbar", "Время текущего сеанса", "Current session duration"),
+                    ("Ctrl+1…9", "Ctrl+1…9", "Быстрое подключение к закреплённому ID", "Quick-connect to pinned ID"),
+                    ("☀/🌙 ☞ боковая панель", "☀/🌙 ☞ sidebar", "Переключить тему", "Toggle dark/light theme"),
                 ];
                 egui::Grid::new("shortcuts-grid")
                     .num_columns(2)
@@ -9790,6 +10426,7 @@ fn remember_history(history: &mut Vec<ConnectionHistoryEntry>, id: &str) {
                 note: String::new(),
                 last_connected_unix: now,
                 connect_count: 1,
+                pinned: false,
             },
         );
     }

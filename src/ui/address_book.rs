@@ -140,8 +140,48 @@ impl EvertyDeskApp {
             }
         });
 
+        // Collect all unique tags for the tag-filter bar.
+        let all_tags: Vec<String> = {
+            let mut tags: Vec<String> = self
+                .config
+                .ui
+                .contacts
+                .iter()
+                .flat_map(|c| c.tags.iter().cloned())
+                .collect();
+            tags.sort_unstable();
+            tags.dedup();
+            tags
+        };
+        if !all_tags.is_empty() {
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new(tr(lang, "Тег:", "Tag:"))
+                        .size(12.0)
+                        .color(crate::theme::palette().text_weak),
+                );
+                let clear_selected = self.contact_tag_filter == *"" || self.contact_tag_filter.is_empty();
+                if ui.selectable_label(clear_selected, tr(lang, "Все", "All")).clicked() {
+                    self.contact_tag_filter.clear();
+                }
+                for tag in &all_tags {
+                    let selected = &self.contact_tag_filter == tag;
+                    let chip_text = egui::RichText::new(format!("# {tag}")).size(12.0);
+                    if ui.selectable_label(selected, chip_text).clicked() {
+                        if selected {
+                            self.contact_tag_filter.clear();
+                        } else {
+                            self.contact_tag_filter = tag.clone();
+                        }
+                    }
+                }
+            });
+        }
+
         ui.add_space(12.0);
         let query = self.contact_search.trim().to_lowercase();
+        let tag_filter = self.contact_tag_filter.trim().to_lowercase();
         let visible_indices: Vec<usize> = self
             .config
             .ui
@@ -150,11 +190,15 @@ impl EvertyDeskApp {
             .enumerate()
             .filter_map(|(idx, contact)| {
                 let haystack = format!(
-                    "{} {} {} {}",
-                    contact.name, contact.remote_id, contact.note, contact.os
+                    "{} {} {} {} {}",
+                    contact.name, contact.remote_id, contact.note, contact.os,
+                    contact.tags.join(" ")
                 )
                 .to_lowercase();
-                if query.is_empty() || haystack.contains(&query) {
+                let text_match = query.is_empty() || haystack.contains(&query);
+                let tag_match = tag_filter.is_empty()
+                    || contact.tags.iter().any(|t| t.to_lowercase() == tag_filter);
+                if text_match && tag_match {
                     Some(idx)
                 } else {
                     None
@@ -460,6 +504,7 @@ impl EvertyDeskApp {
                             os: address_book::platform().to_owned(),
                             last_seen: String::new(),
                             online: false,
+                            tags: Vec::new(),
                         };
                         match self.add_address_book_contact(&contact) {
                             Ok(()) => {
@@ -592,6 +637,54 @@ impl EvertyDeskApp {
                     tr(lang, "владелец, отдел, назначение", "owner, team, purpose"),
                     false,
                 );
+
+                // ── Tags ─────────────────────────────────────────────────────
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(tr(lang, "Теги", "Tags"))
+                        .size(12.0)
+                        .color(crate::theme::palette().text_weak),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    let mut remove_tag: Option<usize> = None;
+                    for (ti, tag) in contact.tags.iter().enumerate() {
+                        ui.label(
+                            egui::RichText::new(format!("#{tag}"))
+                                .size(11.5)
+                                .color(crate::theme::palette().accent),
+                        );
+                        if ui
+                            .small_button("✕")
+                            .on_hover_text(tr(lang, "Удалить тег", "Remove tag"))
+                            .clicked()
+                        {
+                            remove_tag = Some(ti);
+                        }
+                        ui.add_space(4.0);
+                    }
+                    if let Some(ti) = remove_tag {
+                        contact.tags.remove(ti);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.contact_tag_new)
+                            .hint_text(tr(lang, "Новый тег…", "New tag…"))
+                            .desired_width(130.0)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    let tag_trimmed = self.contact_tag_new.trim().to_lowercase();
+                    let can_add = !tag_trimmed.is_empty()
+                        && !contact.tags.iter().any(|t| t.to_lowercase() == tag_trimmed);
+                    if ui
+                        .add_enabled(can_add, egui::Button::new(tr(lang, "Добавить", "Add")))
+                        .clicked()
+                    {
+                        contact.tags.push(tag_trimmed.clone());
+                        self.contact_tag_new.clear();
+                    }
+                });
+
                 ui.add_space(4.0);
                 ui.horizontal_wrapped(|ui| {
                     let t = crate::theme::palette();
@@ -703,7 +796,20 @@ impl EvertyDeskApp {
         };
 
         self.config.ui.address_book_guid = guid;
-        self.config.ui.contacts = contacts;
+        // Preserve local-only fields (tags) that the server doesn't know about.
+        let mut merged = contacts;
+        for entry in &mut merged {
+            if let Some(existing) = self
+                .config
+                .ui
+                .contacts
+                .iter()
+                .find(|c| normalize_remote_id(&c.remote_id) == normalize_remote_id(&entry.remote_id))
+            {
+                entry.tags = existing.tags.clone();
+            }
+        }
+        self.config.ui.contacts = merged;
         self.config.ui.address_book_signed_in = true;
         self.config.save();
         Ok(())
@@ -874,7 +980,21 @@ fn draw_contact_tile(
             .truncate(),
         );
 
-        ui.add_space((inner_height - 98.0).max(0.0));
+        // Tag chips
+        if !contact.tags.is_empty() {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                for tag in &contact.tags {
+                    ui.label(
+                        egui::RichText::new(format!("#{tag}"))
+                            .size(10.5)
+                            .color(crate::theme::palette().accent),
+                    );
+                }
+            });
+        }
+
+        ui.add_space((inner_height - 98.0 - if contact.tags.is_empty() { 0.0 } else { 18.0 }).max(0.0));
         ui.horizontal(|ui| {
             status_dot(
                 ui,

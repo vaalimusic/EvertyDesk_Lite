@@ -741,9 +741,10 @@ fn encode_loop(
     // cleared within ~3 frames the loop would spin. Bail out after that.
     let mut evrt_disconnect_spins: u8 = 0;
     // H264/H265: 1200ms — частые IDR для recovery при потере пакетов.
-    // EVRTCK: 10s — FEC покрывает потери; IDR = полный кадр = дорого.
+    // EVRTCK: настраивается (default 20s); IDR = полный кадр ~850KB дорогой.
     const IDR_MIN_H264: Duration = Duration::from_millis(1_200);
-    const IDR_MIN_EVRTCK: Duration = Duration::from_secs(10);
+    let idr_interval_secs = config.display.idr_interval_secs.clamp(5, 120);
+    let idr_min_evrtck = Duration::from_secs(u64::from(idr_interval_secs));
     let mut current_idr_min = IDR_MIN_H264;
     const SPIN: Duration = Duration::from_micros(1_500);
     // Отслеживаем переход EVRTCK inactive→active: нужен IDR при первом подключении.
@@ -759,7 +760,7 @@ fn encode_loop(
         // Вычисляем evrt_on один раз в начале итерации — используется
         // везде ниже (fps-cap, want_idr, dispatch, bitrate-cap).
         let evrt_on = evrt_active.lock().map(|g| g.is_some()).unwrap_or(false);
-        current_idr_min = if evrt_on { IDR_MIN_EVRTCK } else { IDR_MIN_H264 };
+        current_idr_min = if evrt_on { idr_min_evrtck } else { IDR_MIN_H264 };
 
         // Любой переход кодека требует IDR на принимающей стороне:
         // • H264→EVRTCK: клиент должен получить полный первый кадр (не дельту).

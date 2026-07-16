@@ -76,7 +76,7 @@ impl EvertyDeskApp {
 
                     ui.add_space(8.0);
 
-                    security_section(ui, selected_lang, draft, &mut self.show_password);
+                    security_section(ui, selected_lang, draft, &mut self.show_password, &mut self.whitelist_new_id);
 
                     ui.add_space(8.0);
 
@@ -85,7 +85,19 @@ impl EvertyDeskApp {
                     });
                 });
 
+                // Detect unsaved changes.
+                let has_changes = self.settings_draft.as_ref().map(|d| {
+                    serde_json::to_string(d).ok() != serde_json::to_string(&self.config).ok()
+                }).unwrap_or(false);
+
                 ui.separator();
+                if has_changes {
+                    ui.label(
+                        egui::RichText::new(tr(selected_lang, "⚠ Есть несохранённые изменения", "⚠ You have unsaved changes"))
+                            .size(12.0)
+                            .color(egui::Color32::from_rgb(0xFF, 0xB7, 0x47)),
+                    );
+                }
                 ui.horizontal(|ui| {
                     if ui
                         .add(
@@ -127,9 +139,24 @@ impl EvertyDeskApp {
                         }
                         self.show_settings = false;
                     }
-                    if ui.button(tr(selected_lang, "Закрыть", "Close")).clicked() {
-                        self.settings_draft = None;
-                        self.show_settings = false;
+                    {
+                        let close_label = if has_changes {
+                            tr(selected_lang, "Отменить изменения", "Discard changes")
+                        } else {
+                            tr(selected_lang, "Закрыть", "Close")
+                        };
+                        let close_btn = if has_changes {
+                            egui::Button::new(
+                                egui::RichText::new(close_label)
+                                    .color(egui::Color32::from_rgb(0xF0, 0x6A, 0x6A)),
+                            )
+                        } else {
+                            egui::Button::new(egui::RichText::new(close_label))
+                        };
+                        if ui.add(close_btn).clicked() {
+                            self.settings_draft = None;
+                            self.show_settings = false;
+                        }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
@@ -282,7 +309,7 @@ impl EvertyDeskApp {
             ui.add_space(8.0);
 
             // ── Security (with password) ─────────────────────────────────────
-            security_section(ui, selected_lang, draft, &mut self.show_password);
+            security_section(ui, selected_lang, draft, &mut self.show_password, &mut self.whitelist_new_id);
 
             ui.add_space(8.0);
 
@@ -445,6 +472,7 @@ fn security_section(
     selected_lang: UiLang,
     draft: &mut AppConfig,
     show_password: &mut bool,
+    whitelist_new_id: &mut String,
 ) {
     settings_section(ui, tr(selected_lang, "Безопасность", "Security"), |ui| {
         // ── Password row ─────────────────────────────────────────────────────
@@ -541,6 +569,80 @@ fn security_section(
                 "Allow clipboard access",
             ),
         );
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        // ── Whitelist ────────────────────────────────────────────────────────
+        ui.label(
+            egui::RichText::new(tr(
+                selected_lang,
+                "Белый список (авто-подключение без диалога)",
+                "Whitelist (auto-approve without dialog)",
+            ))
+            .size(13.0)
+            .strong()
+            .color(crate::theme::palette().text),
+        );
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new(tr(
+                selected_lang,
+                "ID из этого списка подключаются без подтверждения",
+                "IDs in this list connect without approval prompt",
+            ))
+            .size(11.0)
+            .color(crate::theme::palette().text_muted),
+        );
+        ui.add_space(6.0);
+
+        // Existing entries
+        let mut remove_idx: Option<usize> = None;
+        for (i, wid) in draft.security.whitelist.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(wid)
+                        .monospace()
+                        .size(13.0)
+                        .color(crate::theme::palette().text),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("✕")
+                        .on_hover_text(tr(selected_lang, "Удалить", "Remove"))
+                        .clicked()
+                    {
+                        remove_idx = Some(i);
+                    }
+                });
+            });
+        }
+        if let Some(idx) = remove_idx {
+            draft.security.whitelist.remove(idx);
+        }
+
+        // Add new entry
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(whitelist_new_id)
+                    .hint_text(tr(selected_lang, "Добавить ID…", "Add ID…"))
+                    .desired_width(180.0)
+                    .font(egui::TextStyle::Monospace),
+            );
+            let can_add = !whitelist_new_id.trim().is_empty()
+                && !draft
+                    .security
+                    .whitelist
+                    .contains(&whitelist_new_id.trim().to_owned());
+            if ui
+                .add_enabled(can_add, egui::Button::new(tr(selected_lang, "Добавить", "Add")))
+                .clicked()
+            {
+                draft.security.whitelist.push(whitelist_new_id.trim().to_owned());
+                whitelist_new_id.clear();
+            }
+        });
     });
 }
 
@@ -685,6 +787,38 @@ fn network_section(
 // ── Video settings body (shared) ─────────────────────────────────────────────
 
 fn video_settings_body(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut AppConfig) {
+    // Quick presets row
+    ui.horizontal(|ui| {
+        ui.label(tr(selected_lang, "Пресет", "Preset"));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button(tr(selected_lang, "🎮 Игры", "🎮 Game")).clicked() {
+                draft.display.streaming_mode = crate::settings::StreamingMode::Game;
+                draft.display.target_fps = 60;
+                draft.display.adaptive_quality = false;
+            }
+            if ui.button(tr(selected_lang, "⚖️ Баланс", "⚖️ Balanced")).clicked() {
+                draft.display.streaming_mode = crate::settings::StreamingMode::Interactive;
+                draft.display.target_fps = 30;
+                draft.display.adaptive_quality = true;
+            }
+            if ui.button(tr(selected_lang, "🎯 Поддержка", "🎯 Support")).clicked() {
+                draft.display.streaming_mode = crate::settings::StreamingMode::Support;
+                draft.display.target_fps = 15;
+                draft.display.adaptive_quality = true;
+            }
+        });
+    });
+    ui.label(
+        egui::RichText::new(tr(
+            selected_lang,
+            "Пресет меняет режим, FPS и адаптацию — остальное настраивается вручную ниже.",
+            "Preset changes mode, FPS and adaptation — other settings remain manual.",
+        ))
+        .size(11.0)
+        .color(crate::theme::palette().text_muted),
+    );
+    ui.add_space(8.0);
+
     // Row: Codec + Mode on same line
     ui.horizontal(|ui| {
         ui.label(tr(selected_lang, "Кодек", "Codec"));
@@ -790,6 +924,35 @@ fn video_settings_body(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut App
         "Отключает интерполяцию при уменьшении масштаба. Чёткость без биленьшного размытия.",
         "Disables interpolation when downscaling. Sharp pixels, no bilinear blur.",
     ));
+
+    // IDR interval (EVRTCK keyframe frequency)
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.label(tr(selected_lang, "IDR-интервал (EVRTCK)", "IDR interval (EVRTCK)"))
+            .on_hover_text(tr(
+                selected_lang,
+                "Как часто отправлять полный ключевой кадр. Реже = меньше трафика, дольше восстановление после потери. 20s оптимально для LAN.",
+                "How often to send a full keyframe. Less frequent = lower bandwidth, slower recovery from packet loss. 20s is optimal for LAN.",
+            ));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            for secs in [60u32, 30, 20, 15, 10] {
+                ui.selectable_value(
+                    &mut draft.display.idr_interval_secs,
+                    secs,
+                    format!("{secs}s"),
+                );
+            }
+        });
+    });
+    ui.label(
+        egui::RichText::new(tr(
+            selected_lang,
+            "Текущий дефолт 20s: при 3.4 Мбит/с IDR ~850КБ ≈ 2с передачи = 10% overhead",
+            "Default 20s: at 3.4 Mbps IDR ~850 KB ≈ 2s transmission = 10% overhead",
+        ))
+        .size(11.0)
+        .color(crate::theme::palette().text_muted),
+    );
 }
 
 fn llm_settings_section(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut AppConfig) {

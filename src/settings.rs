@@ -40,6 +40,9 @@ pub struct SecurityConfig {
     /// Let the remote side read / paste the local clipboard.
     #[serde(default = "default_true")]
     pub allow_clipboard: bool,
+    /// IDs that bypass the approval dialog and are auto-accepted.
+    #[serde(default)]
+    pub whitelist: Vec<String>,
 }
 
 impl Default for SecurityConfig {
@@ -48,6 +51,7 @@ impl Default for SecurityConfig {
             require_confirmation: false,
             allow_keyboard_mouse: true,
             allow_clipboard: true,
+            whitelist: Vec::new(),
         }
     }
 }
@@ -200,6 +204,12 @@ pub struct DisplayConfig {
     /// Defaults to false (bilinear/linear interpolation).
     #[serde(default)]
     pub nearest_neighbour: bool,
+
+    /// EVRTCK IDR (keyframe) interval in seconds. Larger = fewer full-frame
+    /// transmissions, better throughput; smaller = faster recovery from loss.
+    /// Default 20s balances the 854 KB / 3.4 Mbps ≈ 2s transmission cost.
+    #[serde(default = "default_idr_interval_secs")]
+    pub idr_interval_secs: u32,
 }
 
 impl Default for DisplayConfig {
@@ -214,6 +224,7 @@ impl Default for DisplayConfig {
             fsr_quality: FsrQualitySetting::Off,
             fsr_sharpness: default_fsr_sharpness(),
             nearest_neighbour: false,
+            idr_interval_secs: default_idr_interval_secs(),
         }
     }
 }
@@ -346,6 +357,8 @@ pub struct ConnectionHistoryEntry {
     pub last_connected_unix: u64,
     #[serde(default)]
     pub connect_count: u32,
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -362,6 +375,9 @@ pub struct ContactEntry {
     pub last_seen: String,
     #[serde(default)]
     pub online: bool,
+    /// Local-only tags for grouping/filtering (not synced to server).
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -556,6 +572,9 @@ fn default_fit_to_window() -> bool {
 }
 fn default_target_fps() -> u32 {
     30
+}
+fn default_idr_interval_secs() -> u32 {
+    20
 }
 fn default_adaptive_quality() -> bool {
     true

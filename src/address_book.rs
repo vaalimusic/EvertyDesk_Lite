@@ -84,6 +84,7 @@ pub(crate) fn peers(api_url: &str, token: &str, guid: &str) -> Result<Vec<Contac
                     os: extract_string_field(peer, "platform").unwrap_or_default(),
                     last_seen: String::new(),
                     online: false,
+                    tags: Vec::new(),
                 });
             }
         }
