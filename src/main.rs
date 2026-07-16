@@ -2578,6 +2578,11 @@ impl EvertyDeskApp {
             }
         }
 
+        // Live system theme tracking: re-apply every frame when mode is Auto.
+        if self.config.ui.theme_mode == crate::theme::ThemeMode::System {
+            crate::theme::apply(ctx, crate::theme::ThemeMode::System);
+        }
+
         if ctx.input(|i| i.viewport().close_requested()) {
             self.shutdown();
             // Start the watchdog NOW, before eframe begins WGPU/D3D teardown.

@@ -22,6 +22,8 @@ use std::sync::{OnceLock, RwLock};
 pub enum ThemeMode {
     Dark,
     Light,
+    /// Follow the OS / system preference (updated live, no restart needed).
+    System,
 }
 
 impl Default for ThemeMode {
@@ -35,6 +37,7 @@ impl ThemeMode {
         match self {
             ThemeMode::Dark => "Тёмная",
             ThemeMode::Light => "Светлая",
+            ThemeMode::System => "Авто",
         }
     }
 
@@ -42,11 +45,24 @@ impl ThemeMode {
         match self {
             ThemeMode::Dark => ThemeMode::Light,
             ThemeMode::Light => ThemeMode::Dark,
+            ThemeMode::System => ThemeMode::Dark,
         }
     }
 
     pub fn is_dark(self) -> bool {
         matches!(self, ThemeMode::Dark)
+    }
+
+    /// Resolve to a concrete Dark or Light mode.
+    /// When `System`, falls back to Dark if OS preference is unavailable.
+    pub fn resolved(self, system: Option<egui::Theme>) -> Self {
+        match self {
+            ThemeMode::System => match system {
+                Some(egui::Theme::Light) => ThemeMode::Light,
+                _ => ThemeMode::Dark,
+            },
+            other => other,
+        }
     }
 }
 
@@ -160,6 +176,7 @@ impl Palette {
         match mode {
             ThemeMode::Dark => Self::dark(),
             ThemeMode::Light => Self::light(),
+            ThemeMode::System => Self::dark(), // caller should resolve System first
         }
     }
 }
@@ -178,7 +195,8 @@ pub fn palette() -> Palette {
 
 /// Применить тему: настроить egui Visuals+Style и обновить глобальную палитру.
 pub fn apply(ctx: &egui::Context, mode: ThemeMode) {
-    let p = Palette::for_mode(mode);
+    let resolved = mode.resolved(ctx.system_theme());
+    let p = Palette::for_mode(resolved);
     if let Ok(mut w) = current().write() {
         *w = p;
     }

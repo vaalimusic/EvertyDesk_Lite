@@ -233,6 +233,7 @@ impl EvertyDeskApp {
                         use crate::theme::ThemeMode;
                         let dark_label = tr(selected_lang, "🌙 Тёмная", "🌙 Dark");
                         let light_label = tr(selected_lang, "☀ Светлая", "☀ Light");
+                        let auto_label = tr(selected_lang, "⚙ Авто", "⚙ Auto");
                         if language_button(ui, light_label, draft.ui.theme_mode == ThemeMode::Light).clicked() {
                             draft.ui.theme_mode = ThemeMode::Light;
                             crate::theme::apply(ui.ctx(), ThemeMode::Light);
@@ -240,6 +241,10 @@ impl EvertyDeskApp {
                         if language_button(ui, dark_label, draft.ui.theme_mode == ThemeMode::Dark).clicked() {
                             draft.ui.theme_mode = ThemeMode::Dark;
                             crate::theme::apply(ui.ctx(), ThemeMode::Dark);
+                        }
+                        if language_button(ui, auto_label, draft.ui.theme_mode == ThemeMode::System).clicked() {
+                            draft.ui.theme_mode = ThemeMode::System;
+                            crate::theme::apply(ui.ctx(), ThemeMode::System);
                         }
                     });
                 });
