@@ -1064,6 +1064,8 @@ struct EvertyDeskApp {
     log_status: Option<String>,
     report_status: Option<String>,
     remote_input_focused: bool,
+    /// When true, all input (mouse+keyboard) is suppressed — view-only mode.
+    view_only: bool,
     remote_modifiers_down: RemoteModifierState,
     last_mouse_pos: Option<(i32, i32)>,
     /// True between a mouse-press that landed *inside* the remote screen and its
@@ -1490,6 +1492,7 @@ impl EvertyDeskApp {
             log_status: None,
             report_status: None,
             remote_input_focused: false,
+            view_only: false,
             remote_modifiers_down: RemoteModifierState::default(),
             last_mouse_pos: None,
             remote_pointer_armed: false,
@@ -7140,6 +7143,21 @@ impl EvertyDeskApp {
             if remote_icon_toggle(ui, ph::GAUGE, self.show_stream_info, "Метрики потока (плавающее окно)").clicked() {
                 self.show_stream_info = !self.show_stream_info;
             }
+            // View-only mode: disables all mouse+keyboard input forwarding.
+            if remote_icon_toggle(
+                ui,
+                ph::EYE,
+                self.view_only,
+                self.text("Только просмотр (ввод заблокирован)", "View-only (input disabled)"),
+            )
+            .clicked()
+            {
+                self.view_only = !self.view_only;
+                if self.view_only {
+                    self.remote_input_focused = false;
+                    self.release_remote_modifiers();
+                }
+            }
 
             // ── Правая группа: профиль AV, VM, меню (заполняет пространство) ──
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -8121,7 +8139,7 @@ impl EvertyDeskApp {
             }
         } // end cursor overlay (VP9 excluded)
 
-        if self.connected {
+        if self.connected && !self.view_only {
             // Mouse movement
             let pointer_pos = response
                 .interact_pointer_pos()
@@ -8232,6 +8250,9 @@ impl EvertyDeskApp {
     }
 
     fn handle_remote_keyboard(&mut self, ctx: &egui::Context) {
+        if self.view_only {
+            return;
+        }
         let current_modifiers = ctx.input(|input| input.modifiers);
         self.sync_remote_modifiers(current_modifiers);
 
