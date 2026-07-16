@@ -7156,18 +7156,23 @@ impl EvertyDeskApp {
                         self.send_command(SessionCommand::ListVms);
                     }
                 }
-                // Профиль кодека/FPS — компактный бейдж-меню.
-                ui.menu_button(
-                    egui::RichText::new(format!(
-                        "{}  {} · {}fps",
-                        ph::SLIDERS_HORIZONTAL,
-                        self.config.display.codec.label(),
-                        self.video_fps
-                    ))
-                    .size(12.5)
-                    .color(t.text),
-                    |ui| self.remote_video_profile_menu_ui(ui),
-                );
+                // Профиль кодека/FPS/задержки — компактный бейдж-меню.
+                let quality_badge = {
+                    let codec = self.config.display.codec.label();
+                    let fps = self.video_fps;
+                    let lat = self.latency_ms.map(|ms| format!(" · {ms}ms")).unwrap_or_default();
+                    let lat_color = self.latency_ms.map(|ms| {
+                        if ms < 80 { egui::Color32::from_rgb(0x4C, 0xBF, 0x7A) }
+                        else if ms < 200 { egui::Color32::from_rgb(0xFF, 0xB7, 0x47) }
+                        else { egui::Color32::from_rgb(0xF0, 0x6A, 0x6A) }
+                    }).unwrap_or(t.text);
+                    egui::RichText::new(format!("{}  {} · {}fps{}", ph::SLIDERS_HORIZONTAL, codec, fps, lat))
+                        .size(12.5)
+                        .color(lat_color)
+                };
+                ui.menu_button(quality_badge, |ui| self.remote_video_profile_menu_ui(ui))
+                    .response
+                    .on_hover_text(self.text("Кодек · FPS · Задержка", "Codec · FPS · Latency"));
             });
         });
     }
