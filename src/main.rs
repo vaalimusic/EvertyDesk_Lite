@@ -2617,10 +2617,10 @@ impl EvertyDeskApp {
         self.poll_hyperv_session(ctx);
         if let Some(image) = self.pending_image.take() {
             if let Some(texture) = self.remote_texture.as_mut() {
-                texture.set(image, remote_texture_options());
+                texture.set(image, remote_texture_options(self.config.display.nearest_neighbour));
             } else {
                 self.remote_texture =
-                    Some(ctx.load_texture("remote-screen", image, remote_texture_options()));
+                    Some(ctx.load_texture("remote-screen", image, remote_texture_options(self.config.display.nearest_neighbour)));
             }
             ctx.request_repaint();
         }
@@ -8771,10 +8771,15 @@ fn health_dot(fps: f32) -> (egui::Color32, bool) {
     }
 }
 
-fn remote_texture_options() -> egui::TextureOptions {
+fn remote_texture_options(nearest_neighbour: bool) -> egui::TextureOptions {
+    let filter = if nearest_neighbour {
+        egui::TextureFilter::Nearest
+    } else {
+        egui::TextureFilter::Linear
+    };
     egui::TextureOptions {
         magnification: egui::TextureFilter::Nearest,
-        minification: egui::TextureFilter::Linear,
+        minification: filter,
         wrap_mode: egui::TextureWrapMode::ClampToEdge,
         mipmap_mode: None,
     }

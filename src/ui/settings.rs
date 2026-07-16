@@ -750,6 +750,21 @@ fn video_settings_body(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut App
             }
         });
     });
+
+    ui.add_space(4.0);
+    ui.checkbox(
+        &mut draft.display.nearest_neighbour,
+        tr(
+            selected_lang,
+            "Пиксель-перфект (ближайший сосед, без размытия)",
+            "Pixel-perfect (nearest-neighbour, no blur)",
+        ),
+    )
+    .on_hover_text(tr(
+        selected_lang,
+        "Отключает интерполяцию при уменьшении масштаба. Чёткость без биленьшного размытия.",
+        "Disables interpolation when downscaling. Sharp pixels, no bilinear blur.",
+    ));
 }
 
 fn llm_settings_section(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut AppConfig) {

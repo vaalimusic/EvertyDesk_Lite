@@ -194,6 +194,12 @@ pub struct DisplayConfig {
     /// Применяется только когда `fsr_quality != Off`.
     #[serde(default = "default_fsr_sharpness")]
     pub fsr_sharpness: f32,
+
+    /// Use nearest-neighbour filtering for the remote screen texture.
+    /// Produces pixel-perfect 1:1 display; useful at integer zoom levels.
+    /// Defaults to false (bilinear/linear interpolation).
+    #[serde(default)]
+    pub nearest_neighbour: bool,
 }
 
 impl Default for DisplayConfig {
@@ -207,6 +213,7 @@ impl Default for DisplayConfig {
             streaming_mode: StreamingMode::Support,
             fsr_quality: FsrQualitySetting::Off,
             fsr_sharpness: default_fsr_sharpness(),
+            nearest_neighbour: false,
         }
     }
 }
