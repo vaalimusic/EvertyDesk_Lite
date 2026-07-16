@@ -292,6 +292,8 @@ pub fn apply_palette(ctx: &egui::Context, p: &Palette) {
     style.spacing.menu_margin = Margin::same(8);
     style.spacing.window_margin = Margin::same(16);
     style.spacing.interact_size.y = 34.0;
+    // 150ms hover transitions feel snappy but not abrupt (egui default: ~83ms).
+    style.animation_time = 0.15;
     ctx.set_global_style(style);
 }
 

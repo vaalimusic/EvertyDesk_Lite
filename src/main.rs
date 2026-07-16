@@ -277,18 +277,44 @@ fn install_panic_logger() {
 }
 
 fn num_cpus_for_encode() -> usize {
-    // On servers with many cores, cap at 8: encoding 4K tiles scales well up
-    // to ~8 threads and gains little beyond that, while fewer threads means
-    // lower peak RAM (each rayon worker holds a zstd CCtx ≈ 256 KB).
-    let cpus = num_cpus();
-    cpus.min(8).max(1)
+    // Use at most half the logical cores, hard-capped at 8.
+    //
+    // Why half: encode throughput scales well up to ~8 threads on tile-parallel
+    // workloads; beyond that gains are diminishing while each extra thread costs
+    // another zstd CCtx (~256 KB) and steals scheduler time from other processes.
+    // Taking half leaves a comfortable headroom even on a 4-core laptop.
+    //
+    // Why 8 max: 4K frame at 32×32 tiles = ~3600 tiles; 8 threads already
+    // parallelises a keyframe in <5ms. Going to 16 threads saves <1ms while
+    // doubling the OS-scheduler contention.
+    (num_cpus() / 2).max(1).min(8)
 }
 
 fn num_cpus() -> usize {
-    // std::thread::available_parallelism() was stabilised in Rust 1.59.
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
+}
+
+/// Set the current thread to below-normal scheduling priority.
+/// On Windows this is the real safety net: even if we have 8 encode threads,
+/// they will only consume genuinely idle CPU time — any normal-priority work
+/// (UI, network, OS services) preempts them immediately.
+#[cfg(windows)]
+fn set_encode_thread_priority() {
+    use windows::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+    };
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
+#[cfg(not(windows))]
+fn set_encode_thread_priority() {
+    // On Linux/macOS we could use libc::setpriority(PRIO_PROCESS, 0, 5) but
+    // niceness requires privileges on some distros. The thread count cap alone
+    // is sufficient there — leave priority at default.
 }
 
 fn main() -> eframe::Result<()> {
@@ -302,6 +328,21 @@ fn main() -> eframe::Result<()> {
         .unwrap_or_else(|| num_cpus_for_encode());
     let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(evrtck_threads)
+        .spawn_handler(|thread| {
+            let mut b = std::thread::Builder::new().name(
+                thread.name().unwrap_or("evrtck-encode").to_owned(),
+            );
+            if let Some(stack) = thread.stack_size() {
+                b = b.stack_size(stack);
+            }
+            b.spawn(move || {
+                // Run encode threads at below-normal OS priority so they
+                // never starve the host machine even on many-core servers.
+                set_encode_thread_priority();
+                thread.run();
+            })?;
+            Ok(())
+        })
         .build_global();
 
     install_panic_logger();
@@ -2817,6 +2858,13 @@ impl EvertyDeskApp {
                 1000 // Idle registered host: do not burn CPU on weak server GPUs.
             };
             ctx.request_repaint_after(Duration::from_millis(repaint_ms));
+        }
+
+        // Keep UI hover animations smooth even during idle (1 s tick) by
+        // requesting 60 fps whenever the pointer is moving or a button is held.
+        // This does not wake the GPU when the user is away from the window.
+        if ctx.input(|i| i.pointer.is_moving() || i.pointer.any_down()) {
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
 
         let software_backend = egui_software_backend_active();
@@ -10048,8 +10096,86 @@ fn configure_ui_scale(ctx: &egui::Context) {
 
 fn configure_icon_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
+
+    // On Windows, Segoe UI renders far smoother than egui's bundled Ubuntu
+    // Light: it's hinted specifically for LCD screens and Windows' compositing
+    // pipeline. Load it from the system fonts directory (present on Win7+).
+    // If unavailable (non-Windows or custom install), fall back to the egui
+    // default with a slight atlas-scale boost for cleaner rendering.
+    #[cfg(windows)]
+    load_system_font_windows(&mut fonts);
+
+    #[cfg(not(windows))]
+    tweak_default_font_scale(&mut fonts);
+
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
     ctx.set_fonts(fonts);
+
+    // Adjust the text-style sizes to match Segoe UI's optical metrics.
+    let mut style = (*ctx.global_style()).clone();
+    style.text_styles = {
+        use egui::{FontFamily::Proportional, FontId, TextStyle::*};
+        [
+            (Heading,   FontId::new(17.0, Proportional)),
+            (Body,      FontId::new(14.0, Proportional)),
+            (Button,    FontId::new(14.0, Proportional)),
+            (Small,     FontId::new(12.0, Proportional)),
+            (Monospace, FontId::new(13.0, egui::FontFamily::Monospace)),
+        ]
+        .into()
+    };
+    ctx.set_global_style(style);
+}
+
+#[cfg(windows)]
+fn load_system_font_windows(fonts: &mut egui::FontDefinitions) {
+    // Prefer Segoe UI Variable (Win11) → Segoe UI (Win7+) → bail to egui default.
+    let candidates = [
+        r"C:\Windows\Fonts\SegoeUIVF.ttf",
+        r"C:\Windows\Fonts\segoeui.ttf",
+    ];
+    for path in &candidates {
+        if let Ok(data) = std::fs::read(path) {
+            let fd = std::sync::Arc::new(
+                egui::FontData::from_owned(data).tweak(egui::FontTweak {
+                    scale: 1.0,
+                    // Nudge baseline slightly up so Segoe UI sits optically
+                    // centred in egui's line boxes (it sits a touch low by default).
+                    y_offset_factor: -0.10,
+                    y_offset: 0.0,
+                    // Force hinting ON: Segoe UI is hinted for LCD rendering and
+                    // looks significantly smoother with hinting than without.
+                    hinting_override: Some(true),
+                    ..Default::default()
+                }),
+            );
+            fonts.font_data.insert("SegoeUI".to_owned(), fd);
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "SegoeUI".to_owned());
+            return;
+        }
+    }
+    // Segoe not found — apply scale tweak to egui's bundled Ubuntu Light.
+    tweak_default_font_scale(fonts);
+}
+
+fn tweak_default_font_scale(fonts: &mut egui::FontDefinitions) {
+    if let Some(fd) = fonts.font_data.get_mut("Ubuntu-Light") {
+        replace_font_tweak(fd, egui::FontTweak {
+            scale: 1.1,
+            hinting_override: Some(true),
+            ..Default::default()
+        });
+    }
+}
+
+fn replace_font_tweak(fd: &mut std::sync::Arc<egui::FontData>, tweak: egui::FontTweak) {
+    let mut inner = (**fd).clone();
+    inner.tweak = tweak;
+    *fd = std::sync::Arc::new(inner);
 }
 
 #[cfg(windows)]
