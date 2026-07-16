@@ -1066,6 +1066,8 @@ struct EvertyDeskApp {
     remote_input_focused: bool,
     /// When true, all input (mouse+keyboard) is suppressed — view-only mode.
     view_only: bool,
+    /// Shows the keyboard shortcut reference popup.
+    show_shortcuts_help: bool,
     remote_modifiers_down: RemoteModifierState,
     last_mouse_pos: Option<(i32, i32)>,
     /// True between a mouse-press that landed *inside* the remote screen and its
@@ -1493,6 +1495,7 @@ impl EvertyDeskApp {
             report_status: None,
             remote_input_focused: false,
             view_only: false,
+            show_shortcuts_help: false,
             remote_modifiers_down: RemoteModifierState::default(),
             last_mouse_pos: None,
             remote_pointer_armed: false,
@@ -7647,6 +7650,13 @@ impl EvertyDeskApp {
             self.last_mouse_pos = None;
             self.wheel_accum = egui::Vec2::ZERO;
         }
+        // Show shortcut help on ? key when not capturing remote input.
+        if !self.remote_input_focused
+            && ctx.input(|i| i.key_pressed(egui::Key::Questionmark))
+        {
+            self.show_shortcuts_help = !self.show_shortcuts_help;
+        }
+        self.shortcuts_help_window(ctx);
 
         // In fullscreen, auto-hide the toolbar after 2s — reveal on mouse near top.
         let show_toolbar = !self.remote_fullscreen || {
@@ -7676,6 +7686,48 @@ impl EvertyDeskApp {
             .show(ctx, |ui| {
                 self.remote_screen_ui(ui);
             });
+    }
+
+    /// Keyboard shortcuts reference popup (press ? when not capturing remote input).
+    fn shortcuts_help_window(&mut self, ctx: &egui::Context) {
+        if !self.show_shortcuts_help {
+            return;
+        }
+        let mut open = self.show_shortcuts_help;
+        let lang = self.ui_lang;
+        egui::Window::new(tr(lang, "Горячие клавиши", "Keyboard shortcuts"))
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(340.0)
+            .default_pos(egui::pos2(100.0, 80.0))
+            .show(ctx, |ui| {
+                let rows: &[(&str, &str, &str, &str)] = &[
+                    ("?", "?", "Горячие клавиши", "Show shortcuts"),
+                    ("Ctrl+Esc", "Ctrl+Esc", "Освободить захват ввода", "Release keyboard capture"),
+                    ("F11", "F11", "Полный экран (вне захвата)", "Fullscreen (outside capture)"),
+                    ("Ctrl+C/V/X/Z", "Ctrl+C/V/X/Z", "Буфер: копировать/вставить/вырезать/отмена", "Clipboard: copy/paste/cut/undo"),
+                    ("Win+любая", "Win+any", "Отправить Win+клавишу удалённому ПК", "Send Win+key to remote"),
+                    ("Esc", "Esc", "Отправить Esc удалённому ПК (вим/диалоги)", "Send Esc to remote (vi/dialogs)"),
+                    ("Мышь внутри экрана → клик", "Click inside screen", "Захватить ввод клавиатуры", "Capture keyboard input"),
+                    ("глаз ☞ тулбар", "Eye ☞ toolbar", "Режим «только просмотр»", "Toggle view-only mode"),
+                    ("Камера ☞ тулбар", "Camera ☞ toolbar", "Сохранить кадр PNG", "Save frame as PNG"),
+                ];
+                egui::Grid::new("shortcuts-grid")
+                    .num_columns(2)
+                    .striped(true)
+                    .spacing([16.0, 4.0])
+                    .show(ui, |ui| {
+                        for &(key_ru, key_en, desc_ru, desc_en) in rows {
+                            let key = match lang { UiLang::Ru => key_ru, UiLang::En => key_en };
+                            let desc = match lang { UiLang::Ru => desc_ru, UiLang::En => desc_en };
+                            ui.label(egui::RichText::new(key).monospace().strong());
+                            ui.label(desc);
+                            ui.end_row();
+                        }
+                    });
+            });
+        self.show_shortcuts_help = open;
     }
 
     /// Красивое окно с детальной диагностикой стрима (по кнопке ℹ Детали).
@@ -7927,6 +7979,10 @@ impl EvertyDeskApp {
                 self.remote_fullscreen = !self.remote_fullscreen;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.remote_fullscreen));
             }
+            if !self.remote_input_focused && ctx.input(|i| i.key_pressed(egui::Key::Questionmark)) {
+                self.show_shortcuts_help = !self.show_shortcuts_help;
+            }
+            self.shortcuts_help_window(ctx);
 
             // In fullscreen, auto-hide the toolbar after 2s — reveal on mouse near top.
             let show_toolbar = !self.remote_fullscreen || {
