@@ -7966,7 +7966,10 @@ impl EvertyDeskApp {
             .unwrap_or(false);
         let _ = live_video_active; // kept for future use
 
-        let hover_cursor = if self.cursor_texture.is_some() {
+        // Hide OS cursor when we draw our own overlay, unless VP9 is active
+        // (VP9/Desktop Duplication bakes cursor into the frame already).
+        let vp9_cursor_in_frame = self.last_frame_codec == "VP9";
+        let hover_cursor = if self.cursor_texture.is_some() && !vp9_cursor_in_frame {
             egui::CursorIcon::None
         } else {
             egui::CursorIcon::Default
@@ -8054,8 +8057,11 @@ impl EvertyDeskApp {
             painter.galley(pill_rect.min + pad, galley, egui::Color32::WHITE);
         }
 
-        // Draw remote cursor overlay on top of the video for all codecs.
-        {
+        // Draw remote cursor overlay on top of the video.
+        // Skip for VP9: Desktop Duplication API bakes the hardware cursor into
+        // the captured frame, so the overlay causes a double cursor.
+        let vp9_active = self.last_frame_codec == "VP9";
+        if !vp9_active {
             if let Some((cursor_tex, hotx, hoty)) = &self.cursor_texture {
                 let cursor_px = cursor_tex.size_vec2();
                 let draw_pos = if let Some(rpos) = self.cursor_pos {
@@ -8079,7 +8085,7 @@ impl EvertyDeskApp {
                     egui::Color32::WHITE,
                 );
             }
-        } // end cursor overlay
+        } // end cursor overlay (VP9 excluded)
 
         if self.connected {
             // Mouse movement
