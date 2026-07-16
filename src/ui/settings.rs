@@ -46,6 +46,28 @@ impl EvertyDeskApp {
                                 },
                             );
                         });
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label(tr(selected_lang, "Масштаб интерфейса", "UI scale"));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if draft.ui.ui_scale == 0.0 {
+                                        // Show platform default
+                                        let default_scale = if cfg!(target_os = "macos") { 1.08_f32 } else { 1.0_f32 };
+                                        draft.ui.ui_scale = default_scale;
+                                    }
+                                    let label = format!("{:.0}%", draft.ui.ui_scale * 100.0);
+                                    ui.label(&label);
+                                    ui.add(
+                                        egui::Slider::new(&mut draft.ui.ui_scale, 0.75..=2.0)
+                                            .step_by(0.05)
+                                            .show_value(false)
+                                            .trailing_fill(true),
+                                    );
+                                },
+                            );
+                        });
                     });
 
                     ui.add_space(8.0);

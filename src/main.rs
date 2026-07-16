@@ -2561,6 +2561,14 @@ impl EvertyDeskApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
         }
 
+        // Apply user-configured UI zoom (0.0 = platform default).
+        {
+            let scale = self.config.ui.ui_scale;
+            if scale > 0.0 {
+                ctx.set_zoom_factor(scale.clamp(0.75, 2.0));
+            }
+        }
+
         if ctx.input(|i| i.viewport().close_requested()) {
             self.shutdown();
             // Start the watchdog NOW, before eframe begins WGPU/D3D teardown.
@@ -3510,6 +3518,35 @@ impl EvertyDeskApp {
                     .size(12.0)
                     .color(status_color),
             );
+        }
+        if self.last_error.is_some() {
+            ui.horizontal(|ui| {
+                if ui
+                    .small_button(self.text("🔄 Повторить", "🔄 Retry"))
+                    .clicked()
+                {
+                    self.reconnect_after = None;
+                    self.connect();
+                }
+                if let Some(at) = self.reconnect_after {
+                    let secs = at
+                        .checked_duration_since(Instant::now())
+                        .map(|d| d.as_secs() + 1)
+                        .unwrap_or(0);
+                    let msg = match self.ui_lang {
+                        UiLang::Ru => format!("авто-переподключение через {secs}с"),
+                        UiLang::En => format!("auto-reconnect in {secs}s"),
+                    };
+                    ui.label(
+                        egui::RichText::new(msg)
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(130, 140, 155)),
+                    );
+                    if ui.small_button(self.text("✕", "✕")).clicked() {
+                        self.reconnect_after = None;
+                    }
+                }
+            });
         }
 
         if self.config.ui.show_connection_details {

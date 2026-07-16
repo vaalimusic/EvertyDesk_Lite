@@ -325,6 +325,9 @@ pub struct UiConfig {
     /// Тема оформления (тёмная/светлая).
     #[serde(default)]
     pub theme_mode: crate::theme::ThemeMode,
+    /// UI zoom factor (0.0 = platform default: 1.08 on macOS, 1.0 elsewhere).
+    #[serde(default)]
+    pub ui_scale: f32,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -386,6 +389,7 @@ impl Default for UiConfig {
             address_book_guid: String::new(),
             agent_machine_id: String::new(),
             theme_mode: crate::theme::ThemeMode::default(),
+            ui_scale: 0.0,
         }
     }
 }
