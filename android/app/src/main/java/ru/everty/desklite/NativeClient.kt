@@ -17,8 +17,9 @@ class NativeClient {
         idServer: String,
         relayServer: String,
         publicKey: String,
+        codec: String = "EVRTCK",
     ): Boolean {
-        handle = nativeStart(id, password, apiUrl, idServer, relayServer, publicKey)
+        handle = nativeStart(id, password, apiUrl, idServer, relayServer, publicKey, codec)
         return handle != 0L
     }
 
@@ -29,8 +30,9 @@ class NativeClient {
         idServer: String,
         relayServer: String,
         publicKey: String,
+        codec: String = "EVRTCK",
     ): Boolean {
-        handle = nativeStartTouchpad(id, password, apiUrl, idServer, relayServer, publicKey)
+        handle = nativeStartTouchpad(id, password, apiUrl, idServer, relayServer, publicKey, codec)
         return handle != 0L
     }
 
@@ -105,9 +107,21 @@ class NativeClient {
     fun status(): String = if (handle == 0L) "—" else nativeStatus(handle)
     fun isConnected(): Boolean = handle != 0L && nativeIsConnected(handle)
 
+    /** Сообщить хосту максимальное разрешение экрана клиента (до старта). */
+    fun setMaxResolution(width: Int, height: Int) = nativeSetMaxResolution(width, height)
+
     fun stop() {
         if (handle != 0L) { nativeStop(handle); handle = 0 }
     }
+
+    /** Достать PCM фрейм из аудио очереди (16-bit stereo LE). null = нет данных. */
+    fun pollAudio(): ByteArray? = if (handle != 0L) nativePollAudio(handle) else null
+
+    /** Sample rate аудио потока (из AudioConfig хоста). Default 48000. */
+    fun audioSampleRate(): Int = nativeGetAudioSampleRate()
+
+    /** Текущая глубина аудио очереди в фреймах (без изъятия). Для jitter buffer. */
+    fun audioQueueDepth(): Int = nativeAudioQueueDepth()
 
     private external fun nativeStart(
         id: String,
@@ -116,6 +130,7 @@ class NativeClient {
         idServer: String,
         relayServer: String,
         publicKey: String,
+        codec: String,
     ): Long
     private external fun nativeStartTouchpad(
         id: String,
@@ -124,6 +139,7 @@ class NativeClient {
         idServer: String,
         relayServer: String,
         publicKey: String,
+        codec: String,
     ): Long
     private external fun nativeFrameSize(handle: Long): Long
     private external fun nativeRemoteSize(handle: Long): Long
@@ -138,6 +154,10 @@ class NativeClient {
     private external fun nativeStatus(handle: Long): String
     private external fun nativeIsConnected(handle: Long): Boolean
     private external fun nativeStop(handle: Long)
+    private external fun nativeSetMaxResolution(width: Int, height: Int)
+    private external fun nativePollAudio(handle: Long): ByteArray?
+    private external fun nativeGetAudioSampleRate(): Int
+    private external fun nativeAudioQueueDepth(): Int
 
     companion object {
         init { System.loadLibrary("evertydesk_core") }

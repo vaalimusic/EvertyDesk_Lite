@@ -116,6 +116,15 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
     // naturalScroll=false (traditional): swipe down → page scrolls up
     private var naturalScroll = true
 
+    // ── hardware decode mode (H264/H265/AV1 → TextureView via MediaCodec Surface) ──
+    // When true: no RGBA data, TextureView renders video; RemoteView only draws cursor.
+    var isHardwareDecodeMode = false
+    // When true: all input to host is blocked — only local pinch-zoom is allowed.
+    var isGameMode = false
+    // Callback fired on every matrix change (zoom, pan, resize) — for TextureView placement.
+    data class VideoRect(val x: Int, val y: Int, val width: Int, val height: Int)
+    var onVideoRectChanged: ((VideoRect) -> Unit)? = null
+
     // ── рендер-тик ──────────────────────────────────────────────────────────
     private val handler = Handler(Looper.getMainLooper())
     private val refreshTick = object : Runnable {
@@ -142,6 +151,7 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
     private val scaleDetector = ScaleGestureDetector(context,
         object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScale(detector: ScaleGestureDetector): Boolean {
+                twoFingerMoved = true  // prevent right-click after pinch
                 val factor = detector.scaleFactor.coerceIn(0.5f, 2f)
                 applyZoom(factor, detector.focusX, detector.focusY)
                 return true
@@ -154,11 +164,31 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
     fun startRendering() { handler.post(refreshTick) }
     fun stopRendering()  { handler.removeCallbacks(refreshTick) }
 
+    /** Hardware decode: set actual decoded video dimensions from MediaCodec output format. */
+    fun setHardwareDimensions(w: Int, h: Int) {
+        if (w == frameW && h == frameH) return
+        frameW = w; frameH = h
+        rebuildMatrix()
+        invalidate()
+    }
+
     fun setNaturalScroll(enabled: Boolean) {
         naturalScroll = enabled
     }
 
     private fun pullFrame() {
+        if (isHardwareDecodeMode) {
+            // Hardware mode: dimensions come from VideoDecoder.onDimensionsAvailable callback
+            // (setHardwareDimensions). Here we just update gesture geometry from remoteGeometry().
+            client.remoteGeometry()?.let { g ->
+                if (g.width > 0 && g.height > 0) {
+                    geomX = g.x; geomY = g.y; geomW = g.width; geomH = g.height
+                }
+            }
+            if (cursorVisible) invalidate()
+            return
+        }
+
         val size = client.frameSize() ?: return
         val (w, h) = size
         if (w <= 0 || h <= 0) return
@@ -195,9 +225,17 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
         matrix.setScale(totalScale, totalScale)
         matrix.postTranslate(tx, ty)
         matrix.invert(matrixInv)
+        onVideoRectChanged?.invoke(VideoRect(tx.toInt(), ty.toInt(), drawW.toInt(), drawH.toInt()))
     }
 
     override fun onDraw(canvas: Canvas) {
+        if (isHardwareDecodeMode) {
+            // TextureView is behind this view and shows the video — only draw cursor overlay.
+            if (cursorVisible && cursorViewX >= 0f) {
+                drawCursor(canvas, cursorViewX, cursorViewY)
+            }
+            return
+        }
         canvas.drawColor(Color.BLACK)
         val bmp = bitmap ?: return
         canvas.drawBitmap(bmp, matrix, paint)
@@ -236,7 +274,7 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         scaleDetector.onTouchEvent(event)
-        gestureDetector.onTouchEvent(event)
+        if (!isGameMode) gestureDetector.onTouchEvent(event)
 
         when (event.actionMasked) {
 
@@ -246,8 +284,10 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
                 prevFingerX = event.x; prevFingerY = event.y
                 remoteAccumX = 0f; remoteAccumY = 0f
                 lastMoveMs = SystemClock.elapsedRealtime()
-                val (cvx, cvy) = remoteToView(lastRemoteX, lastRemoteY)
-                showCursorAt(cvx, cvy)
+                if (!isGameMode) {
+                    val (cvx, cvy) = remoteToView(lastRemoteX, lastRemoteY)
+                    showCursorAt(cvx, cvy)
+                }
             }
 
             MotionEvent.ACTION_POINTER_DOWN -> {
@@ -268,8 +308,9 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
 
             MotionEvent.ACTION_MOVE -> {
                 if (twoFingerMode && event.pointerCount >= 2) {
-                    handleTwoFingerMove(event)
-                } else if (!twoFingerMode) {
+                    // In game mode allow pan only when zoomed in (local, no host events)
+                    if (!isGameMode || userZoom > 1f) handleTwoFingerMove(event)
+                } else if (!twoFingerMode && !isGameMode) {
                     handleOneFingerMove(event)
                 }
             }
@@ -279,10 +320,9 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
                     twoFingerEndTime = System.currentTimeMillis()
                     val elapsed = twoFingerEndTime - twoFingerDownTime
 
-                    if (!twoFingerMoved && elapsed < TWO_FINGER_TAP_MS) {
+                    if (!isGameMode && !twoFingerMoved && elapsed < TWO_FINGER_TAP_MS) {
                         performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
                         client.rightClick(lastRemoteX, lastRemoteY)
-                        longPressFired = true
                     }
 
                     val ri = if (event.actionIndex == 0) 1 else 0
@@ -290,6 +330,8 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
                     downViewX = prevFingerX; downViewY = prevFingerY
                     remoteAccumX = 0f; remoteAccumY = 0f
                     lastMoveMs = SystemClock.elapsedRealtime()
+                    // Suppress phantom left-click in ACTION_UP after any 2-finger gesture
+                    longPressFired = true
 
                     twoFingerMode = false
                     scrollAccumX = 0f; scrollAccumY = 0f
@@ -297,7 +339,7 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
             }
 
             MotionEvent.ACTION_UP -> {
-                if (!twoFingerMode && !longPressFired) {
+                if (!twoFingerMode && !longPressFired && !isGameMode) {
                     val dist = hypot(event.x - downViewX, event.y - downViewY)
                     if (dist < tapSlop) {
                         if (rightClickCallback?.invoke(lastRemoteX, lastRemoteY) != true) {

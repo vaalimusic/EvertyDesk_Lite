@@ -10,6 +10,7 @@
 
 // ── Core-модули (нужны клиентскому пути transport → evrt_client → декод) ──────
 pub mod capability_engine;
+#[cfg(feature = "desktop-gui")]
 pub mod theme;
 pub mod libvirt_provider;
 pub mod proxmox_provider;
@@ -55,3 +56,5 @@ pub mod vpx_system;
 // ── Android JNI-мост ──────────────────────────────────────────────────────────
 #[cfg(all(target_os = "android", feature = "android-client"))]
 pub mod android_ffi;
+#[cfg(all(target_os = "android", feature = "android-client"))]
+pub mod android_video;

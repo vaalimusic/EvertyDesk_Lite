@@ -942,6 +942,7 @@ pub struct AdaptiveRelief {
     recovery_score: i32,
     last_change_at: Option<Instant>,
     pending_step: Option<u8>,
+    session_start: Instant,
 }
 
 impl AdaptiveRelief {
@@ -953,10 +954,14 @@ impl AdaptiveRelief {
             recovery_score: 0,
             last_change_at: None,
             pending_step: None,
+            session_start: Instant::now(),
         }
     }
 
     const COOLDOWN: Duration = Duration::from_millis(1800);
+    // Decoder warmup + stale TCP-era feedback can make the first 2-3 seconds
+    // look like sustained pressure even on a healthy LAN connection.
+    const GRACE_PERIOD: Duration = Duration::from_secs(3);
 
     /// Обработать очередной feedback от клиента.
     /// Возвращает `Some(new_step)` если нужно перенастроить энкодер.
@@ -971,6 +976,13 @@ impl AdaptiveRelief {
             return None;
         }
 
+        // Ignore feedback during decoder warmup and while stale TCP-era feedback
+        // drains through the channel.  The first few seconds of an EVRT session
+        // often show artificially high pressure that resolves on its own.
+        if self.session_start.elapsed() < Self::GRACE_PERIOD {
+            return None;
+        }
+
         if let Some(t) = self.last_change_at {
             if t.elapsed() < Self::COOLDOWN {
                 return None;
@@ -979,10 +991,21 @@ impl AdaptiveRelief {
 
         let pressure_critical = fb.pressure == Critical;
         let pressure_high = fb.pressure == High;
+        // Ignore fps < 10: Surface-path clients (Android MediaCodec) don't reliably
+        // increment PerfStats during warmup, so decode_fps=1 is a measurement artifact,
+        // not real starvation. Pressure (queue backlog) remains the reliable signal.
+        //
+        // Also require backlog > 0: if the queue is empty and decode_fps < target_fps,
+        // the HOST is not sending enough frames (e.g. static_skip suppressing output) —
+        // not a decoder bottleneck. Don't reduce bitrate for the host's own frame-skip.
         let decode_behind =
-            fb.decode_fps > 0 && fb.decode_fps <= (target_fps.saturating_sub(3)).max(28);
+            fb.backlog_frames > 0
+            && fb.decode_fps >= 10
+            && fb.decode_fps <= (target_fps.saturating_sub(3)).max(28);
         let decode_collapsed =
-            fb.decode_fps > 0 && fb.decode_fps <= (target_fps.saturating_sub(8)).max(24);
+            fb.backlog_frames > 0
+            && fb.decode_fps >= 10
+            && fb.decode_fps <= (target_fps.saturating_sub(8)).max(24);
         let present_elevated = fb.present_delta_ms >= 20;
         let present_high = fb.present_delta_ms >= 26;
 
@@ -1010,7 +1033,7 @@ impl AdaptiveRelief {
         }
 
         let threshold = if self.step == 0 {
-            2
+            4  // require sustained pressure (≥2 High reports) before first step
         } else if severe {
             4
         } else {

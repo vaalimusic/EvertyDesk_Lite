@@ -89,7 +89,7 @@ mod inner {
         STATUS.get_or_init(|| MfVideoDecodeStatus {
             vp9: decoder_available(MfVideoCodec::Vp9),
             h265: decoder_available(MfVideoCodec::H265),
-            av1: experimental_av1_decode_enabled() && decoder_available(MfVideoCodec::Av1),
+            av1: decoder_available(MfVideoCodec::Av1),
         })
     }
 
@@ -98,19 +98,12 @@ mod inner {
     }
 
     pub fn av1_decode_available() -> bool {
-        mf_video_decode_status().av1
+        // av1decodermft_store.dll is present on many Windows machines but crashes
+        // with a null pointer (0xC0000005) when actually instantiated — same bug
+        // as HEVCDECODER_STORE.dll. Disable until a stable AV1 decode path exists.
+        false
     }
 
-    fn experimental_av1_decode_enabled() -> bool {
-        matches!(
-            std::env::var("EVERTYDESK_ENABLE_AV1_MF")
-                .ok()
-                .as_deref()
-                .map(str::to_ascii_lowercase)
-                .as_deref(),
-            Some("1" | "true" | "yes" | "on")
-        )
-    }
 
     fn decoder_available(codec: MfVideoCodec) -> bool {
         unsafe { first_decoder_subtype(codec).is_some() }

@@ -127,6 +127,18 @@ mod win {
         unsafe { capture_into_inner(display, out) }
     }
 
+    /// Leak the DXGI D3D11 device held by this thread's capture state.
+    /// Called from the capture thread just before it exits so that the D3D11
+    /// device destructor never runs concurrently with WGPU/WGL — both paths
+    /// acquire the NVIDIA KMD lock and deadlock if they overlap.
+    pub fn leak_capture_resources() {
+        DXGI_CAPTURE.with(|cell| {
+            if let Some(cap) = cell.borrow_mut().take() {
+                std::mem::forget(cap);
+            }
+        });
+    }
+
     unsafe fn capture_into_inner(display: i32, out: &mut Vec<u8>) -> Option<(u32, u32)> {
         let info = cached_display_info(display)?;
         if info.width <= 0 || info.height <= 0 {
@@ -924,6 +936,12 @@ pub fn capture_screen_into(pixels: &mut Vec<u8>) -> Option<(u32, u32)> {
 }
 
 /// Capture a specific display by the index announced in `display_infos`.
+#[allow(unused)]
+pub fn leak_capture_resources() {
+    #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
+    win::leak_capture_resources();
+}
+
 #[allow(unused)]
 pub fn capture_display_into(display: i32, pixels: &mut Vec<u8>) -> Option<(u32, u32)> {
     #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]

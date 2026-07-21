@@ -819,9 +819,9 @@ fn video_settings_body(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut App
     );
     ui.add_space(8.0);
 
-    // Row: Codec + Mode on same line
+    // Row: Transport / Codec
     ui.horizontal(|ui| {
-        ui.label(tr(selected_lang, "Кодек", "Codec"));
+        ui.label(tr(selected_lang, "Транспорт", "Transport"));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             for codec in codec_preference_order() {
                 ui.selectable_value(&mut draft.display.codec, codec, codec.label());
@@ -1120,28 +1120,43 @@ fn settings_secret_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
     ui.add_space(4.0);
 }
 
-fn codec_preference_order() -> [CodecPreference; 5] {
+fn codec_preference_order() -> [CodecPreference; 6] {
     [
-        CodecPreference::Av1,
+        CodecPreference::Evrtck,
+        CodecPreference::Auto,
+        CodecPreference::H264,
         CodecPreference::H265,
         CodecPreference::Vp9,
-        CodecPreference::H264,
-        CodecPreference::Auto,
+        CodecPreference::Av1,
     ]
 }
 
 fn codec_status_text(codec: CodecPreference) -> String {
     match codec {
-        CodecPreference::Auto => {
-            "Auto: AV1/H265 используются только когда в сборке есть decoder backend".to_owned()
+        CodecPreference::Evrtck => {
+            "EVRTCK: UDP-транспорт, lossless XOR-diff. Лучший выбор для LAN и прямых подключений.".to_owned()
         }
-        CodecPreference::Av1 if !crate::video::av1_available() => {
-            "AV1 decoder пока не подключен: будет fallback на H264/VP9".to_owned()
+        CodecPreference::Auto => {
+            "Авто: EVRT если доступен, иначе TCP/H264. Кодек выбирается автоматически.".to_owned()
+        }
+        CodecPreference::H264 => {
+            "H264: TCP relay, без EVRT. Работает везде, хорошо для WAN/интернет.".to_owned()
         }
         CodecPreference::H265 if !crate::video::h265_available() => {
-            "H265 decoder пока не подключен: будет fallback на H264/VP9".to_owned()
+            "H265: TCP relay — decoder недоступен в этой сборке, будет fallback на H264.".to_owned()
         }
-        _ => "Кодек будет запрошен, если локальная сборка умеет его декодировать".to_owned(),
+        CodecPreference::H265 => {
+            "H265: TCP relay, без EVRT. Лучше H264 по качеству при том же битрейте.".to_owned()
+        }
+        CodecPreference::Vp9 => {
+            "VP9: TCP relay, без EVRT. Открытый кодек, хорошее качество на низком битрейте.".to_owned()
+        }
+        CodecPreference::Av1 if !crate::video::av1_available() => {
+            "AV1: TCP relay — decoder недоступен в этой сборке, будет fallback на H264.".to_owned()
+        }
+        CodecPreference::Av1 => {
+            "AV1: TCP relay, без EVRT. Лучшее сжатие, но требует мощного CPU на хосте.".to_owned()
+        }
     }
 }
 

@@ -66,13 +66,20 @@ pub fn h264_available() -> bool {
 }
 
 pub fn h265_available() -> bool {
-    // Windows Media Foundation HEVC, or macOS VideoToolbox HEVC (same gate as
-    // the VT H264 decoder — true only on macOS).
+    // Android Rust decoder is OpenH264 (H264 only). H265 requires MediaCodec
+    // in Kotlin which is not yet implemented — report false until then.
+    #[cfg(all(target_os = "android", feature = "android-client"))]
+    return false;
+    // Windows Media Foundation HEVC, or macOS VideoToolbox HEVC.
     crate::mf_video::h265_decode_available()
         || crate::videotoolbox::videotoolbox_h264_decoder_available()
 }
 
 pub fn av1_available() -> bool {
+    // Android Rust decoder is OpenH264 (H264 only). AV1 via MediaCodec
+    // in Kotlin is not yet implemented — report false until then.
+    #[cfg(all(target_os = "android", feature = "android-client"))]
+    return false;
     crate::mf_video::av1_decode_available()
 }
 

@@ -349,15 +349,26 @@ bool init_encoder(NvencContext &ctx, int codec, uint32_t width, uint32_t height,
     NV_ENC_CONFIG config = preset.presetCfg;
     config.version = NV_ENC_CONFIG_VER;
     config.profileGUID = NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID;
-    config.gopLength = std::max<uint32_t>(fps, 1);
+    // NVENC_INFINITE_GOPLENGTH: IDR only on explicit NV_ENC_PIC_FLAG_FORCEIDR request.
+    // Periodic IDR (gopLength = fps = 1 IDR/sec) wastes enormous bandwidth because
+    // every frame becomes a keyframe — P-frames carry 10-20× fewer bits than IDR.
+    // The software encode loop in video_pipeline.rs controls IDR timing (want_idr /
+    // IDR_MIN_EVRT_HXXX = 4s for EVRT, IDR_MIN_H264 = 1.2s for TCP relay).
+    config.gopLength = 0xffffffff;
     config.frameIntervalP = 1;
-    config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
+    // VBR даёт encoder'у burst-запас (до 2× bitrate) на резкие смены сцены
+    // (разворот окна, видео после статики). CBR в этих ситуациях набивает VBV
+    // под завязку на статике, а на сложных фреймах пережимает — видна дёрганность.
+    // averageBitRate остаётся неизменным — долгосрочная нагрузка на сеть та же.
+    config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
     config.rcParams.multiPass = NV_ENC_MULTI_PASS_DISABLED;
     config.rcParams.averageBitRate = bitrate;
-    config.rcParams.maxBitRate = bitrate;
+    config.rcParams.maxBitRate = bitrate * 2;
+    // 6 фреймов: достаточно для burst на сцене перехода, не вносит задержки
     config.rcParams.vbvBufferSize =
-        std::max<uint32_t>((bitrate / std::max<uint32_t>(fps, 1)) * 2, 64 * 1024);
-    config.rcParams.vbvInitialDelay = config.rcParams.vbvBufferSize;
+        std::max<uint32_t>((bitrate / std::max<uint32_t>(fps, 1)) * 6, 128 * 1024);
+    // Начать с пустого буфера — encoder сразу выдаёт полный bitrate
+    config.rcParams.vbvInitialDelay = config.rcParams.vbvBufferSize / 2;
     config.rcParams.enableLookahead = 0;
     config.rcParams.lookaheadDepth = 0;
     config.rcParams.zeroReorderDelay = 1;

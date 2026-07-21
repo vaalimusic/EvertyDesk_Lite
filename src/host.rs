@@ -27,6 +27,17 @@ static APPROVALS: OnceLock<Mutex<std::collections::HashMap<String, bool>>> = Onc
 static RECENT_RELAY_EVENTS: OnceLock<Mutex<std::collections::HashMap<String, Instant>>> =
     OnceLock::new();
 
+/// When true, incoming mouse/keyboard events from the remote client are discarded.
+static BLOCK_REMOTE_INPUT: AtomicBool = AtomicBool::new(false);
+
+pub fn set_remote_input_blocked(blocked: bool) {
+    BLOCK_REMOTE_INPUT.store(blocked, Ordering::Relaxed);
+}
+
+pub fn is_remote_input_blocked() -> bool {
+    BLOCK_REMOTE_INPUT.load(Ordering::Relaxed)
+}
+
 fn approvals() -> &'static Mutex<std::collections::HashMap<String, bool>> {
     APPROVALS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
@@ -341,6 +352,14 @@ fn run_host_loop(
     // from the ID server (hbbs).  The rule is a no-op on subsequent runs once
     // already present.
     setup_udp_firewall(&events);
+
+    // Логируем доступные кодеки — видно в GUI при первом запуске.
+    #[cfg(all(feature = "live-vp9-mf", target_os = "windows"))]
+    {
+        let enc = crate::mf_encode::mf_encoder_status().label();
+        let dec = crate::mf_video::mf_video_decode_status().label();
+        host_log(&events, format!("Кодеки: {enc} | {dec}"));
+    }
 
     // On macOS, host mode needs Screen Recording + Accessibility permission.
     // Surface a clear hint if either is missing — otherwise capture is blank or
@@ -982,6 +1001,31 @@ fn handle_relay_session(
     let _ = events.send(HostEvent::StateChanged(HostState::Ready));
 }
 
+/// Returns a short debug string describing the current Windows logon session.
+///
+/// Shows the session name (Console / RDP-Tcp#N) so the host user can verify
+/// that EvertyDesk is injecting input into the same session they are looking at.
+fn windows_session_info() -> String {
+    let session_name = std::env::var("SESSIONNAME").unwrap_or_else(|_| "Console".into());
+    let username = std::env::var("USERNAME").unwrap_or_else(|_| "?".into());
+
+    #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
+    {
+        use windows::Win32::System::Threading::GetCurrentProcessId;
+        use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+        let mut session_id: u32 = 0;
+        let our_pid = unsafe { GetCurrentProcessId() };
+        let ok = unsafe { ProcessIdToSessionId(our_pid, &mut session_id) }.as_bool();
+        if ok {
+            return format!(
+                "PID={our_pid} session_id={session_id} SESSIONNAME={session_name} USER={username}"
+            );
+        }
+    }
+
+    format!("SESSIONNAME={session_name} USER={username}")
+}
+
 fn relay_session_inner(
     config: &AppConfig,
     events: &Sender<HostEvent>,
@@ -993,6 +1037,7 @@ fn relay_session_inner(
     if host_stop.load(Ordering::Relaxed) {
         return Ok(());
     }
+    host_log(events, format!("Session debug: {}", windows_session_info()));
     // ── 1. Connect to relay ───────────────────────────────────────────────────
     host_log(events, format!("Connecting to relay {relay_server}…"));
     let mut relay =
@@ -1306,7 +1351,9 @@ fn relay_session_inner(
         let _ = send_peer_enc(&mut relay, &mut cipher, &misc_port);
     }
 
-    let target_fps = negotiated_target_fps(&login, config.display.target_fps);
+    // EVRT game mode: allow up to 60fps regardless of host's configured limit (default 30).
+    let fps_limit = if evrt_socket.is_some() { MAX_TARGET_FPS } else { config.display.target_fps };
+    let target_fps = negotiated_target_fps(&login, fps_limit);
     let quality_milli = negotiated_quality_milli(&login);
     let client_video = client_video_support(&login);
 
@@ -1320,12 +1367,6 @@ fn relay_session_inner(
     let _ = events.send(HostEvent::SessionStarted {
         peer_id: peer_id.to_owned(),
     });
-
-    // Block the host's physical mouse while the remote session is active so the
-    // host user can't interfere with the remote client's cursor control.
-    // BlockInput requires elevation; if it fails we continue silently.
-    #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
-    let _block_guard = WindowsInputBlocker::new();
 
     // ── Единый пайплайн: один захват → один энкодер → TCP + UDP ──────────────
     //
@@ -1424,7 +1465,7 @@ fn relay_session_inner(
             let _ = pipeline_handle.join();
             let _ = done_tx.send(());
         });
-        match done_rx.recv_timeout(Duration::from_secs(8)) {
+        match done_rx.recv_timeout(Duration::from_secs(15)) {
             Ok(()) => host_log(events, format!("Pipeline join complete for {peer_id}")),
             Err(_) => {
                 host_log(events, format!("Pipeline join timeout for {peer_id}"));
@@ -1569,7 +1610,7 @@ struct FrameFingerprint {
     tile_hashes: Vec<u64>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct ClientVideoSupport {
     pub h264: bool,
     pub h265: bool,
@@ -1870,7 +1911,7 @@ fn explicit_codec_target(codec_preference: CodecPreference) -> Option<crate::nve
         CodecPreference::H264 => Some(crate::nvenc::NvencCodec::H264),
         CodecPreference::H265 => Some(crate::nvenc::NvencCodec::H265),
         CodecPreference::Av1 => Some(crate::nvenc::NvencCodec::Av1),
-        CodecPreference::Vp9 | CodecPreference::Auto => None,
+        CodecPreference::Vp9 | CodecPreference::Auto | CodecPreference::Evrtck => None,
     }
 }
 
@@ -1958,7 +1999,7 @@ fn choose_mf_encoder_codec(
             let hardware = match codec {
                 crate::nvenc::NvencCodec::H264 => status.has_hardware_h264(),
                 crate::nvenc::NvencCodec::H265 => status.has_hardware_h265(),
-                crate::nvenc::NvencCodec::Av1 => false,
+                crate::nvenc::NvencCodec::Av1 => status.has_hardware_av1(),
             };
             (codec, hardware)
         })
@@ -2545,6 +2586,9 @@ fn handle_client_input_pipeline(
             if crate::vm_bridge::route_mouse(&ev) {
                 return;
             }
+            if BLOCK_REMOTE_INPUT.load(Ordering::Relaxed) {
+                return;
+            }
             if mouse_event_should_log(&ev) {
                 host_log(events, format!("Host input: {}", mouse_event_summary(&ev)));
             }
@@ -2552,6 +2596,9 @@ fn handle_client_input_pipeline(
         }
         Some(peer_message::Union::KeyEvent(ev)) => {
             if crate::vm_bridge::route_key(&ev) {
+                return;
+            }
+            if BLOCK_REMOTE_INPUT.load(Ordering::Relaxed) {
                 return;
             }
             host_log(events, format!("Host input: {}", key_event_summary(&ev)));
@@ -2638,6 +2685,23 @@ fn handle_client_input_pipeline(
             if let Some(quality) = option_quality_milli(&option) {
                 quality_milli.store(quality, Ordering::Relaxed);
                 let _ = cmd_tx.send(PipelineCmd::SetQuality(quality));
+            }
+            if let Some(sd) = &option.supported_decoding {
+                let prefer = PreferCodec::try_from(sd.prefer).unwrap_or(PreferCodec::Auto);
+                let new_video = ClientVideoSupport {
+                    h264: sd.ability_h264 != 0,
+                    h265: sd.ability_h265 != 0,
+                    av1: sd.ability_av1 != 0,
+                    prefer,
+                };
+                host_log(
+                    events,
+                    format!(
+                        "Host: клиент запросил кодек {:?} (h264={} h265={} av1={})",
+                        prefer, new_video.h264, new_video.h265, new_video.av1
+                    ),
+                );
+                let _ = cmd_tx.send(PipelineCmd::SetClientCodec(new_video));
             }
         }
         Some(peer_message::Union::Misc(Misc {
@@ -2901,39 +2965,6 @@ fn send_shell_out(outgoing: &Sender<PeerMessage>, kind: ShellMessageKind, data: 
 }
 
 /// Release mouse buttons (and common modifier keys) that may have been left
-/// RAII guard: calls BlockInput(TRUE) on construction, BlockInput(FALSE) on drop.
-/// Prevents the host's physical mouse/keyboard from interfering with injected
-/// remote input while a session is active.
-/// BlockInput requires elevation; if the process is not elevated the call is a
-/// no-op and we fall through silently — remote control still works, the host
-/// user can just interfere more easily.
-#[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
-struct WindowsInputBlocker;
-
-#[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
-impl WindowsInputBlocker {
-    fn new() -> Self {
-        unsafe {
-            use windows::Win32::UI::Input::KeyboardAndMouse::BlockInput;
-            let ok = BlockInput(true);
-            if ok.as_bool() {
-                eprintln!("[host] Physical input blocked for remote session");
-            }
-        }
-        Self
-    }
-}
-
-#[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
-impl Drop for WindowsInputBlocker {
-    fn drop(&mut self) {
-        unsafe {
-            use windows::Win32::UI::Input::KeyboardAndMouse::BlockInput;
-            BlockInput(false);
-            eprintln!("[host] Physical input unblocked");
-        }
-    }
-}
 
 /// "down" when a session ended mid-click — otherwise the local desktop becomes
 /// unusable (e.g. Start menu not clickable).
@@ -2941,27 +2972,44 @@ impl Drop for WindowsInputBlocker {
 fn release_stuck_input() {
     use std::mem::size_of;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
-        MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTUP, MOUSEINPUT, VIRTUAL_KEY,
+        GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+        KEYEVENTF_KEYUP, MOUSE_EVENT_FLAGS, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEUP,
+        MOUSEEVENTF_RIGHTUP, MOUSEINPUT, VIRTUAL_KEY,
     };
     unsafe {
-        let mouse_up = MOUSEEVENTF_LEFTUP | MOUSEEVENTF_RIGHTUP | MOUSEEVENTF_MIDDLEUP;
-        let mi = MOUSEINPUT {
-            dx: 0,
-            dy: 0,
-            mouseData: 0,
-            dwFlags: mouse_up,
-            time: 0,
-            dwExtraInfo: 0,
-        };
-        let m_input = INPUT {
-            r#type: INPUT_MOUSE,
-            Anonymous: INPUT_0 { mi },
-        };
-        SendInput(&[m_input], size_of::<INPUT>() as i32);
+        // VK_LBUTTON=1, VK_RBUTTON=2, VK_MBUTTON=4
+        // GetAsyncKeyState high bit = button currently down
+        let ldown = (GetAsyncKeyState(0x01) as u16) & 0x8000 != 0;
+        let rdown = (GetAsyncKeyState(0x02) as u16) & 0x8000 != 0;
+        let mdown = (GetAsyncKeyState(0x04) as u16) & 0x8000 != 0;
 
-        // Release common modifiers: Ctrl(0x11), Alt(0x12), Shift(0x10), Win(0x5B/0x5C).
+        let mut flags = MOUSE_EVENT_FLAGS(0);
+        if ldown { flags |= MOUSEEVENTF_LEFTUP; }
+        if rdown { flags |= MOUSEEVENTF_RIGHTUP; }
+        if mdown { flags |= MOUSEEVENTF_MIDDLEUP; }
+
+        if flags.0 != 0 {
+            let mi = MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            };
+            let m_input = INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 { mi },
+            };
+            SendInput(&[m_input], size_of::<INPUT>() as i32);
+        }
+
+        // Release common modifiers only if actually down.
+        // Ctrl=0x11, Alt=0x12, Shift=0x10, LWin=0x5B, RWin=0x5C
         for vk in [0x11u16, 0x12, 0x10, 0x5B, 0x5C] {
+            if (GetAsyncKeyState(vk as i32) as u16) & 0x8000 == 0 {
+                continue;
+            }
             let ki = KEYBDINPUT {
                 wVk: VIRTUAL_KEY(vk),
                 wScan: 0,

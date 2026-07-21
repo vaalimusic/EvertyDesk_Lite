@@ -56,11 +56,34 @@ impl Default for SecurityConfig {
     }
 }
 
+// ── Theme mode ───────────────────────────────────────────────────────────────
+
+/// Режим темы — хранится в конфиге, используется UI (desktop-only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeMode {
+    Dark,
+    Light,
+    /// Follow the OS / system preference.
+    System,
+}
+
+impl Default for ThemeMode {
+    fn default() -> Self {
+        ThemeMode::Dark
+    }
+}
+
 // ── Display / codec configuration ────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum CodecPreference {
+    /// EVRT UDP transport with EVRTCK codec (lossless XOR-diff, LAN-optimized).
+    /// This is the primary path when a direct connection is available.
     #[default]
+    Evrtck,
+    /// TCP relay with auto-selected video codec (H264 preferred).
+    /// Use when EVRT is unavailable or undesirable (WAN/relay-only).
     Auto,
     H264,
     H265,
@@ -71,12 +94,20 @@ pub enum CodecPreference {
 impl CodecPreference {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Evrtck => "EVRTCK",
             Self::Auto => "Авто",
             Self::H264 => "H264",
             Self::H265 => "H265",
             Self::Av1 => "AV1",
             Self::Vp9 => "VP9",
         }
+    }
+
+    /// When true, the EVRT UDP path is started alongside TCP.
+    /// All codec preferences attempt EVRT; the specific codec (EVRTCK/H264/H265/AV1)
+    /// is negotiated separately. TCP is used as fallback when EVRT is unavailable.
+    pub fn use_evrt(self) -> bool {
+        true
     }
 }
 
@@ -342,7 +373,7 @@ pub struct UiConfig {
     pub agent_machine_id: String,
     /// Тема оформления (тёмная/светлая).
     #[serde(default)]
-    pub theme_mode: crate::theme::ThemeMode,
+    pub theme_mode: ThemeMode,
     /// UI zoom factor (0.0 = platform default: 1.08 on macOS, 1.0 elsewhere).
     #[serde(default)]
     pub ui_scale: f32,
@@ -411,7 +442,7 @@ impl Default for UiConfig {
             address_book_access_token: String::new(),
             address_book_guid: String::new(),
             agent_machine_id: String::new(),
-            theme_mode: crate::theme::ThemeMode::default(),
+            theme_mode: ThemeMode::default(),
             ui_scale: 0.0,
         }
     }

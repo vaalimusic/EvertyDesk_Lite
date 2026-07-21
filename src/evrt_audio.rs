@@ -28,11 +28,55 @@ use std::{
     net::{SocketAddr, UdpSocket},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex, OnceLock,
     },
     thread,
     time::Duration,
 };
+
+// ─── Android PCM очередь ─────────────────────────────────────────────────────
+// Максимум 6 фреймов × 10 мс = 60 мс. При переполнении — дроп старых.
+const ANDROID_QUEUE_MAX_FRAMES: usize = 256; // 256 × 10мс = ~2.5с буфер против джиттера
+
+fn android_queue() -> &'static Mutex<VecDeque<Vec<u8>>> {
+    static Q: OnceLock<Mutex<VecDeque<Vec<u8>>>> = OnceLock::new();
+    Q.get_or_init(|| Mutex::new(VecDeque::with_capacity(ANDROID_QUEUE_MAX_FRAMES + 1)))
+}
+
+/// Сохранённый sample rate из AudioConfig (для JNI запросов).
+/// 0 = AudioConfig ещё не получен, fallback = 48000.
+static AUDIO_SAMPLE_RATE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Пушить PCM фрейм в Android очередь (вызывается из evrt_client.rs на Android).
+pub fn push_android_audio(pcm: Vec<u8>) {
+    if let Ok(mut q) = android_queue().lock() {
+        while q.len() >= ANDROID_QUEUE_MAX_FRAMES {
+            q.pop_front();
+        }
+        q.push_back(pcm);
+    }
+}
+
+/// Достать один PCM фрейм из Android очереди (вызывается из JNI).
+pub fn pop_android_audio() -> Option<Vec<u8>> {
+    android_queue().lock().ok()?.pop_front()
+}
+
+/// Текущая глубина очереди в фреймах (без изъятия). Используется jitter buffer.
+pub fn android_queue_depth() -> usize {
+    android_queue().lock().ok().map(|q| q.len()).unwrap_or(0)
+}
+
+/// Сохранить sample_rate из AudioConfig (вызывается из evrt_client при получении AudioConfig).
+pub fn set_audio_sample_rate(rate: u32) {
+    AUDIO_SAMPLE_RATE.store(rate, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Получить последний известный sample_rate. 0 если AudioConfig ещё не получен.
+pub fn get_audio_sample_rate() -> u32 {
+    AUDIO_SAMPLE_RATE.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 use crate::evrt;
 
@@ -104,16 +148,21 @@ pub fn run_audio_capture(
     peer_addr: SocketAddr,
     stop: Arc<AtomicBool>,
     session_token: Option<String>,
+    events: std::sync::mpsc::Sender<crate::host::HostEvent>,
 ) {
     #[cfg(all(target_os = "windows", feature = "evrt-wasapi"))]
     {
-        if let Err(e) = run_audio_capture_windows(socket, peer_addr, stop, session_token) {
-            eprintln!("[evrt-audio] захват завершился: {e}");
+        if let Err(e) =
+            run_audio_capture_windows(socket, peer_addr, stop, session_token, &events)
+        {
+            let msg = format!("EVRT Audio: захват завершился с ошибкой: {e}");
+            eprintln!("[evrt-audio] {msg}");
+            let _ = events.send(crate::host::HostEvent::Log(msg));
         }
     }
     #[cfg(not(all(target_os = "windows", feature = "evrt-wasapi")))]
     {
-        let _ = (socket, peer_addr, session_token);
+        let _ = (socket, peer_addr, session_token, events);
         while !stop.load(Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(100));
         }
@@ -126,15 +175,26 @@ fn run_audio_capture_windows(
     peer_addr: SocketAddr,
     stop: Arc<AtomicBool>,
     session_token: Option<String>,
+    events: &std::sync::mpsc::Sender<crate::host::HostEvent>,
 ) -> Result<(), String> {
     use windows::Win32::{
         Media::Audio::{
             eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator,
             MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-            WAVEFORMATEX, WAVE_FORMAT_PCM,
         },
-        System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED},
+        System::Com::{
+            CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED,
+        },
     };
+
+    // WAVE_FORMAT_* constants (winmm)
+    const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
+    const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
+
+    fn audio_log(ev: &std::sync::mpsc::Sender<crate::host::HostEvent>, msg: String) {
+        eprintln!("[evrt-audio] {msg}");
+        let _ = ev.send(crate::host::HostEvent::Log(msg));
+    }
 
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -152,34 +212,72 @@ fn run_audio_capture_windows(
             .Activate::<IAudioClient>(CLSCTX_ALL, None)
             .map_err(|e| format!("Activate IAudioClient: {e}"))?;
 
-        // ── Формат: PCM 16-bit stereo 48kHz ──────────────────────────────────
-        let cfg = AudioConfig::default();
-        let block_align = (cfg.channels * cfg.bits_per_sample / 8) as u16;
-        let fmt = WAVEFORMATEX {
-            wFormatTag: WAVE_FORMAT_PCM as u16,
-            nChannels: cfg.channels,
-            nSamplesPerSec: cfg.sample_rate,
-            nAvgBytesPerSec: cfg.sample_rate * block_align as u32,
-            nBlockAlign: block_align,
-            wBitsPerSample: cfg.bits_per_sample,
-            cbSize: 0,
+        // ── GetMixFormat: WASAPI shared mode ТРЕБУЕТ нативный формат устройства ─
+        // Хардкоженный PCM 16-bit вызывает AUDCLNT_E_UNSUPPORTED_FORMAT.
+        let mix_fmt_ptr = client
+            .GetMixFormat()
+            .map_err(|e| format!("GetMixFormat: {e}"))?;
+        let mix_fmt = &*mix_fmt_ptr;
+
+        let channels = mix_fmt.nChannels;
+        let sample_rate = mix_fmt.nSamplesPerSec;
+        let bits = mix_fmt.wBitsPerSample;
+        let tag = mix_fmt.wFormatTag;
+
+        // Detect float32: tag==3 (IEEE_FLOAT) или EXTENSIBLE с SubFormat.Data1==3
+        // WAVEFORMATEXTENSIBLE layout: WAVEFORMATEX (18 bytes) + Samples (2) + ChannelMask (4) + SubFormat GUID (16)
+        // SubFormat.Data1 (u32) находится на байтовом смещении 24.
+        let is_float32 = if tag == WAVE_FORMAT_IEEE_FLOAT {
+            true
+        } else if tag == WAVE_FORMAT_EXTENSIBLE {
+            let sub_data1 = u32::from_le_bytes([
+                *(mix_fmt_ptr as *const u8).add(24),
+                *(mix_fmt_ptr as *const u8).add(25),
+                *(mix_fmt_ptr as *const u8).add(26),
+                *(mix_fmt_ptr as *const u8).add(27),
+            ]);
+            sub_data1 == 3 // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+        } else {
+            false
         };
 
-        // Период буфера: 10 мс в единицах 100-нс
-        let buffer_dur: i64 = 100_000; // 10 мс
+        audio_log(
+            events,
+            format!(
+                "EVRT Audio: устройство {}Hz {}ch {}bit {} (tag=0x{:04X})",
+                sample_rate,
+                channels,
+                bits,
+                if is_float32 { "float32" } else { "PCM_i16" },
+                tag,
+            ),
+        );
 
         client
             .Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
                 AUDCLNT_STREAMFLAGS_LOOPBACK,
-                buffer_dur,
+                100_000, // 10 мс буфер (единицы 100-нс)
                 0,
-                &fmt as *const _,
+                mix_fmt_ptr,
                 None,
             )
-            .map_err(|e| format!("IAudioClient::Initialize: {e}"))?;
+            .map_err(|e| {
+                CoTaskMemFree(Some(mix_fmt_ptr as *mut _));
+                format!("IAudioClient::Initialize: {e}")
+            })?;
 
-        // ── Отправить AudioConfig клиенту ─────────────────────────────────────
+        CoTaskMemFree(Some(mix_fmt_ptr as *mut _));
+
+        // Всегда отдаём клиенту 48000Hz — Android LOW_LATENCY поддерживает только 48кГц.
+        // Если устройство на 44100Hz — ресемплируем на хосте.
+        const TARGET_RATE: u32 = 48000;
+        let out_channels: u16 = channels.min(2);
+        let cfg = AudioConfig {
+            sample_rate: TARGET_RATE,
+            channels: out_channels,
+            bits_per_sample: 16,
+        };
         let cfg_pkt = evrt::build_single_authenticated(
             evrt::TYPE_AUDIO_CONFIG,
             &cfg.to_json(),
@@ -195,13 +293,35 @@ fn run_audio_capture_windows(
             .Start()
             .map_err(|e| format!("IAudioClient::Start: {e}"))?;
 
-        eprintln!(
-            "[evrt-audio] WASAPI loopback старт: {}Hz {}ch {}bit",
-            cfg.sample_rate, cfg.channels, cfg.bits_per_sample
+        audio_log(
+            events,
+            format!(
+                "EVRT Audio: WASAPI loopback запущен → {}Hz {}ch → клиент i16 stereo",
+                sample_rate, channels,
+            ),
         );
 
-        let bytes_per_frame = cfg.bytes_per_frame();
+        const AUDCLNT_BUFFERFLAGS_SILENT: u32 = 0x0000_0002;
+        // Фиксированный выходной фрейм: 480 сэмплов × TARGET_RATE / 48000
+        // = ровно 10 мс при TARGET_RATE=48000. Всегда 960 байт i16 stereo.
+        let out_frame_samples: usize = TARGET_RATE as usize * 10 / 1000; // 480
+
+        let ch = channels as usize;
+        let out_ch = out_channels as usize;
+        let bytes_per_native_frame = ch * (bits as usize / 8);
+        let need_resample = sample_rate != TARGET_RATE;
+
+        // Буфер накапливает i16 stereo сэмплы после конвертации из нативного формата.
+        // Защитный cap: 48000 сэмплов × 2 канала = 1 секунда при 48kHz.
+        // Если за 1 сек не дренируется — обрезаем хвост, предотвращая неограниченный рост.
+        const RAW_BUF_CAP_FRAMES: usize = 48000;
+        let mut raw_i16_buf: Vec<i16> = Vec::new(); // i16 стерео сэмплы (пары L,R)
+        let out_frame_bytes = out_frame_samples * out_ch * 2; // 480 * 2 * 2 = 1920 байт
+
         let mut frame_id: u32 = 0;
+        // Дробная позиция для линейной интерполяции ресемплинга
+        let mut resample_pos: f64 = 0.0;
+        let resample_step: f64 = sample_rate as f64 / TARGET_RATE as f64;
 
         while !stop.load(Ordering::Relaxed) {
             let mut num_frames_available: u32 = 0;
@@ -222,27 +342,104 @@ fn run_audio_capture_windows(
                 continue;
             }
 
-            let byte_len = num_frames_available as usize * bytes_per_frame;
-            let pcm_slice = std::slice::from_raw_parts(data_ptr, byte_len);
+            let n = num_frames_available as usize;
 
-            // Пакетизируем и отправляем
-            frame_id = frame_id.wrapping_add(1);
-            let pts_us = pts_hns / 10;
-            let pkts = evrt::packetize_audio_frame_authenticated(
-                frame_id,
-                pts_us,
-                pcm_slice,
-                session_token.as_deref(),
-            );
-            for pkt in &pkts {
-                let _ = socket.send_to(pkt, peer_addr);
+            // Конвертируем нативный формат → i16 stereo (без ресемплинга пока)
+            if flags & AUDCLNT_BUFFERFLAGS_SILENT != 0 {
+                // WASAPI пометил буфер как тишина — добавляем нули
+                for _ in 0..n {
+                    for _ in 0..out_ch { raw_i16_buf.push(0); }
+                }
+            } else if is_float32 {
+                let floats = std::slice::from_raw_parts(data_ptr as *const f32, n * ch);
+                for i in 0..n {
+                    for c in 0..out_ch {
+                        let s = floats[i * ch + c.min(ch - 1)];
+                        raw_i16_buf.push((s.clamp(-1.0, 1.0) * 32767.0) as i16);
+                    }
+                }
+            } else if ch == out_ch {
+                let samples = std::slice::from_raw_parts(data_ptr as *const i16, n * ch);
+                raw_i16_buf.extend_from_slice(samples);
+            } else {
+                let samples = std::slice::from_raw_parts(data_ptr as *const i16, n * ch);
+                for i in 0..n {
+                    for c in 0..out_ch {
+                        raw_i16_buf.push(samples[i * ch + c.min(ch - 1)]);
+                    }
+                }
             }
 
             capture_client.ReleaseBuffer(num_frames_available).ok();
+
+            // Защита от накопления: если буфер превысил 1 сек — обрезаем,
+            // иначе после длительного простоя (Sleep/Suspend) отправим burst.
+            let cap = RAW_BUF_CAP_FRAMES * out_ch;
+            if raw_i16_buf.len() > cap {
+                let excess = raw_i16_buf.len() - cap;
+                raw_i16_buf.drain(..excess);
+                if need_resample {
+                    resample_pos = resample_pos.max(0.0) - excess as f64 / out_ch as f64;
+                    resample_pos = resample_pos.max(0.0);
+                }
+            }
+
+            // Ресемплинг + нарезка на фиксированные фреймы 480 × out_ch
+            // raw_i16_buf хранит стерео-пары [(L0,R0),(L1,R1),...] из input-rate
+            let in_frames = raw_i16_buf.len() / out_ch;
+
+            let mut pcm_out: Vec<u8> = Vec::new();
+            while need_resample {
+                let idx = resample_pos as usize;
+                if idx + 1 >= in_frames { break; }
+                let frac = resample_pos - idx as f64;
+                for c in 0..out_ch {
+                    let s0 = raw_i16_buf[idx * out_ch + c] as f64;
+                    let s1 = raw_i16_buf[(idx + 1) * out_ch + c] as f64;
+                    let s = (s0 + (s1 - s0) * frac) as i16;
+                    pcm_out.extend_from_slice(&s.to_le_bytes());
+                }
+                resample_pos += resample_step;
+            }
+            if !need_resample {
+                for s in &raw_i16_buf {
+                    pcm_out.extend_from_slice(&s.to_le_bytes());
+                }
+            }
+
+            // Сдвигаем позицию ресемплинга чтобы не выходить за пределы использованных сэмплов
+            let consumed_in_frames = if need_resample {
+                resample_pos as usize
+            } else {
+                in_frames
+            };
+            let consumed = consumed_in_frames.min(in_frames);
+            raw_i16_buf.drain(..consumed * out_ch);
+            if need_resample {
+                resample_pos -= consumed as f64;
+            }
+
+            // Нарезаем pcm_out на фиксированные фреймы и отправляем
+            let mut pos = 0;
+            while pos + out_frame_bytes <= pcm_out.len() {
+                let chunk = &pcm_out[pos..pos + out_frame_bytes];
+                frame_id = frame_id.wrapping_add(1);
+                let pts_us = pts_hns / 10;
+                let pkts = evrt::packetize_audio_frame_authenticated(
+                    frame_id,
+                    pts_us,
+                    chunk,
+                    session_token.as_deref(),
+                );
+                for pkt in &pkts {
+                    let _ = socket.send_to(pkt, peer_addr);
+                }
+                pos += out_frame_bytes;
+            }
         }
 
         client.Stop().ok();
-        eprintln!("[evrt-audio] WASAPI loopback стоп");
+        audio_log(events, "EVRT Audio: WASAPI loopback остановлен".into());
         Ok(())
     }
 }
@@ -318,7 +515,11 @@ impl AudioPlayer {
             self.enqueue_pcm(pcm);
             self.pump();
         }
-        #[cfg(not(all(target_os = "windows", feature = "evrt-wasapi")))]
+        #[cfg(target_os = "android")]
+        if !pcm.is_empty() {
+            push_android_audio(pcm.to_vec());
+        }
+        #[cfg(not(any(all(target_os = "windows", feature = "evrt-wasapi"), target_os = "android")))]
         let _ = pcm;
     }
 

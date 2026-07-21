@@ -88,7 +88,6 @@ ironrdp-core = "0.2"
 ironrdp-graphics = "0.8"
 ironrdp-session = "0.9"
 ironrdp-pdu = "0.8"
-native-tls = "0.2"
 
 [target.'cfg(target_os = "android")'.dependencies]
 # Логи Android logcat
@@ -101,6 +100,7 @@ minifb = { version = "0.28", default-features = false, features = ["x11"] }
 x11rb = { version = "0.13", features = ["xtest", "shm", "randr"] }
 
 [target.'cfg(windows)'.dependencies]
+native-tls = "0.2"
 font8x8 = "0.3"
 minifb = { version = "0.28", default-features = false }
 windows = { version = "0.48", features = [
@@ -130,6 +130,8 @@ windows = { version = "0.48", features = [
     "Win32_Networking_WinSock",
     # Shared foundation types (HWND, HDC, HBITMAP …)
     "Win32_Foundation",
+    # Session diagnostics (ProcessIdToSessionId)
+    "Win32_System_RemoteDesktop",
     # Hyper-V VM console (WMI)
     "Win32_System_Wmi",
     "Win32_System_Ole",

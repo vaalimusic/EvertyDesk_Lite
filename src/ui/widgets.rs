@@ -374,13 +374,18 @@ pub(crate) fn nav_icon_button(
 ) -> egui::Response {
     let desired = egui::vec2(ui.available_width(), 44.0);
     let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
-    let fill = if active || response.hovered() {
-        crate::theme::palette().surface
+    let t = crate::theme::palette();
+
+    let fill = if active {
+        crate::theme::accent_tint(&t, if t.mode.is_dark() { 0.12 } else { 0.08 })
+    } else if response.hovered() {
+        t.surface_raised
     } else {
         egui::Color32::TRANSPARENT
     };
-    let t = crate::theme::palette();
-    let stroke = if active || response.hovered() {
+    let border_stroke = if active {
+        egui::Stroke::new(1.0, crate::theme::accent_tint(&t, 0.35))
+    } else if response.hovered() {
         egui::Stroke::new(1.0, t.border_strong)
     } else {
         egui::Stroke::NONE
@@ -390,17 +395,26 @@ pub(crate) fn nav_icon_button(
     ui.painter().rect_stroke(
         rect,
         egui::CornerRadius::same(12),
-        stroke,
+        border_stroke,
         egui::StrokeKind::Inside,
     );
 
+    // Акцентная полоса слева для активного пункта
+    if active {
+        let bar = egui::Rect::from_min_size(
+            rect.min + egui::vec2(0.0, 8.0),
+            egui::vec2(3.0, rect.height() - 16.0),
+        );
+        ui.painter()
+            .rect_filled(bar, egui::CornerRadius::same(2), t.accent);
+    }
+
     let icon_rect =
-        egui::Rect::from_min_size(rect.min + egui::vec2(13.0, 12.0), egui::vec2(20.0, 20.0));
-    // Активный пункт — акцентная иконка; иначе приглушённая.
+        egui::Rect::from_min_size(rect.min + egui::vec2(14.0, 12.0), egui::vec2(20.0, 20.0));
     let icon_color = if active { t.accent } else { t.text_weak };
     draw_line_icon(ui.painter(), icon_rect, icon, icon_color);
     ui.painter().text(
-        egui::pos2(rect.min.x + 44.0, rect.center().y),
+        egui::pos2(rect.min.x + 46.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
         egui::FontId::proportional(14.0),
@@ -543,6 +557,25 @@ fn draw_line_icon(p: &egui::Painter, rect: egui::Rect, icon: &str, color: egui::
             ];
             for pair in body.windows(2) {
                 p.line_segment([pair[0], pair[1]], stroke);
+            }
+        }
+        "game-controller" => {
+            let body = egui::Rect::from_center_size(c, egui::vec2(18.0, 11.0));
+            p.rect_stroke(body, egui::CornerRadius::same(4), stroke, egui::StrokeKind::Inside);
+            let lx = c.x - 5.5;
+            p.line_segment([egui::pos2(lx, c.y - 3.5), egui::pos2(lx, c.y + 3.5)], stroke);
+            p.line_segment([egui::pos2(lx - 3.5, c.y), egui::pos2(lx + 3.5, c.y)], stroke);
+            p.circle_stroke(c + egui::vec2(5.5, 0.0), 2.0, stroke);
+        }
+        "server" => {
+            // Сервер: три горизонтальные «полки»
+            for dy in [-5.0_f32, 0.0, 5.0] {
+                let r = egui::Rect::from_center_size(
+                    c + egui::vec2(0.0, dy),
+                    egui::vec2(18.0, 3.5),
+                );
+                p.rect_stroke(r, egui::CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
+                p.circle_stroke(c + egui::vec2(6.5, dy), 0.9, stroke);
             }
         }
         _ => {

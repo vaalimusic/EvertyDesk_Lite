@@ -19,8 +19,8 @@ mod inner {
                 CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVGOPSize,
                 CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI,
                 IMFActivate, IMFSample, IMFTransform, MFCreateMediaType, MFCreateMemoryBuffer,
-                MFCreateSample, MFMediaType_Video, MFStartup, MFTEnumEx, MFVideoFormat_H264,
-                MFVideoFormat_H264_ES, MFVideoFormat_H265, MFVideoFormat_HEVC,
+                MFCreateSample, MFMediaType_Video, MFStartup, MFTEnumEx, MFVideoFormat_AV1,
+                MFVideoFormat_H264, MFVideoFormat_H264_ES, MFVideoFormat_H265, MFVideoFormat_HEVC,
                 MFVideoFormat_HEVC_ES, MFVideoFormat_NV12, MFSTARTUP_NOSOCKET,
                 MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE,
                 MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_COMMAND_FLUSH,
@@ -46,8 +46,10 @@ mod inner {
     pub struct MfEncoderStatus {
         pub h264: bool,
         pub h265: bool,
+        pub av1: bool,
         pub hardware_h264: bool,
         pub hardware_h265: bool,
+        pub hardware_av1: bool,
     }
 
     impl MfEncoderStatus {
@@ -67,6 +69,13 @@ mod inner {
                     "H265"
                 });
             }
+            if self.av1 {
+                codecs.push(if self.hardware_av1 {
+                    "AV1(hw)"
+                } else {
+                    "AV1"
+                });
+            }
             if codecs.is_empty() {
                 "Media Foundation encode: unavailable".to_owned()
             } else {
@@ -81,6 +90,10 @@ mod inner {
         pub fn has_hardware_h265(&self) -> bool {
             self.hardware_h265
         }
+        /// Есть ли аппаратный AV1 энкодер (Intel ARC / AMD RX 7000 / RTX 4000+).
+        pub fn has_hardware_av1(&self) -> bool {
+            self.hardware_av1
+        }
     }
 
     pub fn mf_encoder_status() -> &'static MfEncoderStatus {
@@ -88,14 +101,20 @@ mod inner {
         STATUS.get_or_init(|| MfEncoderStatus {
             h264: encoder_available(NvencCodec::H264, false),
             h265: encoder_available(NvencCodec::H265, false),
+            av1: encoder_available(NvencCodec::Av1, false),
             hardware_h264: encoder_available(NvencCodec::H264, true),
             hardware_h265: encoder_available(NvencCodec::H265, true),
+            hardware_av1: encoder_available(NvencCodec::Av1, true),
         })
     }
 
     pub fn mf_encoder_codecs() -> Vec<NvencCodec> {
         let status = mf_encoder_status();
         let mut codecs = Vec::new();
+        // AV1 первый — самое высокое качество при той же битрейте
+        if status.av1 {
+            codecs.push(NvencCodec::Av1);
+        }
         if status.h265 {
             codecs.push(NvencCodec::H265);
         }
@@ -135,9 +154,6 @@ mod inner {
             fps: u32,
             bitrate: u32,
         ) -> Result<Self, String> {
-            if codec == NvencCodec::Av1 {
-                return Err("Media Foundation AV1 encoder is not wired yet".to_owned());
-            }
             let fps = fps.clamp(5, 60);
             unsafe {
                 Self::create(codec, width.max(2), height.max(2), fps, bitrate)
@@ -581,7 +597,7 @@ mod inner {
                 MFVideoFormat_H265,
                 MFVideoFormat_HEVC_ES,
             ],
-            NvencCodec::Av1 => &[],
+            NvencCodec::Av1 => &[MFVideoFormat_AV1],
         }
     }
 
@@ -622,7 +638,8 @@ mod inner {
         ) {
             applied.push("gop");
         }
-        if set_codec_api_u32(&codec_api, &CODECAPI_AVEncCommonQualityVsSpeed, 100) {
+        // 70 = balance speed/quality for realtime streaming (was 100 = max quality/slowest)
+        if set_codec_api_u32(&codec_api, &CODECAPI_AVEncCommonQualityVsSpeed, 70) {
             applied.push("speed");
         }
 
@@ -859,6 +876,10 @@ mod fallback {
         }
         /// Нет аппаратного H265 на не-Windows сборках.
         pub fn has_hardware_h265(&self) -> bool {
+            false
+        }
+        /// Нет аппаратного AV1 на не-Windows сборках.
+        pub fn has_hardware_av1(&self) -> bool {
             false
         }
     }

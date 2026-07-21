@@ -3,6 +3,8 @@ package ru.everty.desklite
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -15,6 +17,9 @@ import android.text.InputType
 import android.text.TextWatcher
 import android.view.Gravity
 import android.view.KeyEvent
+import android.graphics.SurfaceTexture
+import android.view.Surface
+import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
@@ -28,6 +33,8 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKeys
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
@@ -38,6 +45,7 @@ class MainActivity : Activity() {
     private lateinit var root: FrameLayout
     private var remoteView: RemoteView? = null
     private var touchpadView: TouchpadView? = null
+    private var audioPlayer: EvrtAudioPlayer? = null
     private val handler = Handler(Looper.getMainLooper())
 
     private val brandBg    = Color.rgb(0xF5, 0xF7, 0xF4)
@@ -51,6 +59,7 @@ class MainActivity : Activity() {
 
     private var rightClickPending = false
     private var rightClickBtn: Button? = null
+    private var rotateBtn: Button? = null
 
     // Скрытый EditText-прокси для клавиатурного ввода
     private var keyProxy: EditText? = null
@@ -58,6 +67,26 @@ class MainActivity : Activity() {
     private var kbVisible = false
 
     private val prefs by lazy { getSharedPreferences("everty_prefs", Context.MODE_PRIVATE) }
+
+    // Пароли хранятся в зашифрованных SharedPreferences (Android Keystore, AES-256-GCM).
+    // На рутованных устройствах plaintext SharedPreferences читаются любым приложением;
+    // EncryptedSharedPreferences защищены аппаратным ключом.
+    private val securePrefs by lazy {
+        try {
+            val keyAlias = MasterKeys.getOrCreate(MasterKeys.AES256_GCM_SPEC)
+            EncryptedSharedPreferences.create(
+                "everty_secure_prefs",
+                keyAlias,
+                this,
+                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
+            )
+        } catch (_: Exception) {
+            // Keystore недоступен (эмулятор без Google Play?) — fallback на обычные prefs.
+            // В проде на реальном устройстве этой ветки не бывает.
+            getSharedPreferences("everty_secure_prefs_fallback", Context.MODE_PRIVATE)
+        }
+    }
     private val PREF_LAST_ID = "last_id"
     private val PREF_API_URL = "api_url"
     private val PREF_ID_SERVER = "id_server"
@@ -73,9 +102,13 @@ class MainActivity : Activity() {
     private val PREF_AB_LOCAL_CONTACTS = "address_book_local_contacts"
     private val PREF_SAVED_PASSWORDS = "saved_passwords"  // JSON {id: password}
     private val PREF_NATURAL_SCROLL = "natural_scroll"    // true = Mac natural (default)
+    private val PREF_CODEC = "codec"                       // EVRTCK | H264 | H265 | AV1
 
     // ID текущего удалённого хоста — используется для уведомления хоста через агент
     private var currentRemoteId = ""
+
+    // Кодек активной сессии — нужен для выбора между Surface и bitmap режимами
+    private var activeCodec = "EVRTCK"
 
     private val defaultApiUrl = "https://desk.everty.ru"
     private val defaultIdServer = "edesk.server1.everty.ru"
@@ -126,17 +159,23 @@ class MainActivity : Activity() {
         fun refreshPwHint() {
             val id = idInput.text.toString().filter { it.isDigit() }
             val saved = if (id.isNotEmpty()) savedPassword(id) else ""
-            if (saved.isNotEmpty() && pwInput.text.isNullOrEmpty()) {
-                pwInput.setText(saved)
-            }
             if (saved.isNotEmpty()) {
-                pwSavedHint.text = "🔑 Пароль сохранён  ·  Нажмите чтобы очистить"
+                // Не заполняем поле автоматически — пользователь сам решает.
+                // Автозаполнение при смене хоста приводило к отправке старого пароля
+                // хосту в режиме "Принять", что вызывало "Wrong Password" даже после
+                // того как хост нажимал "Принять".
+                pwSavedHint.text = "🔑 Пароль сохранён  ·  Нажмите чтобы подставить"
                 pwSavedHint.visibility = View.VISIBLE
                 pwSavedHint.setOnClickListener {
-                    val rid = idInput.text.toString().filter { it.isDigit() }
-                    savePassword(rid, "")
-                    pwInput.setText("")
-                    pwSavedHint.visibility = View.GONE
+                    if (pwInput.text.isNullOrEmpty()) {
+                        pwInput.setText(saved)
+                        pwSavedHint.text = "🔑 Пароль подставлен  ·  Нажмите чтобы очистить"
+                    } else {
+                        val rid = idInput.text.toString().filter { it.isDigit() }
+                        savePassword(rid, "")
+                        pwInput.setText("")
+                        pwSavedHint.visibility = View.GONE
+                    }
                 }
             } else {
                 pwSavedHint.visibility = View.GONE
@@ -453,18 +492,32 @@ class MainActivity : Activity() {
         idInput.requestFocus()
     }
 
-    // ── Сохранённые пароли ────────────────────────────────────────────────────
+    // ── Сохранённые пароли (зашифрованные) ───────────────────────────────────
 
-    private fun savedPassword(id: String): String {
-        val json = prefs.getString(PREF_SAVED_PASSWORDS, "{}") ?: "{}"
-        return try { JSONObject(json).optString(id, "") } catch (_: Exception) { "" }
-    }
+    private fun savedPassword(id: String): String =
+        // Каждый пароль хранится как отдельная запись "pw_<id>" → нет JSON-парсинга в hot path.
+        securePrefs.getString("pw_$id", "").orEmpty().also { pw ->
+            // Однократная миграция из старого plaintext хранилища
+            if (pw.isEmpty()) {
+                val legacy = prefs.getString(PREF_SAVED_PASSWORDS, "{}") ?: "{}"
+                val old = try { JSONObject(legacy).optString(id, "") } catch (_: Exception) { "" }
+                if (old.isNotEmpty()) {
+                    securePrefs.edit().putString("pw_$id", old).apply()
+                    // Удалить из старого хранилища
+                    val obj = try { JSONObject(legacy) } catch (_: Exception) { JSONObject() }
+                    obj.remove(id)
+                    prefs.edit().putString(PREF_SAVED_PASSWORDS, obj.toString()).apply()
+                    return old
+                }
+            }
+        }
 
     private fun savePassword(id: String, password: String) {
-        val json = prefs.getString(PREF_SAVED_PASSWORDS, "{}") ?: "{}"
-        val obj = try { JSONObject(json) } catch (_: Exception) { JSONObject() }
-        if (password.isBlank()) obj.remove(id) else obj.put(id, password)
-        prefs.edit().putString(PREF_SAVED_PASSWORDS, obj.toString()).apply()
+        if (password.isBlank()) {
+            securePrefs.edit().remove("pw_$id").apply()
+        } else {
+            securePrefs.edit().putString("pw_$id", password).apply()
+        }
     }
 
     // ── Уведомление хоста о подключении ──────────────────────────────────────
@@ -719,6 +772,402 @@ class MainActivity : Activity() {
         col.addView(naturalScrollRow, matchWrap())
         col.addView(vSpace(dp(8)))
         col.addView(label("Отключите, если скролл ощущается перевёрнутым на вашем хосте"), matchWrap())
+
+        // ── Кодек ────────────────────────────────────────────────────────────
+        col.addView(vSpace(dp(24)))
+        col.addView(sectionHeader("Кодек видео"))
+        col.addView(vSpace(dp(8)))
+        col.addView(TextView(this).apply {
+            text = "Выбранный кодек используется при следующем подключении. EVRTCK — лучший выбор для LAN и прямых соединений."
+            setTextColor(textSoft)
+            textSize = 12f
+            setLineSpacing(0f, 1.2f)
+        }, matchWrap())
+        col.addView(vSpace(dp(12)))
+
+        val codecs = listOf("EVRTCK", "H264", "H265", "AV1")
+        val codecLabels = mapOf("EVRTCK" to "EVRTCK\nLAN / прямой", "H264" to "H264\nСовместимость", "H265" to "H265\nКачество/фильмы", "AV1" to "AV1\nЭффективность")
+        val codecBtnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        val codecBtns = mutableMapOf<String, Button>()
+
+        fun updateCodecButtons(selected: String) {
+            codecs.forEach { c ->
+                codecBtns[c]?.apply {
+                    background = if (c == selected) roundedBg(brandGreen, 14) else roundedBg(cardBg, 14, lineSoft)
+                    setTextColor(if (c == selected) Color.WHITE else textMain)
+                }
+            }
+        }
+
+        codecs.forEach { c ->
+            val btn = Button(this).apply {
+                text = codecLabels[c] ?: c
+                textSize = 10f
+                isAllCaps = false
+                setOnClickListener {
+                    prefs.edit().putString(PREF_CODEC, c).apply()
+                    updateCodecButtons(c)
+                }
+            }
+            codecBtns[c] = btn
+            codecBtnRow.addView(btn, LinearLayout.LayoutParams(0, dp(64), 1f).also {
+                it.setMargins(dp(2), 0, dp(2), 0)
+            })
+        }
+        updateCodecButtons(selectedCodec())
+        col.addView(codecBtnRow, matchWrap())
+    }
+
+    // ── Игровой режим ─────────────────────────────────────────────────────────
+    private fun showGameScreen() {
+        val col = showAppScreen(
+            active = "game",
+            title = "Игра",
+            subtitle = "H265 / EVRT — стриминг с низкой задержкой",
+        )
+
+        val infoCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = roundedBg(Color.rgb(0x0D, 0x20, 0x18), 18, Color.rgb(0x12, 0xC9, 0x72))
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+        }
+        infoCard.addView(TextView(this).apply {
+            text = "🎮  Игровой стриминг"
+            setTextColor(brandGreen)
+            textSize = 15f
+            typeface = Typeface.DEFAULT_BOLD
+        }, matchWrap())
+        infoCard.addView(vSpace(dp(6)))
+        infoCard.addView(TextView(this).apply {
+            text = "Использует H265 через EVRT UDP — минимальная задержка, высокое качество. H265 эффективнее сжимает и даёт лучшую картинку при том же битрейте."
+            setTextColor(Color.rgb(0xCC, 0xFF, 0xE0))
+            textSize = 12f
+            setLineSpacing(0f, 1.2f)
+        }, matchWrap())
+        col.addView(infoCard, matchWrap())
+        col.addView(vSpace(dp(20)))
+
+        val idInput = makeInput("ID партнёра", false).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            textSize = 18f
+            prefs.getString(PREF_LAST_ID, "")?.takeIf { it.isNotEmpty() }?.let {
+                setText(it)
+                setSelection(it.length)
+            }
+        }
+        col.addView(idInput, matchWrap())
+        col.addView(vSpace(dp(10)))
+        val pwInput = makeInput("Пароль (необязательно)", true)
+        col.addView(pwInput, matchWrap())
+        col.addView(vSpace(dp(20)))
+
+        // Выбор кодека для игрового режима
+        col.addView(label("Кодек (рекомендуется H265)"))
+        col.addView(vSpace(dp(8)))
+        val gameCodecs = listOf("H265", "AV1", "EVRTCK")
+        var gameCodec = prefs.getString("game_codec", "H265") ?: "H265"
+        val gameCodecRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+        val gameCodecBtns = mutableMapOf<String, Button>()
+
+        fun updateGameCodecBtns(sel: String) {
+            gameCodecs.forEach { c ->
+                gameCodecBtns[c]?.apply {
+                    background = if (c == sel) roundedBg(brandGreen, 14) else roundedBg(cardBg, 14, lineSoft)
+                    setTextColor(if (c == sel) Color.WHITE else textMain)
+                }
+            }
+        }
+
+        gameCodecs.forEach { c ->
+            val btn = Button(this).apply {
+                text = c
+                textSize = 11f
+                isAllCaps = false
+                setOnClickListener {
+                    gameCodec = c
+                    prefs.edit().putString("game_codec", c).apply()
+                    updateGameCodecBtns(c)
+                }
+            }
+            gameCodecBtns[c] = btn
+            gameCodecRow.addView(btn, LinearLayout.LayoutParams(0, dp(44), 1f).also {
+                it.setMargins(dp(2), 0, dp(2), 0)
+            })
+        }
+        updateGameCodecBtns(gameCodec)
+        col.addView(gameCodecRow, matchWrap())
+        col.addView(vSpace(dp(20)))
+
+        val statusLabel = TextView(this).apply {
+            text = " "
+            setTextColor(textSoft)
+            textSize = 13f
+            gravity = Gravity.CENTER
+        }
+
+        col.addView(makePrimaryButton("▶  Запустить игровой стрим") {
+            val id = idInput.text.toString().filter { it.isDigit() }
+            if (id.isEmpty()) {
+                statusLabel.text = "Введите ID партнёра"
+                statusLabel.setTextColor(Color.rgb(0xE3, 0x4B, 0x2F))
+                return@makePrimaryButton
+            }
+            prefs.edit().putString(PREF_LAST_ID, id).apply()
+            statusLabel.text = "Подключение (${gameCodec})..."
+            statusLabel.setTextColor(textSoft)
+            val pw = pwInput.text.toString()
+            val dm = android.util.DisplayMetrics()
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay.getRealMetrics(dm)
+            client.setMaxResolution(dm.widthPixels, dm.heightPixels)
+            val started = client.start(id, pw, apiUrl(), idServer(), relayServer(), publicKey(), gameCodec)
+            if (!started) {
+                statusLabel.text = "Не удалось запустить сессию"
+                statusLabel.setTextColor(Color.rgb(0xE3, 0x4B, 0x2F))
+                return@makePrimaryButton
+            }
+            rememberRecentSession(id)
+            if (pw.isNotEmpty()) savePassword(id, pw)
+            currentRemoteId = id
+            activeCodec = gameCodec
+            showGameRemoteScreen()
+        }.apply { textSize = 16f }, LinearLayout.LayoutParams(MATCH_PARENT, dp(56)))
+
+        col.addView(vSpace(dp(12)))
+        col.addView(statusLabel, matchWrap())
+    }
+
+    // ── Удалённый экран для игрового режима ───────────────────────────────────
+    private fun showGameRemoteScreen() {
+        root.removeAllViews()
+        kbVisible = false
+        touchpadView = null
+
+        val useHardware = activeCodec != "EVRTCK"
+
+        // TextureView — unlike SurfaceView, resize doesn't destroy/recreate the surface,
+        // so the decoder survives onVideoRectChanged without a 2-second IDR wait.
+        var textureView: TextureView? = null
+        if (useHardware) {
+            val tv = TextureView(this).apply {
+                layoutParams = FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)
+                keepScreenOn = true
+            }
+            textureView = tv
+            root.addView(tv)
+        }
+
+        val rv = RemoteView(this, client).apply {
+            layoutParams = FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)
+            setNaturalScroll(false)
+            isGameMode = useHardware
+            if (useHardware) {
+                isHardwareDecodeMode = true
+                setBackgroundColor(Color.TRANSPARENT)
+                onVideoRectChanged = { rect ->
+                    textureView?.layoutParams = FrameLayout.LayoutParams(rect.width, rect.height).apply {
+                        leftMargin = rect.x
+                        topMargin = rect.y
+                    }
+                }
+            }
+        }
+        remoteView = rv
+        root.addView(rv)
+
+        if (useHardware) {
+            VideoDecoder.onDimensionsAvailable = { w, h ->
+                handler.post { rv.setHardwareDimensions(w, h) }
+            }
+            textureView?.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
+                    // Re-arm onDimensionsAvailable — releaseAll() might have cleared it
+                    VideoDecoder.onDimensionsAvailable = { dw, dh ->
+                        handler.post { rv.setHardwareDimensions(dw, dh) }
+                    }
+                    VideoDecoder.setSurface(Surface(st))
+                }
+                override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
+                override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                    VideoDecoder.releaseAll()
+                    return true
+                }
+                override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+            }
+        }
+
+        val proxy = buildKeyProxy()
+        keyProxy = proxy
+        root.addView(proxy, FrameLayout.LayoutParams(1, 1).also { it.gravity = Gravity.TOP or Gravity.START })
+
+        // Статус-оверлей
+        val overlay = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.argb(0xAA, 0, 0, 0))
+            textSize = 11f
+            setPadding(dp(10), dp(6), dp(10), dp(6))
+        }
+        root.addView(overlay, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.START))
+
+        // Геймпад-оверлей (скрыт по умолчанию)
+        val gamepadOverlay = buildGamepadOverlay()
+        var gamepadVisible = false
+        root.addView(gamepadOverlay, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT, Gravity.BOTTOM))
+        gamepadOverlay.visibility = View.GONE
+
+        // Тулбар
+        val toolbar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(toolbarBg)
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(6), dp(6), dp(6), dp(6))
+        }
+
+        val gamepadBtn = makeToolBtn("🎮  Геймпад", Color.rgb(0x22, 0x33, 0x55))
+        gamepadBtn.setOnClickListener {
+            gamepadVisible = !gamepadVisible
+            gamepadOverlay.visibility = if (gamepadVisible) View.VISIBLE else View.GONE
+            gamepadBtn.background = roundedBg(
+                if (gamepadVisible) brandGreen else Color.rgb(0x22, 0x33, 0x55), 14)
+        }
+
+        val kbBtn = makeToolBtn("⌨  Клав.", Color.rgb(0x22, 0x44, 0x55))
+        kbBtn.setOnClickListener { toggleKeyboard() }
+
+        val zoomBtn = makeToolBtn("⊞  1:1", Color.rgb(0x22, 0x44, 0x33))
+        zoomBtn.setOnClickListener { rv.resetZoom() }
+
+        val rotBtn = makeRotateBtn()
+
+        val muteBtn = makeToolBtn("🔊  Звук", Color.rgb(0x22, 0x44, 0x44))
+        muteBtn.setOnClickListener {
+            val player = audioPlayer ?: return@setOnClickListener
+            player.muted = !player.muted
+            if (player.muted) {
+                muteBtn.text = "🔇  Звук"
+                muteBtn.background = roundedBg(Color.rgb(0x55, 0x33, 0x22), 14)
+            } else {
+                muteBtn.text = "🔊  Звук"
+                muteBtn.background = roundedBg(Color.rgb(0x22, 0x44, 0x44), 14)
+            }
+        }
+
+        val discBtn = makeToolBtn("✕  Выход", Color.rgb(0x66, 0x22, 0x22))
+        discBtn.setOnClickListener { disconnect() }
+
+        listOf(gamepadBtn, kbBtn, zoomBtn, rotBtn, muteBtn, discBtn).forEach { btn ->
+            toolbar.addView(btn, LinearLayout.LayoutParams(0, dp(40), 1f).also {
+                it.setMargins(dp(3), 0, dp(3), 0)
+            })
+        }
+
+        val specRow = buildSpecialKeysRow()
+        kbPanel = specRow
+        val bottomBar = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        bottomBar.addView(specRow, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        bottomBar.addView(toolbar, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        root.addView(bottomBar, FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.BOTTOM))
+
+        rv.setRightClickCallback { _, _ -> false }
+        rv.startRendering()
+
+        // Запускаем аудио плеер для игрового режима
+        audioPlayer?.stop()
+        audioPlayer = EvrtAudioPlayer(client).also { it.start() }
+
+        val statusTick = object : Runnable {
+            var hostNotified = false
+            var authWatchTicks = 0
+            override fun run() {
+                val connected = client.isConnected()
+                val status = client.status()
+                if (!connected) {
+                    authWatchTicks++
+                    if (authWatchTicks in 2..30 && looksLikeAuthError(status)) {
+                        handleAuthFailure(currentRemoteId)
+                        return
+                    }
+                } else {
+                    authWatchTicks = 99
+                }
+                val statusText = if (connected) "● $status" else status
+                overlay.text = if (useHardware && connected) {
+                    "$statusText  |  ${PerfStats.summary()}"
+                } else {
+                    statusText
+                }
+                if (connected && !hostNotified) {
+                    hostNotified = true
+                    notifySessionConnected(currentRemoteId)
+                }
+                handler.postDelayed(this, 500)
+            }
+        }
+        handler.post(statusTick)
+    }
+
+    private fun buildGamepadOverlay(): FrameLayout {
+        val pad = FrameLayout(this).apply {
+            setBackgroundColor(Color.argb(0, 0, 0, 0))
+        }
+
+        // D-pad в нижнем левом углу
+        val dpad = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+
+        fun gameKey(label: String, keyCode: Int) = Button(this).apply {
+            text = label
+            setTextColor(Color.WHITE)
+            background = roundedBg(Color.argb(0xCC, 0x11, 0x22, 0x33), 12)
+            textSize = 14f
+            isAllCaps = false
+            setOnClickListener { client.keyControl(keyCode) }
+        }
+
+        val upRow = LinearLayout(this).apply { gravity = Gravity.CENTER }
+        upRow.addView(gameKey("↑", 32), LinearLayout.LayoutParams(dp(54), dp(50)))
+        val midRow = LinearLayout(this).apply { gravity = Gravity.CENTER }
+        midRow.addView(gameKey("←", 22), LinearLayout.LayoutParams(dp(54), dp(50)).also { it.setMargins(0,0,dp(2),0) })
+        midRow.addView(gameKey("↓", 6), LinearLayout.LayoutParams(dp(54), dp(50)).also { it.setMargins(dp(2),0,dp(2),0) })
+        midRow.addView(gameKey("→", 28), LinearLayout.LayoutParams(dp(54), dp(50)).also { it.setMargins(dp(2),0,0,0) })
+        dpad.addView(upRow)
+        dpad.addView(vSpace(dp(2)))
+        dpad.addView(midRow)
+
+        val dpadLp = FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.START)
+        dpadLp.setMargins(dp(16), 0, 0, dp(56))
+        pad.addView(dpad, dpadLp)
+
+        // Кнопки действий справа
+        val actionCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.END
+        }
+        val actRow1 = LinearLayout(this).apply { gravity = Gravity.CENTER }
+        actRow1.addView(gameKey("Esc", 8), LinearLayout.LayoutParams(dp(54), dp(50)).also { it.setMargins(0,0,dp(4),0) })
+        actRow1.addView(gameKey("Tab", 31), LinearLayout.LayoutParams(dp(54), dp(50)))
+        val actRow2 = LinearLayout(this).apply { gravity = Gravity.CENTER }
+        actRow2.addView(gameKey("Enter", 27), LinearLayout.LayoutParams(dp(68), dp(50)).also { it.setMargins(0,0,dp(4),0) })
+        actRow2.addView(gameKey("Space", 27).apply {
+            text = "Sp"
+            setOnClickListener { client.keyText(" ") }
+        }, LinearLayout.LayoutParams(dp(50), dp(50)))
+        actionCol.addView(actRow1)
+        actionCol.addView(vSpace(dp(2)))
+        actionCol.addView(actRow2)
+
+        val actLp = FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.END)
+        actLp.setMargins(0, 0, dp(16), dp(56))
+        pad.addView(actionCol, actLp)
+
+        return pad
     }
 
     // ── О нас / контакты ─────────────────────────────────────────────────────
@@ -756,11 +1205,18 @@ class MainActivity : Activity() {
         password: String,
         statusLabel: TextView,
         touchpadOnly: Boolean = false,
+        codec: String = selectedCodec(),
     ) {
+        // Сообщить хосту размер экрана — pipeline сделает downscale до него.
+        val dm = android.util.DisplayMetrics()
+        @Suppress("DEPRECATION")
+        windowManager.defaultDisplay.getRealMetrics(dm)
+        client.setMaxResolution(dm.widthPixels, dm.heightPixels)
+
         val started = if (touchpadOnly) {
-            client.startTouchpad(id, password, apiUrl(), idServer(), relayServer(), publicKey())
+            client.startTouchpad(id, password, apiUrl(), idServer(), relayServer(), publicKey(), codec)
         } else {
-            client.start(id, password, apiUrl(), idServer(), relayServer(), publicKey())
+            client.start(id, password, apiUrl(), idServer(), relayServer(), publicKey(), codec)
         }
         if (!started) {
             statusLabel.text = "Не удалось запустить сессию"
@@ -770,6 +1226,7 @@ class MainActivity : Activity() {
         rememberRecentSession(id)
         if (password.isNotEmpty()) savePassword(id, password)
         currentRemoteId = id
+        activeCodec = codec
         if (touchpadOnly) {
             showTouchpadScreen()
         } else {
@@ -783,12 +1240,56 @@ class MainActivity : Activity() {
         kbVisible = false
         touchpadView = null
 
+        val useHardware = activeCodec != "EVRTCK"
+
+        // TextureView — resize via onVideoRectChanged doesn't destroy the surface,
+        // so the decoder stays alive without an IDR gap (unlike SurfaceView).
+        var textureView: TextureView? = null
+        if (useHardware) {
+            val tv = TextureView(this).apply {
+                layoutParams = FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)
+                keepScreenOn = true
+            }
+            textureView = tv
+            root.addView(tv)
+        }
+
         val rv = RemoteView(this, client).apply {
             layoutParams = FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)
             setNaturalScroll(prefs.getBoolean(PREF_NATURAL_SCROLL, true))
+            if (useHardware) {
+                isHardwareDecodeMode = true
+                setBackgroundColor(Color.TRANSPARENT)
+                onVideoRectChanged = { rect ->
+                    textureView?.layoutParams = FrameLayout.LayoutParams(rect.width, rect.height).apply {
+                        leftMargin = rect.x
+                        topMargin = rect.y
+                    }
+                }
+            }
         }
         remoteView = rv
         root.addView(rv)
+
+        if (useHardware) {
+            VideoDecoder.onDimensionsAvailable = { w, h ->
+                handler.post { rv.setHardwareDimensions(w, h) }
+            }
+            textureView?.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
+                    VideoDecoder.onDimensionsAvailable = { dw, dh ->
+                        handler.post { rv.setHardwareDimensions(dw, dh) }
+                    }
+                    VideoDecoder.setSurface(Surface(st))
+                }
+                override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
+                override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                    VideoDecoder.releaseAll()
+                    return true
+                }
+                override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+            }
+        }
 
         // Скрытый EditText-прокси для клавиатуры
         val proxy = buildKeyProxy()
@@ -834,6 +1335,8 @@ class MainActivity : Activity() {
         val zoomBtn = makeToolBtn("⊞  1:1", Color.rgb(0x22, 0x44, 0x33))
         zoomBtn.setOnClickListener { rv.resetZoom() }
 
+        val rotBtn = makeRotateBtn()
+
         val discBtn = makeToolBtn("✕  Выход", Color.rgb(0x66, 0x22, 0x22))
         discBtn.setOnClickListener { disconnect() }
 
@@ -844,6 +1347,8 @@ class MainActivity : Activity() {
         toolbar.addView(kbBtn, LinearLayout.LayoutParams(0, dp(40), 1f).also {
             it.setMargins(dp(3), 0, dp(3), 0) })
         toolbar.addView(zoomBtn, LinearLayout.LayoutParams(0, dp(40), 1f).also {
+            it.setMargins(dp(3), 0, dp(3), 0) })
+        toolbar.addView(rotBtn, LinearLayout.LayoutParams(0, dp(40), 1f).also {
             it.setMargins(dp(3), 0, dp(3), 0) })
         toolbar.addView(discBtn, LinearLayout.LayoutParams(0, dp(40), 1f).also {
             it.setMargins(dp(3), 0, dp(3), 0) })
@@ -872,9 +1377,28 @@ class MainActivity : Activity() {
 
         val statusTick = object : Runnable {
             var hostNotified = false
+            var authWatchTicks = 0
             override fun run() {
                 val connected = client.isConnected()
-                overlay.text = if (connected) "● ${client.status()}" else client.status()
+                val status = client.status()
+                // Auth watchdog: первые 15 сек (30 тиков) проверяем статус на ошибку пароля.
+                // Тик 0 пропускаем — статус ещё "Connecting..." а не результат.
+                if (!connected) {
+                    authWatchTicks++
+                    if (authWatchTicks in 2..30 && looksLikeAuthError(status)) {
+                        handleAuthFailure(currentRemoteId)
+                        return
+                    }
+                } else {
+                    authWatchTicks = 99 // подключились — watchdog больше не нужен
+                }
+
+                val statusText = if (connected) "● $status" else status
+                overlay.text = if (useHardware && connected) {
+                    "$statusText  |  ${PerfStats.summary()}"
+                } else {
+                    statusText
+                }
                 if (connected && !hostNotified) {
                     hostNotified = true
                     notifySessionConnected(currentRemoteId)
@@ -933,6 +1457,8 @@ class MainActivity : Activity() {
         val centerBtn = makeToolBtn("Центр", Color.rgb(0x22, 0x44, 0x33))
         centerBtn.setOnClickListener { tv.centerCursor() }
 
+        val rotBtn = makeRotateBtn()
+
         val discBtn = makeToolBtn("Выход", Color.rgb(0x66, 0x22, 0x22))
         discBtn.setOnClickListener { disconnect() }
 
@@ -943,6 +1469,9 @@ class MainActivity : Activity() {
             it.setMargins(dp(3), 0, dp(3), 0)
         })
         toolbar.addView(centerBtn, LinearLayout.LayoutParams(0, dp(40), 1f).also {
+            it.setMargins(dp(3), 0, dp(3), 0)
+        })
+        toolbar.addView(rotBtn, LinearLayout.LayoutParams(0, dp(40), 1f).also {
             it.setMargins(dp(3), 0, dp(3), 0)
         })
         toolbar.addView(discBtn, LinearLayout.LayoutParams(0, dp(40), 1f).also {
@@ -961,10 +1490,21 @@ class MainActivity : Activity() {
 
         val statusTick = object : Runnable {
             var hostNotified = false
+            var authWatchTicks = 0
             override fun run() {
-                tv.refreshRemoteSize()
                 val connected = client.isConnected()
-                overlay.text = if (connected) "● ${client.status()}" else client.status()
+                val status = client.status()
+                if (!connected) {
+                    authWatchTicks++
+                    if (authWatchTicks in 2..30 && looksLikeAuthError(status)) {
+                        handleAuthFailure(currentRemoteId)
+                        return
+                    }
+                } else {
+                    authWatchTicks = 99
+                }
+                tv.refreshRemoteSize()
+                overlay.text = if (connected) "● $status" else status
                 if (connected && !hostNotified) {
                     hostNotified = true
                     notifySessionConnected(currentRemoteId)
@@ -975,14 +1515,22 @@ class MainActivity : Activity() {
         handler.post(statusTick)
     }
 
+    private fun selectedCodec(): String = prefs.getString(PREF_CODEC, "EVRTCK") ?: "EVRTCK"
+
     private fun disconnect() {
+        audioPlayer?.stop()
+        audioPlayer = null
         remoteView?.stopRendering()
+        VideoDecoder.releaseAll()
         client.stop()
         handler.removeCallbacksAndMessages(null)
         rightClickPending = false
         rightClickBtn = null
+        rotateBtn = null
         remoteView = null
         touchpadView = null
+        activeCodec = "EVRTCK"
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_USER
 
         // Ждём ~700ms пока поток старой сессии обработает Close и закроет TCP-сокет к relay.
         // Без паузы повторное подключение приходит пока старый сокет жив — relay/хост отклоняют.
@@ -1000,11 +1548,123 @@ class MainActivity : Activity() {
         handler.postDelayed({ showConnectScreen() }, 700)
     }
 
+    // ── Auth failure ──────────────────────────────────────────────────────────
+
+    private fun looksLikeAuthError(status: String): Boolean {
+        val s = status.lowercase()
+        return s.contains("wrong") || s.contains("password") ||
+               s.contains("denied") || s.contains("rejected") || s.contains("forbidden")
+    }
+
+    /** Вызывается когда в статусе обнаружена ошибка аутентификации.
+     *  Останавливает сессию, удаляет устаревший пароль, показывает диалог. */
+    private fun handleAuthFailure(id: String) {
+        audioPlayer?.stop()
+        audioPlayer = null
+        remoteView?.stopRendering()
+        VideoDecoder.releaseAll()
+        client.stop()
+        handler.removeCallbacksAndMessages(null)
+        savePassword(id, "")   // устаревший пароль удалён
+        remoteView = null
+        touchpadView = null
+        activeCodec = "EVRTCK"
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_USER
+
+        handler.postDelayed({
+            showConnectScreen()
+            showPasswordDialog(id)
+        }, 400)
+    }
+
+    /** Диалог повторного ввода пароля после неудачной аутентификации. */
+    private fun showPasswordDialog(id: String) {
+        val overlay = FrameLayout(this).apply {
+            setBackgroundColor(Color.argb(0xCC, 0, 0, 0))
+            isClickable = true
+            isFocusable = true
+        }
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = roundedBg(cardBg, 22)
+            setPadding(dp(20), dp(20), dp(20), dp(20))
+        }
+
+        card.addView(TextView(this).apply {
+            text = "Пароль не подошёл"
+            textSize = 19f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.rgb(0xE3, 0x4B, 0x2F))
+            gravity = Gravity.CENTER
+        }, matchWrap())
+        card.addView(vSpace(dp(10)))
+        card.addView(TextView(this).apply {
+            // Объясняем оба сценария — пользователь не знает почему хост нажал "Принять" но всё равно отказ
+            text = "Два частых случая:\n\n" +
+                   "• Хост нажал «Принять» — значит он работает без пароля. " +
+                   "Нажмите «Без пароля» ниже — это правильный способ подключения к такому хосту.\n\n" +
+                   "• Пароль изменился — введите новый пароль.\n\n" +
+                   "Сохранённый пароль для ID $id удалён."
+            setTextColor(textSoft)
+            textSize = 13f
+            setLineSpacing(0f, 1.25f)
+        }, matchWrap())
+        card.addView(vSpace(dp(16)))
+
+        fun dismiss() { root.removeView(overlay) }
+
+        // "Без пароля" — основная кнопка: именно это нужно когда хост в режиме "Принять"
+        card.addView(makePrimaryButton("Без пароля (хост нажмёт «Принять»)") {
+            dismiss()
+            connect(id, "", TextView(this))
+        }, LinearLayout.LayoutParams(MATCH_PARENT, dp(52)))
+        card.addView(vSpace(dp(10)))
+
+        // Разделитель "или"
+        card.addView(TextView(this).apply {
+            text = "— или введите новый пароль —"
+            setTextColor(textSoft)
+            textSize = 11f
+            gravity = Gravity.CENTER
+        }, matchWrap())
+        card.addView(vSpace(dp(10)))
+
+        val pwInput = makeInput("Новый пароль", true)
+        card.addView(pwInput, matchWrap())
+        card.addView(vSpace(dp(10)))
+        card.addView(makeSecondaryButton("Подключиться с паролем") {
+            val pw = pwInput.text.toString()
+            dismiss()
+            connect(id, pw, TextView(this))
+        }, LinearLayout.LayoutParams(MATCH_PARENT, dp(46)))
+        card.addView(vSpace(dp(8)))
+        card.addView(makeSecondaryButton("Отмена") { dismiss() },
+            LinearLayout.LayoutParams(MATCH_PARENT, dp(46)))
+
+        val lp = FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.CENTER).apply {
+            val m = dp(24); setMargins(m, m, m, m)
+        }
+        overlay.addView(card, lp)
+        root.addView(overlay, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+        pwInput.requestFocus()
+    }
+
     override fun onDestroy() {
         remoteView?.stopRendering()
         touchpadView = null
         client.stop()
         super.onDestroy()
+    }
+
+    // Вызывается системой при смене ориентации — Activity НЕ пересоздаётся (configChanges в манифесте).
+    // MATCH_PARENT views автоматически перемеряются; обновляем только текст кнопки поворота.
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        val isLandscape = newConfig.orientation == Configuration.ORIENTATION_LANDSCAPE
+        rotateBtn?.apply {
+            text = if (isLandscape) "↕ Портрет" else "↔ Пейзаж"
+            tag = isLandscape
+        }
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────
@@ -1070,6 +1730,7 @@ class MainActivity : Activity() {
         }
         row.addView(navButton("Подключение", active == "connect") { showConnectScreen() })
         row.addView(navButton("Контакты", active == "contacts") { showContactsScreen() })
+        row.addView(navButton("Игра", active == "game") { showGameScreen() })
         row.addView(navButton("Настройки", active == "settings") { showSettingsScreen() })
         row.addView(navButton("О нас", active == "about") { showAboutScreen() })
         return HorizontalScrollView(this).apply {
@@ -1329,6 +1990,31 @@ class MainActivity : Activity() {
         textSize = 11f
         isAllCaps = false
         setPadding(dp(4), 0, dp(4), 0)
+    }
+
+    // Кнопка поворота экрана: тап переключает между пейзажем и портретом.
+    // tag=true → сейчас пейзаж, следующий тап → портрет. И наоборот.
+    private fun makeRotateBtn(): Button {
+        val isLandscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        return makeToolBtn(
+            if (isLandscape) "↕ Портрет" else "↔ Пейзаж",
+            Color.rgb(0x22, 0x33, 0x44)
+        ).apply {
+            tag = isLandscape
+            setOnClickListener { v ->
+                val btn = v as Button
+                val wasLandscape = btn.tag as Boolean
+                if (wasLandscape) {
+                    requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                    btn.text = "↔ Пейзаж"
+                    btn.tag = false
+                } else {
+                    requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                    btn.text = "↕ Портрет"
+                    btn.tag = true
+                }
+            }
+        }.also { rotateBtn = it }
     }
 
     private fun toggleKeyboard() {

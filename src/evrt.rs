@@ -851,6 +851,10 @@ pub struct ReceiverFeedback {
     pub present_delta_ms: i32,
     pub pulse_estimate_ms: i32,
     pub input_estimate_ms: i32,
+    /// Client's display max width — host downscales to fit (0 = no constraint).
+    pub max_width: u32,
+    /// Client's display max height — host downscales to fit (0 = no constraint).
+    pub max_height: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -896,12 +900,13 @@ impl Pressure {
 }
 
 impl ReceiverFeedback {
-    /// Бинарная сериализация: 41 байт.
+    /// Бинарная сериализация: 49 байт.
     /// Формат: [pressure:u8][backlog:u32][drops:u64][fps:u32]
     ///         [assembly:i32][arrival:i32][decode:i32][present:i32]
-    ///         [pulse:i32][input:i32]
-    pub fn to_bytes(&self) -> [u8; 41] {
-        let mut b = [0u8; 41];
+    ///         [pulse:i32][input:i32][max_width:u32][max_height:u32]
+    /// Старые клиенты шлют 41 байт — max_width/max_height читаются как 0.
+    pub fn to_bytes(&self) -> [u8; 49] {
+        let mut b = [0u8; 49];
         b[0] = self.pressure.to_u8();
         b[1..5].copy_from_slice(&self.backlog_frames.to_be_bytes());
         b[5..13].copy_from_slice(&self.queue_drops.to_be_bytes());
@@ -912,6 +917,8 @@ impl ReceiverFeedback {
         b[29..33].copy_from_slice(&self.present_delta_ms.to_be_bytes());
         b[33..37].copy_from_slice(&self.pulse_estimate_ms.to_be_bytes());
         b[37..41].copy_from_slice(&self.input_estimate_ms.to_be_bytes());
+        b[41..45].copy_from_slice(&self.max_width.to_be_bytes());
+        b[45..49].copy_from_slice(&self.max_height.to_be_bytes());
         b
     }
 
@@ -931,11 +938,13 @@ impl ReceiverFeedback {
             present_delta_ms:  i32::from_be_bytes([b[29], b[30], b[31], b[32]]),
             pulse_estimate_ms: i32::from_be_bytes([b[33], b[34], b[35], b[36]]),
             input_estimate_ms: i32::from_be_bytes([b[37], b[38], b[39], b[40]]),
+            max_width:  if b.len() >= 45 { u32::from_be_bytes([b[41], b[42], b[43], b[44]]) } else { 0 },
+            max_height: if b.len() >= 49 { u32::from_be_bytes([b[45], b[46], b[47], b[48]]) } else { 0 },
         })
     }
 }
 
-/// Сериализовать feedback в бинарный TYPE_CONTROL пакет (42 байта).
+/// Сериализовать feedback в бинарный TYPE_CONTROL пакет (50 байт = 1 + 49).
 pub fn build_receiver_feedback(fb: &ReceiverFeedback) -> Vec<u8> {
     build_receiver_feedback_authenticated(fb, None)
 }
@@ -951,9 +960,10 @@ pub fn build_receiver_feedback_authenticated(
     fb: &ReceiverFeedback,
     session_token: Option<&str>,
 ) -> Vec<u8> {
-    let mut payload = [0u8; 42];
+    let fb_bytes = fb.to_bytes();
+    let mut payload = vec![0u8; 1 + fb_bytes.len()];
     payload[0] = CTRL_RECEIVER_FEEDBACK;
-    payload[1..42].copy_from_slice(&fb.to_bytes());
+    payload[1..].copy_from_slice(&fb_bytes);
     build_single_authenticated(TYPE_CONTROL, &payload, session_token)
 }
 
@@ -1125,6 +1135,8 @@ fn parse_feedback(s: &str) -> Option<ReceiverFeedback> {
         present_delta_ms: json_i32_field(s, "presentDeltaMs").unwrap_or(-1),
         pulse_estimate_ms: json_i32_field(s, "pulseEstimateMs").unwrap_or(-1),
         input_estimate_ms: json_i32_field(s, "inputEstimateMs").unwrap_or(-1),
+        max_width: 0,
+        max_height: 0,
     })
 }
 

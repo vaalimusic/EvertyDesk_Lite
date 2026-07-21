@@ -176,8 +176,11 @@ mod windows_nvenc {
     const STATUS_NO_PACKET: i32 = 1;
     const CODEC_ID_H264: i32 = 1;
     const CODEC_ID_H265: i32 = 2;
+    const CODEC_ID_AV1: i32 = 3;
     const CODEC_MASK_H264: u32 = 1 << 0;
     const CODEC_MASK_H265: u32 = 1 << 1;
+    // AV1 поддерживается шимом начиная с RTX 4000 (Ada Lovelace). Bit 2 в маске.
+    const CODEC_MASK_AV1: u32 = 1 << 2;
     const ERR_BUF_LEN: usize = 512;
 
     #[derive(Clone, Debug)]
@@ -357,6 +360,9 @@ mod windows_nvenc {
         if mask & CODEC_MASK_H265 != 0 {
             codecs.push(NvencCodec::H265);
         }
+        if mask & CODEC_MASK_AV1 != 0 {
+            codecs.push(NvencCodec::Av1);
+        }
 
         Some(NvencSupport {
             codecs,
@@ -368,9 +374,7 @@ mod windows_nvenc {
         match codec {
             NvencCodec::H264 => Ok(CODEC_ID_H264),
             NvencCodec::H265 => Ok(CODEC_ID_H265),
-            NvencCodec::Av1 => {
-                Err("NVENC AV1 is not enabled until AV1 decode is stable".to_owned())
-            }
+            NvencCodec::Av1 => Ok(CODEC_ID_AV1),
         }
     }
 

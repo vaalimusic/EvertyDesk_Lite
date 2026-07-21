@@ -16,21 +16,8 @@
 use eframe::egui::{self, Color32};
 use std::sync::{OnceLock, RwLock};
 
-/// Режим темы — сохраняется в конфиге.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ThemeMode {
-    Dark,
-    Light,
-    /// Follow the OS / system preference (updated live, no restart needed).
-    System,
-}
-
-impl Default for ThemeMode {
-    fn default() -> Self {
-        ThemeMode::Dark
-    }
-}
+// ThemeMode re-exported from settings (defined there so lib compiles without eframe)
+pub use crate::settings::ThemeMode;
 
 impl ThemeMode {
     pub fn label(self) -> &'static str {

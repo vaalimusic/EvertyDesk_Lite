@@ -70,4 +70,8 @@ android {
 
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
+    // Шифрование SharedPreferences через Android Keystore (аппаратный AES-256-GCM).
+    // Пароли подключений хранятся в EncryptedSharedPreferences — не читаются
+    // другими приложениями даже на устройствах с root.
+    implementation("androidx.security:security-crypto:1.0.0")
 }

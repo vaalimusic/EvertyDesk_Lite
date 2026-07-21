@@ -514,7 +514,8 @@ pub fn run_diagnose(remote_id: &str, password: &str, secs: u64, out_dir: &str) -
 
     let started = Instant::now();
     let session = std::thread::spawn(move || {
-        TransportClient::run_session(request, cmd_rx, ev_tx);
+        let no_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        TransportClient::run_session(request, cmd_rx, ev_tx, no_stop);
     });
 
     let mut collected = Collected::default();

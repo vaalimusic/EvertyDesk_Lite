@@ -12,15 +12,66 @@
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver, Sender},
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
 };
 use std::thread;
 
-use jni::objects::{JClass, JString};
-use jni::sys::{jboolean, jint, jintArray, jlong};
-use jni::JNIEnv;
+use jni::objects::{GlobalRef, JByteArray, JClass, JString};
+use jni::sys::{jboolean, jbyteArray, jint, jintArray, jlong};
+use jni::{JavaVM, JNIEnv};
 
-use crate::settings::{AppConfig, ServerConfig};
+// ─── JavaVM и класс декодера — сохраняем при загрузке .so ─────────────────────
+
+static ANDROID_JVM: OnceLock<JavaVM> = OnceLock::new();
+
+// GlobalRef на VideoDecoder class — кешируем в JNI_OnLoad, пока доступен
+// загрузчик классов приложения. Фоновые потоки используют этот ref напрямую,
+// минуя системный загрузчик (который не знает о классах APK).
+static DECODER_CLASS_REF: OnceLock<GlobalRef> = OnceLock::new();
+static PERF_STATS_CLASS_REF: OnceLock<GlobalRef> = OnceLock::new();
+
+/// Вызывается JVM при `System.loadLibrary("evertydesk_core")`.
+/// Сохраняем JavaVM и GlobalRef на VideoDecoder/PerfStats для фоновых потоков.
+#[no_mangle]
+pub extern "system" fn JNI_OnLoad(
+    vm: *mut jni::sys::JavaVM,
+    _reserved: *mut std::ffi::c_void,
+) -> jni::sys::jint {
+    if let Ok(jvm) = unsafe { JavaVM::from_raw(vm) } {
+        // Пока мы на потоке приложения — находим класс через правильный ClassLoader.
+        if let Ok(mut env) = jvm.attach_current_thread() {
+            if let Ok(cls) = env.find_class("ru/everty/desklite/VideoDecoder") {
+                if let Ok(global) = env.new_global_ref(cls) {
+                    let _ = DECODER_CLASS_REF.set(global);
+                }
+            }
+            if let Ok(cls) = env.find_class("ru/everty/desklite/PerfStats") {
+                if let Ok(global) = env.new_global_ref(cls) {
+                    let _ = PERF_STATS_CLASS_REF.set(global);
+                }
+            }
+        }
+        let _ = ANDROID_JVM.set(jvm);
+    }
+    jni::sys::JNI_VERSION_1_6
+}
+
+/// Доступ к JavaVM для фоновых JNI-вызовов (android_video.rs).
+pub fn android_jvm() -> Option<&'static JavaVM> {
+    ANDROID_JVM.get()
+}
+
+/// GlobalRef на класс VideoDecoder — безопасен для использования в любом потоке.
+pub fn decoder_class_ref() -> Option<&'static GlobalRef> {
+    DECODER_CLASS_REF.get()
+}
+
+/// GlobalRef на класс PerfStats — безопасен для использования в любом потоке.
+pub fn perf_stats_class_ref() -> Option<&'static GlobalRef> {
+    PERF_STATS_CLASS_REF.get()
+}
+
+use crate::settings::{AppConfig, CodecPreference, ServerConfig};
 use crate::transport::{
     ConnectionRequest, RemoteDisplay, SessionCommand, SessionEvent, TransportClient,
 };
@@ -70,7 +121,7 @@ fn jni_log(msg: &str) {
 
 /// Запустить сессию. Возвращает handle (указатель) или 0 при ошибке.
 ///
-/// Kotlin: `external fun nativeStart(id, password, apiUrl, idServer, relayServer, publicKey): Long`
+/// Kotlin: `external fun nativeStart(id, password, apiUrl, idServer, relayServer, publicKey, codec): Long`
 #[no_mangle]
 pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeStart(
     mut env: JNIEnv,
@@ -81,6 +132,7 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeStart(
     id_server: JString,
     relay_server: JString,
     public_key: JString,
+    codec: JString,
 ) -> jlong {
     start_android_session(
         &mut env,
@@ -90,6 +142,7 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeStart(
         id_server,
         relay_server,
         public_key,
+        codec,
         false,
     )
 }
@@ -104,6 +157,7 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeStartTouchpad(
     id_server: JString,
     relay_server: JString,
     public_key: JString,
+    codec: JString,
 ) -> jlong {
     start_android_session(
         &mut env,
@@ -113,8 +167,20 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeStartTouchpad(
         id_server,
         relay_server,
         public_key,
+        codec,
         true,
     )
+}
+
+fn parse_codec_preference(s: &str) -> CodecPreference {
+    match s.trim().to_ascii_uppercase().as_str() {
+        "H264" => CodecPreference::H264,
+        "H265" => CodecPreference::H265,
+        "AV1"  => CodecPreference::Av1,
+        "VP9"  => CodecPreference::Vp9,
+        "AUTO" => CodecPreference::Auto,
+        _      => CodecPreference::Evrtck,
+    }
 }
 
 fn start_android_session(
@@ -125,6 +191,7 @@ fn start_android_session(
     id_server: JString,
     relay_server: JString,
     public_key: JString,
+    codec: JString,
     control_only: bool,
 ) -> jlong {
     // Инициализируем android_logger один раз
@@ -150,11 +217,26 @@ fn start_android_session(
         relay_server: jstring_or(env, &relay_server, config.server.relay_server.clone()),
         public_key: jstring_or(env, &public_key, config.server.public_key.clone()),
     };
+    let mut display = config.display.clone();
+    // Don't limit fps from the Android side — let the host enforce its own target_fps cap.
+    // Stored config may have an outdated/low value; the host negotiates down if needed.
+    display.target_fps = 60;
+    // Game mode on LAN: disable adaptive quality so codec-switch noise doesn't
+    // trigger lower_adaptive_fps(60→30) and send custom_fps=30 to the host.
+    display.adaptive_quality = false;
+    let codec_str: String = match env.get_string(&codec) {
+        Ok(s) => s.into(),
+        Err(_) => String::new(),
+    };
+    if !codec_str.trim().is_empty() {
+        display.codec = parse_codec_preference(&codec_str);
+    }
+    jni_log(&format!("codec={:?}", display.codec));
     let request = ConnectionRequest {
         remote_id,
         password,
         server,
-        display: config.display.clone(),
+        display,
         control_only,
     };
 
@@ -169,8 +251,9 @@ fn start_android_session(
 
     // Поток сессии
     {
+        let stop_for_session = stop.clone();
         thread::spawn(move || {
-            TransportClient::run_session(request, cmd_rx, ev_tx);
+            TransportClient::run_session(request, cmd_rx, ev_tx, stop_for_session);
         });
     }
 
@@ -545,6 +628,20 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeIsConnected(
     jboolean::from(v)
 }
 
+// ─── resolution hint ─────────────────────────────────────────────────────────
+
+/// Сообщить хосту максимальное разрешение экрана клиента (до старта сессии).
+/// Kotlin: `external fun nativeSetMaxResolution(width: Int, height: Int)`
+#[no_mangle]
+pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeSetMaxResolution(
+    _env: JNIEnv,
+    _class: JClass,
+    width: jint,
+    height: jint,
+) {
+    crate::evrt_client::set_max_resolution(width as u32, height as u32);
+}
+
 // ─── stop ──────────────────────────────────────────────────────────────────────
 
 /// Остановить и освободить сессию. Kotlin: `external fun nativeStop(handle: Long)`
@@ -638,4 +735,44 @@ fn jstring_or(env: &mut JNIEnv, value: &JString, fallback: String) -> String {
         }
         Err(_) => fallback,
     }
+}
+
+// ─── аудио ───────────────────────────────────────────────────────────────────
+
+/// Достать один PCM фрейм из очереди. Возвращает null если нет данных.
+/// Формат: PCM 16-bit stereo, little-endian. Sample rate — см. nativeGetAudioSampleRate.
+/// Kotlin: `external fun nativePollAudio(handle: Long): ByteArray?`
+#[no_mangle]
+pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativePollAudio(
+    env: JNIEnv,
+    _class: JClass,
+    _handle: jlong,
+) -> jbyteArray {
+    let Some(pcm) = crate::evrt_audio::pop_android_audio() else {
+        return std::ptr::null_mut();
+    };
+    match env.byte_array_from_slice(&pcm) {
+        Ok(arr) => arr.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Получить sample rate аудио потока (из AudioConfig от хоста). Default 48000.
+/// Kotlin: `external fun nativeGetAudioSampleRate(): Int`
+#[no_mangle]
+pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeGetAudioSampleRate(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    crate::evrt_audio::get_audio_sample_rate() as jint
+}
+
+/// Текущая глубина аудио очереди в фреймах. Используется jitter buffer на стороне Kotlin.
+/// Kotlin: `external fun nativeAudioQueueDepth(): Int`
+#[no_mangle]
+pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeAudioQueueDepth(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    crate::evrt_audio::android_queue_depth() as jint
 }

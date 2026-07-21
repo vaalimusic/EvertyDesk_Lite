@@ -392,7 +392,11 @@ impl TransportClient {
             _evrt_base,
             _early_evrt_candidates,
             _evrt_token,
-        ) = establish_session(request.clone(), &mut progress)?;
+        ) = establish_session(
+            request.clone(),
+            &mut progress,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )?;
 
         progress(99, format!("Login stage: {peer_stage}"));
         Ok(ConnectionState::RelayReady {
@@ -404,6 +408,7 @@ impl TransportClient {
         request: ConnectionRequest,
         commands: Receiver<SessionCommand>,
         events: Sender<SessionEvent>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) {
         let display_config = request.display.clone();
         let control_only = request.control_only;
@@ -426,7 +431,7 @@ impl TransportClient {
             evrt_host_base,
             early_evrt_candidates,
             mut evrt_token,
-        ) = match establish_session(request.clone(), &mut emit_progress) {
+        ) = match establish_session(request.clone(), &mut emit_progress, stop) {
             Ok(session) => session,
             Err(err) => {
                 let _ = events.send(SessionEvent::Failed(err));
@@ -464,7 +469,7 @@ impl TransportClient {
         let evrt_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let mut evrt_started = false;
-        if !control_only {
+        if !control_only && codec_preference.use_evrt() {
             if let Some(host_addr) = evrt_host_addr {
             evrt_started = true;
             let evrt_events = events.clone();
@@ -489,7 +494,7 @@ impl TransportClient {
             });
             }
         }
-        if !control_only && !evrt_started && !early_evrt_candidates.is_empty() {
+        if !control_only && !evrt_started && !early_evrt_candidates.is_empty() && codec_preference.use_evrt() {
             evrt_started = true;
             let evrt_events = events.clone();
             let evrt_ull = display_config.target_fps >= 60;
@@ -684,7 +689,7 @@ impl TransportClient {
                         };
 
                         if codec_switched {
-                            target_video_fps = target_video_fps.min(30).max(min_video_fps);
+                            target_video_fps = target_video_fps.min(initial_video_fps).max(min_video_fps);
                             current_quality = initial_stream_quality(target_video_fps);
                             last_decoder_recovery = Some(Instant::now());
                             last_quality_change = Instant::now();
@@ -1124,7 +1129,7 @@ impl TransportClient {
                         // ★ EVRT (после LoginResponse). Собираем кандидаты:
                         //   1) список EvrtEndpoints (LAN+VPN) — основной путь
                         //   2) host IP от hbbs punch-hole + EvrtUdpPort — запасной
-                        if !control_only && !evrt_started {
+                        if !control_only && !evrt_started && codec_preference.use_evrt() {
                             let mut candidates = evrt_candidates;
                             if let (Some(port), Some(mut base)) = (evrt_port_seen, evrt_host_base) {
                                 base.set_port(port);
@@ -1481,6 +1486,7 @@ fn image_quality_label(quality: ImageQuality) -> &'static str {
 fn establish_session(
     request: ConnectionRequest,
     progress: &mut impl FnMut(u8, String),
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<
     (
         TcpStream,
@@ -1789,6 +1795,7 @@ fn establish_session(
             bootstrap_wait_secs,
             control_only,
             progress,
+            stop.clone(),
         ) {
             Ok((
                 peer_stage,
@@ -2169,6 +2176,7 @@ fn open_direct_tcp_session(
         DIRECT_TCP_BOOTSTRAP_WAIT_SECS,
         control_only,
         progress,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )
     .map(|(peer_stage, displays, evrt_port, evrt_candidates, evrt_token)| {
         (
@@ -2217,6 +2225,7 @@ fn read_initial_peer_stage(
     bootstrap_wait_secs: u64,
     control_only: bool,
     progress: &mut impl FnMut(u8, String),
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<
     (
         String,
@@ -2241,6 +2250,9 @@ fn read_initial_peer_stage(
     let auth_deadline = started + Duration::from_secs(RELAY_AUTH_WAIT_SECS);
     let mut last_wait_progress = started;
     loop {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("Подключение отменено пользователем".to_owned());
+        }
         let payload = match read_framed(relay) {
             Ok(payload) => payload,
             Err(err) if is_timeout_error(&err) => {
@@ -2317,16 +2329,19 @@ fn read_initial_peer_stage(
                 send_framed(relay, &encode_peer_message(&fallback))?;
             }
             Some(peer_message::Union::Hash(hash)) => {
-                let login = build_login_request(
-                    password,
-                    &hash.salt,
-                    &hash.challenge,
-                    remote_id,
-                    fps,
-                    codec_preference,
-                );
-                send_framed(relay, &encode_peer_message(&login))?;
-                sent_login = true;
+                // Guard: some Accept-mode hosts resend Hash while waiting; reply only once.
+                if !sent_login {
+                    let login = build_login_request(
+                        password,
+                        &hash.salt,
+                        &hash.challenge,
+                        remote_id,
+                        fps,
+                        codec_preference,
+                    );
+                    send_framed(relay, &encode_peer_message(&login))?;
+                    sent_login = true;
+                }
             }
             Some(peer_message::Union::LoginResponse(response)) => {
                 if login_response_is_remote_accept_wait(&response) {
@@ -2597,6 +2612,9 @@ fn preferred_codec(
     vp9_capable: bool,
 ) -> PreferCodec {
     match codec_preference {
+        // EVRTCK: the UDP path handles video, so tell the host Auto for its
+        // TCP fallback encoder — it will pick the best it can.
+        CodecPreference::Evrtck => PreferCodec::Auto,
         // Explicit client choice → advertise that concrete codec (the host
         // honours it as a strong preference over raw quality ranking).
         CodecPreference::Av1 if av1_capable => PreferCodec::Av1,
@@ -2604,11 +2622,9 @@ fn preferred_codec(
         CodecPreference::H264 if h264_capable => PreferCodec::H264,
         CodecPreference::Vp9 if vp9_capable => PreferCodec::Vp9,
         // Auto → advertise Auto so the host's capability-aware brain picks the
-        // best codec both ends can hardware-handle. Advertising a concrete codec
-        // here would override that and pin the session to it.
+        // best codec both ends can hardware-handle.
         CodecPreference::Auto => PreferCodec::Auto,
-        // Explicit choice not decodable on this machine → fall back to whatever
-        // we *can* decode, best-first.
+        // Explicit choice not decodable on this machine → fall back.
         _ if h265_capable => PreferCodec::H265,
         _ if h264_capable => PreferCodec::H264,
         _ if av1_capable => PreferCodec::Av1,
