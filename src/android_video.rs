@@ -69,6 +69,45 @@ pub fn decode_frame_to_surface(
     }
 }
 
+/// Запрашивает у Android реальную HW-поддержку декодирования H265/AV1 через
+/// `VideoDecoder.isDecodeSupported()` (обёртка над `MediaCodecList` пробой,
+/// уже использовавшуюся для pre-warm/фильтрации декодера).
+///
+/// До этого `crate::video::h265_available()`/`av1_available()` на Android
+/// были жёстко захардкожены в `false` с комментарием "MediaCodec в Kotlin
+/// ещё не реализован" — хотя HW MediaCodec-декод уже реализован и работает
+/// (см. VideoDecoder.kt). Из-за этого `preferred_codec()` в transport.rs
+/// молча откатывал ЛЮБОЙ выбор пользователя (H265/AV1) на H264, независимо
+/// от реальных возможностей телефона.
+///
+/// Возвращает (h265_supported, av1_supported). При недоступности JNI —
+/// (false, false) — тот же консервативный дефолт, что был раньше.
+pub fn query_android_decode_caps() -> (bool, bool) {
+    let Some(jvm) = crate::android_ffi::android_jvm() else { return (false, false); };
+    let Some(cls_ref) = crate::android_ffi::decoder_class_ref() else { return (false, false); };
+    let mut env = match jvm.attach_current_thread() {
+        Ok(e) => e,
+        Err(_) => return (false, false),
+    };
+    let cls: JClass = unsafe { JClass::from(JObject::from_raw(cls_ref.as_raw())) };
+
+    let h265_ok = match env.new_string("video/hevc") {
+        Ok(jmime) => env
+            .call_static_method(&cls, "isDecodeSupported", "(Ljava/lang/String;)Z", &[JValue::Object(&jmime)])
+            .and_then(|v| v.z())
+            .unwrap_or(false),
+        Err(_) => false,
+    };
+    let av1_ok = match env.new_string("video/av01") {
+        Ok(jmime) => env
+            .call_static_method(&cls, "isDecodeSupported", "(Ljava/lang/String;)Z", &[JValue::Object(&jmime)])
+            .and_then(|v| v.z())
+            .unwrap_or(false),
+        Err(_) => false,
+    };
+    (h265_ok, av1_ok)
+}
+
 /// Читает PerfStats.nativeTotalFrames() и nativeAvgDecodeMs() через два простых JNI-вызова.
 /// Два отдельных вызова надёжнее, чем читать LongArray через unsafe JPrimitiveArray cast.
 /// Возвращает (total_decoded_frames, avg_decode_ms). При ошибке — кешированные значения.

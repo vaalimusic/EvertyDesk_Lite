@@ -85,6 +85,12 @@ pub enum PipelineCmd {
     EvrtSessionEnded,
     /// Hot-switch encoder codec: restarts video services with the new preference.
     SetClientCodec(crate::host::ClientVideoSupport),
+    /// EVRT2CKMAX-TASK-01: last known remote cursor position (host screen pixel
+    /// coordinates), driven by incoming MouseEvent. Used as the Visible Region
+    /// focus point for EVRTCK's priority tile ordering — see
+    /// `EvrtckEncoder::set_focus_pixel`. Experimental: only affects sessions
+    /// where `want_evrtck` is true (client opted into EVRTCK).
+    CursorMoved { x: u32, y: u32 },
 }
 
 struct VideoServiceHandle {
@@ -178,6 +184,13 @@ pub fn run(cfg: PipelineConfig) {
     // Обновляется encode_loop каждый кадр; EVRT сессия читает для корректного bitrate.
     let actual_encode_res: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
+    // ── EVRT2CKMAX-TASK-01: последняя известная позиция курсора клиента ────────
+    // Упаковано x<<32|y, в пиксельных координатах экрана хоста. 0 = ещё не
+    // известно (encode_loop тогда не выставляет фокус — обычный raster order).
+    // Обновляется командой PipelineCmd::CursorMoved из handle_client_input_pipeline
+    // при каждом MouseEvent. Читается encode_loop перед EVRTCK-кодированием.
+    let cursor_pos: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+
     // ── Forwarder: peer_msg_rx (shell output) → TCP канал ────────────────────
     {
         let tcp_fwd = tcp_tx.clone();
@@ -221,6 +234,7 @@ pub fn run(cfg: PipelineConfig) {
         &client_max_res,
         &actual_encode_res,
         &want_evrtck,
+        &cursor_pos,
     );
 
     // ── TCP Sender thread ─────────────────────────────────────────────────────
@@ -345,6 +359,7 @@ pub fn run(cfg: PipelineConfig) {
                             &client_max_res,
                             &actual_encode_res,
                             &want_evrtck,
+                            &cursor_pos,
                         );
                     }
                 }
@@ -386,6 +401,7 @@ pub fn run(cfg: PipelineConfig) {
                     &client_max_res,
                     &actual_encode_res,
                     &want_evrtck,
+                    &cursor_pos,
                 );
             }
         }
@@ -400,6 +416,9 @@ pub fn run(cfg: PipelineConfig) {
             }
             Ok(PipelineCmd::SetQuality(q)) => {
                 quality_ms.store(q, Ordering::Relaxed);
+            }
+            Ok(PipelineCmd::CursorMoved { x, y }) => {
+                cursor_pos.store(((x as u64) << 32) | (y as u64), Ordering::Relaxed);
             }
             Ok(PipelineCmd::SetDisplay(display)) => {
                 let display = display.max(0);
@@ -420,6 +439,7 @@ pub fn run(cfg: PipelineConfig) {
                     &client_max_res,
                     &actual_encode_res,
                     &want_evrtck,
+                    &cursor_pos,
                 );
             }
             Ok(PipelineCmd::SetSubscribedDisplays(displays)) => {
@@ -440,6 +460,7 @@ pub fn run(cfg: PipelineConfig) {
                     &client_max_res,
                     &actual_encode_res,
                     &want_evrtck,
+                    &cursor_pos,
                 );
             }
             Ok(PipelineCmd::AddSubscribedDisplays(displays)) => {
@@ -462,6 +483,7 @@ pub fn run(cfg: PipelineConfig) {
                     &client_max_res,
                     &actual_encode_res,
                     &want_evrtck,
+                    &cursor_pos,
                 );
             }
             Ok(PipelineCmd::RemoveSubscribedDisplays(displays)) => {
@@ -489,6 +511,7 @@ pub fn run(cfg: PipelineConfig) {
                     &client_max_res,
                     &actual_encode_res,
                     &want_evrtck,
+                    &cursor_pos,
                 );
             }
             Ok(PipelineCmd::RefreshDisplay(display)) => {
@@ -588,6 +611,7 @@ pub fn run(cfg: PipelineConfig) {
                             &client_max_res,
                             &actual_encode_res,
                             &want_evrtck,
+                            &cursor_pos,
                         );
                     }
                 }
@@ -635,6 +659,7 @@ fn set_subscribed_displays(
     client_max_res: &Arc<AtomicU64>,
     actual_encode_res: &Arc<AtomicU64>,
     want_evrtck: &Arc<AtomicBool>,
+    cursor_pos: &Arc<AtomicU64>,
 ) {
     // RustDesk-compatible service model: switching displays changes the
     // subscribed service set instead of mutating capture state inside a worker.
@@ -682,6 +707,7 @@ fn set_subscribed_displays(
             client_max_res.clone(),
             actual_encode_res.clone(),
             want_evrtck.clone(),
+            cursor_pos.clone(),
         );
         services.insert(display, service);
     }
@@ -716,6 +742,7 @@ fn start_video_service(
     client_max_res: Arc<AtomicU64>,
     actual_encode_res: Arc<AtomicU64>,
     want_evrtck: Arc<AtomicBool>,
+    cursor_pos: Arc<AtomicU64>,
 ) -> VideoServiceHandle {
     let service_stop = Arc::new(AtomicBool::new(false));
     let loop_stop = Arc::new(AtomicBool::new(false));
@@ -767,6 +794,7 @@ fn start_video_service(
                 client_max_res,
                 actual_encode_res,
                 want_evrtck,
+                cursor_pos,
             );
 
             if let Some(watcher) = watcher {
@@ -837,6 +865,7 @@ fn encode_loop(
     client_max_res: Arc<AtomicU64>,
     actual_encode_res: Arc<AtomicU64>,
     want_evrtck: Arc<AtomicBool>,
+    cursor_pos: Arc<AtomicU64>,
 ) {
     use crate::host::{h264_target_bitrate_bps_pub, EncodedOutput, MultiEncoder};
     use crate::evrtck::EvrtckEncoder;
@@ -1273,6 +1302,19 @@ fn encode_loop(
                 // IDR = сбросить prev в 0 → все тайлы dirty → клиент получает полный кадр.
                 if want_idr {
                     enc.as_mut().unwrap().request_keyframe();
+                }
+                // EVRT2CKMAX-TASK-01 (experimental): последняя известная позиция курсора
+                // клиента как Visible Region — dirty-тайлы рядом с курсором уходят на
+                // проводе первыми. Координаты из MouseEvent — host screen space; если
+                // включён downscale под client_max_res, точность страдает (курсор может
+                // указывать чуть правее/ниже реального тайла), но это лабораторный путь:
+                // set_focus_pixel клэмпит в границы кадра, деградация не хуже "фокус
+                // немного смещён", не крэш и не порча данных.
+                let packed_cursor = cursor_pos.load(Ordering::Relaxed);
+                if packed_cursor != 0 {
+                    let cx = (packed_cursor >> 32) as u32;
+                    let cy = (packed_cursor & 0xFFFF_FFFF) as u32;
+                    enc.as_mut().unwrap().set_focus_pixel(cx, cy);
                 }
                 let pkt = enc.as_mut().unwrap().encode(bgra, frame_id);
                 if !evrtck_logged {

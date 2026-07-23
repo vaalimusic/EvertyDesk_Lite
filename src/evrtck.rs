@@ -15,12 +15,12 @@
 //!      or zstd level-1. ZRLE wins on sparse deltas (mostly-zero XOR patterns
 //!      typical for P-frames); zstd wins on keyframe tiles (raw pixel data).
 //!
-//! # Wire format
+//! # Wire format (v2)
 //!
 //! ```text
 //! Frame header (20 bytes)
 //!   magic      [u8; 4]  = b"EVCK"
-//!   version    u8       = 1
+//!   version    u8       = 2
 //!   flags      u8       (reserved, must be 0)
 //!   frame_id   u32 LE
 //!   width      u32 LE
@@ -28,15 +28,29 @@
 //!   map_bytes  u16 LE   — byte length of the tile dirty-map that follows
 //!
 //! Tile dirty-map
-//!   One bit per tile (LSB first), 1 = tile changed.
-//!   Padded to the next byte boundary.
+//!   One bit per tile (LSB first), 1 = tile changed. Used only to derive the
+//!   dirty tile COUNT via popcount — NOT to derive tile identity or stream
+//!   position. Padded to the next byte boundary.
 //!
-//! Tile data  (for each dirty tile, in raster order)
-//!   mode  u8
+//! Tile data  (repeated `popcount(dirty-map)` times, in WIRE order —
+//!             which may differ from raster order; see "Priority ordering" below)
+//!   tile_idx  u16 LE   — raster tile index (tx + ty * tiles_x); self-describing,
+//!                        so entries can appear in any order the encoder chooses
+//!   mode      u8
 //!     MODE_SOLID  = 1 → color [u8; 4] (RGBA)
 //!     MODE_DELTA  = 2 → len u32 LE, then ZRLE-encoded XOR delta
 //!     MODE_ZSTD   = 3 → len u32 LE, then zstd-compressed XOR delta
 //! ```
+//!
+//! # Priority ordering (EVRT2CKMAX-TASK-01)
+//!
+//! v1 required tile data to appear in ascending raster order (the decoder
+//! inferred position from stream order + the dirty-map bit position). v2
+//! makes each tile entry self-describing (explicit `tile_idx`), which lets
+//! the encoder emit dirty tiles in ANY order — in particular, nearest-to-focus
+//! first, so the Visible Region (see EVRT2CKMAX.md's Attention Map / Task 01)
+//! reaches the decoder before less important regions, without changing what
+//! "decoded correctly" means. See `EvrtckEncoder::set_focus_pixel`.
 
 use std::fmt;
 use rayon::prelude::*;
@@ -44,7 +58,7 @@ use rayon::prelude::*;
 // ── Constants ────────────────────────────────────────────────────────────────
 
 pub const MAGIC: &[u8; 4] = b"EVCK";
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 
 /// Pixels per tile edge. 32×32 = 1024 px, maps well onto L1 cache lines.
 pub const TILE_SIZE: usize = 32;
@@ -72,6 +86,9 @@ pub enum EvrtckError {
     DimensionMismatch { expected: (u32, u32), got: (u32, u32) },
     InvalidTileMode(u8),
     InvalidDelta,
+    /// v2: explicit `tile_idx` in the wire stream is >= tile_count for this
+    /// frame's dimensions — corrupt data or a version/dimension mismatch.
+    InvalidTileIndex(u16),
 }
 
 impl fmt::Display for EvrtckError {
@@ -85,6 +102,7 @@ impl fmt::Display for EvrtckError {
             }
             Self::InvalidTileMode(m) => write!(f, "unknown tile mode 0x{m:02x}"),
             Self::InvalidDelta => write!(f, "malformed delta stream (ZRLE or zstd)"),
+            Self::InvalidTileIndex(i) => write!(f, "tile index {i} out of range for frame dimensions"),
         }
     }
 }
@@ -162,6 +180,13 @@ pub trait EvrtckEncoderBackend: Send {
     /// Fast dirty-tile pre-scan (no compression). GPU backends may override with
     /// a compute shader. Default: O(W×H) CPU compare.
     fn dirty_ratio(&self, bgra: &[u8]) -> f32;
+    /// Set (or clear, with `None`) the Visible Region anchor in TILE coordinates
+    /// (not pixels). When set, dirty tiles are emitted nearest-to-focus first
+    /// instead of raster order — see EVRT2CKMAX-TASK-01. Default: no-op, so
+    /// backends that don't implement priority ordering still compile and behave
+    /// exactly as before (raster order, since sort is a stable no-op when
+    /// `focus` is `None`).
+    fn set_focus(&mut self, _focus_tile: Option<(usize, usize)>) {}
 }
 
 // ── CPU backend — always available, no GPU required ───────────────────────────
@@ -171,6 +196,7 @@ struct CpuEvrtckEncoder {
     width: usize,
     height: usize,
     pending_keyframe: bool,
+    focus: Option<(usize, usize)>,
 }
 
 impl CpuEvrtckEncoder {
@@ -180,6 +206,7 @@ impl CpuEvrtckEncoder {
             width,
             height,
             pending_keyframe: true, // first frame is always a keyframe
+            focus: None,
         }
     }
 }
@@ -189,7 +216,7 @@ impl EvrtckEncoderBackend for CpuEvrtckEncoder {
         debug_assert_eq!(bgra.len(), self.width * self.height * 4);
         let is_kf = self.pending_keyframe;
         self.pending_keyframe = false;
-        let (data, stats) = encode_frame(bgra, &self.prev, self.width, self.height, frame_id, is_kf);
+        let (data, stats) = encode_frame(bgra, &self.prev, self.width, self.height, frame_id, is_kf, self.focus);
         // Skip memcpy on NOP frames (bgra == prev, copy would do nothing). Always
         // copy on keyframes so the next P-frame diffs against the correct baseline.
         if stats.dirty_tiles > 0 || is_kf {
@@ -232,6 +259,10 @@ impl EvrtckEncoderBackend for CpuEvrtckEncoder {
             }
         }
         dirty as f32 / total as f32
+    }
+
+    fn set_focus(&mut self, focus_tile: Option<(usize, usize)>) {
+        self.focus = focus_tile;
     }
 }
 
@@ -298,6 +329,24 @@ impl EvrtckEncoder {
 
     pub fn width(&self) -> usize { self.inner.width() }
     pub fn height(&self) -> usize { self.inner.height() }
+
+    /// Set the Visible Region anchor in PIXEL coordinates (e.g. the last known
+    /// cursor/aim position). Dirty tiles nearest this point are emitted first
+    /// in the wire stream instead of raster order — see EVRT2CKMAX-TASK-01
+    /// and the module-level "Priority ordering" doc comment.
+    ///
+    /// Cheap to call every frame; it only sets a field, no recompute happens
+    /// until the next `encode()`/`encode_with_stats()` call.
+    pub fn set_focus_pixel(&mut self, x: u32, y: u32) {
+        let tx = (x as usize / TILE_SIZE).min(tiles_in_dim(self.width()).saturating_sub(1));
+        let ty = (y as usize / TILE_SIZE).min(tiles_in_dim(self.height()).saturating_sub(1));
+        self.inner.set_focus(Some((tx, ty)));
+    }
+
+    /// Clear the Visible Region anchor — dirty tiles go back to raster order.
+    pub fn clear_focus(&mut self) {
+        self.inner.set_focus(None);
+    }
 }
 
 // ── Stateful decoder ─────────────────────────────────────────────────────────
@@ -347,6 +396,32 @@ impl EvrtckDecoder {
 
 // ── Core: encode ─────────────────────────────────────────────────────────────
 
+/// Squared Chebyshev-ish distance in tile-grid units — cheap (no sqrt), and
+/// monotonic with actual distance, which is all a sort key needs.
+#[inline]
+fn tile_distance_key(idx: usize, tiles_x: usize, focus: (usize, usize)) -> u32 {
+    let tx = (idx % tiles_x) as i64;
+    let ty = (idx / tiles_x) as i64;
+    let dx = tx - focus.0 as i64;
+    let dy = ty - focus.1 as i64;
+    (dx * dx + dy * dy) as u32
+}
+
+/// Reorder dirty tiles nearest-to-focus first (EVRT2CKMAX-TASK-01 Visible
+/// Region). Stable sort: tiles at equal distance keep their original
+/// (raster) relative order, so behavior is deterministic and — with
+/// `focus = None` — this function is skipped entirely (raster order, same
+/// as v1 always produced).
+fn order_by_focus(
+    dirty_tiles: &mut [(usize, Vec<u8>, u8)],
+    tiles_x: usize,
+    focus: Option<(usize, usize)>,
+) {
+    if let Some(focus) = focus {
+        dirty_tiles.sort_by_key(|&(idx, _, _)| tile_distance_key(idx, tiles_x, focus));
+    }
+}
+
 pub(crate) fn encode_frame(
     rgba: &[u8],
     prev: &[u8],
@@ -354,6 +429,7 @@ pub(crate) fn encode_frame(
     height: usize,
     frame_id: u32,
     is_keyframe: bool,
+    focus: Option<(usize, usize)>,
 ) -> (Vec<u8>, FrameStats) {
     let tiles_x = tiles_in_dim(width);
     let tiles_y = tiles_in_dim(height);
@@ -379,7 +455,7 @@ pub(crate) fn encode_frame(
     // Keyframe: all tiles encoded in one rayon pass.
     // P-frame rayon: combined dirty-check + encode in a single filter_map pass.
     // P-frame sequential: same but without rayon (< RAYON_THRESHOLD tiles).
-    let dirty_tiles: Vec<(usize, Vec<u8>, u8)> = if is_keyframe {
+    let mut dirty_tiles: Vec<(usize, Vec<u8>, u8)> = if is_keyframe {
         (0..tile_count)
             .into_par_iter()
             .map(|idx| {
@@ -413,6 +489,9 @@ pub(crate) fn encode_frame(
     };
 
     // Build dirty-map and stats from compact dirty list — O(dirty) not O(total).
+    // Map bit ORDER doesn't matter here (it's just a set of "which idx is dirty",
+    // used by the decoder only for a popcount), so this loop runs before the
+    // priority reorder below without any correctness dependency on it.
     let map_bytes = (tile_count + 7) / 8;
     let mut tile_map = vec![0u8; map_bytes];
     let mut solid_count = 0u32;
@@ -426,9 +505,13 @@ pub(crate) fn encode_frame(
     }
     let dirty_count = dirty_tiles.len() as u32;
 
+    // EVRT2CKMAX-TASK-01: nearest-to-focus first. No-op (raster order
+    // preserved) when focus is None.
+    order_by_focus(&mut dirty_tiles, tiles_x, focus);
+
     // Assemble final packet. Capacity estimate: keyframe ~200 B/tile (zstd raw RGBA),
-    // P-frame ~30 B/tile (ZRLE sparse XOR delta).
-    let bytes_per_tile = if is_keyframe { 200 } else { 30 };
+    // P-frame ~30 B/tile (ZRLE sparse XOR delta). +2 bytes/tile for explicit tile_idx (v2).
+    let bytes_per_tile = if is_keyframe { 202 } else { 32 };
     let mut out = Vec::with_capacity(20 + map_bytes + dirty_tiles.len() * bytes_per_tile);
     out.extend_from_slice(MAGIC);
     out.push(VERSION);
@@ -438,7 +521,8 @@ pub(crate) fn encode_frame(
     out.extend_from_slice(&(height as u32).to_le_bytes());
     out.extend_from_slice(&(map_bytes as u16).to_le_bytes());
     out.extend_from_slice(&tile_map);
-    for (_, data, _) in &dirty_tiles {
+    for (idx, data, _) in &dirty_tiles {
+        out.extend_from_slice(&(*idx as u16).to_le_bytes());
         out.extend_from_slice(data);
     }
 
@@ -477,11 +561,14 @@ pub(crate) fn encode_pframe_from_dirty_indices(
     height: usize,
     frame_id: u32,
     dirty_indices: Vec<usize>,
+    focus: Option<(usize, usize)>,
 ) -> (Vec<u8>, FrameStats) {
     let tiles_x = tiles_in_dim(width);
     let tile_count = tiles_in_dim(width) * tiles_in_dim(height);
 
-    // dirty_indices must be in ascending (raster) order; rayon collect preserves it.
+    // dirty_indices order doesn't need to be raster anymore (v2 tiles are
+    // self-describing via explicit tile_idx) — this comment kept accurate:
+    // input order here is whatever the GPU dirty-detect pass produced.
     let dirty_tiles: Vec<(usize, Vec<u8>, u8)> = if dirty_indices.len() < RAYON_THRESHOLD {
         dirty_indices.iter().map(|&idx| {
             let (data, mode) = encode_tile_buf(rgba, prev, width, height, idx % tiles_x, idx / tiles_x, false);
@@ -510,7 +597,11 @@ pub(crate) fn encode_pframe_from_dirty_indices(
     }
     let dirty_count = dirty_tiles.len() as u32;
 
-    let mut out = Vec::with_capacity(20 + map_bytes + dirty_tiles.len() * 30);
+    // EVRT2CKMAX-TASK-01: nearest-to-focus first.
+    let mut dirty_tiles = dirty_tiles;
+    order_by_focus(&mut dirty_tiles, tiles_x, focus);
+
+    let mut out = Vec::with_capacity(20 + map_bytes + dirty_tiles.len() * 32);
     out.extend_from_slice(MAGIC);
     out.push(VERSION);
     out.push(0); // P-frame
@@ -519,7 +610,8 @@ pub(crate) fn encode_pframe_from_dirty_indices(
     out.extend_from_slice(&(height as u32).to_le_bytes());
     out.extend_from_slice(&(map_bytes as u16).to_le_bytes());
     out.extend_from_slice(&tile_map);
-    for (_, data, _) in &dirty_tiles {
+    for (idx, data, _) in &dirty_tiles {
+        out.extend_from_slice(&(*idx as u16).to_le_bytes());
         out.extend_from_slice(data);
     }
 
@@ -726,23 +818,33 @@ fn decode_frame(data: &[u8], frame: &mut Vec<u8>, width: usize, height: usize) -
     }
 
     let map_bytes = read_u16!() as usize;
-    // Borrow tile_map directly from data — no allocation needed.
+    // Borrow tile_map directly from data — no allocation needed. v2 uses this
+    // ONLY for its popcount (how many tile entries follow) — tile IDENTITY and
+    // stream POSITION come from each entry's explicit tile_idx below, not from
+    // bit position. This is what makes priority-ordered (non-raster) tile
+    // streams decodable — see EVRT2CKMAX-TASK-01 and the module doc comment.
     let tile_map = read_bytes!(map_bytes);
+    let dirty_count: usize = tile_map.iter().map(|b| b.count_ones() as usize).sum();
 
     let tiles_x = tiles_in_dim(width);
     let tiles_y = tiles_in_dim(height);
     let tile_count = tiles_x * tiles_y;
 
     // Phase 1: scan the byte stream, recording the position and metadata of each
-    // dirty tile without decompressing. O(stream) sequential, no allocation per tile.
+    // dirty tile without decompressing. O(dirty_count) sequential, no per-tile
+    // allocation. Entries may arrive in ANY order (priority order, not raster) —
+    // each is self-describing via its explicit tile_idx.
     // Fields: (x0, y0, x1, y1, mode, enc_start, enc_end)
-    let mut dirty: Vec<(usize, usize, usize, usize, u8, usize, usize)> = Vec::new();
+    let mut dirty: Vec<(usize, usize, usize, usize, u8, usize, usize)> = Vec::with_capacity(dirty_count);
 
-    for idx in 0..tile_count {
+    for _ in 0..dirty_count {
+        let tile_idx = read_u16!();
+        let idx = tile_idx as usize;
+        if idx >= tile_count {
+            return Err(EvrtckError::InvalidTileIndex(tile_idx));
+        }
         let tx = idx % tiles_x;
         let ty = idx / tiles_x;
-        let dirty_bit = (tile_map.get(idx / 8).copied().unwrap_or(0) >> (idx % 8)) & 1 == 1;
-        if !dirty_bit { continue; }
 
         need!(1);
         let mode = data[pos]; pos += 1;
@@ -1199,5 +1301,148 @@ mod tests {
         let frame2 = solid_frame(w, h, [1, 2, 3, 255]);
         let pkt = enc.encode(&frame2, 3);
         assert!(pkt.data[5] & FLAG_NOP == 0, "changed frame must not be NOP");
+    }
+
+    // ── EVRT2CKMAX-TASK-01: focus-priority tile ordering (v2 wire format) ──────
+
+    /// Extract the tile_idx of the FIRST tile entry in the wire stream.
+    /// Layout: header(20) + tile_map(map_bytes) + [tile_idx(2) + mode(1) + ...]...
+    fn first_wire_tile_idx(data: &[u8]) -> u16 {
+        let map_bytes = u16::from_le_bytes([data[18], data[19]]) as usize;
+        let start = 20 + map_bytes;
+        u16::from_le_bytes(data[start..start + 2].try_into().unwrap())
+    }
+
+    /// Mark the tile at raster index `idx` (in a `tiles_x`-wide grid) dirty by
+    /// changing one pixel strictly inside it.
+    fn dirty_one_pixel_in_tile(frame: &mut [u8], w: usize, idx: usize, tiles_x: usize, value: u8) {
+        let tx = idx % tiles_x;
+        let ty = idx / tiles_x;
+        let px = tx * TILE_SIZE + 3;
+        let py = ty * TILE_SIZE + 3;
+        let off = (py * w + px) * 4;
+        frame[off] = value;
+    }
+
+    #[test]
+    fn focus_priority_orders_nearest_tile_first_and_decodes_correctly() {
+        let (w, h) = (128, 128); // 4×4 = 16 tiles of 32×32, tiles_x = 4
+        let mut frame = black(w, h);
+        let mut enc = EvrtckEncoder::new(w, h);
+        let mut dec = EvrtckDecoder::new();
+
+        dec.decode(&enc.encode(&frame, 1)).unwrap(); // keyframe baseline both sides
+
+        // Dirty diagonal tiles 0, 5, 10, 15 — raster order would emit 0 first.
+        for &idx in &[0usize, 5, 10, 15] {
+            dirty_one_pixel_in_tile(&mut frame, w, idx, 4, 200);
+        }
+
+        // Focus on tile 15's pixel area — nearest dirty tile to the focus is 15 itself.
+        enc.set_focus_pixel((3 * TILE_SIZE + 1) as u32, (3 * TILE_SIZE + 1) as u32);
+        let pkt = enc.encode(&frame, 2);
+
+        assert_eq!(
+            first_wire_tile_idx(&pkt.data), 15,
+            "nearest-to-focus dirty tile must be emitted first, not raster-first"
+        );
+
+        // Correctness: priority-ordered stream must still decode byte-identical.
+        let got = dec.decode(&pkt).unwrap();
+        assert_eq!(got, bgra_to_rgba(&frame).as_slice());
+    }
+
+    #[test]
+    fn clear_focus_reverts_to_raster_order() {
+        let (w, h) = (128, 128);
+        let mut frame = black(w, h);
+        let mut enc = EvrtckEncoder::new(w, h);
+        enc.encode(&frame, 1);
+
+        for &idx in &[15usize, 10, 5, 0] {
+            dirty_one_pixel_in_tile(&mut frame, w, idx, 4, 200);
+        }
+
+        enc.set_focus_pixel((3 * TILE_SIZE + 1) as u32, (3 * TILE_SIZE + 1) as u32);
+        enc.clear_focus();
+        let pkt = enc.encode(&frame, 2);
+
+        assert_eq!(
+            first_wire_tile_idx(&pkt.data), 0,
+            "without a focus point, tiles must stay in ascending raster order"
+        );
+    }
+
+    #[test]
+    fn focus_ordering_survives_equal_distance_ties_deterministically() {
+        // Two tiles equidistant from focus — tie must break by original
+        // (raster) order, not be arbitrary, so encode output is reproducible.
+        let (w, h) = (128, 128);
+        let mut frame = black(w, h);
+        let mut enc = EvrtckEncoder::new(w, h);
+        enc.encode(&frame, 1);
+
+        // Tiles 1 and 4 are both distance-1 (Chebyshev) from tile 0 in a 4-wide grid:
+        // idx 1 = (1,0), idx 4 = (0,1). Focus at tile 0 → both equidistant.
+        dirty_one_pixel_in_tile(&mut frame, w, 4, 4, 111);
+        dirty_one_pixel_in_tile(&mut frame, w, 1, 4, 111);
+        enc.set_focus_pixel(1, 1); // tile (0,0)
+        let pkt1 = enc.encode(&frame, 2);
+
+        // Re-run from scratch — must produce the identical first tile every time.
+        let mut frame_b = black(w, h);
+        let mut enc_b = EvrtckEncoder::new(w, h);
+        enc_b.encode(&frame_b, 1);
+        dirty_one_pixel_in_tile(&mut frame_b, w, 4, 4, 111);
+        dirty_one_pixel_in_tile(&mut frame_b, w, 1, 4, 111);
+        enc_b.set_focus_pixel(1, 1);
+        let pkt2 = enc_b.encode(&frame_b, 2);
+
+        assert_eq!(first_wire_tile_idx(&pkt1.data), first_wire_tile_idx(&pkt2.data));
+        // And it must be the raster-earlier of the tied pair (tile 1, not tile 4).
+        assert_eq!(first_wire_tile_idx(&pkt1.data), 1);
+    }
+
+    #[test]
+    fn gpu_path_pframe_focus_ordering_and_roundtrip() {
+        // Exercises encode_pframe_from_dirty_indices directly — the function
+        // the WGPU backend calls after GPU dirty-tile detection.
+        let (w, h) = (128, 128);
+        let prev = black(w, h);
+        let mut frame = black(w, h);
+        let dirty_idxs = vec![0usize, 5, 10, 15];
+        for &idx in &dirty_idxs {
+            dirty_one_pixel_in_tile(&mut frame, w, idx, 4, 77);
+        }
+
+        // Focus tile (2,2) = raster idx 10 — nearest among the dirty set is itself.
+        let (data, stats) = encode_pframe_from_dirty_indices(
+            &frame, &prev, w, h, 1, dirty_idxs, Some((2, 2)),
+        );
+        assert_eq!(stats.dirty_tiles, 4);
+        assert_eq!(first_wire_tile_idx(&data), 10);
+
+        // Round-trip via the low-level decode_frame (prev/frame both black, so
+        // BGRA==RGBA at the byte level and no conversion is needed for the base).
+        let mut out_frame = vec![0u8; w * h * 4];
+        decode_frame(&data, &mut out_frame, w, h).unwrap();
+        assert_eq!(out_frame, bgra_to_rgba(&frame));
+    }
+
+    #[test]
+    fn corrupt_tile_index_is_rejected_not_undefined_behavior() {
+        let (w, h) = (64, 64); // 2×2 = 4 tiles
+        let frame = solid_frame(w, h, [9, 9, 9, 255]);
+        let mut enc = EvrtckEncoder::new(w, h);
+        let mut pkt = enc.encode(&frame, 1);
+
+        // Corrupt the first tile_idx (right after header + tile_map) to an
+        // out-of-range value (tile_count for 2×2 is 4, so 999 is invalid).
+        let map_bytes = u16::from_le_bytes([pkt.data[18], pkt.data[19]]) as usize;
+        let idx_pos = 20 + map_bytes;
+        pkt.data[idx_pos..idx_pos + 2].copy_from_slice(&999u16.to_le_bytes());
+
+        let mut dec = EvrtckDecoder::new();
+        assert_eq!(dec.decode(&pkt), Err(EvrtckError::InvalidTileIndex(999)));
     }
 }

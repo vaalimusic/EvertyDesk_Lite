@@ -850,6 +850,8 @@ mod inner {
                 h265: false,
                 hardware_h264: true,
                 hardware_h265: false,
+                av1: false,
+                hardware_av1: false,
             };
             assert_eq!(status.label(), "Media Foundation encode: H264(hw)");
         }

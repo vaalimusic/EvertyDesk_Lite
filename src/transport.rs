@@ -3862,6 +3862,19 @@ fn decode_one_frame(
             })
         }),
         DecoderInput::H264 { sid, frames, .. } => {
+            // Android game mode: route H264 directly to VideoDecoder.kt (HW MediaCodec).
+            // This makes TCP relay H264 work exactly like EVRT UDP H264 —
+            // same hardware path, same TextureView surface.
+            // When surface is not set (support mode / no active session), returns false gracefully.
+            #[cfg(all(target_os = "android", feature = "android-client"))]
+            {
+                let _ = sid;
+                for pkt in &frames.frames {
+                    crate::android_video::decode_frame_to_surface("H264", &pkt.data, pkt.key, 0, 0);
+                }
+                return Ok(None); // rendered directly to Surface, no RGBA needed
+            }
+            #[cfg(not(all(target_os = "android", feature = "android-client")))]
             let vt_error = if let Some(decoder) = h264_vt.as_mut() {
                 match decoder.decode_packets(frames.frames.iter().map(|frame| frame.data.clone())) {
                     Ok(Some((width, height, rgba))) => {
@@ -3884,6 +3897,9 @@ fn decode_one_frame(
             };
 
             // Only reach here when VT is disabled (None) or returned a real error.
+            // Unreachable on Android (early `return Ok(None)` above) — `vt_error`
+            // only exists under the matching `#[cfg(not(android))]` on its `let`.
+            #[cfg(not(all(target_os = "android", feature = "android-client")))]
             if let Some(err) = vt_error.as_ref() {
                 eprintln!("[decoder] VideoToolbox H264 error, disabling: {err}");
                 *h264_vt = None;
@@ -3902,7 +3918,7 @@ fn decode_one_frame(
                     })
                 })
             }
-            #[cfg(not(feature = "live-h264"))]
+            #[cfg(all(not(feature = "live-h264"), not(all(target_os = "android", feature = "android-client"))))]
             {
                 let _ = sid;
                 let _ = frames;
@@ -3913,6 +3929,16 @@ fn decode_one_frame(
                 } else {
                     Ok(None)
                 }
+            }
+            // Android without live-h264 (not a supported build per android/README.md,
+            // but kept so the match stays exhaustive if it's ever attempted):
+            // the early `return Ok(None)` above always fires first, so this arm
+            // is unreachable — it exists only to satisfy the compiler.
+            #[cfg(all(not(feature = "live-h264"), all(target_os = "android", feature = "android-client")))]
+            {
+                let _ = sid;
+                let _ = frames;
+                Ok(None)
             }
         }
         DecoderInput::Vp8 { sid, frames, .. } => {

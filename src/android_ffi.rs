@@ -231,7 +231,17 @@ fn start_android_session(
     if !codec_str.trim().is_empty() {
         display.codec = parse_codec_preference(&codec_str);
     }
-    jni_log(&format!("codec={:?}", display.codec));
+    // Query REAL device HW decode capability before advertising it to the
+    // host. Previously h265/av1 support was hardcoded false on Android
+    // (stale "not yet implemented" assumption), so any H265/AV1 selection
+    // silently downgraded to H264 regardless of what the phone could
+    // actually decode — see crate::video::set_android_decode_caps doc comment.
+    let (h265_ok, av1_ok) = crate::android_video::query_android_decode_caps();
+    crate::video::set_android_decode_caps(h265_ok, av1_ok);
+    jni_log(&format!(
+        "codec={:?} device_decode_caps: h265={h265_ok} av1={av1_ok}",
+        display.codec
+    ));
     let request = ConnectionRequest {
         remote_id,
         password,

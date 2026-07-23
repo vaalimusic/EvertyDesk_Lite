@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<!-- saved from url=(0253)https://d5c8c8a3-42f1-41ed-8b79-eb83751b23fb.frame.claudeusercontent.com/_f/1784314148-c15d/?__frame_t=sSIvgFxrDO09koSi2RzishZF.da9706d6-9ec2-433d-9077-5346966d74d2.a61782ff-3143-4ec7-ab0d-cb1a343127b6.1784317822&__frame_v=manifest.cb1867cc31c5c090.json -->
+<html><div id="in-page-channel-node-id" data-channel-name="in_page_channel_hcmyw3"></div><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8"><!-- frame-runtime --><!--<base href="/_f/1784314148-c15d/">--><base href="."><script>window.__FRAME_PREAMBLE={"capabilities":{"downloads":"downloads.DUzXFHNF.js","mcp":"mcp.CLzOm9JX.js","permissions":"permissions.C9OCnDjh.js","self":"self.DqF_PxOe.js"},"transforms":"_transforms.DYk1Ltlh.js","comments":"_comments.Dp6RDy7J.js","translate":"_translate.DHzvAjkZ.js"}</script><script>(function(){"use strict";const fe="modulepreload",de=function(e){return"/"+e},pe={},J=function(t,r,u){let o=Promise.resolve();function i(f){const c=new Event("vite:preloadError",{cancelable:!0});if(c.payload=f,window.dispatchEvent(c),!c.defaultPrevented)throw f}return o.then(f=>{for(const c of f||[])c.status==="rejected"&&i(c.reason);return t().catch(i)})},V=["light","dark","system"];function Y(e){if(e==null||typeof e!="object")return!1;const t=e.__frame_init;return t!=null&&typeof t=="object"}function Q(e){return e!=null&&typeof e=="object"&&e.__frame_size_poke===!0}function X(e){if(e==null||typeof e!="object")return!1;const t=e.__frame_theme;if(t==null||typeof t!="object")return!1;const r=t.theme;return typeof r=="string"&&V.includes(r)}function Z(e){try{typeof reportError=="function"?reportError(e):setTimeout(()=>{throw e},0)}catch{}}function D(e){if(window===top||e.type==="auxclick"&&e.button!==1)return;const t=e.composedPath?e.composedPath():[e.target];let r=null;for(let f=0;f<t.length;f++){const c=t[f];if(c&&c.matches&&c.matches("a[href],area[href]")){r=c;break}}if(!r&&e.target&&e.target.closest&&(r=e.target.closest("a[href],area[href]")),!r)return;const u=r.getAttribute("href");if(!u)return;let o,i;try{o=new URL(u,document.baseURI),i=new URL(document.baseURI).origin}catch{return}(o.protocol==="http:"||o.protocol==="https:")&&o.origin!==i&&(e.preventDefault(),parent.postMessage({__frame_nav:!0,url:o.href},"*"))}const U={};function T(e){if(window===top)return;const t=Date.now();t-(U[e]||0)<500||(U[e]=t,parent.postMessage({__frame_engaged:!0,kind:e},"*"))}const ee=2e3,F=["wheel","touchstart","touchmove","keydown","pointerdown"];let H=0;function te(e){e.isTrusted&&(H=Date.now())}function ne(){addEventListener("click",D,!0),addEventListener("auxclick",D,!0)}function re(){for(let e=0;e<F.length;e++)addEventListener(F[e],te,{capture:!0,passive:!0});addEventListener("scroll",e=>{e.isTrusted&&Date.now()-H<ee&&T("scroll")},{capture:!0,passive:!0}),addEventListener("pointermove",e=>{e.isTrusted&&T("pointer")},{capture:!0,passive:!0}),addEventListener("click",e=>{e.isTrusted&&T("click")},{capture:!0,passive:!0})}function oe(e,t,r){const u=[...t.values()].filter(o=>o.targets.some(i=>i.startsWith(e+".")));return{wrap(o,i){const f=`${e}.${o}`,c=u.filter(s=>s.targets.includes(f));return c.length===0?(...s)=>{try{return i(...s)}catch(p){return Promise.reject(p)}}:(...s)=>{let p=s;for(const a of c){const l=a.module.parameters;if(l)try{p=l(p)}catch{return Promise.reject({code:"transform_error",id:a.id,scope:e,message:"parameters transform failed"})}}let g;try{g=i(...p)}catch(a){g=Promise.reject(a)}return g.then(a=>{for(let l=c.length-1;l>=0;l--){const m=c[l],d=m.module.returns;if(d)try{a=d(a)}catch{return r({id:m.id,scope:e,leg:"returns"}),a}}return a},a=>{for(let l=c.length-1;l>=0;l--){const m=c[l],d=m.module.throws;if(d)try{a=d(a)}catch{return r({id:m.id,scope:e,leg:"throws"}),Promise.reject(a)}}return Promise.reject(a)})}}}}function se(e,t,r,u=()=>{}){const o=new Set(e.changes??[]),i=new Map;for(const f of o){const c=t[f];c&&i.set(f,c)}return{contract:e.contract,changes:o,flags:new Set(e.flags??[]),capabilities:e.capabilities??{},capBudgets:e.capBudgets??{},transforms:i,shellOrigin:r.shellOrigin,mount:r.mount,pipe:f=>oe(f,i,u)}}(function(){const e=Object.defineProperty,t=globalThis,r=["RTCPeerConnection","webkitRTCPeerConnection","RTCDataChannel","RTCIceCandidate","RTCSessionDescription","RTCRtpSender","RTCRtpReceiver"];let u=0;for(let o=0;o<r.length;o++){const i=r[o];try{e(t,i,{value:void 0,writable:!1,configurable:!1})}catch{try{delete t[i]}catch{}try{e(t,i,{value:void 0,writable:!1,configurable:!0})}catch{}}typeof t[i]=="function"&&u++}if(u&&window!==top)try{parent.postMessage({__frame_rtc_lockdown_failed:u},"*")}catch{}})();const ie=1e4,ae=Object.freeze([...window.__FRAME_PREAMBLE?.origins??["https://claude.ai","https://preview.claude.ai"]]);function ce(e){for(const t of ae)if(t.endsWith(":*"))try{const r=new URL(e);if(`${r.protocol}//${r.hostname}:*`===t)return!0}catch{}else if(e===t)return!0;return!1}const j=Object.freeze({...window.__FRAME_PREAMBLE?.capabilities??{}}),k=window.__FRAME_PREAMBLE?.transforms,C=window.__FRAME_PREAMBLE?.comments,N=window.__FRAME_PREAMBLE?.translate,O=/^[\w.-]+\.js$/,le=/^[a-z][a-z0-9_-]{0,63}$/;let W=null,P=null;function I(e,t,r){try{Object.defineProperty(e,t,{value:r,writable:!1,configurable:!1,enumerable:!0})}catch{try{Object.defineProperty(e,t,{value:r,writable:!1,configurable:!0,enumerable:!0})}catch{}}}let $=!1;function x(e){const t=document.documentElement;e==="light"||e==="dark"?(t.dataset.theme=e,t.style.colorScheme=e,$=!0):$&&(delete t.dataset.theme,t.style.colorScheme="",$=!1)}const M={mcp:{watchTool:{handlerArg:3}}},S=new Map;function ue(e,t){const r=S.get(e);if(!r)return;Object.assign(r.impl,t),r.impl.__settled=()=>Promise.reject({code:"capability_removed",message:`${e}: method not in this runtime`});const u=r.queue;r.queue=[];for(const o of u){const i=t[o.method];if(i)if(M[e]?.[o.method])try{o.resolve(i(...o.args))}catch{A(o,M[e][o.method].handlerArg,{code:"transform_error",message:`${e}.${o.method} rejected its arguments`})}else i(...o.args).then(o.resolve,o.reject);else{const f={code:"capability_removed",message:`${e}.${o.method} is not in this runtime`},c=M[e]?.[o.method];if(c){A(o,c.handlerArg,f);continue}o.reject(f)}}}function q(e,t){const r=S.get(e);if(!r)return;r.impl.__settled=()=>Promise.reject(t);const u=r.queue;r.queue=[];for(const o of u){const i=M[e]?.[o.method];if(i){A(o,i.handlerArg,t);continue}o.reject(t)}}function A(e,t,r){if(e.syncState?.dead)return;const u=e.args[t];typeof u=="function"&&queueMicrotask(()=>{if(!e.syncState?.dead)try{u({type:"error",error:r})}catch(o){Z(o)}})}const z=Object.getOwnPropertyDescriptor(window,"claude");if(window!==top&&!(z&&z.writable===!1)){ne(),re();const e=z?.value??{};I(window,"claude",e);const t=s=>{const p={impl:Object.create(null),queue:[]};S.set(s,p);const g=new Proxy(p.impl,{get:(a,l)=>{if(typeof l!="string"||l==="then"||l==="toJSON"||l==="valueOf")return;if(l==="toString")return Object.prototype.toString;const m=M[s]?.[l];return m?(...d)=>{if(typeof d[m.handlerArg]!="function")throw new TypeError(`${s}.${l} requires a handler function`);const b=a[l];if(b)return b(...d);if(a.__settled){const w={dead:!1},E={args:[...d],syncState:w};return a.__settled().catch(R=>A(E,m.handlerArg,R)),()=>{w.dead=!0}}let h=null;const _={dead:!1};return p.queue.push({method:l,args:d,resolve:w=>{h=typeof w=="function"?w:null,_.dead&&h?.()},reject:()=>{},syncState:_}),()=>{_.dead=!0,h?.()}}:(...d)=>{const b=a[l]??a.__settled;return b?b(...d):new Promise((h,_)=>{p.queue.push({method:l,args:d,resolve:h,reject:_})})}},set:()=>!1});I(e,s,g)};for(const s of Object.keys(j)){if(e[s]!==void 0){I(e,s,e[s]);continue}t(s)}let r=null,u=null,o=0;const i=s=>{s.source!==parent||!ce(s.origin)||Y(s.data)&&(r=s.data.__frame_init,P=s.origin,removeEventListener("message",i),clearTimeout(o),u?.())};addEventListener("message",i),parent.postMessage({__frame_connect:!0},"*");const f=new Promise(s=>{u=s,o=setTimeout(()=>{removeEventListener("message",i),s()},ie)}),c=document.readyState==="loading"?new Promise(s=>document.addEventListener("DOMContentLoaded",()=>s(),{once:!0})):Promise.resolve();f.then(async()=>{if(!r||!P){for(const n of S.keys())q(n,{code:"not_granted",message:"frame initialization did not arrive - capability unavailable"});return}x(r.theme);const s=P;let p=!1,g=!1;addEventListener("message",n=>{if(n.source!==parent||n.origin!==s)return;X(n.data)&&x(n.data.__frame_theme.theme);const y=n.data?.__fc_mode;y&&typeof y=="object"&&!p&&C&&O.test(C)&&(p=!0,a(C).then(B=>B.install?.(s,y.on===!0)).catch(()=>{}));const v=n.data?.__ft_cmd;v&&typeof v=="object"&&!g&&N&&O.test(N)&&(g=!0,a(N).then(B=>B.install?.(s,v)).catch(()=>{}))});const a=n=>J(()=>import("/_runtime/"+n),void 0),l=Object.keys(r.capabilities??{});for(const n of l)Object.hasOwn(j,n)||le.test(n)&&e[n]===void 0&&(t(n),q(n,{code:"capability_disabled",message:"capability not in this runtime generation"}));const m=l.filter(n=>Object.hasOwn(j,n)).map(n=>[n,j[n]]).filter(n=>typeof n[1]=="string"&&O.test(n[1])),[d,...b]=await Promise.allSettled([k&&O.test(k)?a(k):Promise.resolve({}),...m.map(([,n])=>a(n))]),h=P;W=se(r,d.status==="fulfilled"&&d.value?.TRANSFORMS||{},{shellOrigin:h,mount:ue},n=>parent.postMessage({__frame_cap_telemetry:n},h));const _=n=>parent.postMessage({__frame_cap_telemetry:{kind:"cap-load-error",cap:n}},h),w=W;b.forEach((n,y)=>{const v=m[y][0];if(n.status!=="fulfilled"){_(v);return}try{n.value?.install?.(w)}catch{_(v)}});for(const[n,y]of S)y.queue.length===0&&Object.keys(y.impl).length>0||q(n,{code:l.includes(n)?"capability_disabled":"not_granted",message:"capability not available in this session"});await c,parent.postMessage({__frame_ready:!0},P);let E=-1,R=0;const K=()=>{R=0;const n=Math.max(document.documentElement.scrollHeight,document.body?document.body.scrollHeight:0);n!==E&&(E=n,parent.postMessage({__frame_size:!0,h:n},h))},L=()=>{R||(R=setTimeout(K,200))},G=new ResizeObserver(L);G.observe(document.documentElement),document.body&&G.observe(document.body),document.addEventListener("load",L,!0),document.fonts?.ready.then(L,()=>{}),addEventListener("beforeprint",()=>{E=-1,K()}),L(),addEventListener("message",n=>{n.source!==parent||n.origin!==h||Q(n.data)&&(E=-1,L())})})}})();</script><!-- /frame-runtime --><meta name="viewport" content="width=device-width,initial-scale=1"><style>:root{color-scheme:light}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}</style></head><body>
+<title>EvertyDesk — Performance Roadmap</title>
+<style>
+  :root {
+    --bg: #0D1210;
+    --card: #141A17;
+    --card2: #1A2420;
+    --green: #12C972;
+    --green-dim: #0D8A4E;
+    --green-faint: rgba(18,201,114,.08);
+    --red: #E34B2F;
+    --yellow: #F5C542;
+    --text: #E8EDE9;
+    --muted: #5F6C67;
+    --line: #252E2A;
+    --mono: 'Menlo', 'Consolas', 'Courier New', monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; font-size: 14px; padding: 24px 20px 40px; max-width: 860px; margin: 0 auto; }
+
+  h1 { font-size: 22px; font-weight: 700; letter-spacing: -.3px; }
+  h1 span { color: var(--green); }
+  .sub { color: var(--muted); font-size: 13px; margin-top: 4px; }
+
+  /* ── Pipeline ──────────────────────────────────────────── */
+  .pipeline { display: flex; align-items: center; gap: 0; margin: 24px 0 8px; overflow-x: auto; padding-bottom: 4px; }
+  .pstep { flex: 1; min-width: 84px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 8px; text-align: center; position: relative; }
+  .pstep.hot { border-color: var(--red); background: rgba(227,75,47,.07); }
+  .pstep.warm { border-color: var(--yellow); background: rgba(245,197,66,.06); }
+  .pstep.ok  { border-color: var(--green-dim); }
+  .pstep-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
+  .pstep-val { font-family: var(--mono); font-size: 15px; font-weight: 700; margin: 4px 0 2px; }
+  .pstep.hot .pstep-val  { color: var(--red); }
+  .pstep.warm .pstep-val { color: var(--yellow); }
+  .pstep.ok  .pstep-val  { color: var(--green); }
+  .pstep-note { font-size: 10px; color: var(--muted); line-height: 1.3; }
+  .parrow { color: var(--muted); font-size: 18px; padding: 0 4px; flex-shrink: 0; align-self: center; }
+  .badge { display: inline-block; font-size: 9px; font-weight: 700; text-transform: uppercase; padding: 2px 5px; border-radius: 4px; letter-spacing: .4px; margin-top: 4px; }
+  .badge-red    { background: rgba(227,75,47,.2); color: var(--red); }
+  .badge-yellow { background: rgba(245,197,66,.2); color: var(--yellow); }
+  .badge-green  { background: rgba(18,201,114,.15); color: var(--green); }
+
+  /* ── Grid ──────────────────────────────────────────────── */
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 20px; }
+  @media (max-width: 600px) { .grid2 { grid-template-columns: 1fr; } }
+
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
+  section h2 { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin-bottom: 12px; }
+
+  /* ── Optimization items ────────────────────────────────── */
+  .opt { display: flex; gap: 10px; align-items: flex-start; padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .opt:last-child { border-bottom: none; padding-bottom: 0; }
+  .opt-rank { flex-shrink: 0; width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 13px; }
+  .rank-1 { background: rgba(18,201,114,.18); color: var(--green); }
+  .rank-2 { background: rgba(18,201,114,.12); color: var(--green); }
+  .rank-3 { background: rgba(245,197,66,.15); color: var(--yellow); }
+  .rank-4 { background: rgba(245,197,66,.10); color: var(--yellow); }
+  .rank-5 { background: rgba(95,108,103,.15); color: var(--muted); }
+  .opt-body { flex: 1; min-width: 0; }
+  .opt-title { font-weight: 600; font-size: 13px; }
+  .opt-desc { color: var(--muted); font-size: 12px; margin-top: 3px; line-height: 1.5; }
+  .opt-gain { font-family: var(--mono); font-size: 11px; margin-top: 5px; }
+  .gain-good   { color: var(--green); }
+  .gain-medium { color: var(--yellow); }
+  .where { display: inline-block; font-size: 10px; padding: 1px 5px; border-radius: 4px; margin-left: 6px; font-weight: 600; }
+  .where-client { background: rgba(18,201,114,.12); color: #6EDBA0; }
+  .where-host   { background: rgba(82,120,255,.15); color: #8BAEFF; }
+  .where-both   { background: rgba(245,197,66,.12); color: #D4AA38; }
+
+  /* ── Metrics ───────────────────────────────────────────── */
+  .metric-group { margin-bottom: 12px; }
+  .metric-group-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: var(--green); margin-bottom: 6px; }
+  .metric-row { display: flex; align-items: center; gap: 8px; padding: 5px 0; border-bottom: 1px solid var(--line); font-size: 12px; }
+  .metric-row:last-child { border-bottom: none; }
+  .metric-name { font-family: var(--mono); font-weight: 600; color: var(--text); min-width: 120px; }
+  .metric-how  { color: var(--muted); flex: 1; }
+  .metric-dot  { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+  .dot-green  { background: var(--green); }
+  .dot-yellow { background: var(--yellow); }
+  .dot-red    { background: var(--red); }
+
+  /* ── Overlay preview ───────────────────────────────────── */
+  .overlay-preview { margin-top: 14px; background: rgba(0,0,0,.6); border-radius: 8px; padding: 8px 12px; font-family: var(--mono); font-size: 12px; line-height: 1.8; border: 1px solid rgba(18,201,114,.2); }
+  .ov-green { color: var(--green); }
+  .ov-yellow { color: var(--yellow); }
+  .ov-red { color: var(--red); }
+  .ov-muted { color: var(--muted); }
+
+  /* ── Resolution calc ───────────────────────────────────── */
+  .res-calc { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+  .res-box { background: var(--card2); border-radius: 8px; padding: 10px 12px; border: 1px solid var(--line); }
+  .res-box.current { border-color: var(--red); }
+  .res-box.proposed { border-color: var(--green-dim); }
+  .res-label { font-size: 10px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); font-weight: 700; }
+  .res-val { font-family: var(--mono); font-size: 17px; font-weight: 800; margin: 4px 0 2px; }
+  .res-val.r-red { color: var(--red); }
+  .res-val.r-green { color: var(--green); }
+  .res-detail { font-size: 11px; color: var(--muted); }
+
+  /* ── Section full-width ────────────────────────────────── */
+  .full { grid-column: 1 / -1; }
+
+  .tag-now { font-size: 10px; font-weight: 700; text-transform: uppercase; padding: 2px 6px; border-radius: 4px; background: rgba(18,201,114,.15); color: var(--green); letter-spacing: .4px; }
+  .tag-next { font-size: 10px; font-weight: 700; text-transform: uppercase; padding: 2px 6px; border-radius: 4px; background: rgba(245,197,66,.12); color: var(--yellow); letter-spacing: .4px; }
+
+  .header-row { display: flex; align-items: baseline; gap: 12px; margin-bottom: 20px; }
+  .dot-sep { color: var(--line); }
+
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); }
+</style>
+
+<h2 class="sr-only">EvertyDesk performance optimization roadmap and metrics collection plan</h2>
+
+<div class="header-row">
+  <h1>EvertyDesk <span>Perf Roadmap</span></h1>
+  <span class="dot-sep">·</span>
+  <span class="sub">от латентности к безумной скорости</span>
+</div>
+
+<!-- Pipeline -->
+<div style="font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);margin-bottom:8px;font-weight:700;">Текущий путь кадра (хост → телефон)</div>
+<div class="pipeline">
+  <div class="pstep ok">
+    <div class="pstep-label">Capture</div>
+    <div class="pstep-val">0ms</div>
+    <div class="pstep-note">DXGI/GDI avg 0ms</div>
+  </div>
+  <div class="parrow">→</div>
+  <div class="pstep warm">
+    <div class="pstep-label">NVENC</div>
+    <div class="pstep-val">8ms</div>
+    <div class="pstep-note">quality=100%<br>2560×1440</div>
+    <div><span class="badge badge-yellow">можно срезать</span></div>
+  </div>
+  <div class="parrow">→</div>
+  <div class="pstep hot">
+    <div class="pstep-label">Сеть UDP</div>
+    <div class="pstep-val">~15ms</div>
+    <div class="pstep-note">LAN но крупные пакеты 17KB avg</div>
+    <div><span class="badge badge-red">bottleneck</span></div>
+  </div>
+  <div class="parrow">→</div>
+  <div class="pstep hot">
+    <div class="pstep-label">Decode</div>
+    <div class="pstep-val">+43ms</div>
+    <div class="pstep-note">sync poll overhead в MediaCodec</div>
+    <div><span class="badge badge-red">bottleneck</span></div>
+  </div>
+  <div class="parrow">→</div>
+  <div class="pstep ok">
+    <div class="pstep-label">GPU Render</div>
+    <div class="pstep-val">~1ms</div>
+    <div class="pstep-note">TextureView Surface</div>
+    <div><span class="badge badge-green">✓ готово</span></div>
+  </div>
+</div>
+<div style="font-size:11px;color:var(--muted);margin-bottom:20px;">Суммарная задержка сейчас: <span style="color:var(--red);font-family:var(--mono);font-weight:700;">~67ms</span> &nbsp;→&nbsp; цель: <span style="color:var(--green);font-family:var(--mono);font-weight:700;">&lt;20ms</span></div>
+
+<div class="grid2">
+
+  <!-- Optimizations -->
+  <section style="grid-column:1/-1">
+    <h2>Оптимизации по приоритету</h2>
+
+    <div class="opt">
+      <div class="opt-rank rank-1">1</div>
+      <div class="opt-body">
+        <div class="opt-title">Async MediaCodec — убрать polling <span class="tag-now">сейчас</span> <span class="where where-client">client</span></div>
+        <div class="opt-desc">Переключить VideoDecoder на callback-режим. Кадр рендерится в <code>onOutputBufferAvailable</code> без ожидания. Убирает до 43ms overhead polling из sync-цикла.</div>
+        <div class="opt-gain gain-good">▼ −30–43ms decode latency &nbsp;·&nbsp; Rust-поток освобождается мгновенно</div>
+      </div>
+    </div>
+
+    <div class="opt">
+      <div class="opt-rank rank-1">2</div>
+      <div class="opt-body">
+        <div class="opt-title">Resolution negotiation — телефон диктует разрешение <span class="tag-next">следующий</span> <span class="where where-both">client + host</span></div>
+        <div class="opt-desc">Клиент читает свой экран, шлёт хосту MaxResolution (например 1920×1080). Хост даунскейлит перед энкодом. Меньше пикселей = меньше данных на всём пути.</div>
+        <div class="res-calc">
+          <div class="res-box current">
+            <div class="res-label">Сейчас</div>
+            <div class="res-val r-red">2560×1440</div>
+            <div class="res-detail">3 686 400 пикселей · 43 KB/кадр · 4.1 Mbps</div>
+          </div>
+          <div class="res-box proposed">
+            <div class="res-label">После</div>
+            <div class="res-val r-green">1920×1080</div>
+            <div class="res-detail">2 073 600 пикселей · 24 KB/кадр · 2.3 Mbps</div>
+          </div>
+        </div>
+        <div class="opt-gain gain-good">▼ −44% пикселей &nbsp;·&nbsp; −44% encode time &nbsp;·&nbsp; −44% сеть &nbsp;·&nbsp; −44% decode</div>
+      </div>
+    </div>
+
+    <div class="opt">
+      <div class="opt-rank rank-2">3</div>
+      <div class="opt-body">
+        <div class="opt-title">PerfStats overlay — метрики на экране телефона <span class="tag-now">сейчас</span> <span class="where where-client">client</span></div>
+        <div class="opt-desc">Singleton с FPS decoded, received kbps, jitter ms. Overlay-строка поверх видео в hw-режиме. Нужен чтобы видеть реальные цифры до и после каждой оптимизации.</div>
+        <div class="opt-gain gain-good">→ Наша "линейка" для измерения всех остальных улучшений</div>
+      </div>
+    </div>
+
+    <div class="opt">
+      <div class="opt-rank rank-3">4</div>
+      <div class="opt-body">
+        <div class="opt-title">NVENC quality 70% + zerolatency tune <span class="tag-next">следующий</span> <span class="where where-host">host</span></div>
+        <div class="opt-desc">Для realtime-стриминга quality=100% избыточно. 70% — субъективно неотличимо, но encode_avg падает с 8ms до ~5ms, пики срезаются. Добавить <code>b-frames=0</code> и <code>lookahead=0</code>.</div>
+        <div class="opt-gain gain-medium">▼ −3ms encode &nbsp;·&nbsp; −15% bitrate при том же качестве</div>
+      </div>
+    </div>
+
+    <div class="opt">
+      <div class="opt-rank rank-4">5</div>
+      <div class="opt-body">
+        <div class="opt-title">SurfaceTexture.setDefaultBufferSize() + TextureView transform <span class="tag-now">сейчас</span> <span class="where where-client">client</span></div>
+        <div class="opt-desc">Когда <code>onDimensionsAvailable</code> даёт реальные размеры — сразу вызвать <code>st.setDefaultBufferSize(w, h)</code>. Убирает возможный re-allocation буфера на первом кадре.</div>
+        <div class="opt-gain gain-medium">→ Убирает возможный first-frame glitch</div>
+      </div>
+    </div>
+
+    <div class="opt">
+      <div class="opt-rank rank-5">6</div>
+      <div class="opt-body">
+        <div class="opt-title">FrameQueue jitter buffer = 0 для LAN <span class="tag-next">следующий</span> <span class="where where-host">host</span></div>
+        <div class="opt-desc">Текущий adaptive jitter buffer добавляет буфер даже на LAN с 1ms jitter. Если клиент сигналит "LAN" через IP-сравнение — выключить буфер совсем.</div>
+        <div class="opt-gain gain-medium">▼ −5–15ms jitter buffer latency на LAN</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Metrics client -->
+  <section>
+    <h2>Метрики — телефон (client)</h2>
+    <div class="metric-group">
+      <div class="metric-group-title">Декодер</div>
+      <div class="metric-row"><span class="metric-dot dot-green"></span><span class="metric-name">fps_decoded</span><span class="metric-how">onOutputBufferAvailable count/sec</span></div>
+      <div class="metric-row"><span class="metric-dot dot-green"></span><span class="metric-name">decode_ms</span><span class="metric-how">submit→onOutput time, FIFO matching</span></div>
+      <div class="metric-row"><span class="metric-dot dot-yellow"></span><span class="metric-name">queue_depth</span><span class="metric-how">pendingFrames.size в async decoder</span></div>
+    </div>
+    <div class="metric-group">
+      <div class="metric-group-title">Сеть</div>
+      <div class="metric-row"><span class="metric-dot dot-green"></span><span class="metric-name">rx_kbps</span><span class="metric-how">bytesReceived() в decodeFrame()</span></div>
+      <div class="metric-row"><span class="metric-dot dot-green"></span><span class="metric-name">jitter_ms</span><span class="metric-how">variance frame arrival intervals</span></div>
+      <div class="metric-row"><span class="metric-dot dot-red"></span><span class="metric-name">idr_per_min</span><span class="metric-how">keyframe ratio в входящих данных</span></div>
+    </div>
+    <div style="margin-top:10px;font-size:11px;color:var(--muted);">Overlay на экране телефона (hw-режим):</div>
+    <div class="overlay-preview">
+      <span class="ov-green">●</span> Connected &nbsp;<span class="ov-muted">|</span>&nbsp;
+      <span class="ov-green">24.1fps</span> &nbsp;<span class="ov-muted">|</span>&nbsp;
+      <span class="ov-green">dec 7ms</span> &nbsp;<span class="ov-muted">|</span>&nbsp;
+      <span class="ov-yellow">jit 3ms</span> &nbsp;<span class="ov-muted">|</span>&nbsp;
+      <span class="ov-green">2.4 Mbps</span>
+    </div>
+  </section>
+
+  <!-- Metrics host -->
+  <section>
+    <h2>Метрики — хост (уже есть)</h2>
+    <div class="metric-group">
+      <div class="metric-group-title">Уже логируются</div>
+      <div class="metric-row"><span class="metric-dot dot-green"></span><span class="metric-name">fps</span><span class="metric-how">fps=20 в заголовке Video</span></div>
+      <div class="metric-row"><span class="metric-dot dot-green"></span><span class="metric-name">encode_avg_ms</span><span class="metric-how">encode_avg=8ms</span></div>
+      <div class="metric-row"><span class="metric-dot dot-green"></span><span class="metric-name">bitrate_kbps</span><span class="metric-how">bitrate=2304kbps</span></div>
+      <div class="metric-row"><span class="metric-dot dot-red"></span><span class="metric-name">idr_storm</span><span class="metric-how">"sending IDR frame" rate — диагностика падений декодера</span></div>
+      <div class="metric-row"><span class="metric-dot dot-yellow"></span><span class="metric-name">relief_scale</span><span class="metric-how">relief=80pct — нагрузка</span></div>
+    </div>
+    <div class="metric-group">
+      <div class="metric-group-title">Добавить: client→host push</div>
+      <div class="metric-row"><span class="metric-dot dot-yellow"></span><span class="metric-name">client_fps</span><span class="metric-how">UDP пакет раз в секунду с клиента</span></div>
+      <div class="metric-row"><span class="metric-dot dot-yellow"></span><span class="metric-name">client_decode_ms</span><span class="metric-how">реальная задержка декода на телефоне</span></div>
+      <div class="metric-row"><span class="metric-dot dot-yellow"></span><span class="metric-name">client_jitter_ms</span><span class="metric-how">хост видит качество своей сети</span></div>
+    </div>
+    <div style="margin-top:10px;font-size:11px;color:var(--muted);">Протокол: маленький JSON в EVRT ACK пакете или отдельный UDP порт 58340. Хост пишет в лог <code>[client_perf]</code> для сравнения.</div>
+  </section>
+
+  <!-- What we build now -->
+  <section class="full" style="border-color:var(--green-dim);background:var(--green-faint)">
+    <h2 style="color:var(--green);">Что делаем прямо сейчас</h2>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;">
+      <div>
+        <div style="font-weight:700;font-size:13px;margin-bottom:6px;">① Async VideoDecoder</div>
+        <div style="font-size:12px;color:var(--muted);line-height:1.6;">MediaCodec.Callback — frame рендерится в момент готовности, без poll. −30ms latency.</div>
+      </div>
+      <div>
+        <div style="font-weight:700;font-size:13px;margin-bottom:6px;">② PerfStats.kt</div>
+        <div style="font-size:12px;color:var(--muted);line-height:1.6;">Singleton: fps, decode_ms, jitter_ms, rx_kbps. Overlay на экране. Измеряем до/после.</div>
+      </div>
+      <div>
+        <div style="font-weight:700;font-size:13px;margin-bottom:6px;">③ SurfaceTexture hint</div>
+        <div style="font-size:12px;color:var(--muted);line-height:1.6;">setDefaultBufferSize(w,h) при onDimensionsAvailable. Устраняет first-frame glitch.</div>
+      </div>
+    </div>
+  </section>
+
+</div>
+
+</body></html>

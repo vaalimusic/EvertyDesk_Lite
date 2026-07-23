@@ -2592,6 +2592,15 @@ fn handle_client_input_pipeline(
             if mouse_event_should_log(&ev) {
                 host_log(events, format!("Host input: {}", mouse_event_summary(&ev)));
             }
+            // EVRT2CKMAX-TASK-01 (experimental): track cursor position as the
+            // Visible Region focus point for EVRTCK priority tile ordering.
+            // Negative coordinates (e.g. multi-monitor offsets) clamp to 0 —
+            // set_focus_pixel clamps into frame bounds anyway, so this only
+            // affects which edge tile gets treated as "nearest," never crashes.
+            let _ = cmd_tx.send(crate::video_pipeline::PipelineCmd::CursorMoved {
+                x: ev.x.max(0) as u32,
+                y: ev.y.max(0) as u32,
+            });
             inject_mouse(ev);
         }
         Some(peer_message::Union::KeyEvent(ev)) => {

@@ -99,6 +99,8 @@ pub struct WgpuEvrtckEncoder {
     tiles_y:          usize,
     tile_count:       usize,
     pending_keyframe: bool,
+    /// Visible Region anchor, tile coords. See EVRT2CKMAX-TASK-01.
+    focus:            Option<(usize, usize)>,
 }
 
 impl WgpuEvrtckEncoder {
@@ -267,6 +269,7 @@ impl WgpuEvrtckEncoder {
             tiles_y,
             tile_count,
             pending_keyframe: true,
+            focus: None,
         })
     }
 
@@ -378,7 +381,7 @@ impl WgpuEvrtckEncoder {
         let is_kf = self.pending_keyframe;
         self.pending_keyframe = false;
         let placeholder = vec![0u8; self.width * self.height * 4];
-        let (data, stats) = encode_frame(&placeholder, &self.prev_cpu, self.width, self.height, frame_id, is_kf);
+        let (data, stats) = encode_frame(&placeholder, &self.prev_cpu, self.width, self.height, frame_id, is_kf, self.focus);
         let pkt = EvrtckPacket { frame_id, width: self.width as u32, height: self.height as u32, data };
         (pkt, stats)
     }
@@ -400,7 +403,7 @@ impl EvrtckEncoderBackend for WgpuEvrtckEncoder {
         // Keyframe: full CPU encode — all tiles dirty, GPU detect unnecessary.
         if is_kf {
             let (data, stats) =
-                encode_frame(bgra, &self.prev_cpu, self.width, self.height, frame_id, true);
+                encode_frame(bgra, &self.prev_cpu, self.width, self.height, frame_id, true, self.focus);
             self.prev_cpu.copy_from_slice(bgra);
             return (EvrtckPacket { frame_id, width: self.width as u32, height: self.height as u32, data }, stats);
         }
@@ -419,7 +422,7 @@ impl EvrtckEncoderBackend for WgpuEvrtckEncoder {
         // Phase 2A: GPU dirty detection → CPU encode dirty tiles only.
         let dirty_indices = self.gpu_dirty_tiles(bgra, &self.prev_cpu);
         let (data, stats) = encode_pframe_from_dirty_indices(
-            bgra, &self.prev_cpu, self.width, self.height, frame_id, dirty_indices,
+            bgra, &self.prev_cpu, self.width, self.height, frame_id, dirty_indices, self.focus,
         );
         self.prev_cpu.copy_from_slice(bgra);
         (EvrtckPacket { frame_id, width: self.width as u32, height: self.height as u32, data }, stats)
@@ -450,5 +453,9 @@ impl EvrtckEncoderBackend for WgpuEvrtckEncoder {
             }
         }
         dirty as f32 / total as f32
+    }
+
+    fn set_focus(&mut self, focus_tile: Option<(usize, usize)>) {
+        self.focus = focus_tile;
     }
 }

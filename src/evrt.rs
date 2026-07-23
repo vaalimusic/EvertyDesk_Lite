@@ -1328,6 +1328,8 @@ mod tests {
             present_delta_ms: 3,
             pulse_estimate_ms: 22,
             input_estimate_ms: 30,
+            max_width: 0,
+            max_height: 0,
         };
         let pkt = build_receiver_feedback(&fb);
         let parsed = parse(&pkt, pkt.len()).unwrap();
@@ -1403,6 +1405,8 @@ mod tests {
             present_delta_ms: 7,
             pulse_estimate_ms: -1,
             input_estimate_ms: -1,
+            max_width: 0,
+            max_height: 0,
         };
         let pkt = build_receiver_feedback_with_token(&fb, Some(token));
         let parsed = parse(&pkt, pkt.len()).unwrap();

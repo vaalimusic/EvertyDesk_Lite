@@ -61,26 +61,54 @@ impl LiveVideoMode {
     }
 }
 
+// Android HW decode capability cache — populated once per session start by
+// `crate::android_video::query_android_decode_caps()` via JNI (real
+// MediaCodecList probe, same one VideoDecoder.kt uses to pre-warm/filter
+// decoders). Defaults to false (conservative — matches pre-fix behavior)
+// until the query runs; see `set_android_decode_caps`.
+#[cfg(all(target_os = "android", feature = "android-client"))]
+static ANDROID_H265_DECODE_OK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(all(target_os = "android", feature = "android-client"))]
+static ANDROID_AV1_DECODE_OK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Called once at Android session start with the result of a real
+/// MediaCodecList capability probe. Until this runs, `h265_available()`/
+/// `av1_available()` conservatively report `false` on Android (same as
+/// before this fix existed) — so a missed call degrades safely to H264,
+/// it never advertises a capability the device doesn't actually have.
+#[cfg(all(target_os = "android", feature = "android-client"))]
+pub fn set_android_decode_caps(h265: bool, av1: bool) {
+    ANDROID_H265_DECODE_OK.store(h265, std::sync::atomic::Ordering::Relaxed);
+    ANDROID_AV1_DECODE_OK.store(av1, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn h264_available() -> bool {
     cfg!(feature = "live-h264") || crate::videotoolbox::videotoolbox_h264_decoder_available()
 }
 
 pub fn h265_available() -> bool {
-    // Android Rust decoder is OpenH264 (H264 only). H265 requires MediaCodec
-    // in Kotlin which is not yet implemented — report false until then.
+    // Real per-device HW capability, queried via JNI at session start — see
+    // `set_android_decode_caps`. Previously hardcoded `false` regardless of
+    // actual device support, which silently downgraded every Android session
+    // to H264 no matter what the user selected in the game-mode codec picker.
     #[cfg(all(target_os = "android", feature = "android-client"))]
-    return false;
+    return ANDROID_H265_DECODE_OK.load(std::sync::atomic::Ordering::Relaxed);
     // Windows Media Foundation HEVC, or macOS VideoToolbox HEVC.
-    crate::mf_video::h265_decode_available()
-        || crate::videotoolbox::videotoolbox_h264_decoder_available()
+    #[cfg(not(all(target_os = "android", feature = "android-client")))]
+    return crate::mf_video::h265_decode_available()
+        || crate::videotoolbox::videotoolbox_h264_decoder_available();
 }
 
 pub fn av1_available() -> bool {
-    // Android Rust decoder is OpenH264 (H264 only). AV1 via MediaCodec
-    // in Kotlin is not yet implemented — report false until then.
+    // Real per-device HW capability, queried via JNI at session start — see
+    // `set_android_decode_caps`. Previously hardcoded `false` regardless of
+    // actual device support (same bug as h265_available above).
     #[cfg(all(target_os = "android", feature = "android-client"))]
-    return false;
-    crate::mf_video::av1_decode_available()
+    return ANDROID_AV1_DECODE_OK.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(all(target_os = "android", feature = "android-client")))]
+    return crate::mf_video::av1_decode_available();
 }
 
 pub fn vp8_available() -> bool {
