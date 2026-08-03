@@ -118,6 +118,8 @@ pub struct EvrtClientParams {
     pub session_token: Option<String>,
     /// Per-viewer playback state; changing it must not affect other sessions.
     pub audio_enabled: Arc<AtomicBool>,
+    /// How long to wait for the initial SessionConfig from this candidate.
+    pub connect_timeout: Duration,
 }
 
 /// Результат попытки EVRT-подключения.
@@ -140,6 +142,7 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
         ultra_low_latency,
         session_token,
         audio_enabled,
+        connect_timeout,
     } = params;
 
     evrt_log(&events, format!("EVRT client: punching to {host_addr}"));
@@ -168,7 +171,7 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
         .set_read_timeout(Some(Duration::from_millis(300)))
         .ok();
     let mut buf = vec![0u8; evrt::MAX_PACKET_SIZE + 64];
-    let deadline = Instant::now() + CONNECT_TIMEOUT;
+    let deadline = Instant::now() + connect_timeout;
     let mut session_cfg: Option<SessionConfig> = None;
 
     while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
@@ -1015,6 +1018,7 @@ pub fn try_evrt_before_relay(
         ultra_low_latency: ultra_low_lat,
         session_token,
         audio_enabled,
+        connect_timeout: CONNECT_TIMEOUT,
     };
 
     match run_evrt_client(params) {
@@ -1024,6 +1028,11 @@ pub fn try_evrt_before_relay(
                 events,
                 "EVRT: no response — falling back to TCP relay".into(),
             );
+            let _ = events.send(SessionEvent::EvrtStatus {
+                active: false,
+                host_addr: host_addr.ip().to_string(),
+                port: host_addr.port(),
+            });
             false
         }
         EvrtConnectResult::Error(e) => {
@@ -1031,12 +1040,17 @@ pub fn try_evrt_before_relay(
                 events,
                 format!("EVRT error ({e}) — falling back to TCP relay"),
             );
+            let _ = events.send(SessionEvent::EvrtStatus {
+                active: false,
+                host_addr: host_addr.ip().to_string(),
+                port: host_addr.port(),
+            });
             false
         }
     }
 }
 
-/// mini-ICE: пробуем список кандидатов хоста (LAN + VPN) по очереди.
+/// mini-ICE: пробуем список кандидатов хоста (LAN + VPN + public/STUN) по очереди.
 /// Первый ответивший — используем. Остальные пропускаем.
 /// Каждый кандидат пробуется со своим свежим UDP-сокетом.
 pub fn try_evrt_candidates(
@@ -1047,6 +1061,8 @@ pub fn try_evrt_candidates(
     stop: Arc<AtomicBool>,
     audio_enabled: Arc<AtomicBool>,
 ) -> bool {
+    const CANDIDATE_CONNECT_TIMEOUT: Duration = Duration::from_millis(1100);
+
     for (i, addr) in candidates.iter().enumerate() {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -1054,9 +1070,10 @@ pub fn try_evrt_candidates(
         evrt_log(
             events,
             format!(
-                "EVRT кандидат {}/{}: пробуем {addr}",
+                "EVRT кандидат {}/{}: пробуем {addr} (timeout={}ms)",
                 i + 1,
-                candidates.len()
+                candidates.len(),
+                CANDIDATE_CONNECT_TIMEOUT.as_millis()
             ),
         );
         let Ok(udp) = UdpSocket::bind("0.0.0.0:0") else {
@@ -1075,6 +1092,7 @@ pub fn try_evrt_candidates(
             ultra_low_latency: ultra_low_lat,
             session_token: session_token.clone(),
             audio_enabled: Arc::clone(&audio_enabled),
+            connect_timeout: CANDIDATE_CONNECT_TIMEOUT,
         }) {
             EvrtConnectResult::Ok => {
                 // Сессия завершилась нормально (была установлена)
@@ -1082,12 +1100,22 @@ pub fn try_evrt_candidates(
             }
             EvrtConnectResult::NoResponse => {
                 evrt_log(events, format!("EVRT кандидат {addr}: нет ответа, дальше"));
+                let _ = events.send(SessionEvent::EvrtStatus {
+                    active: false,
+                    host_addr: addr.ip().to_string(),
+                    port: addr.port(),
+                });
             }
             EvrtConnectResult::Error(e) => {
                 evrt_log(
                     events,
                     format!("EVRT кандидат {addr}: ошибка ({e}), дальше"),
                 );
+                let _ = events.send(SessionEvent::EvrtStatus {
+                    active: false,
+                    host_addr: addr.ip().to_string(),
+                    port: addr.port(),
+                });
             }
         }
     }

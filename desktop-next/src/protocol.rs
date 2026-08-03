@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-pub const IPC_PROTOCOL_VERSION: u16 = 7;
+pub const IPC_PROTOCOL_VERSION: u16 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -9,6 +9,9 @@ pub enum ViewerStatus {
     Starting,
     Progress {
         percent: u8,
+        message: String,
+    },
+    Info {
         message: String,
     },
     Connected {

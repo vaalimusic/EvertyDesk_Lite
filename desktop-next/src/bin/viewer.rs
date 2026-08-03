@@ -436,6 +436,17 @@ enum ViewerEvent {
     Status(String),
     Latency(u32),
     Codec(String),
+    EvrtStatus {
+        active: bool,
+        endpoint: String,
+    },
+    EvrtMetrics {
+        pressure: String,
+        jitter_ms: u32,
+        fps: u32,
+        reassembly_drops: u64,
+        queue_drops: u64,
+    },
     Displays(Vec<RemoteDisplay>),
     CursorData {
         id: u64,
@@ -540,6 +551,13 @@ struct ViewerDiagnostics {
     input_kbps: u64,
     dropped_frames: u64,
     latency_ms: Option<u32>,
+    evrt_active: bool,
+    evrt_endpoint: String,
+    evrt_pressure: String,
+    evrt_jitter_ms: Option<u32>,
+    evrt_fps: Option<u32>,
+    evrt_reassembly_drops: u64,
+    evrt_queue_drops: u64,
     last_performance_at: Option<Instant>,
 }
 
@@ -822,6 +840,12 @@ fn spawn_session(
                         let _ = proxy
                             .send_event(ViewerEvent::Status(format!("{percent}% — {message}")));
                     }
+                    SessionEvent::Info(message) => {
+                        emit_status(&ViewerStatus::Info {
+                            message: message.clone(),
+                        });
+                        let _ = proxy.send_event(ViewerEvent::Status(message));
+                    }
                     SessionEvent::Connected(peer) => {
                         emit_status(&ViewerStatus::Connected { peer: peer.clone() });
                         let _ = proxy.send_event(ViewerEvent::Connected(peer));
@@ -842,6 +866,36 @@ fn spawn_session(
                         let _ = proxy.send_event(ViewerEvent::Status(format!(
                             "Подключено — {milliseconds} мс"
                         )));
+                    }
+                    SessionEvent::EvrtStatus {
+                        active,
+                        host_addr,
+                        port,
+                    } => {
+                        let endpoint = format!("{host_addr}:{port}");
+                        let status = if active {
+                            format!("EVRT UDP active - {endpoint}")
+                        } else {
+                            "EVRT UDP stopped - TCP fallback".to_owned()
+                        };
+                        let _ = proxy.send_event(ViewerEvent::EvrtStatus { active, endpoint });
+                        let _ = proxy.send_event(ViewerEvent::Status(status));
+                    }
+                    SessionEvent::EvrtMetrics {
+                        pressure,
+                        jitter_ms,
+                        fps,
+                        reassembly_drops,
+                        queue_drops,
+                        ..
+                    } => {
+                        let _ = proxy.send_event(ViewerEvent::EvrtMetrics {
+                            pressure,
+                            jitter_ms,
+                            fps,
+                            reassembly_drops,
+                            queue_drops,
+                        });
                     }
                     SessionEvent::FrameMetrics { dropped, .. } => {
                         dropped_frames = dropped_frames
@@ -1692,7 +1746,7 @@ fn draw_diagnostics_panel(
     clipboard_enabled: bool,
 ) {
     const PANEL_WIDTH: i32 = 272;
-    const PANEL_HEIGHT: i32 = 397;
+    const PANEL_HEIGHT: i32 = 454;
     let x = (width - PANEL_WIDTH - 14).max(4);
     let y = toolbar_overlay_top(true, 10);
     fill_rgba_rect(
@@ -1735,10 +1789,34 @@ fn draw_diagnostics_panel(
             .last_performance_at
             .map(|updated| updated.elapsed()),
     );
+    let transport = if diagnostics.evrt_active {
+        "EVRT UDP"
+    } else {
+        "TCP fallback"
+    };
+    let evrt_fps = diagnostics
+        .evrt_fps
+        .map_or_else(|| "--".to_owned(), |value| value.to_string());
+    let evrt_jitter = diagnostics
+        .evrt_jitter_ms
+        .map_or_else(|| "--".to_owned(), |value| value.to_string());
+    let evrt_pressure = if diagnostics.evrt_pressure.is_empty() {
+        "--"
+    } else {
+        diagnostics.evrt_pressure.as_str()
+    };
     let lines = [
         "CONNECTION INFO".to_owned(),
         format!("Health      {health}"),
         format!("Codec       {codec}"),
+        format!("Transport   {transport}"),
+        format!("EVRT FPS    {evrt_fps}"),
+        format!("EVRT jitter {evrt_jitter} ms"),
+        format!("EVRT press  {evrt_pressure}"),
+        format!(
+            "EVRT drops  {}/{}",
+            diagnostics.evrt_reassembly_drops, diagnostics.evrt_queue_drops
+        ),
         format!(
             "FPS         {}.{:02}",
             diagnostics.fps_times_100 / 100,
@@ -1827,6 +1905,40 @@ fn resolved_display_index(displays: &[RemoteDisplay], previous: Option<i32>) -> 
     previous
         .filter(|selected| displays.iter().any(|display| display.index == *selected))
         .or_else(|| displays.first().map(|display| display.index))
+}
+
+fn map_frame_position_to_display(
+    frame_x: i32,
+    frame_y: i32,
+    frame_size: (u32, u32),
+    display: &RemoteDisplay,
+) -> (i32, i32) {
+    let frame_width = i64::from(frame_size.0.max(1));
+    let frame_height = i64::from(frame_size.1.max(1));
+    let display_width = i64::from(display.width.max(1));
+    let display_height = i64::from(display.height.max(1));
+
+    let local_x = i64::from(frame_x.max(0));
+    let local_y = i64::from(frame_y.max(0));
+    let scaled_x = (local_x * display_width / frame_width).clamp(0, display_width - 1);
+    let scaled_y = (local_y * display_height / frame_height).clamp(0, display_height - 1);
+
+    (
+        i32::try_from(i64::from(display.x) + scaled_x).unwrap_or_else(|_| {
+            if display.x.is_negative() {
+                i32::MIN
+            } else {
+                i32::MAX
+            }
+        }),
+        i32::try_from(i64::from(display.y) + scaled_y).unwrap_or_else(|_| {
+            if display.y.is_negative() {
+                i32::MIN
+            } else {
+                i32::MAX
+            }
+        }),
+    )
 }
 
 fn diagnostics_health(
@@ -2171,6 +2283,18 @@ impl Viewer {
             .window_pos_to_pixel((physical_x as f32, physical_y as f32))
             .ok()?;
         Some((i32::try_from(x).ok()?, i32::try_from(y).ok()?))
+    }
+
+    fn remote_input_position(&self, frame_x: i32, frame_y: i32) -> (i32, i32) {
+        let Some(display) = self.selected_display.and_then(|selected| {
+            self.displays
+                .iter()
+                .find(|display| display.index == selected)
+        }) else {
+            return (frame_x, frame_y);
+        };
+
+        map_frame_position_to_display(frame_x, frame_y, self.frame_size, display)
     }
 
     fn update_modifiers(&mut self, next: ModifiersState) {
@@ -2905,10 +3029,14 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                if let Some((x, y)) = self.remote_position(position.x, position.y) {
+                if let Some((frame_x, frame_y)) = self.remote_position(position.x, position.y) {
                     let frame_width = i32::try_from(self.frame_size.0).unwrap_or(i32::MAX);
-                    let next_chrome =
-                        toolbar_chrome_hit_test(x, y, frame_width, self.toolbar_visible);
+                    let next_chrome = toolbar_chrome_hit_test(
+                        frame_x,
+                        frame_y,
+                        frame_width,
+                        self.toolbar_visible,
+                    );
                     let next_toolbar = match next_chrome {
                         Some(ToolbarChrome::Action(action)) => Some(action),
                         _ => None,
@@ -2934,6 +3062,7 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
                         self.cursor_position = None;
                         return;
                     }
+                    let (x, y) = self.remote_input_position(frame_x, frame_y);
                     self.cursor_position = Some((x, y));
                     if self.focused && self.input_enabled {
                         self.session.send(SessionCommand::MouseMove { x, y });
@@ -2963,14 +3092,21 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
                 if !self.focused || !self.input_enabled {
                     return;
                 }
-                let Some((x, y)) = self.cursor_position else {
+                let position = match (state, self.cursor_position) {
+                    (ElementState::Pressed, Some(position)) => {
+                        self.pressed_mouse_buttons.insert(button, position);
+                        Some(position)
+                    }
+                    (ElementState::Released, Some(position)) => {
+                        self.pressed_mouse_buttons.remove(&button);
+                        Some(position)
+                    }
+                    (ElementState::Released, None) => self.pressed_mouse_buttons.remove(&button),
+                    (ElementState::Pressed, None) => None,
+                };
+                let Some((x, y)) = position else {
                     return;
                 };
-                if state == ElementState::Pressed {
-                    self.pressed_mouse_buttons.insert(button, (x, y));
-                } else {
-                    self.pressed_mouse_buttons.remove(&button);
-                }
                 if let Some(command) = mouse_button_command(button, state, x, y) {
                     self.session.send(command);
                 }
@@ -3034,6 +3170,34 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
                     if self.diagnostics_visible {
                         self.redraw_toolbar();
                     }
+                }
+            }
+            ViewerEvent::EvrtStatus { active, endpoint } => {
+                self.diagnostics.evrt_active = active;
+                self.diagnostics.evrt_endpoint = endpoint;
+                if !active {
+                    self.diagnostics.evrt_pressure.clear();
+                    self.diagnostics.evrt_jitter_ms = None;
+                    self.diagnostics.evrt_fps = None;
+                }
+                if self.diagnostics_visible {
+                    self.redraw_toolbar();
+                }
+            }
+            ViewerEvent::EvrtMetrics {
+                pressure,
+                jitter_ms,
+                fps,
+                reassembly_drops,
+                queue_drops,
+            } => {
+                self.diagnostics.evrt_pressure = pressure;
+                self.diagnostics.evrt_jitter_ms = Some(jitter_ms);
+                self.diagnostics.evrt_fps = Some(fps);
+                self.diagnostics.evrt_reassembly_drops = reassembly_drops;
+                self.diagnostics.evrt_queue_drops = queue_drops;
+                if self.diagnostics_visible {
+                    self.redraw_toolbar();
                 }
             }
             ViewerEvent::Displays(displays) => {
@@ -3851,6 +4015,7 @@ mod input_safety_tests {
                 dropped_frames: 3,
                 latency_ms: Some(42),
                 last_performance_at: Some(Instant::now()),
+                ..ViewerDiagnostics::default()
             },
             65,
             1,
@@ -3973,6 +4138,46 @@ mod input_safety_tests {
         assert_eq!(resolved_display_index(&displays, Some(7)), Some(7));
         assert_eq!(resolved_display_index(&displays, Some(99)), Some(2));
         assert_eq!(resolved_display_index(&[], Some(7)), None);
+    }
+
+    #[test]
+    fn frame_input_coordinates_are_mapped_to_selected_display_origin() {
+        let display = RemoteDisplay {
+            index: 7,
+            name: "Secondary".to_owned(),
+            width: 2560,
+            height: 1440,
+            x: 1920,
+            y: -180,
+            cursor_embedded: false,
+        };
+
+        assert_eq!(
+            map_frame_position_to_display(0, 0, (2560, 1440), &display),
+            (1920, -180)
+        );
+        assert_eq!(
+            map_frame_position_to_display(2559, 1439, (2560, 1440), &display),
+            (4479, 1259)
+        );
+    }
+
+    #[test]
+    fn downscaled_frame_input_coordinates_expand_to_display_pixels() {
+        let display = RemoteDisplay {
+            index: 0,
+            name: "Main".to_owned(),
+            width: 3840,
+            height: 2160,
+            x: 0,
+            y: 0,
+            cursor_embedded: false,
+        };
+
+        assert_eq!(
+            map_frame_position_to_display(960, 540, (1920, 1080), &display),
+            (1920, 1080)
+        );
     }
 
     #[test]

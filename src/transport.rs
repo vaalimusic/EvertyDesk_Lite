@@ -60,7 +60,7 @@ fn relay_first_fast_path() -> bool {
 }
 
 fn blocking_udp_nat_probe_enabled() -> bool {
-    env_flag("EVERTYDESK_CONNECT_UDP_PROBE", false)
+    env_flag("EVERTYDESK_CONNECT_UDP_PROBE", true)
 }
 
 fn direct_tcp_probe_enabled() -> bool {
@@ -379,6 +379,9 @@ enum FrameSource {
 
 enum DecoderFeedback {
     BacklogTrimmed {
+        dropped: usize,
+    },
+    EvrtckChainBroken {
         dropped: usize,
     },
     DecodeFailed {
@@ -711,6 +714,23 @@ impl TransportClient {
                             }
                         }
                     }
+                    DecoderFeedback::EvrtckChainBroken { dropped } => {
+                        stable_decoded_frames = 0;
+                        live_video_seen = false;
+                        last_decoder_recovery = Some(Instant::now());
+                        let _ = events.send(SessionEvent::Info(format!(
+                            "EVRTCK backlog dropped {dropped} delta frame(s); requesting a fresh keyframe"
+                        )));
+                        let _ = send_video_start_messages_with_quality(
+                            &mut relay,
+                            current_display,
+                            true,
+                            target_video_fps,
+                            codec_preference,
+                            current_quality,
+                        );
+                        last_live_bootstrap = Instant::now();
+                    }
                     DecoderFeedback::DecodeFailed { codec } => {
                         stable_decoded_frames = 0;
                         match codec {
@@ -829,6 +849,49 @@ impl TransportClient {
                             "H265" => h265_decode_failures = 0,
                             "AV1" => av1_decode_failures = 0,
                             _ => {}
+                        }
+                        if adaptive_quality
+                            && live_video_seen
+                            && decoder_latency_needs_recovery(queue_ms, decode_ms)
+                        {
+                            stable_decoded_frames = 0;
+                            let cooldown_ready = last_decoder_recovery
+                                .map(|instant| instant.elapsed() >= Duration::from_secs(2))
+                                .unwrap_or(true);
+                            if cooldown_ready {
+                                let severe = queue_ms >= 700 || decode_ms >= 140;
+                                let next_fps = lower_adaptive_fps(
+                                    target_video_fps,
+                                    backlog_recovery_min_fps(initial_video_fps, min_video_fps),
+                                    severe,
+                                );
+                                let next_quality = if severe {
+                                    ImageQuality::Low
+                                } else {
+                                    downgrade_one_quality(current_quality)
+                                };
+                                if next_fps < target_video_fps || next_quality != current_quality {
+                                    target_video_fps = next_fps;
+                                    current_quality = next_quality;
+                                    last_decoder_recovery = Some(Instant::now());
+                                    last_adaptive_raise = Instant::now();
+                                    last_quality_change = Instant::now();
+                                    low_input_quality_windows = 0;
+                                    let _ = events.send(SessionEvent::Info(format!(
+                                        "Decoder latency queue={queue_ms}ms decode={decode_ms}ms; lowering stream to {target_video_fps} fps / {}",
+                                        image_quality_label(current_quality)
+                                    )));
+                                    let _ = send_video_start_messages_with_quality(
+                                        &mut relay,
+                                        current_display,
+                                        true,
+                                        target_video_fps,
+                                        codec_preference,
+                                        current_quality,
+                                    );
+                                    last_live_bootstrap = Instant::now();
+                                }
+                            }
                         }
                         if live_video_seen
                             && queue_ms <= 200
@@ -1633,6 +1696,18 @@ fn quality_raise_bootstrap_wait(next_quality: ImageQuality) -> Duration {
     }
 }
 
+fn decoder_latency_needs_recovery(queue_ms: u64, decode_ms: u64) -> bool {
+    queue_ms >= 350 || decode_ms >= 90
+}
+
+fn downgrade_one_quality(current: ImageQuality) -> ImageQuality {
+    match current {
+        ImageQuality::Best => ImageQuality::Balanced,
+        ImageQuality::Balanced => ImageQuality::Low,
+        ImageQuality::Low | ImageQuality::NotSet => current,
+    }
+}
+
 fn quality_drop_is_severe(target_fps: i32, input_fps: f32) -> bool {
     let target = target_fps.clamp(5, 60) as f32;
     input_fps < (target * 0.15).max(6.0)
@@ -1708,7 +1783,7 @@ fn establish_session(
     if relay_first {
         progress(
             45,
-            "Fast connect: relay-first; direct probes are opt-in".to_owned(),
+            "Fast connect: relay-first; probing UDP for EVRT".to_owned(),
         );
     } else {
         progress(
@@ -1722,7 +1797,7 @@ fn establish_session(
     } else {
         UdpNatProbe {
             port: 0,
-            detail: "skipped by fast connect; set EVERTYDESK_CONNECT_UDP_PROBE=1 to enable"
+            detail: "skipped by EVERTYDESK_CONNECT_UDP_PROBE=0; EVRT endpoint race may still work"
                 .to_owned(),
         }
     };
@@ -1737,7 +1812,10 @@ fn establish_session(
     } else {
         progress(
             52,
-            format!("UDP NAT probe unavailable ({})", udp_nat.detail),
+            format!(
+                "UDP NAT probe unavailable; continuing with relay + EVRT endpoint race ({})",
+                udp_nat.detail
+            ),
         );
     }
 
@@ -2092,7 +2170,7 @@ fn probe_udp_nat_port(id_server: &str) -> UdpNatProbe {
         let mut buf = [0_u8; 1500];
         let mut retry_sleep = Duration::from_millis(20);
 
-        for attempt in 1..=12 {
+        for attempt in 1..=4 {
             if let Err(err) = socket.send(&payload) {
                 last_detail = format!("{server_addr} attempt {attempt}: send failed: {err}");
                 continue;
@@ -4080,9 +4158,15 @@ fn decode_frame_loop(
         let drained_len = batch.len();
         if has_video {
             batch.retain(DecoderInput::is_video);
-            let dropped = trim_video_backlog_to_keyframe(&mut batch);
+            let trim = trim_video_backlog_to_keyframe(&mut batch);
+            let dropped = trim.dropped;
             if dropped > 0 {
-                let _ = feedback.send(DecoderFeedback::BacklogTrimmed { dropped });
+                if trim.evrtck_chain_broken {
+                    evrtck_dec.reset();
+                    let _ = feedback.send(DecoderFeedback::EvrtckChainBroken { dropped });
+                } else {
+                    let _ = feedback.send(DecoderFeedback::BacklogTrimmed { dropped });
+                }
                 dropped_frames = dropped;
             }
             #[cfg(all(target_os = "android", feature = "android-client"))]
@@ -4233,14 +4317,21 @@ impl DecoderInput {
     }
 }
 
-fn trim_video_backlog_to_keyframe(batch: &mut Vec<DecoderInput>) -> usize {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BacklogTrim {
+    dropped: usize,
+    evrtck_chain_broken: bool,
+}
+
+fn trim_video_backlog_to_keyframe(batch: &mut Vec<DecoderInput>) -> BacklogTrim {
     // Keep at most 3 frames per batch. Remote desktop latency matters more
     // than smooth playback: always show the most recent frame quickly.
     const MAX_VIDEO_BACKLOG: usize = 3;
     if batch.len() <= MAX_VIDEO_BACKLOG {
-        return 0;
+        return BacklogTrim::default();
     }
     let before = batch.len();
+    let evrtck_only = batch.iter().all(|frame| matches!(frame, DecoderInput::Evrtck { .. }));
     if let Some(index) = batch.iter().rposition(DecoderInput::has_keyframe) {
         if index > 0 {
             batch.drain(..index);
@@ -4251,7 +4342,16 @@ fn trim_video_backlog_to_keyframe(batch: &mut Vec<DecoderInput>) -> usize {
             batch.drain(..keep_from);
         }
     }
-    before.saturating_sub(batch.len())
+    let dropped = before.saturating_sub(batch.len());
+    let evrtck_chain_broken =
+        evrtck_only && dropped > 0 && !batch.first().is_some_and(DecoderInput::has_keyframe);
+    if evrtck_chain_broken {
+        batch.clear();
+    }
+    BacklogTrim {
+        dropped,
+        evrtck_chain_broken,
+    }
 }
 
 fn decoder_needs_more_packets(err: &str) -> bool {
@@ -5824,6 +5924,48 @@ mod tests {
         );
     }
 
+    fn evrtck_test_frame(key: bool) -> DecoderInput {
+        DecoderInput::Evrtck {
+            sid: String::new(),
+            bytes: Vec::new(),
+            key,
+            queued_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn evrtck_backlog_without_keyframe_breaks_delta_chain() {
+        let mut batch = vec![
+            evrtck_test_frame(false),
+            evrtck_test_frame(false),
+            evrtck_test_frame(false),
+            evrtck_test_frame(false),
+        ];
+
+        let trim = trim_video_backlog_to_keyframe(&mut batch);
+
+        assert_eq!(trim.dropped, 1);
+        assert!(trim.evrtck_chain_broken);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn evrtck_backlog_keeps_chain_from_latest_keyframe() {
+        let mut batch = vec![
+            evrtck_test_frame(false),
+            evrtck_test_frame(true),
+            evrtck_test_frame(false),
+            evrtck_test_frame(false),
+        ];
+
+        let trim = trim_video_backlog_to_keyframe(&mut batch);
+
+        assert_eq!(trim.dropped, 1);
+        assert!(!trim.evrtck_chain_broken);
+        assert_eq!(batch.len(), 3);
+        assert!(batch.first().is_some_and(DecoderInput::has_keyframe));
+    }
+
     #[test]
     fn best_quality_requires_real_incoming_fps() {
         assert_eq!(best_quality_min_input_fps(60), 51.0);
@@ -5846,6 +5988,16 @@ mod tests {
             next_quality_after_stability(ImageQuality::Balanced, 60, 52.0),
             Some(ImageQuality::Best)
         );
+    }
+
+    #[test]
+    fn decoder_queue_latency_triggers_recovery_before_seconds_of_lag() {
+        assert!(!decoder_latency_needs_recovery(120, 30));
+        assert!(decoder_latency_needs_recovery(350, 30));
+        assert!(decoder_latency_needs_recovery(80, 90));
+        assert_eq!(downgrade_one_quality(ImageQuality::Best), ImageQuality::Balanced);
+        assert_eq!(downgrade_one_quality(ImageQuality::Balanced), ImageQuality::Low);
+        assert_eq!(downgrade_one_quality(ImageQuality::Low), ImageQuality::Low);
     }
 
     #[test]

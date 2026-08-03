@@ -5133,7 +5133,6 @@ mod macos_cgevent {
 
     type CGEventRef = *mut c_void;
     type CGEventSourceRef = *mut c_void;
-    type CGDisplayModeRef = *mut c_void;
     type CGDirectDisplayID = u32;
     type CGFloat = f64;
 
@@ -5142,6 +5141,20 @@ mod macos_cgevent {
     struct CGPoint {
         x: CGFloat,
         y: CGFloat,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGSize {
+        width: CGFloat,
+        height: CGFloat,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGRect {
+        origin: CGPoint,
+        size: CGSize,
     }
 
     // CGEventType
@@ -5211,10 +5224,9 @@ mod macos_cgevent {
         fn CGEventPost(tap: u32, event: CGEventRef);
 
         fn CGMainDisplayID() -> CGDirectDisplayID;
-        fn CGDisplayCopyDisplayMode(display: CGDirectDisplayID) -> CGDisplayModeRef;
-        fn CGDisplayModeGetWidth(mode: CGDisplayModeRef) -> usize;
-        fn CGDisplayModeGetPixelWidth(mode: CGDisplayModeRef) -> usize;
-        fn CGDisplayModeRelease(mode: CGDisplayModeRef);
+        fn CGDisplayBounds(display: CGDirectDisplayID) -> CGRect;
+        fn CGDisplayPixelsWide(display: CGDirectDisplayID) -> usize;
+        fn CGDisplayPixelsHigh(display: CGDirectDisplayID) -> usize;
     }
 
     #[link(name = "CoreFoundation", kind = "framework")]
@@ -5278,25 +5290,64 @@ mod macos_cgevent {
         // Last cursor position in display *points*, so button events that arrive
         // without coordinates (x=y=0) land where the cursor actually is.
         static LAST_POS: Cell<(f64, f64)> = const { Cell::new((0.0, 0.0)) };
+        static PRESSED_BUTTONS: Cell<u8> = const { Cell::new(0) };
     }
 
-    /// Retina scale: the captured frame is in native pixels, but CGEvent works
-    /// in points. `points = pixels * (mode_width / mode_pixel_width)`.
-    fn pixel_to_point_scale() -> f64 {
+    /// Convert captured-frame native pixels into Quartz global display points.
+    /// Retina displays report the capture in physical pixels while CGEvent
+    /// injection expects the global display coordinate space in points.
+    fn pixel_to_point(x: i32, y: i32) -> CGPoint {
         unsafe {
-            let mode = CGDisplayCopyDisplayMode(CGMainDisplayID());
-            if mode.is_null() {
-                return 1.0;
-            }
-            let points = CGDisplayModeGetWidth(mode) as f64;
-            let pixels = CGDisplayModeGetPixelWidth(mode) as f64;
-            CGDisplayModeRelease(mode);
-            if pixels > 0.0 && points > 0.0 {
-                points / pixels
-            } else {
-                1.0
+            let display = CGMainDisplayID();
+            let bounds = CGDisplayBounds(display);
+            let pixel_width = CGDisplayPixelsWide(display).max(1) as f64;
+            let pixel_height = CGDisplayPixelsHigh(display).max(1) as f64;
+            let scale_x = bounds.size.width / pixel_width;
+            let scale_y = bounds.size.height / pixel_height;
+            CGPoint {
+                x: bounds.origin.x + f64::from(x).clamp(0.0, pixel_width - 1.0) * scale_x,
+                y: bounds.origin.y + f64::from(y).clamp(0.0, pixel_height - 1.0) * scale_y,
             }
         }
+    }
+
+    fn pressed_mask(button: i32) -> u8 {
+        match button {
+            MB_LEFT => 1,
+            MB_RIGHT => 2,
+            MB_MIDDLE => 4,
+            _ => 0,
+        }
+    }
+
+    fn update_pressed(button: i32, down: bool) {
+        let mask = pressed_mask(button);
+        if mask == 0 {
+            return;
+        }
+        PRESSED_BUTTONS.with(|pressed| {
+            let next = if down {
+                pressed.get() | mask
+            } else {
+                pressed.get() & !mask
+            };
+            pressed.set(next);
+        });
+    }
+
+    fn move_event_type() -> u32 {
+        PRESSED_BUTTONS.with(|pressed| {
+            let pressed = pressed.get();
+            if pressed & pressed_mask(MB_LEFT) != 0 {
+                K_LEFT_MOUSE_DRAGGED
+            } else if pressed & pressed_mask(MB_RIGHT) != 0 {
+                K_RIGHT_MOUSE_DRAGGED
+            } else if pressed & pressed_mask(MB_MIDDLE) != 0 {
+                K_OTHER_MOUSE_DRAGGED
+            } else {
+                K_MOUSE_MOVED
+            }
+        })
     }
 
     fn post(event: CGEventRef) {
@@ -5318,15 +5369,11 @@ mod macos_cgevent {
     pub fn inject_mouse(ev: crate::rustdesk_proto::MouseEvent) {
         let evt_type = ev.mask & 0x7;
         let button = ev.mask >> 3;
-        let scale = pixel_to_point_scale();
 
         // Resolve target point: use supplied pixel coords (scaled to points)
         // when present, otherwise fall back to the last known position.
         let point = if ev.x != 0 || ev.y != 0 {
-            let p = CGPoint {
-                x: ev.x as f64 * scale,
-                y: ev.y as f64 * scale,
-            };
+            let p = pixel_to_point(ev.x, ev.y);
             LAST_POS.with(|c| c.set((p.x, p.y)));
             p
         } else {
@@ -5335,9 +5382,10 @@ mod macos_cgevent {
         };
 
         match evt_type {
-            EVT_MOVE => post_mouse(K_MOUSE_MOVED, point, BTN_LEFT),
+            EVT_MOVE => post_mouse(move_event_type(), point, BTN_LEFT),
             EVT_DOWN | EVT_UP => {
                 let down = evt_type == EVT_DOWN;
+                update_pressed(button, down);
                 let (mtype, cg_btn) = match button {
                     MB_LEFT => (
                         if down {
@@ -5479,6 +5527,7 @@ mod macos_cgevent {
         post_mouse(K_LEFT_MOUSE_UP, point, BTN_LEFT);
         post_mouse(K_RIGHT_MOUSE_UP, point, BTN_RIGHT);
         post_mouse(K_OTHER_MOUSE_UP, point, BTN_CENTER);
+        PRESSED_BUTTONS.with(|pressed| pressed.set(0));
     }
 
     /// Map a RustDesk ControlKey to a macOS virtual keycode (kVK_*).

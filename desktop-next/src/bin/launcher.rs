@@ -1,11 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use evertydesk_core::host::{HostCommand, HostEvent, HostService, HostState};
+#[cfg(windows)]
+use evertydesk_core::hyperv;
 use evertydesk_core::settings::{
     generate_numeric_token, AppConfig, ContactEntry, ServerConfig, StreamingMode,
 };
+use evertydesk_core::virtualbox;
 use evertydesk_core::vm_bridge;
-use evertydesk_core::{hyperv, virtualbox};
 use evertydesk_desktop_next::credential_store;
 use evertydesk_desktop_next::ipc::{read_bounded_line, MAX_IPC_LINE_BYTES};
 use evertydesk_desktop_next::launcher_store::{
@@ -548,6 +550,7 @@ enum Message {
         target: String,
         action: VmPowerAction,
     },
+    VmPowerActionFinished(String),
     SetGameCodec(GameCodecPreference),
     SetGameEvrt2(bool),
     GameRemoteIdChanged(String),
@@ -578,6 +581,7 @@ enum Message {
     },
     CopyLocalId,
     CopyLocalPassword,
+    OpenMacPrivacySettings,
     TogglePasswordVisibility,
     RegeneratePassword,
     PermanentPasswordChanged(String),
@@ -885,11 +889,20 @@ impl Launcher {
             Ok(tray) => launcher.tray = Some(tray),
             Err(error) => launcher.status = format!("Системный трей недоступен: {error}"),
         }
-        if !launcher.store.start_host_on_launch {
-            launcher.store.start_host_on_launch = true;
-            let _ = launcher.store.save_default();
+        #[cfg(target_os = "macos")]
+        {
+            if launcher.store.start_host_on_launch {
+                launcher.store.start_host_on_launch = false;
+                let _ = launcher.store.save_default();
+            }
+            launcher.status = macos_startup_status();
         }
-        launcher.start_hosting();
+        #[cfg(not(target_os = "macos"))]
+        {
+            if launcher.store.start_host_on_launch {
+                launcher.start_hosting();
+            }
+        }
         (launcher, open_main_window.map(|_| Message::WindowOpened))
     }
 
@@ -1290,7 +1303,15 @@ impl Launcher {
                     self.vm_bridge_status = "Выберите VM перед power action".to_owned();
                     return Task::none();
                 }
-                self.vm_bridge_status = dispatch_vm_power_action(&target, action);
+                self.vm_bridge_busy = true;
+                self.vm_bridge_status = format!("Выполняю {} для VM {target}…", action.label());
+                return Task::perform(
+                    run_vm_power_action(target, action),
+                    Message::VmPowerActionFinished,
+                );
+            }
+            Message::VmPowerActionFinished(status) => {
+                self.vm_bridge_status = status;
                 self.vm_bridge_busy = true;
                 return Task::perform(run_vm_inventory(), Message::VmBridgeInventory);
             }
@@ -1405,6 +1426,9 @@ impl Launcher {
                     "Пароль скопирован на 30 секунд",
                     true,
                 );
+            }
+            Message::OpenMacPrivacySettings => {
+                self.status = open_macos_privacy_settings();
             }
             Message::TogglePasswordVisibility => {
                 self.password_visible = !self.password_visible;
@@ -2408,6 +2432,28 @@ impl Launcher {
         ]
         .spacing(16)
         .align_x(Alignment::Center);
+
+        #[cfg(target_os = "macos")]
+        {
+            let (summary, color) = macos_permission_summary();
+            body = body.push(
+                container(
+                    row![
+                        text("macOS").size(12).color(color),
+                        text(summary).size(12).color(MUTED).width(Fill),
+                        button("Открыть доступы")
+                            .on_press(Message::OpenMacPrivacySettings)
+                            .padding([7, 10])
+                            .style(quiet_button),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                )
+                .padding([9, 12])
+                .width(Fill)
+                .style(subtle_panel),
+            );
+        }
 
         if let Some(pending) = &self.pending_approval {
             body = body.push(
@@ -6847,20 +6893,28 @@ fn dispatch_vm_power_action(target: &str, action: VmPowerAction) -> String {
                 action.label()
             )
         }
-        "hyperv" => {
-            let hv_action = match action {
-                VmPowerAction::Start => hyperv::VmPowerAction::Start,
-                VmPowerAction::Stop => hyperv::VmPowerAction::Stop,
-                VmPowerAction::Restart => hyperv::VmPowerAction::Restart,
-            };
-            hyperv::request_power_action(real_id, hv_action);
-            format!(
-                "Hyper-V: команда {} отправлена для {real_id}",
-                action.label()
-            )
-        }
+        "hyperv" => dispatch_hyperv_power_action(real_id, action),
         other => format!("Power action не поддержан для VM provider: {other}"),
     }
+}
+
+#[cfg(windows)]
+fn dispatch_hyperv_power_action(real_id: &str, action: VmPowerAction) -> String {
+    let hv_action = match action {
+        VmPowerAction::Start => hyperv::VmPowerAction::Start,
+        VmPowerAction::Stop => hyperv::VmPowerAction::Stop,
+        VmPowerAction::Restart => hyperv::VmPowerAction::Restart,
+    };
+    hyperv::request_power_action(real_id, hv_action);
+    format!(
+        "Hyper-V: команда {} отправлена для {real_id}",
+        action.label()
+    )
+}
+
+#[cfg(not(windows))]
+fn dispatch_hyperv_power_action(real_id: &str, _action: VmPowerAction) -> String {
+    format!("Hyper-V недоступен на этой платформе: {real_id}")
 }
 
 fn viewer_game_codec(codec: GameCodecPreference) -> ViewerGameCodec {
@@ -7274,6 +7328,77 @@ fn current_vm_status_text() -> String {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn macos_startup_status() -> String {
+    let (screen_recording, accessibility) = evertydesk_core::host::macos_permission_status();
+    match (screen_recording, accessibility) {
+        (true, true) => {
+            "Готов к подключению. Входящий доступ на macOS включается вручную.".to_owned()
+        }
+        (false, true) => {
+            "Нужен доступ Screen Recording для входящих подключений на macOS".to_owned()
+        }
+        (true, false) => {
+            "Нужен доступ Accessibility для управления мышью и клавиатурой на macOS".to_owned()
+        }
+        (false, false) => {
+            "Нужны доступы Screen Recording и Accessibility для входящих подключений на macOS"
+                .to_owned()
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_permission_summary() -> (&'static str, Color) {
+    let (screen_recording, accessibility) = evertydesk_core::host::macos_permission_status();
+    match (screen_recording, accessibility) {
+        (true, true) => (
+            "Screen Recording и Accessibility разрешены",
+            Color::from_rgb(0.12, 0.58, 0.35),
+        ),
+        (false, true) => (
+            "Разреши Screen Recording в Privacy & Security",
+            Color::from_rgb(0.91, 0.58, 0.10),
+        ),
+        (true, false) => (
+            "Разреши Accessibility в Privacy & Security",
+            Color::from_rgb(0.91, 0.58, 0.10),
+        ),
+        (false, false) => (
+            "Разреши Screen Recording и Accessibility в Privacy & Security",
+            Color::from_rgb(0.91, 0.58, 0.10),
+        ),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_macos_privacy_settings() -> String {
+    let urls = [
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+    ];
+    let mut opened = false;
+    for url in urls {
+        if std::process::Command::new("open")
+            .arg(url)
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            opened = true;
+        }
+    }
+    if opened {
+        "Открыл Privacy & Security. Разреши Accessibility и Screen Recording для EvertyDesk Next, затем перезапусти входящий доступ.".to_owned()
+    } else {
+        "Не удалось открыть Privacy & Security автоматически".to_owned()
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_macos_privacy_settings() -> String {
+    "Настройки Privacy & Security доступны только на macOS".to_owned()
+}
+
 async fn run_vm_inventory() -> Result<Vec<VmInventoryEntry>, String> {
     let raw = vm_bridge::list_json();
     parse_vm_inventory(&raw)
@@ -7297,6 +7422,10 @@ async fn run_vm_detach() -> Result<String, String> {
             status
         }
     })
+}
+
+async fn run_vm_power_action(target: String, action: VmPowerAction) -> String {
+    dispatch_vm_power_action(&target, action)
 }
 
 fn parse_vm_inventory(raw: &str) -> Result<Vec<VmInventoryEntry>, String> {
@@ -9235,6 +9364,7 @@ fn status_text(status: &ViewerStatus) -> String {
     match status {
         ViewerStatus::Starting => "Запуск viewer…".to_owned(),
         ViewerStatus::Progress { percent, message } => format!("{percent}% — {message}"),
+        ViewerStatus::Info { message } => message.clone(),
         ViewerStatus::Connected { peer } => format!("Подключено: {peer}"),
         ViewerStatus::Latency { milliseconds } => {
             format!("Подключено · {milliseconds} мс")
