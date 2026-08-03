@@ -82,6 +82,13 @@
    Client → Host: ClientHello { evrt2_version, silicon_caps, max_res, max_fps }
    Host → Client: ServerHello { evrt2_version, mode, silicon_caps, session_token }
 
+   Wire encoding (implemented): SESSION_HELLO payload =
+     max_fps u32 BE | max_res_w u32 BE | max_res_h u32 BE | extra_caps bytes…
+   (`silicon_caps` travels inside `extra_caps` as a free-form blob until
+   the capability registry's binary encoding is specified.)
+   SESSION_ACK currently carries an empty payload — the full ServerHello
+   fields (mode, session_token) are a specified-but-unimplemented gap.
+
 2. MODE NEGOTIATION
    Host reads screen context → selects AR / 2R / 47
    Mode can change mid-session (e.g. game launches → 47)

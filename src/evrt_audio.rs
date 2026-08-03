@@ -45,8 +45,7 @@ fn android_queue() -> &'static Mutex<VecDeque<Vec<u8>>> {
 
 /// Сохранённый sample rate из AudioConfig (для JNI запросов).
 /// 0 = AudioConfig ещё не получен, fallback = 48000.
-static AUDIO_SAMPLE_RATE: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
+static AUDIO_SAMPLE_RATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Пушить PCM фрейм в Android очередь (вызывается из evrt_client.rs на Android).
 pub fn push_android_audio(pcm: Vec<u8>) {
@@ -143,18 +142,29 @@ impl AudioConfig {
 ///
 /// Блокирует до установки `stop=true`.
 /// На не-Windows платформах — no-op.
+/// `on_tcp_frame`: optional mirror callback, invoked with each raw PCM chunk
+/// (i16 stereo 48kHz, 1920 bytes) alongside the existing EVRT UDP send —
+/// lets a TCP-relay-only session (no EVRT UDP available) receive audio too.
+/// `None` preserves the exact original UDP-only behavior. The callback
+/// receives the same bytes the UDP path packetizes, before EVRT framing.
 pub fn run_audio_capture(
     socket: Arc<UdpSocket>,
     peer_addr: SocketAddr,
     stop: Arc<AtomicBool>,
     session_token: Option<String>,
     events: std::sync::mpsc::Sender<crate::host::HostEvent>,
+    on_tcp_frame: Option<Box<dyn Fn(&[u8]) + Send>>,
 ) {
     #[cfg(all(target_os = "windows", feature = "evrt-wasapi"))]
     {
-        if let Err(e) =
-            run_audio_capture_windows(socket, peer_addr, stop, session_token, &events)
-        {
+        if let Err(e) = run_audio_capture_windows(
+            socket,
+            peer_addr,
+            stop,
+            session_token,
+            &events,
+            on_tcp_frame,
+        ) {
             let msg = format!("EVRT Audio: захват завершился с ошибкой: {e}");
             eprintln!("[evrt-audio] {msg}");
             let _ = events.send(crate::host::HostEvent::Log(msg));
@@ -162,7 +172,7 @@ pub fn run_audio_capture(
     }
     #[cfg(not(all(target_os = "windows", feature = "evrt-wasapi")))]
     {
-        let _ = (socket, peer_addr, session_token, events);
+        let _ = (socket, peer_addr, session_token, events, on_tcp_frame);
         while !stop.load(Ordering::Relaxed) {
             thread::sleep(Duration::from_millis(100));
         }
@@ -176,6 +186,7 @@ fn run_audio_capture_windows(
     stop: Arc<AtomicBool>,
     session_token: Option<String>,
     events: &std::sync::mpsc::Sender<crate::host::HostEvent>,
+    on_tcp_frame: Option<Box<dyn Fn(&[u8]) + Send>>,
 ) -> Result<(), String> {
     use windows::Win32::{
         Media::Audio::{
@@ -202,21 +213,21 @@ fn run_audio_capture_windows(
         // ── Получить устройство воспроизведения (loopback захватывает его вывод) ─
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-                .map_err(|e| format!("MMDeviceEnumerator: {e}"))?;
+                .map_err(|e| format!("MMDeviceEnumerator: {:#010X}", e.code().0))?;
 
         let device = enumerator
             .GetDefaultAudioEndpoint(eRender, eConsole)
-            .map_err(|e| format!("GetDefaultAudioEndpoint: {e}"))?;
+            .map_err(|e| format!("GetDefaultAudioEndpoint: {:#010X}", e.code().0))?;
 
         let client: IAudioClient = device
             .Activate::<IAudioClient>(CLSCTX_ALL, None)
-            .map_err(|e| format!("Activate IAudioClient: {e}"))?;
+            .map_err(|e| format!("Activate IAudioClient: {:#010X}", e.code().0))?;
 
         // ── GetMixFormat: WASAPI shared mode ТРЕБУЕТ нативный формат устройства ─
         // Хардкоженный PCM 16-bit вызывает AUDCLNT_E_UNSUPPORTED_FORMAT.
         let mix_fmt_ptr = client
             .GetMixFormat()
-            .map_err(|e| format!("GetMixFormat: {e}"))?;
+            .map_err(|e| format!("GetMixFormat: {:#010X}", e.code().0))?;
         let mix_fmt = &*mix_fmt_ptr;
 
         let channels = mix_fmt.nChannels;
@@ -264,7 +275,7 @@ fn run_audio_capture_windows(
             )
             .map_err(|e| {
                 CoTaskMemFree(Some(mix_fmt_ptr as *mut _));
-                format!("IAudioClient::Initialize: {e}")
+                format!("IAudioClient::Initialize: {:#010X}", e.code().0)
             })?;
 
         CoTaskMemFree(Some(mix_fmt_ptr as *mut _));
@@ -287,11 +298,11 @@ fn run_audio_capture_windows(
 
         let capture_client: IAudioCaptureClient = client
             .GetService()
-            .map_err(|e| format!("GetService IAudioCaptureClient: {e}"))?;
+            .map_err(|e| format!("GetService IAudioCaptureClient: {:#010X}", e.code().0))?;
 
         client
             .Start()
-            .map_err(|e| format!("IAudioClient::Start: {e}"))?;
+            .map_err(|e| format!("IAudioClient::Start: {:#010X}", e.code().0))?;
 
         audio_log(
             events,
@@ -348,7 +359,9 @@ fn run_audio_capture_windows(
             if flags & AUDCLNT_BUFFERFLAGS_SILENT != 0 {
                 // WASAPI пометил буфер как тишина — добавляем нули
                 for _ in 0..n {
-                    for _ in 0..out_ch { raw_i16_buf.push(0); }
+                    for _ in 0..out_ch {
+                        raw_i16_buf.push(0);
+                    }
                 }
             } else if is_float32 {
                 let floats = std::slice::from_raw_parts(data_ptr as *const f32, n * ch);
@@ -391,7 +404,9 @@ fn run_audio_capture_windows(
             let mut pcm_out: Vec<u8> = Vec::new();
             while need_resample {
                 let idx = resample_pos as usize;
-                if idx + 1 >= in_frames { break; }
+                if idx + 1 >= in_frames {
+                    break;
+                }
                 let frac = resample_pos - idx as f64;
                 for c in 0..out_ch {
                     let s0 = raw_i16_buf[idx * out_ch + c] as f64;
@@ -433,6 +448,9 @@ fn run_audio_capture_windows(
                 );
                 for pkt in &pkts {
                     let _ = socket.send_to(pkt, peer_addr);
+                }
+                if let Some(cb) = &on_tcp_frame {
+                    cb(chunk);
                 }
                 pos += out_frame_bytes;
             }
@@ -519,13 +537,23 @@ impl AudioPlayer {
         if !pcm.is_empty() {
             push_android_audio(pcm.to_vec());
         }
-        #[cfg(not(any(all(target_os = "windows", feature = "evrt-wasapi"), target_os = "android")))]
+        #[cfg(not(any(
+            all(target_os = "windows", feature = "evrt-wasapi"),
+            target_os = "android"
+        )))]
         let _ = pcm;
     }
 
     pub fn tick(&mut self) {
         #[cfg(all(target_os = "windows", feature = "evrt-wasapi"))]
         self.pump();
+    }
+
+    /// Drop queued PCM immediately when a viewer session is muted.
+    pub fn clear_buffer(&mut self) {
+        self.queue.clear();
+        self.front_offset = 0;
+        self.buffering = true;
     }
 
     #[cfg(all(target_os = "windows", feature = "evrt-wasapi"))]
@@ -635,15 +663,15 @@ impl WasapiPlayer {
 
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-                    .map_err(|e| format!("MMDeviceEnumerator: {e}"))?;
+                    .map_err(|e| format!("MMDeviceEnumerator: {:#010X}", e.code().0))?;
 
             let device = enumerator
                 .GetDefaultAudioEndpoint(eRender, eConsole)
-                .map_err(|e| format!("GetDefaultAudioEndpoint: {e}"))?;
+                .map_err(|e| format!("GetDefaultAudioEndpoint: {:#010X}", e.code().0))?;
 
             let client: IAudioClient = device
                 .Activate::<IAudioClient>(CLSCTX_ALL, None)
-                .map_err(|e| format!("Activate: {e}"))?;
+                .map_err(|e| format!("Activate: {:#010X}", e.code().0))?;
 
             let block_align = (cfg.channels * cfg.bits_per_sample / 8) as u16;
             let fmt = WAVEFORMATEX {
@@ -665,17 +693,19 @@ impl WasapiPlayer {
                     &fmt as *const _,
                     None,
                 )
-                .map_err(|e| format!("Initialize: {e}"))?;
+                .map_err(|e| format!("Initialize: {:#010X}", e.code().0))?;
 
             let buffer_frames = client
                 .GetBufferSize()
-                .map_err(|e| format!("GetBufferSize: {e}"))?;
+                .map_err(|e| format!("GetBufferSize: {:#010X}", e.code().0))?;
 
             let render_client: IAudioRenderClient = client
                 .GetService()
-                .map_err(|e| format!("GetService IAudioRenderClient: {e}"))?;
+                .map_err(|e| format!("GetService IAudioRenderClient: {:#010X}", e.code().0))?;
 
-            client.Start().map_err(|e| format!("Start: {e}"))?;
+            client
+                .Start()
+                .map_err(|e| format!("Start: {:#010X}", e.code().0))?;
 
             Ok(Self {
                 client,
@@ -695,7 +725,7 @@ impl WasapiPlayer {
             let padding = self
                 .client
                 .GetCurrentPadding()
-                .map_err(|e| format!("GetCurrentPadding: {e}"))?;
+                .map_err(|e| format!("GetCurrentPadding: {:#010X}", e.code().0))?;
 
             let available = self.buffer_frames.saturating_sub(padding);
             let frames_in_data = (pcm.len() / self.block_align) as u32;
@@ -708,14 +738,14 @@ impl WasapiPlayer {
             let buf_ptr = self
                 .render_client
                 .GetBuffer(frames_to_write)
-                .map_err(|e| format!("GetBuffer: {e}"))?;
+                .map_err(|e| format!("GetBuffer: {:#010X}", e.code().0))?;
 
             let write_bytes = frames_to_write as usize * self.block_align;
             std::ptr::copy_nonoverlapping(pcm.as_ptr(), buf_ptr, write_bytes.min(pcm.len()));
 
             self.render_client
                 .ReleaseBuffer(frames_to_write, 0)
-                .map_err(|e| format!("ReleaseBuffer: {e}"))?;
+                .map_err(|e| format!("ReleaseBuffer: {:#010X}", e.code().0))?;
 
             Ok(write_bytes)
         }
@@ -901,6 +931,21 @@ mod tests {
         assert_eq!(player.queued_ms(), 30);
         player.front_offset = frame_10ms;
         assert_eq!(player.queued_ms(), 20);
+    }
+
+    #[test]
+    fn audio_player_mute_clears_buffered_pcm() {
+        let mut player = AudioPlayer::new();
+        player.cfg = Some(AudioConfig::default());
+        player.queue.push_back(vec![1; 1_920]);
+        player.front_offset = 100;
+        player.buffering = false;
+
+        player.clear_buffer();
+
+        assert_eq!(player.queued_bytes(), 0);
+        assert_eq!(player.front_offset, 0);
+        assert!(player.buffering);
     }
 
     #[test]

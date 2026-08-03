@@ -21,6 +21,7 @@ constexpr int kNoPacket = 1;
 constexpr int kErr = -1;
 constexpr uint32_t kCodecMaskH264 = 1u << 0;
 constexpr uint32_t kCodecMaskH265 = 1u << 1;
+constexpr uint32_t kCodecMaskAV1 = 1u << 2;
 constexpr uint32_t kBufferCount = 3;
 
 using NvEncodeApiCreateInstance =
@@ -51,6 +52,8 @@ const GUID *codec_guid(int codec) {
         return &NV_ENC_CODEC_H264_GUID;
     case 2:
         return &NV_ENC_CODEC_HEVC_GUID;
+    case 3:
+        return &NV_ENC_CODEC_AV1_GUID;
     default:
         return nullptr;
     }
@@ -235,9 +238,37 @@ struct NvencContext {
     std::vector<Surface> surfaces;
     std::vector<uint8_t> packet;
 
+    // Zero-copy: OpenSharedResource is a real driver/KMD round trip, not a
+    // cheap pointer cast — calling it every single frame (as the first cut
+    // of encode_frame_texture did) reintroduced a large per-frame cost right
+    // where the zero-copy path was supposed to remove one. The capture side
+    // (capture.rs's `shared` field) already keeps the SAME texture object —
+    // and therefore the same HANDLE — alive across frames as long as the
+    // resolution doesn't change, so the opened ID3D11Texture2D* is cached
+    // here and only reopened when the incoming handle actually differs.
+    void *cached_shared_handle = nullptr;
+    ID3D11Texture2D *cached_shared_texture = nullptr;
+    // Paired with `cached_shared_texture` (same lifetime, re-fetched
+    // whenever that texture is reopened) — see `encode_frame_texture`'s
+    // own comment at the `CopyResource` read for why this exists: the
+    // capture side (capture.rs) writes this same shared texture on a
+    // DIFFERENT D3D11 device, and only a real cross-device sync primitive
+    // (not `Flush()` alone) can guarantee this read never observes a
+    // torn/in-flight write.
+    IDXGIKeyedMutex *cached_shared_keyed_mutex = nullptr;
+
     ~NvencContext() { destroy(); }
 
     void destroy() {
+        if (cached_shared_keyed_mutex) {
+            cached_shared_keyed_mutex->Release();
+            cached_shared_keyed_mutex = nullptr;
+        }
+        if (cached_shared_texture) {
+            cached_shared_texture->Release();
+            cached_shared_texture = nullptr;
+            cached_shared_handle = nullptr;
+        }
         if (!encoder) {
             return;
         }
@@ -348,7 +379,18 @@ bool init_encoder(NvencContext &ctx, int codec, uint32_t width, uint32_t height,
 
     NV_ENC_CONFIG config = preset.presetCfg;
     config.version = NV_ENC_CONFIG_VER;
-    config.profileGUID = NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID;
+    // ROADMAP.md task #30: AUTOSELECT left NVENC free to pick HEVC's profile
+    // itself — on an 8-bit BGRA source this should always resolve to Main,
+    // but AUTOSELECT's exact heuristic isn't documented, and some Android
+    // HEVC hardware decoders (this investigation's own MI_8/Adreno630 case:
+    // MediaCodec confirms real decode + "First frame rendered to surface",
+    // yet the physical display stays black) are known to silently
+    // mis-render HEVC when handed a profile they don't expect (e.g. Main10
+    // when the decoder only really supports Main). Pin it explicitly rather
+    // than trust AUTOSELECT's guess — removes one real, testable unknown
+    // from an otherwise fully green trail (encode bitrate, wire delivery,
+    // decode logs, and View geometry all already checked out clean).
+    config.profileGUID = (codec == 2) ? NV_ENC_HEVC_PROFILE_MAIN_GUID : NV_ENC_CODEC_PROFILE_AUTOSELECT_GUID;
     // NVENC_INFINITE_GOPLENGTH: IDR only on explicit NV_ENC_PIC_FLAG_FORCEIDR request.
     // Periodic IDR (gopLength = fps = 1 IDR/sec) wastes enormous bandwidth because
     // every frame becomes a keyframe — P-frames carry 10-20× fewer bits than IDR.
@@ -385,6 +427,21 @@ bool init_encoder(NvencContext &ctx, int codec, uint32_t width, uint32_t height,
         config.encodeCodecConfig.hevcConfig.repeatSPSPPS = 1;
         config.encodeCodecConfig.hevcConfig.disableSPSPPS = 0;
         config.encodeCodecConfig.hevcConfig.idrPeriod = config.gopLength;
+        // ROADMAP.md task #30: pin explicitly (SDK doc: "Should be set to 1
+        // for yuv420 input") rather than trust whatever the preset config
+        // left it at — same reasoning as the profileGUID pin above, closing
+        // another unknown in an otherwise fully green diagnostic trail.
+        config.encodeCodecConfig.hevcConfig.chromaFormatIDC = 1;
+    } else if (codec == 3) {
+        // repeatSeqHdr: AV1's equivalent of repeatSPSPPS — re-emit the sequence
+        // header on every keyframe so a client attaching mid-stream (or after a
+        // forced IDR) can start decoding immediately, same reasoning as H264/H265
+        // above. outputAnnexBFormat left at 0 (default): AV1 has no real "Annex B"
+        // — 0 gives the standard low-overhead OBU bitstream that MediaCodec's
+        // "video/av01" decoder and the rest of this pipeline expect (matches the
+        // raw-OBU parsing already written client-side, see av1_payload_has_sequence_header).
+        config.encodeCodecConfig.av1Config.repeatSeqHdr = 1;
+        config.encodeCodecConfig.av1Config.idrPeriod = config.gopLength;
     }
 
     NV_ENC_INITIALIZE_PARAMS init = {};
@@ -506,6 +563,9 @@ bool supported_codecs(uint32_t *mask, std::string *name, std::string &err) {
     if (codec_supported(ctx, NV_ENC_CODEC_HEVC_GUID)) {
         *mask |= kCodecMaskH265;
     }
+    if (codec_supported(ctx, NV_ENC_CODEC_AV1_GUID)) {
+        *mask |= kCodecMaskAV1;
+    }
     if (name) {
         *name = ctx.dx.adapter_name;
     }
@@ -620,23 +680,72 @@ int encode_frame_texture(NvencContext &ctx, void *shared_handle,
         return kErr;
     }
 
-    // Открываем shared-текстуру захвата на устройстве энкодера
-    ID3D11Texture2D *src_texture = nullptr;
-    HRESULT hr = ctx.dx.device->OpenSharedResource(
-        reinterpret_cast<HANDLE>(shared_handle),
-        __uuidof(ID3D11Texture2D),
-        reinterpret_cast<void **>(&src_texture));
-    if (FAILED(hr) || !src_texture) {
-        err = "OpenSharedResource failed (capture/encoder device mismatch?)";
-        return kErr;
+    // Открываем shared-текстуру захвата на устройстве энкодера — но только
+    // если хендл реально изменился с прошлого кадра (см. комментарий у
+    // `cached_shared_texture` в NvencContext). OpenSharedResource — это
+    // настоящий driver/KMD round trip, кешируем результат.
+    if (ctx.cached_shared_texture && ctx.cached_shared_handle != shared_handle) {
+        if (ctx.cached_shared_keyed_mutex) {
+            ctx.cached_shared_keyed_mutex->Release();
+            ctx.cached_shared_keyed_mutex = nullptr;
+        }
+        ctx.cached_shared_texture->Release();
+        ctx.cached_shared_texture = nullptr;
+        ctx.cached_shared_handle = nullptr;
     }
+    if (!ctx.cached_shared_texture) {
+        ID3D11Texture2D *opened = nullptr;
+        HRESULT hr = ctx.dx.device->OpenSharedResource(
+            reinterpret_cast<HANDLE>(shared_handle),
+            __uuidof(ID3D11Texture2D),
+            reinterpret_cast<void **>(&opened));
+        if (FAILED(hr) || !opened) {
+            err = "OpenSharedResource failed (capture/encoder device mismatch?)";
+            return kErr;
+        }
+        ctx.cached_shared_texture = opened;
+        ctx.cached_shared_handle = shared_handle;
+
+        // Created with D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX on the
+        // capture side (capture.rs's `ensure_shared_texture`) — every
+        // texture opened from that same handle exposes the identical
+        // IDXGIKeyedMutex, so QueryInterface here always succeeds for a
+        // texture that came from that path.
+        HRESULT hr_mutex = opened->QueryInterface(
+            __uuidof(IDXGIKeyedMutex),
+            reinterpret_cast<void **>(&ctx.cached_shared_keyed_mutex));
+        if (FAILED(hr_mutex) || !ctx.cached_shared_keyed_mutex) {
+            err = "shared texture has no IDXGIKeyedMutex (capture-side texture created without the flag?)";
+            return kErr;
+        }
+    }
+    ID3D11Texture2D *src_texture = ctx.cached_shared_texture;
 
     Surface &surface = ctx.surfaces[ctx.frame_idx % ctx.surfaces.size()];
 
+    // See `encode_frame_texture`'s doc comment (and `cached_shared_keyed_mutex`'s
+    // own, and capture.rs's `shared` field doc) for the full "teleport" bug
+    // story. Reader's turn: acquire key 1 (waits for the writer's release),
+    // GPU→GPU copy, release key 0 back to the writer. Live-found: the
+    // writer side (capture.rs) originally used a 1000ms bound here too and
+    // that alone made the whole stream visibly crawl — the writer now
+    // never blocks at all (0ms try-once). This reader side keeps a SHORT
+    // bound (not the same 1000ms mistake, and not 0 either — capture's
+    // own hold time per frame is a couple of `CopyResource`/`Flush` calls,
+    // genuinely a few ms at most, so 50ms is generous slack for normal
+    // scheduling jitter without ever being long enough to read as a
+    // stall) so a wedged/crashed writer can't hang the encode loop for
+    // long; on timeout, honestly fail this frame rather than silently
+    // reading a possibly-torn texture without the lock.
+    HRESULT hr_acquire = ctx.cached_shared_keyed_mutex->AcquireSync(1, 50);
+    if (FAILED(hr_acquire)) {
+        err = "IDXGIKeyedMutex::AcquireSync(1) timed out or failed — capture side stalled?";
+        return kErr;
+    }
     // GPU→GPU копия: текстура захвата → входная текстура энкодера.
     // Никакого CPU-roundtrip.
     ctx.dx.context->CopyResource(surface.texture, src_texture);
-    src_texture->Release();
+    ctx.cached_shared_keyed_mutex->ReleaseSync(0);
 
     NV_ENC_MAP_INPUT_RESOURCE mapped = {};
     mapped.version = NV_ENC_MAP_INPUT_RESOURCE_VER;

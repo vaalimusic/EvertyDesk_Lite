@@ -90,7 +90,10 @@ pub enum PipelineCmd {
     /// focus point for EVRTCK's priority tile ordering — see
     /// `EvrtckEncoder::set_focus_pixel`. Experimental: only affects sessions
     /// where `want_evrtck` is true (client opted into EVRTCK).
-    CursorMoved { x: u32, y: u32 },
+    CursorMoved {
+        x: u32,
+        y: u32,
+    },
 }
 
 struct VideoServiceHandle {
@@ -146,9 +149,10 @@ pub fn run(cfg: PipelineConfig) {
     // Auto/VP9 → клиент поддерживает EVRTCK. H265/H264/AV1 → стандартный кодек.
     // Последующие смены (TCP relay churn) не меняют этот флаг — он отражает
     // истинную EVRTCK-совместимость клиента, а не текущий TCP codec.
-    let want_evrtck: Arc<AtomicBool> = Arc::new(AtomicBool::new(
-        matches!(initial_client_video.prefer, PreferCodec::Auto | PreferCodec::Vp9),
-    ));
+    let want_evrtck: Arc<AtomicBool> = Arc::new(AtomicBool::new(matches!(
+        initial_client_video.prefer,
+        PreferCodec::Auto | PreferCodec::Vp9
+    )));
     let mut first_codec_set = false;
     // Game-mode codec negotiation state.
     // In game mode (want_evrtck=false), SetClientCodec messages may arrive before
@@ -163,12 +167,17 @@ pub fn run(cfg: PipelineConfig) {
     // IDR request channel: cmd_rx → encoder
     let (global_idr_tx, global_idr_rx) = mpsc::channel::<()>();
 
-    // ── TCP канал несёт И видео, И control (shell output) ──────────────────────
-    // TcpItem::Video — видеокадры (с приоритетом latency, буфер 2)
-    // TcpItem::Peer  — shell output, control сообщения (всегда доставляются)
-    // Буфер 4: при блокирующем send даёт backpressure без большой задержки
-    // (≤4 кадра в полёте ≈ 130мс на 30fps). EVRT-канал меньше — UDP latency-critical.
-    let (tcp_tx, tcp_rx) = mpsc::sync_channel::<TcpItem>(4);
+    // ── TCP канал несёт И видео, И control (shell output), И (при EVRT timeout)
+    //    аудио-зеркало (TcpAudioFrame, ~100 маленьких кадров/сек, см. audio-mirror
+    //    ниже) ────────────────────────────────────────────────────────────────
+    // TcpItem::Video — видеокадры (приоритет latency)
+    // TcpItem::Peer  — shell output, control-сообщения, TCP-аудио
+    // Буфер поднят с 4 до 16: при 4 слотах TcpItem::Peer(audio) отправляется через
+    // try_send и почти всегда проигрывал гонку за место видеокадрам — звук
+    // тихо терялся целиком на relay-only сессиях (WAN без EVRT punch). 16 слотов
+    // при ~160 сообщений/сек совокупно даёт ≤100мс худшего буферизования —
+    // не свободный обед, но предпочтительнее "звука нет вообще".
+    let (tcp_tx, tcp_rx) = mpsc::sync_channel::<TcpItem>(16);
     let (evrt_tx, evrt_rx) = mpsc::sync_channel::<EncodedFrame>(2);
     let mut worker_handles = Vec::new();
     let mut video_services: HashMap<i32, VideoServiceHandle> = HashMap::new();
@@ -258,7 +267,63 @@ pub fn run(cfg: PipelineConfig) {
     if let Some(udp_sock) = evrt_socket {
         let stop_u = stop.clone();
         let ev_u = events.clone();
-        let cfg_u = app_config.clone();
+        // `evrt_session` builds the very first `SessionConfig` — the codec name
+        // the client sees BEFORE any frame arrives, and therefore the decoder
+        // it opens first — out of `config.display.codec`. Feed it the codec the
+        // CLIENT asked for, not this host's own preference setting, which has
+        // nothing to do with what will actually be sent down this session.
+        //
+        // Getting this wrong is not cosmetic: announcing a codec that doesn't
+        // match the bytes is what crashed the client outright (task #39 —
+        // `HEVCDECODER_STORE.dll` 0xC0000005, announced H265 while sending
+        // H264). The host's own `SetClientCodec`/`TYPE_CODEC_CONFIG` mechanism
+        // does correct a mismatch on the first frame, but that correction
+        // travels a DIFFERENT path (mpsc channel) than the frames themselves
+        // (packet queue), so there is a real, if narrow, window where frames
+        // can reach a decoder that hasn't switched yet. Announcing the client's
+        // own request closes that window for the common case — the client asked
+        // for H265 and the host has an H265 encoder, so no switch is needed at
+        // all.
+        let cfg_u = {
+            use crate::settings::CodecPreference;
+            let mut cfg = app_config.clone();
+            // Кодек, который клиент ПРОСИТ. Это ещё не ответ на вопрос, что он
+            // получит: у хоста может не быть соответствующего энкодера.
+            let requested = match initial_client_video.prefer {
+                // Auto/VP9 — ровно то условие, по которому хост уходит в EVRTCK
+                // (см. `want_evrtck` выше). Держим синхронно.
+                PreferCodec::Auto | PreferCodec::Vp9 => CodecPreference::Evrtck,
+                PreferCodec::H264 => CodecPreference::H264,
+                PreferCodec::H265 => CodecPreference::H265,
+                PreferCodec::Av1 => CodecPreference::Av1,
+                // VP8 наш `preferred_codec()` не производит никогда, и VP8-энкодера
+                // у хоста нет — каскад сядет на свою H264-сетку.
+                PreferCodec::Vp8 => CodecPreference::H264,
+            };
+            // А теперь — что реально будет закодировано. Объявлять клиенту
+            // нужно ИМЕННО ЭТО: `SessionConfig.codec` решает, какой декодер он
+            // откроет ещё до первого кадра, и расхождение убивает его процесс
+            // (см. doc у `negotiated_session_codec`). Живо поймано: клиент
+            // просил H265 и умеет его декодировать, но у хоста в MF только
+            // H264(hw) — каскад отдавал H264 под вывеской H265, и клиент падал
+            // сразу после подключения.
+            cfg.display.codec = if requested == CodecPreference::Evrtck {
+                CodecPreference::Evrtck
+            } else {
+                match crate::host::negotiated_session_codec(
+                    app_config.display.encoder,
+                    requested,
+                    initial_client_video,
+                ) {
+                    Some(crate::nvenc::NvencCodec::H265) => CodecPreference::H265,
+                    Some(crate::nvenc::NvencCodec::Av1) => CodecPreference::Av1,
+                    // H264 либо `None` (аппаратного бэкенда нет вообще →
+                    // программный OpenH264, на проводе всё равно H264).
+                    _ => CodecPreference::H264,
+                }
+            };
+            cfg
+        };
         let fps_u = target_fps.clone();
         let qual_u = quality_ms.clone();
         let bitrate_scale_u = bitrate_scale_milli.clone();
@@ -316,8 +381,15 @@ pub fn run(cfg: PipelineConfig) {
             prev_evrt_addr = cur_evrt;
             if let Some(addr) = cur_evrt {
                 let _ = global_idr_tx.send(());
-                let mode = if want_evrtck.load(Ordering::Relaxed) { "EVRTCK" } else { "H265/EVRT" };
-                log(&events, format!("Pipeline: EVRT активен → {addr} (режим={mode})"));
+                let mode = if want_evrtck.load(Ordering::Relaxed) {
+                    "EVRTCK"
+                } else {
+                    "H265/EVRT"
+                };
+                log(
+                    &events,
+                    format!("Pipeline: EVRT активен → {addr} (режим={mode})"),
+                );
 
                 // Game-mode codec commit: runs exactly once on first EVRT punch.
                 // All SetClientCodec messages received before this point were buffered
@@ -329,8 +401,28 @@ pub fn run(cfg: PipelineConfig) {
                     // Pick the best codec the client actually supports, ignoring
                     // the order of SetClientCodec messages. The client may send
                     // H265 then fall back to H264 (no IDR received yet), so the
-                    // last message is unreliable. Prefer H265 > H264 if supported.
-                    let best_prefer = if pending_game_video.h265 {
+                    // last message is unreliable.
+                    //
+                    // Respect the client's ACTUAL selection first (e.g. AV1, now
+                    // that NVENC AV1 is wired up — see nvenc_shim.cpp codec_guid).
+                    // Previously this unconditionally forced H265 whenever
+                    // h265==true, silently overriding an AV1 pick even when the
+                    // host could genuinely encode it — the codec selector in the
+                    // UI had no real effect. Only fall back to "prefer H265" when
+                    // the client's own choice isn't actually supported.
+                    let best_prefer = if pending_game_video.prefer == PreferCodec::Av1
+                        && pending_game_video.av1
+                    {
+                        PreferCodec::Av1
+                    } else if pending_game_video.prefer == PreferCodec::H265
+                        && pending_game_video.h265
+                    {
+                        PreferCodec::H265
+                    } else if pending_game_video.prefer == PreferCodec::H264
+                        && pending_game_video.h264
+                    {
+                        PreferCodec::H264
+                    } else if pending_game_video.h265 {
                         PreferCodec::H265
                     } else {
                         pending_game_video.prefer
@@ -341,7 +433,10 @@ pub fn run(cfg: PipelineConfig) {
                     client_video = committed;
                     let displays: Vec<i32> = subscribed_displays.iter().copied().collect();
                     if !displays.is_empty() {
-                        log(&events, format!("Pipeline: game codec commit → {:?}", target_prefer));
+                        log(
+                            &events,
+                            format!("Pipeline: game codec commit → {:?}", target_prefer),
+                        );
                         set_subscribed_displays(
                             displays,
                             &mut video_services,
@@ -370,20 +465,32 @@ pub fn run(cfg: PipelineConfig) {
 
         // Fallback: если EVRT punch не пришёл за 3 сек, коммитим pending game codec.
         // Актуально для клиентов за NAT где UDP punch недоступен (Android relay-only).
+        //
+        // ВАЖНО: этот путь по определению означает TCP relay-only (EVRT UDP не
+        // поднялся) — H265/AV1 по relay ломает MediaCodec decode на Android (тот
+        // же guard, что и в обычном не-game-mode пути ниже, "H265/AV1 over TCP
+        // relay causes MediaCodec decode errors on Android"). До фикса capability
+        // (h265_available()/av1_available() были хардкожены false на Android) это
+        // маскировалось — клиент никогда не репортил h265=true, поэтому сюда всегда
+        // попадал H264. После фикса client_video.h265 стал честным, и эта ветка
+        // начала реально выбирать H265 для relay-only сессии → пустой экран.
         let is_game_mode = !want_evrtck.load(Ordering::Relaxed);
-        if is_game_mode && !game_codec_committed && std::time::Instant::now() >= evrt_punch_deadline {
+        if is_game_mode && !game_codec_committed && std::time::Instant::now() >= evrt_punch_deadline
+        {
             game_codec_committed = true;
-            let best_prefer = if pending_game_video.h265 {
-                PreferCodec::H265
-            } else {
-                pending_game_video.prefer
-            };
+            let best_prefer = PreferCodec::H264;
             let mut committed = pending_game_video;
             committed.prefer = best_prefer;
             client_video = committed;
             let displays: Vec<i32> = subscribed_displays.iter().copied().collect();
             if !displays.is_empty() {
-                log(&events, format!("Pipeline: game codec commit (EVRT timeout) → {:?}", best_prefer));
+                log(
+                    &events,
+                    format!(
+                        "Pipeline: game codec commit (EVRT timeout) → {:?}",
+                        best_prefer
+                    ),
+                );
                 set_subscribed_displays(
                     displays,
                     &mut video_services,
@@ -403,6 +510,80 @@ pub fn run(cfg: PipelineConfig) {
                     &want_evrtck,
                     &cursor_pos,
                 );
+            }
+
+            // ★ Аудио по TCP relay: этот момент по определению означает, что EVRT
+            // UDP никогда не поднимется для данной сессии — значит EVRT Audio
+            // (evrt_session.rs) тоже никогда не запустится, звука не будет вообще.
+            // Зеркалим WASAPI-захват в TCP через тот же evrt_audio::run_audio_capture,
+            // что и EVRT-путь, но с фиктивным UDP-адресом (реальная доставка идёт
+            // через колбэк on_tcp_frame → tcp_tx). WASAPI-логика захвата не тронута.
+            {
+                use crate::rustdesk_proto::{misc, peer_message, Misc, PeerMessage};
+                let tcp_tx_audio = tcp_tx.clone();
+                let audio_stop = stop.clone();
+                let audio_events = events.clone();
+                let audio_events_log = events.clone();
+                thread::Builder::new()
+                    .name("tcp-audio-mirror".into())
+                    .spawn(move || {
+                        // Фиктивные socket/peer_addr: run_audio_capture требует их для
+                        // неизменённого EVRT UDP пути, но здесь этот путь просто не
+                        // доставит пакеты никуда (не тронут, не наблюдаем ошибок —
+                        // `let _ = socket.send_to(...)` в evrt_audio.rs их и так глушит).
+                        let Ok(dummy_sock) = std::net::UdpSocket::bind("0.0.0.0:0") else {
+                            return;
+                        };
+                        let dummy_peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+                        let sent_count = std::sync::atomic::AtomicU64::new(0);
+                        let dropped_count = std::sync::atomic::AtomicU64::new(0);
+                        let on_tcp_frame: Box<dyn Fn(&[u8]) + Send> =
+                            Box::new(move |chunk: &[u8]| {
+                                let msg = PeerMessage {
+                                    union: Some(peer_message::Union::Misc(Misc {
+                                        union: Some(misc::Union::TcpAudioFrame(chunk.to_vec())),
+                                    })),
+                                };
+                                match tcp_tx_audio.try_send(TcpItem::Peer(msg)) {
+                                    Ok(()) => {
+                                        let n = sent_count
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                            + 1;
+                                        if n == 1 || n % 50 == 0 {
+                                            log(
+                                                &audio_events_log,
+                                                format!(
+                                                    "TCP audio mirror: #{n} sent ok, {} bytes",
+                                                    chunk.len()
+                                                ),
+                                            );
+                                        }
+                                    }
+                                    Err(_) => {
+                                        let d = dropped_count
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                            + 1;
+                                        if d == 1 || d % 50 == 0 {
+                                            log(
+                                                &audio_events_log,
+                                                format!(
+                                                    "TCP audio mirror: #{d} DROPPED (channel full)"
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                        crate::evrt_audio::run_audio_capture(
+                            Arc::new(dummy_sock),
+                            dummy_peer,
+                            audio_stop,
+                            None,
+                            audio_events,
+                            Some(on_tcp_frame),
+                        );
+                    })
+                    .ok();
             }
         }
 
@@ -867,8 +1048,8 @@ fn encode_loop(
     want_evrtck: Arc<AtomicBool>,
     cursor_pos: Arc<AtomicU64>,
 ) {
-    use crate::host::{h264_target_bitrate_bps_pub, EncodedOutput, MultiEncoder};
     use crate::evrtck::EvrtckEncoder;
+    use crate::host::{h264_target_bitrate_bps_pub, EncodedOutput, MultiEncoder};
 
     thread_local! {
         static EVRTCK_ENC: std::cell::RefCell<Option<EvrtckEncoder>> =
@@ -886,6 +1067,22 @@ fn encode_loop(
         &events,
         format!("Encoder каскад: {}", encoder.backend_label()),
     );
+    // Клиент запросил конкретный аппаратный кодек (игровой режим), а у нас нет
+    // ни одного аппаратного энкодера, который он смог бы декодировать. Каскад
+    // сейчас свалится в OpenH264/PNG — это не игровой режим. Пишем громко: без
+    // этой строки диагностика выглядит как «игровой режим просто медленный».
+    if !want_evrtck.load(Ordering::Relaxed) && !encoder.has_hardware_backend() {
+        log(
+            &events,
+            format!(
+                "⚠️ ИГРОВОЙ РЕЖИМ НЕВОЗМОЖЕН: клиент просит аппаратный кодек (prefer={:?}), \
+                 но на этом хосте нет подходящего аппаратного энкодера \
+                 (NVENC / Intel Quick Sync / AMD / VideoToolbox). \
+                 Кодирование пойдёт софтом — клиенту будет медленнее, чем в обычном режиме.",
+                client_video.prefer,
+            ),
+        );
+    }
     let allow_static_skip = config.display.streaming_mode.allows_static_skip();
     log(
         &events,
@@ -938,6 +1135,12 @@ fn encode_loop(
     let mut downscale_to: Option<(u32, u32)> = None;
     let mut downscale_buf: Vec<u8> = Vec::new();
     let mut software_profile_active = false;
+    // fps/quality as they were the moment the software profile clamped them —
+    // restored verbatim if a hardware backend later takes over. Saved rather
+    // than re-read because the software profile re-clamps `target_fps` every
+    // iteration while active, so by then the client's real request is gone.
+    let mut fps_before_software_profile: u32 = 0;
+    let mut quality_before_software_profile: u32 = 0;
 
     // Capture double buffer
     type CapSlot = Arc<Mutex<Option<(i32, u32, u32, Vec<u8>)>>>;
@@ -1018,6 +1221,10 @@ fn encode_loop(
     let mut frame_id: u32 = 0;
     let mut last_idr: Instant = Instant::now();
     let mut force_recovery_key = true;
+    // Взводится, когда EVRTCK-кадр закодирован (база энкодера уже сдвинулась),
+    // но отправить его не удалось — клиент остался на старой базе. Снимается
+    // только когда IDR реально ушёл. См. ветку `TrySendError::Full`.
+    let mut evrtck_baseline_dirty = false;
     let mut next_frame_due: Instant = Instant::now();
     // Game-mode static-frame cache: DXGI AcquireNextFrame(0) on Windows 11 can
     // block until DWM composites (~8fps for static desktops) even with timeout=0.
@@ -1051,16 +1258,21 @@ fn encode_loop(
         // Вычисляем evrt_on один раз в начале итерации — используется
         // везде ниже (fps-cap, want_idr, dispatch, bitrate-cap).
         let evrt_on = evrt_active.lock().map(|g| g.is_some()).unwrap_or(false);
-        // using_evrtck: EVRT активен И клиент поддерживает EVRTCK (want_evrtck=true).
+        // using_evrtck: клиент поддерживает EVRTCK (want_evrtck=true) — НЕ зависит
+        // от evrt_on. Раньше EVRTCK кодировался только когда прямой EVRT UDP уже
+        // подключён; без него «обычный режим» тихо скатывался на H264/H265 через
+        // TCP. Теперь EVRTCK кодируется всегда, когда клиент его хочет — при
+        // evrt_on=true кадры едут по EVRT UDP как раньше, при evrt_on=false те же
+        // EVRTCK-кадры едут по TCP relay (Misc::TcpEvrtckFrame, dispatch ниже).
         // want_evrtck фиксируется по первому SetClientCodec: Auto/VP9 → true, иначе false.
         // Это отличает игровой режим (H265 при старте → false) от обычного (Auto → true).
         // encode_loop не перезапускается при смене кодека (set_subscribed_displays no-op),
         // поэтому want_evrtck пробрасывается через Arc<AtomicBool> вместо локального prefer.
-        let using_evrtck = evrt_on && want_evrtck.load(Ordering::Relaxed);
+        let using_evrtck = want_evrtck.load(Ordering::Relaxed);
         current_idr_min = if using_evrtck {
             idr_min_evrtck
         } else if evrt_on {
-            IDR_MIN_EVRT_HXXX  // H265/H264 через EVRT UDP — NACK/FEC покрывает потери
+            IDR_MIN_EVRT_HXXX // H265/H264 через EVRT UDP — NACK/FEC покрывает потери
         } else {
             IDR_MIN_H264
         };
@@ -1109,13 +1321,55 @@ fn encode_loop(
         }
 
         // IDR по таймеру/запросу.
-        // External IDR requests (from RefreshVideoDisplay) are subject to current_idr_min
-        // just like the periodic timer: for EVRTCK this prevents a 1 MB IDR storm when
-        // H264 TCP decode errors trigger repeated RefreshVideoDisplay commands.
+        //
+        // Requested IDRs get their OWN, much shorter floor than the periodic
+        // timer. They used to share `current_idr_min`, which for EVRTCK is the
+        // configurable `idr_interval_secs` — 20 SECONDS by default. That gate
+        // is right for the unrequested periodic refresh, but catastrophic for
+        // the request path, because a request means the client has already
+        // lost data and cannot decode anything until it gets an IDR:
+        //
+        //   client drops a frame (FEC couldn't recover it)
+        //     → sends RequestKeyFrame and enters `wait_for_keyframe()`
+        //     → `ChannelReassembler.waiting_after_loss` discards every P-frame
+        //     → host's `evrt_session` also sets `waiting_for_idr` and stops
+        //       forwarding non-IDR frames
+        //     → and then BOTH sides sit there for up to 20 s
+        //
+        // i.e. one unrecovered packet froze the picture on the last good frame
+        // for up to twenty seconds, which is exactly what a user reports as
+        // "EVRTCK много артефактов" — not corrupted pixels, but stale content
+        // that lingers and then snaps forward.
+        //
+        // The IDR-storm concern the old shared gate protected against is real
+        // but is already handled one layer up: `evrt_session` rate-limits
+        // EVRTCK keyframe requests to `IDR_RATELIMIT_EVRTCK` (500 ms). Use the
+        // same 500 ms here so the two limits agree, instead of the outer one
+        // silently overriding the inner by 40×.
+        const IDR_MIN_REQUESTED: Duration = Duration::from_millis(500);
         let external_idr = idr_rx.try_recv().is_ok();
         while idr_rx.try_recv().is_ok() {} // drain burst — multiple requests count as one
-        let periodic_key = force_recovery_key
-            || (external_idr && last_idr.elapsed() >= current_idr_min)
+                                           // `evrtck_baseline_dirty`: мы закодировали EVRTCK-кадр (сдвинув XOR-базу
+                                           // энкодера), но не смогли его отправить — см. ветку TrySendError::Full
+                                           // ниже. База клиента разошлась с нашей, лечится только IDR. Идёт по тому
+                                           // же троттлируемому пути, что и запрос клиента.
+        let recovery_idr = external_idr || evrtck_baseline_dirty;
+        // Даже аварийный `force_recovery_key` подчиняется полу — кроме самого
+        // первого кадра сессии, который обязан быть ключевым безусловно.
+        //
+        // Раньше он обходил все пороги, и на живой сессии это давало IDR на
+        // СОСЕДНИХ кадрах (id=111,112 и 159,160,161 в логе хоста) по 50-128 КБ
+        // каждый. При 60fps это десятки мегабит одних только ключевых кадров:
+        // канал отправки захлёбывается, кадры дропаются, fps падает до
+        // единиц, а вместе с видео встаёт и ввод — ровно та картина, которую
+        // видел пользователь. Один пропущенный аварийный IDR стоит ≤300мс
+        // ожидания; шторм стоит всей сессии.
+        const IDR_MIN_FORCED: Duration = Duration::from_millis(300);
+        let first_frame_ever = frame_id == 0;
+        let forced_allowed =
+            force_recovery_key && (first_frame_ever || last_idr.elapsed() >= IDR_MIN_FORCED);
+        let periodic_key = forced_allowed
+            || (recovery_idr && last_idr.elapsed() >= IDR_MIN_REQUESTED.min(current_idr_min))
             || last_idr.elapsed() > current_idr_min;
 
         // Захват
@@ -1133,7 +1387,9 @@ fn encode_loop(
             }
             Some(f)
         } else if is_game_mode_enc {
-            last_game_frame.as_ref().map(|(d, w, h, data)| (*d, *w, *h, data.clone()))
+            last_game_frame
+                .as_ref()
+                .map(|(d, w, h, data)| (*d, *w, *h, data.clone()))
         } else {
             None
         };
@@ -1219,7 +1475,11 @@ fn encode_loop(
         // (каждые 2 сек при статичном экране → 1 МБ IDR зря). EVRTCK — lossless delta
         // codec, refresh не нужен. Изменения разрешения обрабатываются ниже через
         // recreation EvrtckEncoder (который ставит pending_keyframe сам).
-        let mut want_idr = if evrt_on { periodic_key } else { decision.force_key || periodic_key };
+        let mut want_idr = if evrt_on {
+            periodic_key
+        } else {
+            decision.force_key || periodic_key
+        };
 
         // Downscale для software encoder: не применяем когда EVRTCK активен,
         // т.к. мы не используем H264 и смена downscale_to не должна форсить IDR.
@@ -1294,7 +1554,11 @@ fn encode_loop(
         let Some(out) = (if using_evrtck {
             Some(EVRTCK_ENC.with(|cell| {
                 let mut enc = cell.borrow_mut();
-                if enc.as_ref().map(|e| e.width() != enc_w as usize || e.height() != enc_h as usize).unwrap_or(true) {
+                if enc
+                    .as_ref()
+                    .map(|e| e.width() != enc_w as usize || e.height() != enc_h as usize)
+                    .unwrap_or(true)
+                {
                     let mut fresh = EvrtckEncoder::new(enc_w as usize, enc_h as usize);
                     fresh.request_keyframe(); // сигнализируем клиенту сбросить prev-буфер
                     *enc = Some(fresh);
@@ -1319,9 +1583,20 @@ fn encode_loop(
                 let pkt = enc.as_mut().unwrap().encode(bgra, frame_id);
                 if !evrtck_logged {
                     evrtck_logged = true;
-                    log(&events, format!("EVRTCK encode: first frame id={frame_id} idr={want_idr} bytes={}", pkt.data.len()));
+                    log(
+                        &events,
+                        format!(
+                            "EVRTCK encode: first frame id={frame_id} idr={want_idr} bytes={}",
+                            pkt.data.len()
+                        ),
+                    );
                 }
-                EncodedOutput { bytes: pkt.data, key: want_idr, sps_pps: None, codec: "evrtck" }
+                EncodedOutput {
+                    bytes: pkt.data,
+                    key: want_idr,
+                    sps_pps: None,
+                    codec: "evrtck",
+                }
             }))
         } else {
             encoder.encode(enc_w, enc_h, fps, eff_bps, bgra, want_idr)
@@ -1445,7 +1720,15 @@ fn encode_loop(
                 &events,
                 format!(
                     "★ Реальный энкодер: {} ({}×{}@{}, первый кадр {}мс)",
-                    encoder.active_backend(),
+                    // В EVRTCK-режиме MultiEncoder не используется вообще
+                    // (тайлы кодирует EvrtckEncoder), поэтому active_backend
+                    // остаётся "none" — в логе это читалось как «энкодера нет»
+                    // и уводило диагностику в сторону. Пишем честно.
+                    if using_evrtck {
+                        "EVRTCK (CPU-тайлы)"
+                    } else {
+                        encoder.active_backend()
+                    },
                     enc_w,
                     enc_h,
                     fps,
@@ -1456,14 +1739,42 @@ fn encode_loop(
             if let Some(err) = encoder.take_mf_error() {
                 log(&events, format!("★ MF отключён, причина: {err}"));
             }
+        }
 
-            // ★ Софт-энкодер на высоком разрешении → включаем даунскейл.
-            //   Цель: высота ≤ 720 (сохраняя пропорции). Аппаратный — не трогаем.
-            let backend = encoder.active_backend();
-            let is_software = backend == "OpenH264-SW" || backend == "PNG";
+        // ★ Софт-энкодер на высоком разрешении → даунскейл + пониженный fps.
+        //   Цель: высота ≤ 720 (сохраняя пропорции). Аппаратный — не трогаем.
+        //
+        //   Пересчитывается на КАЖДОЙ смене бэкенда, а не один раз на первом
+        //   кадре. Раньше весь этот профиль решался внутри `if !backend_logged`
+        //   выше — и если первый кадр случайно выдал OpenH264-SW (обычное дело
+        //   на холодном старте: NVENC/MF инициализируются лениво, первый кадр
+        //   успевает уйти через софт), сессия НАВСЕГДА оставалась на 15fps,
+        //   даунскейле и низком битрейте. Живо наблюдалось на Intel-ПК
+        //   пользователя: «★ Реальный энкодер: OpenH264-SW … @15fps», а уже
+        //   следующей строкой телеметрии `backend=MediaFoundation encode_ms=8`
+        //   — железо подхватило кодирование, но actual_fps так и остался 15.0
+        //   до конца сессии.
+        //
+        //   Решение принимается по НАЛИЧИЮ аппаратного бэкенда, а не по тому,
+        //   кто выдал последний конкретный кадр. Это принципиально: каскад
+        //   `MultiEncoder::encode` пробует MF, и если тот вернул `Ok(None)`
+        //   (аппаратный MFT асинхронный, ему случается нужен ещё вход, прежде
+        //   чем отдать пакет), управление проваливается в OpenH264 — и
+        //   `active_backend` на этом кадре честно становится софтверным, хотя
+        //   железо никуда не делось. Первая версия этой проверки смотрела
+        //   именно на `active_backend`, и на живом Intel-хосте профиль начал
+        //   ДРЕБЕЗЖАТЬ: в логе «Software encoder profile» и «Аппаратный
+        //   энкодер подхватил» чередовались каждую секунду, каждый раз
+        //   переставляя fps/разрешение и форся IDR — fps просел до 3-6.
+        //   `has_active_hardware_backend()` меняется только когда бэкенд
+        //   действительно выключился из-за ошибки, то есть по-настоящему редко.
+        let backend = encoder.active_backend();
+        let is_software = !encoder.has_active_hardware_backend();
+        if is_software != software_profile_active {
+            software_profile_active = is_software;
             if is_software {
-                software_profile_active = true;
-
+                fps_before_software_profile = target_fps.load(Ordering::Relaxed);
+                quality_before_software_profile = quality_ms.load(Ordering::Relaxed);
                 let software_fps = software_encoder_target_fps(target_fps.load(Ordering::Relaxed));
                 if software_fps < fps {
                     target_fps.store(software_fps, Ordering::Relaxed);
@@ -1490,6 +1801,36 @@ fn encode_loop(
                         software_quality,
                         floor_bps / 1_000,
                         cap_bps / 1_000,
+                    ),
+                );
+            } else {
+                // Железо подхватило кодирование — снимаем софтверные ограничения
+                // и возвращаем то, что клиент реально просил. Разрешение меняется,
+                // поэтому нужен IDR: у клиента иначе останется декодер, настроенный
+                // на старый (уменьшенный) размер кадра.
+                // Не чистим downscale_buf: `downscale_bgra` начинает с
+                // `dst.resize(...)` и перезаписывает буфер целиком, так что
+                // старое содержимое никогда не может «просочиться». (Заодно
+                // это единственный вариант, который здесь вообще компилируется
+                // — на этой строке буфер ещё одолжен как `bgra` для encode.)
+                if downscale_to.is_some() {
+                    downscale_to = None;
+                    force_recovery_key = true;
+                }
+                let restored_fps = fps_before_software_profile.clamp(5, 60);
+                if restored_fps > 0 && target_fps.load(Ordering::Relaxed) < restored_fps {
+                    target_fps.store(restored_fps, Ordering::Relaxed);
+                    next_frame_due = Instant::now();
+                }
+                if quality_before_software_profile > 0
+                    && quality_ms.load(Ordering::Relaxed) < quality_before_software_profile
+                {
+                    quality_ms.store(quality_before_software_profile, Ordering::Relaxed);
+                }
+                log(
+                    &events,
+                    format!(
+                        "★ Аппаратный энкодер подхватил ({backend}) — софт-профиль снят: {restored_fps}fps, полное разрешение {enc_w}×{enc_h}",
                     ),
                 );
             }
@@ -1551,13 +1892,34 @@ fn encode_loop(
                     evrt_disconnect_spins = 0;
                     if is_idr {
                         force_recovery_key = false;
+                        // IDR реально ушёл — базы снова сошлись.
+                        evrtck_baseline_dirty = false;
                     }
                 }
                 Err(mpsc::TrySendError::Full(_)) => {
                     // Канал занят: evrt_session ещё отправляет крупный IDR (100 Мбит/с ≈ 80мс/МБ).
-                    // НЕ форсим новый IDR — это создаёт каскад: Full → IDR → Full → IDR.
-                    // Просто дропаем этот кадр: клиент видит последний декодированный кадр
-                    // до тех пор, пока текущий IDR не долетит.
+                    // Дропаем этот кадр — форсить новый IDR безусловно нельзя,
+                    // это как раз и даёт каскад Full → IDR → Full → IDR.
+                    //
+                    // НО для EVRTCK «просто дропнуть» недостаточно, и старое
+                    // утверждение «клиент видит последний декодированный кадр»
+                    // здесь неверно. Оно справедливо для H264/H265, где ссылки
+                    // ведёт сам декодер. EVRTCK же — XOR-дельта против кадра,
+                    // который энкодер УЖЕ сдвинул в момент кодирования: раз кадр
+                    // закодирован, база хоста стала N, а у клиента осталась N-1.
+                    // Дальше каждая следующая дельта ложится на чужую базу —
+                    // картинка рассыпается (призрачные смещённые копии окон,
+                    // блоки шума) и сама не чинится до следующего IDR. Живо
+                    // воспроизводится перетаскиванием окна: кадры большие,
+                    // канал (ёмкость 2) забивается, дропы идут пачками.
+                    //
+                    // Поэтому помечаем базу испорченной и просим IDR через
+                    // ТРОТТЛИРУЕМЫЙ путь (IDR_MIN_REQUESTED, 500мс), а не через
+                    // `force_recovery_key`, который обходит все ограничения и
+                    // ровно этот каскад бы и устроил.
+                    if using_evrtck {
+                        evrtck_baseline_dirty = true;
+                    }
                 }
                 Err(mpsc::TrySendError::Disconnected(_)) => {
                     // evrt_send_loop clears evrt_active=None when the session ends,
@@ -1652,7 +2014,8 @@ fn tcp_send_loop(
 
 fn make_tcp_video_frame(frame: &EncodedFrame) -> crate::rustdesk_proto::PeerMessage {
     use crate::rustdesk_proto::{
-        peer_message, video_frame, EncodedVideoFrame, EncodedVideoFrames, PeerMessage, VideoFrame,
+        misc, peer_message, video_frame, EncodedVideoFrame, EncodedVideoFrames, Misc, PeerMessage,
+        VideoFrame,
     };
     debug_assert!(
         frame.width > 0 && frame.height > 0,
@@ -1660,6 +2023,19 @@ fn make_tcp_video_frame(frame: &EncodedFrame) -> crate::rustdesk_proto::PeerMess
         frame.width,
         frame.height
     );
+    // EVRTCK — self-describing wire bytes (magic+version+dims baked in), едет
+    // как Misc::TcpEvrtckFrame, а не VideoFrame: RustDesk-совместимый VideoFrame
+    // union жёстко ограничен H264/H265/VP8/VP9/AV1 — заворачивать в него тайлы
+    // EVRTCK означало бы, что клиент попытается скормить их H264-декодеру
+    // (именно так раньше «обычный режим» без прямого EVRT молча скатывался на
+    // H264/H265, что и привело к краху системного HEVC-декодера на части машин).
+    if frame.codec == "evrtck" {
+        return PeerMessage {
+            union: Some(peer_message::Union::Misc(Misc {
+                union: Some(misc::Union::TcpEvrtckFrame((*frame.bytes).clone())),
+            })),
+        };
+    }
     let encoded = EncodedVideoFrame {
         data: (*frame.bytes).clone(),
         key: frame.is_idr,
@@ -1764,11 +2140,15 @@ fn evrt_send_loop(
         }
         if let Ok((len, src)) = socket.recv_from(&mut buf) {
             if evrt_token.is_some() {
-                let token_ok = crate::evrt::parse_authenticated(&buf, len, evrt_token.as_deref()).is_some_and(|pkt| {
-                    pkt.packet_type == crate::evrt::TYPE_CONTROL
-                        && crate::evrt::control_token_matches(&pkt.payload, evrt_token.as_deref())
-                        && crate::evrt::parse_control(&pkt.payload).is_some()
-                });
+                let token_ok = crate::evrt::parse_authenticated(&buf, len, evrt_token.as_deref())
+                    .is_some_and(|pkt| {
+                        pkt.packet_type == crate::evrt::TYPE_CONTROL
+                            && crate::evrt::control_token_matches(
+                                &pkt.payload,
+                                evrt_token.as_deref(),
+                            )
+                            && crate::evrt::parse_control(&pkt.payload).is_some()
+                    });
                 if !token_ok {
                     continue;
                 }
@@ -2365,5 +2745,101 @@ mod tests {
             h: 64,
         };
         assert_eq!(adapt_bitrate(base, roi, 1920, 1080, false, 800), 3_100_000);
+    }
+
+    #[test]
+    fn evrtck_frame_routes_to_misc_not_h264_wrapper() {
+        // Regression for "normal mode always EVRTCK": before this fix, any
+        // frame reaching make_tcp_video_frame() with evrt_on=false got wrapped
+        // as VideoFrame::H264s regardless of actual codec — for codec=="evrtck"
+        // that means the client's H264 decoder would receive raw EVRTCK tile
+        // bytes as if they were H264 NAL units.
+        use crate::evrtck::{EvrtckDecoder, EvrtckEncoder};
+        use crate::rustdesk_proto::{misc, peer_message};
+
+        let (w, h) = (64usize, 64usize);
+        let mut bgra = vec![0u8; w * h * 4];
+        for (i, px) in bgra.chunks_exact_mut(4).enumerate() {
+            px[0] = (i % 251) as u8;
+            px[2] = ((i / 3) % 251) as u8;
+            px[3] = 255;
+        }
+        let mut enc = EvrtckEncoder::new(w, h);
+        let pkt = enc.encode(&bgra, 1);
+
+        let frame = EncodedFrame {
+            bytes: std::sync::Arc::new(pkt.data),
+            is_idr: true,
+            frame_id: 1,
+            pts_us: 0,
+            display: 0,
+            sps_pps: None,
+            width: w as u32,
+            height: h as u32,
+            codec: "evrtck",
+            roi: crate::evrt::RoiRect {
+                frame_id: 1,
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+            },
+        };
+
+        let msg = make_tcp_video_frame(&frame);
+
+        // Must be Misc::TcpEvrtckFrame, NOT VideoFrame::H264s.
+        let wire_bytes = match msg.union {
+            Some(peer_message::Union::Misc(m)) => match m.union {
+                Some(misc::Union::TcpEvrtckFrame(bytes)) => bytes,
+                other => panic!("expected TcpEvrtckFrame, got {other:?}"),
+            },
+            other => {
+                panic!("expected Misc, got {other:?} — EVRTCK frame was wrapped as VideoFrame")
+            }
+        };
+
+        // And the client's EVRTCK decoder must be able to make sense of it.
+        let mut dec = EvrtckDecoder::new();
+        let rgba_len = dec
+            .decode_wire(&wire_bytes)
+            .expect("decode_wire must succeed")
+            .len();
+        assert_eq!(dec.width(), w);
+        assert_eq!(dec.height(), h);
+        assert_eq!(rgba_len, w * h * 4);
+    }
+
+    #[test]
+    fn h264_frame_still_routes_to_video_frame_union() {
+        // Game mode / non-EVRTCK codecs must be unaffected by the EVRTCK routing
+        // added to make_tcp_video_frame().
+        use crate::rustdesk_proto::{peer_message, video_frame};
+
+        let frame = EncodedFrame {
+            bytes: std::sync::Arc::new(vec![0, 1, 2, 3]),
+            is_idr: true,
+            frame_id: 1,
+            pts_us: 0,
+            display: 0,
+            sps_pps: None,
+            width: 64,
+            height: 64,
+            codec: "H264",
+            roi: crate::evrt::RoiRect {
+                frame_id: 1,
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+            },
+        };
+        let msg = make_tcp_video_frame(&frame);
+        match msg.union {
+            Some(peer_message::Union::VideoFrame(vf)) => {
+                assert!(matches!(vf.union, Some(video_frame::Union::H264s(_))));
+            }
+            other => panic!("expected VideoFrame, got {other:?}"),
+        }
     }
 }

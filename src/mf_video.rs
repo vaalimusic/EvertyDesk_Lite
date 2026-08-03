@@ -104,7 +104,6 @@ mod inner {
         false
     }
 
-
     fn decoder_available(codec: MfVideoCodec) -> bool {
         unsafe { first_decoder_subtype(codec).is_some() }
     }

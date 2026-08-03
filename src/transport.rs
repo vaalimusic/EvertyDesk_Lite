@@ -1,7 +1,11 @@
 use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        atomic::AtomicBool,
+        mpsc::{self, Receiver, Sender},
+        Arc,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -71,9 +75,18 @@ fn elapsed_ms(started: &Instant) -> u128 {
 pub struct ConnectionRequest {
     pub remote_id: String,
     pub password: String,
+    pub client_id: String,
+    pub client_name: String,
     pub server: ServerConfig,
     pub display: DisplayConfig,
     pub control_only: bool,
+    /// Per-session audio playback state. Shared with direct EVRT and relay paths.
+    pub audio_enabled: Arc<AtomicBool>,
+    /// Request an EVRT2-only test session: host skips the live EVRT1 video
+    /// pipeline entirely. Implies control_only client-side (no video request,
+    /// no EVRT1 UDP threads) — the EVRT2 experiment stream is started
+    /// separately once connected.
+    pub evrt2_only: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -133,6 +146,8 @@ pub enum SessionEvent {
     /// Round-trip latency measured by the peer's TestDelay heartbeat (milliseconds).
     Latency(u32),
     ClipboardText(String),
+    /// PCM i16 audio received through the TCP relay fallback.
+    AudioFrame(Vec<u8>),
     ShellOutput(String),
     ShellClosed,
     ShellError(String),
@@ -166,6 +181,30 @@ pub enum SessionEvent {
     VmCapabilities(String),
     /// Agentless VM: список чекпоинтов (JSON).
     VmCheckpoints(String),
+    /// Экспериментальная кнопка «EVRT2»: декодированный кадр с отдельного
+    /// EVRT2 UDP-потока. Намеренно ОТДЕЛЬНЫЙ вариант от `Frame` — если бы
+    /// EVRT2-кадры шли через `Frame`, они писали бы в тот же render-буфер,
+    /// что и живое EVRT1-видео (session.latest на Android, remote_texture
+    /// на ПК), и картинка бы мигала/смешивалась между двумя независимыми
+    /// потоками. Рендерится в отдельном маленьком превью, не трогая живой
+    /// экран сессии.
+    Evrt2ExperimentFrame {
+        width: usize,
+        height: usize,
+        rgba: Vec<u8>,
+    },
+    /// ROADMAP.md Phase 1.3: a real Task-01 breach (`DEGRADE_SIGNAL`)
+    /// arrived on the EVRT2 experimental stream — structured, so a
+    /// consumer can render an actual visual indicator instead of
+    /// string-matching `Info`'s free-text log line. See
+    /// `evrt2_preview_window` in main.rs for the PC consumer; Android has
+    /// no dedicated consumer yet (falls through the FFI dispatcher's
+    /// catch-all — the text log line via `Info` still reaches it).
+    Evrt2Degrade {
+        measured_age_ms: f32,
+        ceiling_ms: f32,
+        tiles: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -240,6 +279,9 @@ pub enum SessionCommand {
     SetVideoFps {
         fps: i32,
     },
+    SetAdaptiveQuality {
+        enabled: bool,
+    },
     SetVideoProfile {
         fps: i32,
         codec: CodecPreference,
@@ -259,6 +301,12 @@ pub enum SessionCommand {
     VmCheckpointOp(String),
     /// Agentless VM: rescue input. JSON: {"vm_id","input_type","text"}
     VmRescueInput(String),
+    /// Установить системную громкость хоста, 0..100 (%).
+    SetHostVolume(u32),
+    /// Экспериментальная кнопка «EVRT2» на экране игрового режима — просит
+    /// хост поднять отдельный EVRT2 UDP-сокет параллельно живому пути.
+    /// См. evrt2_experiment.rs.
+    StartEvrt2Experiment,
     Close,
 }
 
@@ -303,6 +351,15 @@ enum DecoderInput {
         bytes: usize,
         width: u32,
         height: u32,
+    },
+    /// EVRTCK через TCP relay (Misc::TcpEvrtckFrame) — фоллбэк для «обычного
+    /// режима», когда прямой EVRT UDP недоступен. Self-describing wire bytes,
+    /// декодируется тем же EvrtckDecoder, что и EVRT UDP путь.
+    Evrtck {
+        sid: String,
+        bytes: Vec<u8>,
+        key: bool,
+        queued_at: Instant,
     },
 }
 
@@ -412,9 +469,10 @@ impl TransportClient {
     ) {
         let display_config = request.display.clone();
         let control_only = request.control_only;
+        let audio_enabled = Arc::clone(&request.audio_enabled);
         let mut codec_preference = display_config.codec;
         let initial_video_fps = display_config.target_fps.clamp(5, 60) as i32;
-        let adaptive_quality = display_config.adaptive_quality;
+        let mut adaptive_quality = display_config.adaptive_quality;
         let min_video_fps = display_config
             .min_fps
             .clamp(5, display_config.target_fps.clamp(5, 60)) as i32;
@@ -468,38 +526,53 @@ impl TransportClient {
         // продолжали слать UDP хосту и не мешали новому подключению.
         let evrt_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+        // ROADMAP.md Phase 5.3 — RELAY_WRAP: created once per session (this
+        // loop only owns `relay` once), not per experiment start — the
+        // "start a fresh experiment race" event just overwrites
+        // `evrt2_relay_in_tx` with a fresh per-race `Sender`, see
+        // `handle_session_message`'s `Evrt2ExperimentEndpoints` arm.
+        let (evrt2_relay_out_tx, evrt2_relay_out_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let mut evrt2_relay_in_tx: Option<std::sync::mpsc::Sender<Vec<u8>>> = None;
+
         let mut evrt_started = false;
         if !control_only && codec_preference.use_evrt() {
             if let Some(host_addr) = evrt_host_addr {
-            evrt_started = true;
-            let evrt_events = events.clone();
-            let evrt_stop_clone = evrt_stop.clone();
-            let evrt_ull = display_config.target_fps >= 60;
-            let evrt_token_for_thread = evrt_token.clone();
+                evrt_started = true;
+                let evrt_events = events.clone();
+                let evrt_stop_clone = evrt_stop.clone();
+                let evrt_ull = display_config.target_fps >= 60;
+                let evrt_token_for_thread = evrt_token.clone();
+                let evrt_audio_enabled = Arc::clone(&audio_enabled);
 
-            eprintln!("[evrt-client] прямой UDP → {host_addr}");
+                eprintln!("[evrt-client] прямой UDP → {host_addr}");
 
-            thread::spawn(move || {
-                if let Ok(udp) = std::net::UdpSocket::bind("0.0.0.0:0") {
-                    let udp = std::sync::Arc::new(udp);
-                    crate::evrt_client::try_evrt_before_relay(
-                        &udp,
-                        host_addr,
-                        evrt_token_for_thread.clone(),
-                        &evrt_events,
-                        evrt_stop_clone,
-                        evrt_ull,
-                    );
-                }
-            });
+                thread::spawn(move || {
+                    if let Ok(udp) = std::net::UdpSocket::bind("0.0.0.0:0") {
+                        let udp = std::sync::Arc::new(udp);
+                        crate::evrt_client::try_evrt_before_relay(
+                            &udp,
+                            host_addr,
+                            evrt_token_for_thread.clone(),
+                            &evrt_events,
+                            evrt_stop_clone,
+                            evrt_ull,
+                            evrt_audio_enabled,
+                        );
+                    }
+                });
             }
         }
-        if !control_only && !evrt_started && !early_evrt_candidates.is_empty() && codec_preference.use_evrt() {
+        if !control_only
+            && !evrt_started
+            && !early_evrt_candidates.is_empty()
+            && codec_preference.use_evrt()
+        {
             evrt_started = true;
             let evrt_events = events.clone();
             let evrt_ull = display_config.target_fps >= 60;
             let evrt_token_for_thread = evrt_token.clone();
             let evrt_stop_clone = evrt_stop.clone();
+            let evrt_audio_enabled = Arc::clone(&audio_enabled);
             eprintln!(
                 "[evrt-client] ранние EVRT кандидаты: {:?}",
                 early_evrt_candidates
@@ -511,6 +584,7 @@ impl TransportClient {
                     &evrt_events,
                     evrt_ull,
                     evrt_stop_clone,
+                    evrt_audio_enabled,
                 );
             });
         }
@@ -535,7 +609,14 @@ impl TransportClient {
         let mut screenshots_received = 0_u64;
         let mut peer_messages_seen = 0_u32;
         let mut live_video_seen = false;
+        // Android's EVRT decode path renders directly to Surface (see
+        // decode_h264/h265/av1_frame in evrt_client.rs) and never produces a
+        // SessionEvent::Frame, so `live_video_seen` alone can't see it — reset
+        // the companion flag for this session; the retry watchdog below checks
+        // both.
+        crate::evrt_client::reset_android_evrt_frame_seen();
         let mut last_frame_received = Instant::now();
+        let mut last_client_keepalive = Instant::now();
         let mut video_metric_packets = 0_u64;
         let mut video_metric_bytes = 0_u64;
         let mut last_video_packet_metrics = Instant::now();
@@ -546,7 +627,7 @@ impl TransportClient {
         let mut stable_decoded_frames = 0_u32;
         // 60 fps sessions are interactive first: start with RustDesk's speed
         // quality, then raise only after the incoming stream proves it is fast.
-        let mut current_quality = initial_stream_quality(initial_video_fps);
+        let mut current_quality = initial_stream_quality(initial_video_fps, codec_preference);
         let mut last_quality_change = Instant::now();
         let mut low_input_quality_windows = 0_u32;
         let mut h264_decode_failures = 0_u32;
@@ -608,7 +689,8 @@ impl TransportClient {
                                 );
                                 if next_fps < target_video_fps {
                                     target_video_fps = next_fps;
-                                    current_quality = initial_stream_quality(target_video_fps);
+                                    current_quality =
+                                        initial_stream_quality(target_video_fps, codec_preference);
                                     last_decoder_recovery = Some(Instant::now());
                                     last_adaptive_raise = Instant::now();
                                     last_quality_change = Instant::now();
@@ -689,8 +771,10 @@ impl TransportClient {
                         };
 
                         if codec_switched {
-                            target_video_fps = target_video_fps.min(initial_video_fps).max(min_video_fps);
-                            current_quality = initial_stream_quality(target_video_fps);
+                            target_video_fps =
+                                target_video_fps.min(initial_video_fps).max(min_video_fps);
+                            current_quality =
+                                initial_stream_quality(target_video_fps, codec_preference);
                             last_decoder_recovery = Some(Instant::now());
                             last_quality_change = Instant::now();
                             low_input_quality_windows = 0;
@@ -712,7 +796,8 @@ impl TransportClient {
                                     lower_adaptive_fps(target_video_fps, min_video_fps, false);
                                 if next_fps < target_video_fps {
                                     target_video_fps = next_fps;
-                                    current_quality = initial_stream_quality(target_video_fps);
+                                    current_quality =
+                                        initial_stream_quality(target_video_fps, codec_preference);
                                     last_decoder_recovery = Some(Instant::now());
                                     last_adaptive_raise = Instant::now();
                                     last_quality_change = Instant::now();
@@ -791,7 +876,8 @@ impl TransportClient {
                                     raise_adaptive_fps(target_video_fps, initial_video_fps);
                                 if next_fps > target_video_fps {
                                     target_video_fps = next_fps;
-                                    current_quality = initial_stream_quality(target_video_fps);
+                                    current_quality =
+                                        initial_stream_quality(target_video_fps, codec_preference);
                                     stable_decoded_frames = 0;
                                     last_adaptive_raise = Instant::now();
                                     last_quality_change = Instant::now();
@@ -815,6 +901,27 @@ impl TransportClient {
                         }
                     }
                 }
+            }
+
+            // ROADMAP.md Phase 5.3 — RELAY_WRAP: forward whatever the active
+            // EVRT2-experiment relay leg wants sent, wrapped as
+            // `Misc::Evrt2RelayWrap`, over this same thread's `relay` — the
+            // only thread allowed to write to it, so this never races the
+            // `commands` writes just below.
+            while let Ok(raw) = evrt2_relay_out_rx.try_recv() {
+                let raw_len = raw.len();
+                let msg = PeerMessage {
+                    union: Some(peer_message::Union::Misc(Misc {
+                        union: Some(misc::Union::Evrt2RelayWrap(raw)),
+                    })),
+                };
+                let send_result = send_framed(&mut relay, &encode_peer_message(&msg));
+                #[cfg(target_os = "android")]
+                log::info!(
+                    "[evrt2] client draining evrt2_relay_out_rx: {raw_len} bytes, send_framed result={:?}",
+                    send_result
+                );
+                let _ = send_result;
             }
 
             let mut pending_mouse_move = None;
@@ -973,7 +1080,8 @@ impl TransportClient {
                     SessionCommand::SetVideoFps { fps } => {
                         flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
                         target_video_fps = fps.clamp(5, 60);
-                        current_quality = initial_stream_quality(target_video_fps);
+                        current_quality =
+                            initial_stream_quality(target_video_fps, codec_preference);
                         if control_only {
                             continue;
                         }
@@ -993,11 +1101,22 @@ impl TransportClient {
                         );
                         last_live_bootstrap = Instant::now();
                     }
+                    SessionCommand::SetAdaptiveQuality { enabled } => {
+                        flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
+                        adaptive_quality = enabled;
+                        low_input_quality_windows = 0;
+                        last_quality_change = Instant::now();
+                        let _ = events.send(SessionEvent::Info(format!(
+                            "Adaptive quality {}",
+                            if enabled { "enabled" } else { "disabled" }
+                        )));
+                    }
                     SessionCommand::SetVideoProfile { fps, codec } => {
                         flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
                         target_video_fps = fps.clamp(5, 60);
                         codec_preference = codec;
-                        current_quality = initial_stream_quality(target_video_fps);
+                        current_quality =
+                            initial_stream_quality(target_video_fps, codec_preference);
                         if control_only {
                             continue;
                         }
@@ -1088,6 +1207,24 @@ impl TransportClient {
                         };
                         let _ = send_framed(&mut relay, &encode_peer_message(&msg));
                     }
+                    SessionCommand::SetHostVolume(vol) => {
+                        flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
+                        let msg = PeerMessage {
+                            union: Some(peer_message::Union::Misc(Misc {
+                                union: Some(misc::Union::SetHostVolume(vol.min(100))),
+                            })),
+                        };
+                        let _ = send_framed(&mut relay, &encode_peer_message(&msg));
+                    }
+                    SessionCommand::StartEvrt2Experiment => {
+                        flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
+                        let msg = PeerMessage {
+                            union: Some(peer_message::Union::Misc(Misc {
+                                union: Some(misc::Union::Evrt2ExperimentRequest(true)),
+                            })),
+                        };
+                        let _ = send_framed(&mut relay, &encode_peer_message(&msg));
+                    }
                     SessionCommand::Close => {
                         flush_pending_mouse_move(&mut relay, &mut pending_mouse_move);
                         evrt_stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1125,6 +1262,8 @@ impl TransportClient {
                             &mut evrt_port_seen,
                             &mut evrt_candidates,
                             &mut evrt_token,
+                            &evrt2_relay_out_tx,
+                            &mut evrt2_relay_in_tx,
                         );
                         // ★ EVRT (после LoginResponse). Собираем кандидаты:
                         //   1) список EvrtEndpoints (LAN+VPN) — основной путь
@@ -1142,6 +1281,7 @@ impl TransportClient {
                                 let evrt_events = events.clone();
                                 let evrt_ull = initial_video_fps >= 60;
                                 let evrt_token_for_thread = evrt_token.clone();
+                                let evrt_audio_enabled = Arc::clone(&audio_enabled);
                                 eprintln!(
                                     "[evrt-client] пробуем {} кандидат(ов): {:?}",
                                     candidates.len(),
@@ -1155,6 +1295,7 @@ impl TransportClient {
                                         &evrt_events,
                                         evrt_ull,
                                         evrt_stop_clone,
+                                        evrt_audio_enabled,
                                     );
                                 });
                             }
@@ -1163,6 +1304,18 @@ impl TransportClient {
                     }
                     Err(err) => {
                         eprintln!("[session] Peer decode FAILED: {err}");
+                        #[cfg(all(target_os = "android", feature = "android-client"))]
+                        {
+                            static FAILS: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
+                            let n = FAILS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            if n == 1 || n % 100 == 0 {
+                                log::warn!(
+                                    "[evd-android] Peer decode FAILED #{n}: {err} ({} bytes)",
+                                    payload.len()
+                                );
+                            }
+                        }
                         None
                     }
                 },
@@ -1172,6 +1325,18 @@ impl TransportClient {
                         eprintln!(
                             "[session] idle: reads={total_reads} timeouts={total_timeouts} screenshots={screenshots_received}"
                         );
+                    }
+                    // control_only sessions (e.g. EVRT2-only) send no mouse/
+                    // keyboard/qos/screenshot traffic at all, so without this
+                    // the relay TCP stream sees total silence in this
+                    // direction and the relay/middlebox drops it as idle
+                    // after ~30s — mirrors the host-side fix in
+                    // host.rs's run_evrt2_only_session.
+                    if control_only && last_client_keepalive.elapsed() >= Duration::from_secs(1) {
+                        last_client_keepalive = Instant::now();
+                        if let Ok(frame) = encode_frame_len(0) {
+                            let _ = relay.write_all(&frame);
+                        }
                     }
                     None
                 }
@@ -1289,8 +1454,8 @@ impl TransportClient {
 
             let qos_feedback_due = !control_only
                 && last_qos_feedback_sent
-                .map(|instant| instant.elapsed() >= Duration::from_secs(1))
-                .unwrap_or(true);
+                    .map(|instant| instant.elapsed() >= Duration::from_secs(1))
+                    .unwrap_or(true);
             if qos_feedback_due {
                 if let Err(err) = send_stream_qos_feedback(&mut relay, target_video_fps) {
                     qos_feedback_failures = qos_feedback_failures.saturating_add(1);
@@ -1316,11 +1481,23 @@ impl TransportClient {
                     last_screenshot_sent.map_or(Duration::from_secs(999), |t| t.elapsed());
                 let request_expired =
                     elapsed >= Duration::from_millis((auto_refresh_millis * 8).clamp(700, 2000));
-                let video_is_fresh =
-                    live_video_seen && last_frame_received.elapsed() < Duration::from_millis(1200);
-                let live_bootstrap_grace =
-                    !live_video_seen && last_live_bootstrap.elapsed() < Duration::from_millis(2500);
-                if !live_video_seen && last_live_bootstrap.elapsed() >= Duration::from_secs(3) {
+                // Android's EVRT direct-to-Surface path never sets `live_video_seen`
+                // (no SessionEvent::Frame — see reset_android_evrt_frame_seen above).
+                // Without this, the retry-watchdog below fired every 3s for the
+                // entire session even while EVRT delivered smooth 60fps video,
+                // forcing a full host-side IDR each time (visible as periodic
+                // stutter). Once Android EVRT has decoded a frame, treat video as
+                // live unconditionally — EVRT's own reconnect/teardown logic
+                // already handles genuine disconnects separately from this
+                // "did we ever get video at all" bootstrap check.
+                let android_evrt_live = crate::evrt_client::android_evrt_frame_seen();
+                let effectively_live = live_video_seen || android_evrt_live;
+                let video_is_fresh = android_evrt_live
+                    || (live_video_seen
+                        && last_frame_received.elapsed() < Duration::from_millis(1200));
+                let live_bootstrap_grace = !effectively_live
+                    && last_live_bootstrap.elapsed() < Duration::from_millis(2500);
+                if !effectively_live && last_live_bootstrap.elapsed() >= Duration::from_secs(3) {
                     let _ = send_video_start_messages_with_quality(
                         &mut relay,
                         current_display,
@@ -1665,11 +1842,14 @@ fn establish_session(
             direct_local_addr,
             &request.password,
             &request.remote_id,
-                initial_video_fps,
-                codec_preference,
-                control_only,
-                progress,
-            ) {
+            &request.client_id,
+            &request.client_name,
+            initial_video_fps,
+            codec_preference,
+            control_only,
+            request.evrt2_only,
+            progress,
+        ) {
             Ok((
                 direct_stream,
                 peer_stage,
@@ -1790,20 +1970,17 @@ fn establish_session(
             &mut relay_stream,
             &request.password,
             &request.remote_id,
+            &request.client_id,
+            &request.client_name,
             initial_video_fps,
             codec_preference,
             bootstrap_wait_secs,
             control_only,
+            request.evrt2_only,
             progress,
             stop.clone(),
         ) {
-            Ok((
-                peer_stage,
-                displays,
-                evrt_port_from_misc,
-                early_evrt_candidates,
-                evrt_token,
-            )) => {
+            Ok((peer_stage, displays, evrt_port_from_misc, early_evrt_candidates, evrt_token)) => {
                 progress(
                     98,
                     format!(
@@ -2122,9 +2299,12 @@ fn open_direct_tcp_session(
     local_addr: Option<SocketAddr>,
     password: &str,
     remote_id: &str,
+    client_id: &str,
+    client_name: &str,
     fps: i32,
     codec_preference: CodecPreference,
     control_only: bool,
+    evrt2_only: bool,
     progress: &mut impl FnMut(u8, String),
 ) -> Result<
     (
@@ -2171,23 +2351,28 @@ fn open_direct_tcp_session(
         &mut stream,
         password,
         remote_id,
+        client_id,
+        client_name,
         fps,
         codec_preference,
         DIRECT_TCP_BOOTSTRAP_WAIT_SECS,
         control_only,
+        evrt2_only,
         progress,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )
-    .map(|(peer_stage, displays, evrt_port, evrt_candidates, evrt_token)| {
-        (
-            stream,
-            peer_stage,
-            displays,
-            evrt_port,
-            evrt_candidates,
-            evrt_token,
-        )
-    })
+    .map(
+        |(peer_stage, displays, evrt_port, evrt_candidates, evrt_token)| {
+            (
+                stream,
+                peer_stage,
+                displays,
+                evrt_port,
+                evrt_candidates,
+                evrt_token,
+            )
+        },
+    )
 }
 
 fn connect_tcp_addr_bound(
@@ -2220,10 +2405,13 @@ fn read_initial_peer_stage(
     relay: &mut TcpStream,
     password: &str,
     remote_id: &str,
+    client_id: &str,
+    client_name: &str,
     fps: i32,
     codec_preference: CodecPreference,
     bootstrap_wait_secs: u64,
     control_only: bool,
+    evrt2_only: bool,
     progress: &mut impl FnMut(u8, String),
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<
@@ -2336,8 +2524,11 @@ fn read_initial_peer_stage(
                         &hash.salt,
                         &hash.challenge,
                         remote_id,
+                        client_id,
+                        client_name,
                         fps,
                         codec_preference,
+                        evrt2_only,
                     );
                     send_framed(relay, &encode_peer_message(&login))?;
                     sent_login = true;
@@ -2475,7 +2666,7 @@ fn send_video_start_messages(
         refresh_all,
         fps,
         codec_preference,
-        initial_stream_quality(fps),
+        initial_stream_quality(fps, codec_preference),
     )
 }
 
@@ -2528,7 +2719,12 @@ fn send_codec_sync_options(
     fps: i32,
     codec_preference: CodecPreference,
 ) -> Result<(), String> {
-    send_codec_sync_options_quality(relay, fps, codec_preference, initial_stream_quality(fps))
+    send_codec_sync_options_quality(
+        relay,
+        fps,
+        codec_preference,
+        initial_stream_quality(fps, codec_preference),
+    )
 }
 
 fn send_codec_sync_options_quality(
@@ -2550,7 +2746,11 @@ fn send_codec_sync_options_quality(
 }
 
 fn video_option_message(fps: i32, codec_preference: CodecPreference) -> OptionMessage {
-    video_option_message_quality(fps, codec_preference, initial_stream_quality(fps))
+    video_option_message_quality(
+        fps,
+        codec_preference,
+        initial_stream_quality(fps, codec_preference),
+    )
 }
 
 fn video_option_message_quality(
@@ -2566,11 +2766,30 @@ fn video_option_message_quality(
     }
 }
 
-fn initial_stream_quality(fps: i32) -> ImageQuality {
-    if fps >= 45 {
-        ImageQuality::Low
-    } else {
-        ImageQuality::Balanced
+fn initial_stream_quality(fps: i32, codec_preference: CodecPreference) -> ImageQuality {
+    // Игровой режим = запрошен КОНКРЕТНЫЙ аппаратный кодек (см. ConnectMode в
+    // main.rs). Там всегда просят Best.
+    //
+    // Раньше качество зависело только от fps, и правило `fps >= 45 → Low`
+    // било ровно по игровому режиму: он просит 60fps — и именно из-за этого
+    // получал САМОЕ НИЗКОЕ качество. Живо наблюдалось как «3.0Mbps» на
+    // 1280×1024@60 в логе хоста и жалоба, что картинка в игровом режиме хуже,
+    // чем в обычном. Логика была задумана для слабых каналов, где высокий fps
+    // приходится оплачивать качеством, но игровой режим идёт по прямому UDP с
+    // пейсингом 50 Мбит/с — экономить там не на чем и не для чего.
+    match codec_preference {
+        CodecPreference::H264
+        | CodecPreference::H265
+        | CodecPreference::Av1
+        | CodecPreference::Vp9 => ImageQuality::Best,
+        // Обычный режим (EVRTCK/Auto) — прежнее поведение без изменений.
+        CodecPreference::Evrtck | CodecPreference::Auto => {
+            if fps >= 45 {
+                ImageQuality::Low
+            } else {
+                ImageQuality::Balanced
+            }
+        }
     }
 }
 
@@ -2612,8 +2831,20 @@ fn preferred_codec(
     vp9_capable: bool,
 ) -> PreferCodec {
     match codec_preference {
-        // EVRTCK: the UDP path handles video, so tell the host Auto for its
-        // TCP fallback encoder — it will pick the best it can.
+        // EVRTCK: the default "normal connection" codec — a custom tile
+        // codec needing no OS/vendor hardware decoder, so it works on any
+        // device unconditionally (the whole point of "обычное подключение").
+        // `Auto` is what makes the host actually pick EVRTCK: host-side
+        // `want_evrtck` (video_pipeline.rs) is set from exactly this `prefer`
+        // value — `Auto`/`Vp9` → EVRTCK, anything else → the H264/H265/AV1
+        // "game" pipeline. An earlier revision of this match sent `H264`
+        // instead (to dodge a since-fixed HEVCDECODER_STORE.dll crash, see
+        // task #39/evrt_session.rs), which had the unintended side effect of
+        // taking EVERY normal connection off EVRTCK and onto the hardware
+        // H264 decoder — the opposite of "works on любое устройство". That
+        // crash's real cause (evrt_session.rs's SessionConfig catch-all
+        // defaulting to H265 for non-explicit codec prefs) is now fixed at
+        // the source, so this branch no longer needs to route around it.
         CodecPreference::Evrtck => PreferCodec::Auto,
         // Explicit client choice → advertise that concrete codec (the host
         // honours it as a strong preference over raw quality ranking).
@@ -2861,6 +3092,21 @@ fn parse_evrt_endpoints(list: &str) -> Vec<SocketAddr> {
     out
 }
 
+/// ROADMAP.md Phase 4.2 — extracts the AuthTag session key host.rs appends
+/// to the EVRT2 endpoints list (`evrt2key=<64 hex chars>`), same
+/// comma-joined format `parse_evrt_endpoints` already tolerates unknown
+/// parts in.
+fn parse_evrt2_key(list: &str) -> Option<crate::evrt2_crypto::SessionKey> {
+    for part in list.split(',') {
+        if let Some(hex) = part.trim().strip_prefix("evrt2key=") {
+            if let Some(key) = crate::evrt2_crypto::key_from_hex(hex) {
+                return Some(key);
+            }
+        }
+    }
+    None
+}
+
 fn parse_evrt_token(list: &str) -> Option<String> {
     for part in list.split(',') {
         let part = part.trim();
@@ -2889,6 +3135,14 @@ fn handle_session_message(
     evrt_port_out: &mut Option<u16>,
     evrt_candidates_out: &mut Vec<std::net::SocketAddr>,
     evrt_token_out: &mut Option<String>,
+    // ROADMAP.md Phase 5.3 — RELAY_WRAP: `evrt2_relay_out_tx` is cloned into
+    // every new `run_client_experiment` race so its relay leg can hand back
+    // bytes to send; `evrt2_relay_in_tx_out` is overwritten each time a
+    // fresh `Evrt2ExperimentEndpoints` starts a new race, and read whenever
+    // an `Evrt2RelayWrap` message arrives to forward it to whichever race
+    // is currently using it.
+    evrt2_relay_out_tx: &std::sync::mpsc::Sender<Vec<u8>>,
+    evrt2_relay_in_tx_out: &mut Option<std::sync::mpsc::Sender<Vec<u8>>>,
 ) -> Option<FrameSource> {
     match message.union {
         Some(peer_message::Union::ScreenshotResponse(response)) => {
@@ -2930,6 +3184,11 @@ fn handle_session_message(
                 Some(video_frame::Union::H264s(frames)) => {
                     let bytes = encoded_frame_bytes(&frames);
                     let sid = encoded_sid("h264", &frames);
+                    #[cfg(all(target_os = "android", feature = "android-client"))]
+                    log::info!(
+                        "[evd-android] TCP VideoFrame(H264) received: {} pkt(s), {bytes} bytes, sid={sid}",
+                        frames.frames.len()
+                    );
                     queue_encoded_frame(
                         frame_tx,
                         DecoderInput::H264 {
@@ -3153,6 +3412,134 @@ fn handle_session_message(
             None
         }
         Some(peer_message::Union::Misc(m)) => {
+            // ROADMAP.md Phase 5.3 — RELAY_WRAP: raw EVRT2 wire bytes
+            // tunneled over this TCP relay stream (the host's fallback for
+            // when no UDP candidate was reachable — symmetric NAT on either
+            // end). Forwarded to whichever `run_client_experiment` race is
+            // currently in flight via the channel `evrt2_relay_in_tx_out`
+            // was last set to; dropped harmlessly if none is (e.g. the
+            // message arrived before the experiment even started, or after
+            // it already ended).
+            if let Some(misc::Union::Evrt2RelayWrap(bytes)) = &m.union {
+                let have_listener = evrt2_relay_in_tx_out.is_some();
+                let send_ok = if let Some(tx) = evrt2_relay_in_tx_out.as_ref() {
+                    tx.send(bytes.clone()).is_ok()
+                } else {
+                    false
+                };
+                #[cfg(target_os = "android")]
+                log::info!(
+                    "[evrt2] client received Evrt2RelayWrap: {} bytes, listener_set={have_listener} send_ok={send_ok}",
+                    bytes.len()
+                );
+                return None;
+            }
+            // EVRTCK через TCP relay (обычный режим без прямого EVRT UDP) —
+            // ранний return, как и VideoFrame: та же очередь декодера
+            // (frame_tx), тот же учёт live-video (FrameSource::Video).
+            if let Some(misc::Union::TcpEvrtckFrame(bytes)) = &m.union {
+                if control_only {
+                    return None;
+                }
+                let n = bytes.len();
+                let frame_id = if bytes.len() >= 10 {
+                    u32::from_le_bytes(bytes[6..10].try_into().unwrap())
+                } else {
+                    0
+                };
+                let key = bytes.get(5).copied().unwrap_or(0) & crate::evrtck::FLAG_KEYFRAME != 0;
+                queue_encoded_frame(
+                    frame_tx,
+                    DecoderInput::Evrtck {
+                        sid: format!("evrtck-tcp-{frame_id}"),
+                        bytes: bytes.clone(),
+                        key,
+                        queued_at: Instant::now(),
+                    },
+                    events,
+                );
+                return Some(FrameSource::Video { bytes: n });
+            }
+            // Экспериментальная кнопка «EVRT2»: хост поднял отдельный UDP-
+            // сокет, вот его кандидаты (LAN/VPN и, начиная с ROADMAP.md Phase
+            // 5.1, WAN/STUN — тот же формат что EvrtEndpoints). ROADMAP.md
+            // Phase 5.2: гоняем HELLO во все кандидаты одновременно вместо
+            // того, чтобы всегда пробовать только первый — победивший путь
+            // выбирает run_client_experiment сам. ROADMAP.md Phase 5.3:
+            // relay — тот же TCP relay stream, что несёт этот самый Misc —
+            // тоже участвует в гонке как ещё один кандидат (см.
+            // `evrt2_relay_out_tx`/`evrt2_relay_in_tx_out` doc). Отдельный
+            // поток — полностью параллельно живой сессии, никак её не
+            // затрагивает.
+            if let Some(misc::Union::Evrt2ExperimentEndpoints(list)) = &m.union {
+                let candidates = parse_evrt_endpoints(list);
+                let auth_key = parse_evrt2_key(list);
+                #[cfg(target_os = "android")]
+                log::info!(
+                    "[evrt2] client received Evrt2ExperimentEndpoints: {} UDP candidate(s), auth_key={}",
+                    candidates.len(), auth_key.is_some()
+                );
+                // A relay candidate is always available here — this Misc
+                // message itself just arrived over that exact TCP stream —
+                // so unlike Phase 5.2's UDP-only candidates, there is no
+                // "nothing to try at all" case left to guard against.
+                let (relay_in_tx, relay_in_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+                *evrt2_relay_in_tx_out = Some(relay_in_tx);
+                let relay_channels = Some((evrt2_relay_out_tx.clone(), relay_in_rx));
+                let events_evrt2 = events.clone();
+                let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let _ = events.send(SessionEvent::Info(format!(
+                    "EVRT2 (experimental): гонка {} UDP-кандидат(ов) + relay…",
+                    candidates.len()
+                )));
+                thread::spawn(move || {
+                    crate::evrt2_experiment::run_client_experiment(
+                        candidates,
+                        relay_channels,
+                        auth_key,
+                        stop,
+                        |width, height, rgba| {
+                            let _ = events_evrt2.send(SessionEvent::Evrt2ExperimentFrame {
+                                width: width as usize,
+                                height: height as usize,
+                                rgba,
+                            });
+                        },
+                        |status| {
+                            let _ = events_evrt2.send(SessionEvent::Info(status));
+                        },
+                        |measured_age, ceiling, tiles| {
+                            let _ = events_evrt2.send(SessionEvent::Evrt2Degrade {
+                                measured_age_ms: measured_age.as_secs_f32() * 1000.0,
+                                ceiling_ms: ceiling.as_secs_f32() * 1000.0,
+                                tiles,
+                            });
+                        },
+                    );
+                });
+                return None;
+            }
+            // Diagnostic: which Misc variant actually arrives on Android. If
+            // audio (TcpAudioFrame) is silently lost, this tells us whether the
+            // Misc even reaches here and how prost decoded its union.
+            #[cfg(all(target_os = "android", feature = "android-client"))]
+            {
+                static MISC_COUNT: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let n = MISC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n <= 5 || n % 200 == 0 {
+                    let variant = match &m.union {
+                        Some(misc::Union::TcpAudioFrame(_)) => "TcpAudioFrame",
+                        Some(misc::Union::Option(_)) => "Option",
+                        Some(misc::Union::SwitchDisplay(_)) => "SwitchDisplay",
+                        Some(misc::Union::EvrtEndpoints(_)) => "EvrtEndpoints",
+                        Some(misc::Union::EvrtUdpPort(_)) => "EvrtUdpPort",
+                        Some(_) => "other",
+                        None => "NONE(unknown-tag)",
+                    };
+                    log::info!("[evd-android] Misc #{n} union={variant}");
+                }
+            }
             // Log what the server tells us — most importantly the codec it selected.
             match &m.union {
                 Some(misc::Union::Option(opt)) => {
@@ -3225,6 +3612,29 @@ fn handle_session_message(
                     // ★ Телеметрия хоста — пробрасываем в --diagnose отчёт.
                     eprintln!("[session] ★ Хост-энкодер: {info}");
                     let _ = events.send(SessionEvent::Info(format!("★ Хост-энкодер: {info}")));
+                }
+                Some(misc::Union::TcpAudioFrame(pcm)) => {
+                    // ★ Аудио по TCP relay — зеркало EVRT-аудио для сессий без EVRT
+                    // UDP (WAN без punch). Тот же формат (i16 stereo 48kHz), та же
+                    // очередь, что и EVRT-путь — EvrtAudioPlayer.kt транспорт-
+                    // агностичен, ничего на Kotlin-стороне менять не нужно.
+                    #[cfg(all(target_os = "android", feature = "android-client"))]
+                    {
+                        static COUNT: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if n == 1 || n % 50 == 0 {
+                            log::info!(
+                                "[evd-android] TcpAudioFrame received: #{n}, {} bytes, queue_depth_before={}",
+                                pcm.len(),
+                                crate::evrt_audio::android_queue_depth()
+                            );
+                        }
+                    }
+                    crate::evrt_audio::set_audio_sample_rate(48000);
+                    #[cfg(target_os = "android")]
+                    crate::evrt_audio::push_android_audio(pcm.clone());
+                    let _ = events.send(SessionEvent::AudioFrame(pcm.clone()));
                 }
                 Some(misc::Union::VmList(json)) => {
                     eprintln!("[session] VM list received");
@@ -3641,6 +4051,10 @@ fn decode_frame_loop(
 
     let mut h265_mf: Option<crate::mf_video::MfVideoDecoder> = None;
     let mut av1_mf: Option<crate::mf_video::MfVideoDecoder> = None;
+    // EVRTCK через TCP relay (обычный режим без прямого EVRT UDP). Тот же
+    // декодер что и на EVRT UDP пути — держит prev-буфер между кадрами, TCP
+    // гарантирует порядок доставки, так что P-frame цепочка не рвётся.
+    let mut evrtck_dec = crate::evrtck::EvrtckDecoder::new();
     let mf_status = crate::mf_video::mf_video_decode_status();
     if mf_status.h265 || mf_status.av1 {
         eprintln!("[decoder] {}", mf_status.label());
@@ -3662,12 +4076,21 @@ fn decode_frame_loop(
         }
         let mut dropped_frames = 0_usize;
         let has_video = batch.iter().any(DecoderInput::is_video);
+        #[cfg(all(target_os = "android", feature = "android-client"))]
+        let drained_len = batch.len();
         if has_video {
             batch.retain(DecoderInput::is_video);
             let dropped = trim_video_backlog_to_keyframe(&mut batch);
             if dropped > 0 {
                 let _ = feedback.send(DecoderFeedback::BacklogTrimmed { dropped });
                 dropped_frames = dropped;
+            }
+            #[cfg(all(target_os = "android", feature = "android-client"))]
+            if drained_len > 1 || dropped > 0 {
+                log::info!(
+                    "[evd-android] channel drain: {drained_len} item(s) pulled in one batch, {dropped} dropped by backlog-trim, {} remain to decode",
+                    batch.len()
+                );
             }
         } else if batch.len() > 1 {
             let latest = batch.pop().expect("batch is not empty");
@@ -3706,6 +4129,7 @@ fn decode_frame_loop(
                 &mut vp9_mf,
                 &mut h265_mf,
                 &mut av1_mf,
+                &mut evrtck_dec,
             ) {
                 Ok(Some(event)) => {
                     h264_vt_fail_streak = 0;
@@ -3756,11 +4180,13 @@ impl DecoderInput {
                 | Self::Vp9 { .. }
                 | Self::H265 { .. }
                 | Self::Av1 { .. }
+                | Self::Evrtck { .. }
         )
     }
 
     fn has_keyframe(&self) -> bool {
         match self {
+            Self::Evrtck { key, .. } => *key,
             Self::H264 { frames, .. }
             | Self::Vp8 { frames, .. }
             | Self::Vp9 { frames, .. }
@@ -3777,6 +4203,7 @@ impl DecoderInput {
             | Self::Vp8 { queued_at, .. }
             | Self::Vp9 { queued_at, .. }
             | Self::H265 { queued_at, .. }
+            | Self::Evrtck { queued_at, .. }
             | Self::Av1 { queued_at, .. } => *queued_at,
         }
     }
@@ -3789,6 +4216,7 @@ impl DecoderInput {
             | Self::Vp9 { bytes, .. }
             | Self::H265 { bytes, .. }
             | Self::Av1 { bytes, .. } => *bytes,
+            Self::Evrtck { bytes, .. } => bytes.len(),
         }
     }
 
@@ -3798,6 +4226,7 @@ impl DecoderInput {
             Self::H264 { .. } => "H264",
             Self::Vp8 { .. } => "VP8",
             Self::Vp9 { .. } => "VP9",
+            Self::Evrtck { .. } => "EVRTCK",
             Self::H265 { .. } => "H265",
             Self::Av1 { .. } => "AV1",
         }
@@ -3844,6 +4273,7 @@ fn decode_one_frame(
     vp9_mf: &mut Option<crate::vp9_mf::Vp9MfDecoder>,
     h265_mf: &mut Option<crate::mf_video::MfVideoDecoder>,
     av1_mf: &mut Option<crate::mf_video::MfVideoDecoder>,
+    evrtck_dec: &mut crate::evrtck::EvrtckDecoder,
 ) -> Result<Option<SessionEvent>, String> {
     // Suppress unused-variable warning when live-vpx handles VP9 instead of MF.
     #[cfg(feature = "live-vpx")]
@@ -3861,7 +4291,36 @@ fn decode_one_frame(
                 rgba,
             })
         }),
-        DecoderInput::H264 { sid, frames, .. } => {
+        DecoderInput::Evrtck { sid, bytes, .. } => {
+            // FLAG_NOP (offset 5, 0x02): экран не изменился — нечего рендерить,
+            // состояние декодера обновлять не нужно (то же самое что EVRT UDP путь).
+            if bytes.get(5).copied().unwrap_or(0) & crate::evrtck::FLAG_NOP != 0 {
+                return Ok(None);
+            }
+            match evrtck_dec.decode_wire(&bytes) {
+                Ok(rgba) => {
+                    let rgba = rgba.to_vec();
+                    let (width, height) = (evrtck_dec.width(), evrtck_dec.height());
+                    Ok(Some(SessionEvent::Frame {
+                        sid,
+                        codec: "EVRTCK".to_owned(),
+                        width,
+                        height,
+                        rgba,
+                    }))
+                }
+                Err(e) => {
+                    eprintln!("[decoder] EVRTCK-over-TCP decode error: {e}");
+                    Ok(None)
+                }
+            }
+        }
+        DecoderInput::H264 {
+            sid,
+            frames,
+            queued_at,
+            ..
+        } => {
             // Android game mode: route H264 directly to VideoDecoder.kt (HW MediaCodec).
             // This makes TCP relay H264 work exactly like EVRT UDP H264 —
             // same hardware path, same TextureView surface.
@@ -3869,8 +4328,16 @@ fn decode_one_frame(
             #[cfg(all(target_os = "android", feature = "android-client"))]
             {
                 let _ = sid;
+                let age_ms = queued_at.elapsed().as_millis();
                 for pkt in &frames.frames {
-                    crate::android_video::decode_frame_to_surface("H264", &pkt.data, pkt.key, 0, 0);
+                    let ok = crate::android_video::decode_frame_to_surface(
+                        "H264", &pkt.data, pkt.key, 0, 0,
+                    );
+                    log::info!(
+                        "[evd-android] decode_frame_to_surface(H264, key={}, {} bytes, queue_age={age_ms}ms) -> {ok}",
+                        pkt.key,
+                        pkt.data.len()
+                    );
                 }
                 return Ok(None); // rendered directly to Surface, no RGBA needed
             }
@@ -3918,7 +4385,10 @@ fn decode_one_frame(
                     })
                 })
             }
-            #[cfg(all(not(feature = "live-h264"), not(all(target_os = "android", feature = "android-client"))))]
+            #[cfg(all(
+                not(feature = "live-h264"),
+                not(all(target_os = "android", feature = "android-client"))
+            ))]
             {
                 let _ = sid;
                 let _ = frames;
@@ -3934,7 +4404,10 @@ fn decode_one_frame(
             // but kept so the match stays exhaustive if it's ever attempted):
             // the early `return Ok(None)` above always fires first, so this arm
             // is unreachable — it exists only to satisfy the compiler.
-            #[cfg(all(not(feature = "live-h264"), all(target_os = "android", feature = "android-client")))]
+            #[cfg(all(
+                not(feature = "live-h264"),
+                all(target_os = "android", feature = "android-client")
+            ))]
             {
                 let _ = sid;
                 let _ = frames;
@@ -4029,33 +4502,106 @@ fn decode_one_frame(
             frames,
             width,
             height,
+            queued_at,
             ..
         } => {
+            // Android: route directly to VideoDecoder.kt (HW MediaCodec) — same
+            // path as DecoderInput::H264 above. Missing until now: only H264 had
+            // this branch, so H265 frames over TCP relay were silently dropped
+            // here (fell through to VideoToolbox/Media Foundation, neither of
+            // which exist on Android) — decodeFrame() was never called, hence
+            // PerfStats staying at 0 kbps despite the host actively sending H265.
+            #[cfg(all(target_os = "android", feature = "android-client"))]
+            {
+                let _ = (sid, width, height);
+                let age_ms = queued_at.elapsed().as_millis();
+                for pkt in &frames.frames {
+                    let ok = crate::android_video::decode_frame_to_surface(
+                        "H265", &pkt.data, pkt.key, 0, 0,
+                    );
+                    log::info!(
+                        "[evd-android] decode_frame_to_surface(H265, key={}, {} bytes, queue_age={age_ms}ms) -> {ok}",
+                        pkt.key,
+                        pkt.data.len()
+                    );
+                }
+                return Ok(None);
+            }
             // macOS VideoToolbox hardware HEVC first (the only HEVC decoder on
             // macOS); Media Foundation is the Windows fallback.
-            if let Some(decoder) = h265_vt.as_mut() {
-                match decoder.decode_packets(frames.frames.iter().map(|frame| frame.data.clone())) {
-                    Ok(Some((width, height, rgba))) => {
-                        return Ok(Some(SessionEvent::Frame {
-                            sid,
-                            codec: "H265".to_owned(),
-                            width,
-                            height,
-                            rgba,
-                        }));
-                    }
-                    Ok(None) => return Ok(None),
-                    Err(err) if decoder_needs_more_packets(&err) => return Ok(None),
-                    Err(err) => {
-                        eprintln!("[decoder] VideoToolbox H265 error, disabling: {err}");
-                        *h265_vt = None;
+            #[cfg(not(all(target_os = "android", feature = "android-client")))]
+            {
+                if let Some(decoder) = h265_vt.as_mut() {
+                    match decoder
+                        .decode_packets(frames.frames.iter().map(|frame| frame.data.clone()))
+                    {
+                        Ok(Some((width, height, rgba))) => {
+                            return Ok(Some(SessionEvent::Frame {
+                                sid,
+                                codec: "H265".to_owned(),
+                                width,
+                                height,
+                                rgba,
+                            }));
+                        }
+                        Ok(None) => return Ok(None),
+                        Err(err) if decoder_needs_more_packets(&err) => return Ok(None),
+                        Err(err) => {
+                            eprintln!("[decoder] VideoToolbox H265 error, disabling: {err}");
+                            *h265_vt = None;
+                        }
                     }
                 }
-            }
 
+                decode_mf_video_rgba(
+                    h265_mf,
+                    crate::mf_video::MfVideoCodec::H265,
+                    width,
+                    height,
+                    frames,
+                )
+                .map(|decoded| {
+                    decoded.map(|(width, height, rgba)| SessionEvent::Frame {
+                        sid,
+                        codec: "H265".to_owned(),
+                        width,
+                        height,
+                        rgba,
+                    })
+                })
+            }
+        }
+        DecoderInput::Av1 {
+            sid,
+            frames,
+            width,
+            height,
+            queued_at,
+            ..
+        } => {
+            // Android: same fix as H265 above — this arm previously only tried
+            // Media Foundation (Windows-only), so AV1 frames over relay never
+            // reached the Android decoder either.
+            #[cfg(all(target_os = "android", feature = "android-client"))]
+            {
+                let _ = (sid, width, height);
+                let age_ms = queued_at.elapsed().as_millis();
+                for pkt in &frames.frames {
+                    let ok = crate::android_video::decode_frame_to_surface(
+                        "AV1", &pkt.data, pkt.key, 0, 0,
+                    );
+                    log::info!(
+                        "[evd-android] decode_frame_to_surface(AV1, key={}, {} bytes, queue_age={age_ms}ms) -> {ok}",
+                        pkt.key,
+                        pkt.data.len()
+                    );
+                }
+                return Ok(None);
+            }
+            #[cfg(not(all(target_os = "android", feature = "android-client")))]
             decode_mf_video_rgba(
-                h265_mf,
-                crate::mf_video::MfVideoCodec::H265,
+                av1_mf,
+                crate::mf_video::MfVideoCodec::Av1,
                 width,
                 height,
                 frames,
@@ -4063,35 +4609,60 @@ fn decode_one_frame(
             .map(|decoded| {
                 decoded.map(|(width, height, rgba)| SessionEvent::Frame {
                     sid,
-                    codec: "H265".to_owned(),
+                    codec: "AV1".to_owned(),
                     width,
                     height,
                     rgba,
                 })
             })
         }
-        DecoderInput::Av1 {
-            sid,
-            frames,
-            width,
-            height,
-            ..
-        } => decode_mf_video_rgba(
-            av1_mf,
-            crate::mf_video::MfVideoCodec::Av1,
-            width,
-            height,
-            frames,
-        )
-        .map(|decoded| {
-            decoded.map(|(width, height, rgba)| SessionEvent::Frame {
-                sid,
-                codec: "AV1".to_owned(),
-                width,
-                height,
-                rgba,
-            })
-        }),
+    }
+}
+
+/// Первый NAL потока, если его удалось найти по стартовому коду.
+///
+/// Возвращает байт сразу за `00 00 01` или `00 00 00 01` — по нему кодек
+/// определяется однозначно, потому что заголовки NAL у H.264 и H.265 разные.
+fn first_nal_byte(data: &[u8]) -> Option<u8> {
+    // Ограничиваем поиск началом кадра: стартовый код у корректного потока
+    // стоит в первых байтах, а сканировать весь мегабайтный ключевой кадр
+    // на каждом вызове — лишняя работа в горячем пути.
+    let horizon = data.len().min(64);
+    let window = &data[..horizon];
+    for i in 0..window.len().saturating_sub(3) {
+        if window[i] == 0 && window[i + 1] == 0 {
+            if window[i + 2] == 1 {
+                return window.get(i + 3).copied();
+            }
+            if window[i + 2] == 0 && window.get(i + 3) == Some(&1) {
+                return window.get(i + 4).copied();
+            }
+        }
+    }
+    None
+}
+
+/// Похож ли поток на H.264 — по первому NAL.
+///
+/// У H.264 заголовок NAL однобайтовый: старший бит нулевой, тип в младших
+/// пяти битах. Проверяем только те типы, которые реально открывают кадр:
+/// 5 (IDR), 7 (SPS), 8 (PPS). У H.265 заголовок двухбайтовый и тип лежит в
+/// битах 1..6, поэтому те же значения там означают совсем другое: 0x67 это
+/// тип 51, 0x68 — тип 52, оба зарезервированные и в реальном потоке не
+/// встречаются.
+fn looks_like_h264(data: &[u8]) -> bool {
+    match first_nal_byte(data) {
+        Some(b) => b & 0x80 == 0 && matches!(b & 0x1F, 5 | 7 | 8),
+        None => false,
+    }
+}
+
+/// Похож ли поток на H.265 — по первому NAL: VPS(32), SPS(33), PPS(34) или
+/// IDR (19/20), закодированные как `тип << 1`.
+fn looks_like_h265(data: &[u8]) -> bool {
+    match first_nal_byte(data) {
+        Some(b) => b & 0x80 == 0 && matches!((b >> 1) & 0x3F, 19 | 20 | 32 | 33 | 34),
+        None => false,
     }
 }
 
@@ -4102,6 +4673,34 @@ fn decode_mf_video_rgba(
     height: u32,
     frames: EncodedVideoFrames,
 ) -> Result<Option<(usize, usize, Vec<u8>)>, String> {
+    // Защита от чужого кодека в потоке.
+    //
+    // Системный HEVC-декодер Windows (`HEVCDECODER_STORE.dll`) на неверном
+    // битстриме НЕ возвращает ошибку — он роняет весь процесс клиента через
+    // access violation. За эту сессию так упало дважды: сперва когда хост
+    // объявлял H265, а слал H264, потом на нашем собственном свежем
+    // HEVC-энкодере. Полагаться на то, что хост всегда говорит правду,
+    // нельзя: цена ошибки — не артефакт, а закрытое окно у пользователя.
+    //
+    // Отбраковываем ТОЛЬКО при уверенном опознании чужого кодека. Если
+    // разобрать заголовок не удалось, кадр пропускается дальше как раньше:
+    // ложное срабатывание не должно ломать рабочие потоки.
+    if let Some(first) = frames.frames.first() {
+        let data = &first.data;
+        let mismatch = match codec {
+            crate::mf_video::MfVideoCodec::H265 => looks_like_h264(data),
+            _ => looks_like_h265(data),
+        };
+        if mismatch {
+            return Err(format!(
+                "поток не похож на {}: первый NAL = {:#04x}. Кадр отброшен, чтобы не уронить \
+                 системный декодер — он на чужом битстриме падает, а не возвращает ошибку.",
+                codec.label(),
+                first_nal_byte(data).unwrap_or(0),
+            ));
+        }
+    }
+
     let recreate = decoder
         .as_ref()
         .map(|decoder| !decoder.matches(codec, width, height))
@@ -4494,6 +5093,10 @@ fn is_timeout_error(err: &str) -> bool {
         || err.contains("os error 11")
         || err.contains("os error 35")
         || err.contains("10060")
+        // ERROR_IO_PENDING: Windows recv() with SO_RCVTIMEO sporadically
+        // fails with 997 instead of WSAETIMEDOUT under load — "no data
+        // yet", not a dead connection (see host.rs `is_timeout`).
+        || err.contains("os error 997")
         || err.contains("Попытка установить соединение")
 }
 
@@ -4647,8 +5250,11 @@ fn build_login_request(
     salt: &str,
     challenge: &str,
     remote_id: &str,
+    client_id: &str,
+    client_name: &str,
     fps: i32,
     codec_preference: CodecPreference,
+    evrt2_only: bool,
 ) -> PeerMessage {
     let password_hash = if password.is_empty() {
         Vec::new()
@@ -4668,12 +5274,13 @@ fn build_login_request(
         union: Some(peer_message::Union::LoginRequest(LoginRequest {
             username: remote_id.to_owned(),
             password: password_hash,
-            my_id: "evertydesk-lite".to_owned(),
-            my_name: "EvertyDesk Lite".to_owned(),
+            my_id: client_id.to_owned(),
+            my_name: client_name.to_owned(),
             option: Some(video_option_message(fps, codec_preference)),
             video_ack_required: false,
             version: "1.4.6".to_owned(),
             my_platform: std::env::consts::OS.to_owned(),
+            evrt2_only,
         })),
     }
 }
@@ -4786,6 +5393,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tcp_audio_frame_survives_encode_decode_roundtrip() {
+        // Regression for the silent-audio bug: a Vec<u8> variant inside a prost
+        // `oneof` must use `bytes = "vec"`. With plain `bytes`, this frame
+        // encoded fine on the host but decoded to `union: None` on the client
+        // ("unknown tag"), dropping every audio packet while video kept working.
+        use crate::rustdesk_proto::{misc, peer_message, Misc, PeerMessage};
+
+        let pcm: Vec<u8> = (0..1920u32).map(|i| (i & 0xff) as u8).collect();
+        let msg = PeerMessage {
+            union: Some(peer_message::Union::Misc(Misc {
+                union: Some(misc::Union::TcpAudioFrame(pcm.clone())),
+            })),
+        };
+
+        let wire = encode_peer_message_raw(&msg);
+        let decoded =
+            crate::rustdesk_proto::decode_peer_message(&wire).expect("TcpAudioFrame must decode");
+
+        match decoded.union {
+            Some(peer_message::Union::Misc(m)) => match m.union {
+                Some(misc::Union::TcpAudioFrame(got)) => assert_eq!(got, pcm),
+                other => {
+                    panic!("expected TcpAudioFrame, got {other:?} (oneof bytes = \"vec\" broken)")
+                }
+            },
+            other => panic!("expected Misc, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tcp_evrtck_frame_survives_encode_decode_roundtrip() {
+        // Same class of bug as tcp_audio_frame_survives_encode_decode_roundtrip:
+        // the oneof's parent `tags = "..."` list must include the new tag (123)
+        // or prost silently drops the field (union decodes to None).
+        use crate::rustdesk_proto::{misc, peer_message, Misc, PeerMessage};
+
+        let wire_bytes: Vec<u8> = (0..256u32).map(|i| (i & 0xff) as u8).collect();
+        let msg = PeerMessage {
+            union: Some(peer_message::Union::Misc(Misc {
+                union: Some(misc::Union::TcpEvrtckFrame(wire_bytes.clone())),
+            })),
+        };
+
+        let wire = encode_peer_message_raw(&msg);
+        let decoded =
+            crate::rustdesk_proto::decode_peer_message(&wire).expect("TcpEvrtckFrame must decode");
+
+        match decoded.union {
+            Some(peer_message::Union::Misc(m)) => match m.union {
+                Some(misc::Union::TcpEvrtckFrame(got)) => assert_eq!(got, wire_bytes),
+                other => panic!(
+                    "expected TcpEvrtckFrame, got {other:?} (missing tag in parent `tags` list?)"
+                ),
+            },
+            other => panic!("expected Misc, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn frame_len_matches_rustdesk_codec_short_packet() {
         assert_eq!(encode_frame_len(0).unwrap(), vec![0]);
         assert_eq!(encode_frame_len(1).unwrap(), vec![4]);
@@ -4832,10 +5498,8 @@ mod tests {
     #[test]
     fn evrt_token_parser_extracts_valid_hex_token() {
         assert_eq!(
-            parse_evrt_token(
-                "192.168.1.10:40000,token=0123456789abcdef0123456789abcdef"
-            )
-            .as_deref(),
+            parse_evrt_token("192.168.1.10:40000,token=0123456789abcdef0123456789abcdef")
+                .as_deref(),
             Some("0123456789abcdef0123456789abcdef")
         );
         assert!(parse_evrt_token("192.168.1.10:40000,token=short").is_none());
@@ -4848,14 +5512,19 @@ mod tests {
             "salt",
             "challenge",
             "123",
+            "987654321",
+            "Office PC",
             60,
             CodecPreference::Auto,
+            false,
         );
         let Some(peer_message::Union::LoginRequest(login)) = message.union else {
             panic!("expected login request");
         };
         assert_eq!(login.password.len(), 32);
         assert_eq!(login.username, "123");
+        assert_eq!(login.my_id, "987654321");
+        assert_eq!(login.my_name, "Office PC");
         let option = login.option.unwrap();
         assert_eq!(option.custom_fps, 60);
         assert_eq!(option.image_quality, ImageQuality::Low as i32);
@@ -4866,8 +5535,17 @@ mod tests {
 
     #[test]
     fn login_request_uses_empty_password_for_remote_approval() {
-        let message =
-            build_login_request("", "salt", "challenge", "123", 30, CodecPreference::Auto);
+        let message = build_login_request(
+            "",
+            "salt",
+            "challenge",
+            "123",
+            "987654321",
+            "Office PC",
+            30,
+            CodecPreference::Auto,
+            false,
+        );
         let Some(peer_message::Union::LoginRequest(login)) = message.union else {
             panic!("expected login request");
         };
@@ -5065,9 +5743,24 @@ mod tests {
 
     #[test]
     fn initial_quality_prefers_speed_for_high_fps() {
-        assert_eq!(initial_stream_quality(60), ImageQuality::Low);
-        assert_eq!(initial_stream_quality(45), ImageQuality::Low);
-        assert_eq!(initial_stream_quality(30), ImageQuality::Balanced);
+        // Обычный режим: прежнее поведение, качество уступает частоте кадров.
+        for pref in [CodecPreference::Evrtck, CodecPreference::Auto] {
+            assert_eq!(initial_stream_quality(60, pref), ImageQuality::Low);
+            assert_eq!(initial_stream_quality(45, pref), ImageQuality::Low);
+            assert_eq!(initial_stream_quality(30, pref), ImageQuality::Balanced);
+        }
+        // Игровой режим (конкретный аппаратный кодек) обязан просить Best
+        // ДАЖЕ на 60fps — именно правило «fps>=45 → Low» и делало картинку в
+        // игровом режиме хуже, чем в обычном.
+        for pref in [
+            CodecPreference::H264,
+            CodecPreference::H265,
+            CodecPreference::Av1,
+            CodecPreference::Vp9,
+        ] {
+            assert_eq!(initial_stream_quality(60, pref), ImageQuality::Best);
+            assert_eq!(initial_stream_quality(30, pref), ImageQuality::Best);
+        }
     }
 
     #[test]
@@ -5258,6 +5951,13 @@ mod tests {
     }
 
     #[test]
+    fn timeout_detection_handles_windows_error_io_pending() {
+        assert!(is_timeout_error(
+            "TCP read header failed: Протекает наложенное событие ввода/вывода. (os error 997)"
+        ));
+    }
+
+    #[test]
     fn relay_response_keeps_server_uuid() {
         let message = RendezvousMessage {
             union: Some(rendezvous_message::Union::RelayResponse(
@@ -5292,4 +5992,53 @@ pub fn encode_peer_message_raw(msg: &crate::rustdesk_proto::PeerMessage) -> Vec<
 /// Публичный алиас send_framed для video_pipeline.
 pub fn send_framed_raw(stream: &mut std::net::TcpStream, payload: &[u8]) -> Result<(), String> {
     send_framed(stream, payload)
+}
+
+#[cfg(test)]
+mod codec_sniff_tests {
+    use super::{first_nal_byte, looks_like_h264, looks_like_h265};
+
+    #[test]
+    fn detects_h264_parameter_sets() {
+        // 4-байтный стартовый код + SPS(0x67), затем PPS(0x68) и IDR(0x65).
+        for byte in [0x67u8, 0x68, 0x65] {
+            let data = [0x00, 0x00, 0x00, 0x01, byte, 0x42, 0x00];
+            assert!(
+                looks_like_h264(&data),
+                "{byte:#04x} должен опознаться как H264"
+            );
+            assert!(
+                !looks_like_h265(&data),
+                "{byte:#04x} не должен пройти как H265"
+            );
+        }
+    }
+
+    #[test]
+    fn detects_h265_parameter_sets() {
+        // VPS(32)<<1=0x40, SPS(33)<<1=0x42, PPS(34)<<1=0x44, IDR_W_RADL(19)<<1=0x26.
+        for byte in [0x40u8, 0x42, 0x44, 0x26] {
+            let data = [0x00, 0x00, 0x01, byte, 0x01, 0x00];
+            assert!(
+                looks_like_h265(&data),
+                "{byte:#04x} должен опознаться как H265"
+            );
+            assert!(
+                !looks_like_h264(&data),
+                "{byte:#04x} не должен пройти как H264"
+            );
+        }
+    }
+
+    /// Без стартового кода судить не о чем — обе проверки обязаны молчать,
+    /// иначе рабочий поток отбраковался бы по недоразумению.
+    #[test]
+    fn unknown_data_is_never_rejected() {
+        let junk = [0xAAu8; 32];
+        assert!(first_nal_byte(&junk).is_none());
+        assert!(!looks_like_h264(&junk));
+        assert!(!looks_like_h265(&junk));
+        assert!(!looks_like_h264(&[]));
+        assert!(!looks_like_h265(&[]));
+    }
 }

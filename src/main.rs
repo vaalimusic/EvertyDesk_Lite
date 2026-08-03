@@ -10,54 +10,78 @@
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod address_book;
+#[cfg(feature = "desktop-gui")]
+mod approval_prompt;
 mod capability_engine;
-mod theme;
-mod libvirt_provider;
-mod proxmox_provider;
-mod provider_api;
-mod session_backend;
-mod smart_connect;
-mod vmware_provider;
 mod capture;
 mod colorconv;
 mod crypto;
+mod d3d12_encode;
 mod diagnostics;
 mod evrt;
+mod evrt2_apf;
+mod evrt2_attention;
+mod evrt2_crypto;
+mod evrt2_experiment;
+mod evrt2_fec;
+mod evrt2_jitter;
+mod evrt2_jitter_rig;
+mod evrt2_modes;
+mod evrt2_packet;
+mod evrt2_rtt;
+mod evrt2_scheduler;
+mod evrt2_session;
 mod evrt_audio;
+mod evrt_client;
+mod evrt_session;
 mod evrtck;
 #[cfg(feature = "gpu-accel")]
 mod evrtck_wgpu;
-mod evrt_client;
-mod evrt_session;
+mod execution_capability;
 mod frame_queue;
 mod fsr;
 mod host;
+mod host_agent;
+#[cfg(unix)]
+mod host_service_unix;
+mod hotfix;
 #[cfg(windows)]
 mod hyperv;
 #[cfg(windows)]
 mod hyperv_rdp;
 mod lan_discovery;
-mod hotfix;
+mod libvirt_provider;
 mod llm;
 mod mf_encode;
 mod mf_video;
 mod netif;
 mod nvenc;
+mod onevpl;
+mod provider_api;
+mod proxmox_provider;
 mod rustdesk_proto;
+mod session_backend;
+#[cfg(feature = "desktop-gui")]
+mod session_toolbar;
 mod settings;
+mod smart_connect;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 mod software_ui;
+mod theme;
 mod transport;
 mod ui;
+mod vbox_rdp;
 mod video;
 mod video_pipeline;
 mod videotoolbox;
-mod vbox_rdp;
 mod virtualbox;
 mod vm_bridge;
+mod vmware_provider;
 mod vp9_mf;
 #[cfg(feature = "live-vpx-system")]
 mod vpx_system;
+#[cfg(windows)]
+mod winservice;
 
 use std::{
     collections::HashMap,
@@ -89,6 +113,11 @@ use ui::widgets::*;
 const APP_NAME: &str = "EvertyDesk Lite";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_SESSION_LOG_LINES: usize = 4_000;
+/// ROADMAP.md Phase 1.3: how long the EVRT2 preview's Task-01 breach
+/// indicator stays visible after a `DEGRADE_SIGNAL` arrives before fading —
+/// a "discreet marker," per Task-01 § Breach Handling, not a persistent
+/// health readout.
+const EVRT2_DEGRADE_INDICATOR_TTL: Duration = Duration::from_millis(2500);
 
 #[derive(Clone, Debug)]
 struct SessionSummary {
@@ -103,7 +132,11 @@ fn version_is_newer(latest: &str, current: &str) -> bool {
         let mut parts = v.splitn(3, '.');
         let major: u32 = parts.next()?.parse().ok()?;
         let minor: u32 = parts.next()?.parse().ok()?;
-        let patch: u32 = parts.next().and_then(|p| p.split('-').next()).and_then(|p| p.parse().ok()).unwrap_or(0);
+        let patch: u32 = parts
+            .next()
+            .and_then(|p| p.split('-').next())
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(0);
         Some((major, minor, patch))
     }
     match (parse(current), parse(latest)) {
@@ -214,6 +247,153 @@ enum ConnectKind {
     Shell,
 }
 
+/// Per-connection choice of how video is encoded on the host.
+///
+/// This maps DIRECTLY onto the host's own EVRTCK-vs-game decision, which is
+/// made from nothing but the client's advertised `PreferCodec`
+/// (`video_pipeline.rs`: `want_evrtck = matches!(prefer, Auto | Vp9)`).
+/// That single fact drives everything below — in particular it is why
+/// `Game` must always resolve to a CONCRETE codec: advertising
+/// `PreferCodec::Auto` would put the host straight back into EVRTCK and
+/// silently produce a "game mode" that is byte-identical to normal mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectMode {
+    /// EVRTCK tile codec. Needs no OS/vendor hardware decoder at all, so it
+    /// works on literally any device — this is the compatibility default a
+    /// normal connection should always get.
+    Normal,
+    /// Real hardware video codec (H265/H264/AV1) through the host's
+    /// NVENC → Media Foundation → VideoToolbox → OpenH264 cascade, which
+    /// already negotiates per-GPU (`host.rs::negotiate_backend_codec`:
+    /// NVIDIA → NVENC, Intel/AMD → hardware MF, Apple → VideoToolbox) and
+    /// refuses any codec this client can't hardware-decode.
+    Game,
+}
+
+/// OS-service install/run state (Phase 3 Windows service / Phase 4
+/// systemd-user / launchd — `TZ_HOST_SERVICE.md`), for the main-window hint
+/// that suggests installing it, the way RustDesk hints at enabling
+/// unattended access.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ServiceHintState {
+    NotInstalled,
+    InstalledNotRunning,
+    Running,
+    /// Install/start was just requested — waiting for the elevated relaunch
+    /// (Windows) or the systemctl/launchctl call (Linux/macOS) to land.
+    Installing,
+}
+
+/// Codec choice offered in `ConnectMode::Game`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GameCodec {
+    Auto,
+    H265,
+    H264,
+    Av1,
+}
+
+impl GameCodec {
+    /// Resolve to the concrete `CodecPreference` advertised to the host.
+    ///
+    /// Never returns `CodecPreference::Auto` — see `ConnectMode::Game`'s doc
+    /// for why that would silently defeat game mode entirely.
+    ///
+    /// `Auto` resolves to H265 when this client can hardware-decode it, else
+    /// H264. AV1 is deliberately NOT auto-selected even when available: AV1
+    /// hardware ENCODE exists only on very recent silicon (RTX 40+, Arc), so
+    /// auto-picking it would often land on a slow software AV1 encoder on the
+    /// host — worse than the H265 it replaced. It stays available as a
+    /// deliberate manual choice.
+    ///
+    /// Note the host still gets the final say: `negotiate_backend_codec`
+    /// keeps H264 as a net under every explicit pick, so asking for H265
+    /// against a host with no H265 encoder degrades to H264 rather than
+    /// failing — and either way the codec stays concrete, so the session
+    /// stays in game mode.
+    fn to_codec_preference(self) -> CodecPreference {
+        match self {
+            // На Windows «Авто» = H264, даже когда H265 формально декодируется.
+            //
+            // Это не вкусовщина, а вывод из живого расследования. Системный
+            // HEVC-декодер Windows (`HEVCDECODER_STORE.dll`) роняет процесс
+            // клиента вместо возврата ошибки: 0xC0000005 по ОДНОМУ И ТОМУ ЖЕ
+            // адресу во всех отладочных дампах этой сессии. Битстрим при этом
+            // заведомо корректный — дамп нашего oneVPL-энкодера разобран
+            // побайтно: VPS(32)+SPS(33)+PPS(34)+SEI(39)+IDR(19), Main profile,
+            // level 4.1, 4:2:0, ширина 1280. То есть чинить со своей стороны
+            // нечего, декодер падает на валидном потоке.
+            //
+            // H264 идёт мимо этой библиотеки полностью, кодируется тем же
+            // аппаратным oneVPL и по скорости на LAN не проигрывает: при 50
+            // Мбит/с пейсинга в битрейт мы не упираемся, а выигрыш H265 —
+            // именно в качестве на мегабит.
+            //
+            // Явный выбор H265 в списке оставлен: на Android-клиенте он
+            // работает и там измеренно быстрее (25-36 fps против 5-8 у H264).
+            #[cfg(windows)]
+            GameCodec::Auto => CodecPreference::H264,
+            #[cfg(not(windows))]
+            GameCodec::Auto => {
+                if crate::video::h265_available() {
+                    CodecPreference::H265
+                } else {
+                    CodecPreference::H264
+                }
+            }
+            GameCodec::H265 => CodecPreference::H265,
+            GameCodec::H264 => CodecPreference::H264,
+            GameCodec::Av1 => CodecPreference::Av1,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            GameCodec::Auto => "Авто (лучший аппаратный)",
+            GameCodec::H265 => "H265 / HEVC",
+            GameCodec::H264 => "H264",
+            GameCodec::Av1 => "AV1",
+        }
+    }
+
+    /// Honest, per-machine status line — says what THIS client can actually
+    /// decode, not what the codec is capable of in theory.
+    fn status_text(self) -> String {
+        match self {
+            GameCodec::Auto if cfg!(windows) => {
+                "H264 — аппаратный, максимально надёжный. На локальной сети по скорости не уступает.".to_owned()
+            }
+            GameCodec::Auto => {
+                if crate::video::h265_available() {
+                    "H265 — этот ПК умеет его аппаратно декодировать. Лучшее качество на мегабит.".to_owned()
+                } else {
+                    "H264 — аппаратного H265-декодера на этом ПК нет. Работает везде.".to_owned()
+                }
+            }
+            GameCodec::H265 if !crate::video::h265_available() => {
+                "⚠️ Аппаратного H265-декодера на этом ПК нет — хост автоматически откатится на H264.".to_owned()
+            }
+            GameCodec::H265 if cfg!(windows) => {
+                "⚠️ На Windows HEVC-декодер Microsoft роняет клиент даже на корректном потоке \
+                 (проверено отладчиком). Выбирайте, только если готовы к падению."
+                    .to_owned()
+            }
+            GameCodec::H265 => {
+                "Лучшее сжатие при том же битрейте. Требует аппаратный H265 с обеих сторон.".to_owned()
+            }
+            GameCodec::H264 => {
+                "Самый совместимый аппаратный кодек — есть практически на любом железе.".to_owned()
+            }
+            GameCodec::Av1 if !crate::video::av1_available() => {
+                "⚠️ Аппаратного AV1-декодера на этом ПК нет — хост откатится на H264.".to_owned()
+            }
+            GameCodec::Av1 => {
+                "Лучшее сжатие, но аппаратный AV1-энкодер есть только на RTX 40+/Intel Arc.".to_owned()
+            }
+        }
+    }
+}
+
 fn tr(lang: UiLang, ru: &'static str, en: &'static str) -> &'static str {
     match lang {
         UiLang::Ru => ru,
@@ -257,7 +437,11 @@ fn install_panic_logger() {
             .map(|p| p.join("evertydesk_panic.log"))
             .unwrap_or_else(|| std::path::PathBuf::from("evertydesk_panic.log"));
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
             let _ = writeln!(f, "{record}");
         }
 
@@ -319,7 +503,111 @@ fn set_encode_thread_priority() {
     // is sufficient there — leave priority at default.
 }
 
+/// Opt the whole process out of Windows 11 EcoQoS / Efficiency Mode.
+///
+/// Windows silently throttles processes with no foreground window (minimized,
+/// or behind another window) by lowering their scheduling priority and clock
+/// — this is EcoQoS, not the app "idling correctly". For a remote-desktop host
+/// that must keep capturing/encoding/injecting input at full speed regardless
+/// of window state, that throttling is exactly what must not happen. OBS and
+/// RustDesk both opt out the same way: `PROCESS_POWER_THROTTLING_STATE` with
+/// `StateMask = 0` tells the scheduler "never throttle execution speed for
+/// this process", overriding the per-thread EcoQoS the OS would otherwise
+/// apply once the window loses foreground/visible state.
+#[cfg(windows)]
+fn disable_power_throttling() {
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, ProcessPowerThrottling, SetProcessInformation,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
+    };
+    unsafe {
+        let mut state = PROCESS_POWER_THROTTLING_STATE {
+            Version: 1, // PROCESS_POWER_THROTTLING_CURRENT_VERSION
+            ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+            StateMask: 0, // 0 = disable throttling for the masked mechanisms
+        };
+        let ok = SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            &mut state as *mut _ as *mut core::ffi::c_void,
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        );
+        let msg = format!(
+            "[EcoQoS] Process power throttling opt-out (EXECUTION_SPEED): {}",
+            if ok.as_bool() {
+                "OK ✓"
+            } else {
+                "FAILED ✗ (window minimized/background may throttle to ~0% and drop input)"
+            }
+        );
+        eprintln!("[EvertyDesk] {msg}");
+        let _ = ECO_QOS_STATUS.set(msg);
+    }
+}
+
+#[cfg(not(windows))]
+fn disable_power_throttling() {}
+
+/// Excludes this app's own window from screen/DXGI capture
+/// (`SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`, Windows 10 2004+).
+///
+/// Root cause this fixes: when the host window is visible (not minimized),
+/// it sits inside the region Desktop Duplication captures. Every egui
+/// repaint of *our own* window then looks like "the screen changed" to the
+/// change-detector, so the encoder never sees a static frame — it re-encodes
+/// continuously at full rate, which is exactly the "100% CPU/GPU when
+/// maximized, normal when minimized" symptom (`TZ_HOST_SERVICE.md` §1). This
+/// makes any capture of this window (ours or a third party's) render it as
+/// a static black rectangle instead, so our own repaints can never register
+/// as motion again — regardless of window state.
+///
+/// Side effect worth knowing: a third-party screen recorder / Print Screen
+/// will also show black where this window is, for as long as the app runs.
+/// For a remote-access host that's an acceptable trade (arguably a plus —
+/// the local password and other UI text never leak into someone else's
+/// recording), so this is applied unconditionally at startup rather than
+/// only while a session is active.
+///
+/// No-op (logged, not fatal) on Windows versions before 2004 where this
+/// flag doesn't exist, and on non-Windows platforms.
+fn exclude_window_from_capture(frame: &eframe::Frame, host_log: &mut Vec<String>) {
+    #[cfg(windows)]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,
+        };
+
+        let Ok(handle) = frame.window_handle() else {
+            return;
+        };
+        let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+            return;
+        };
+        let hwnd = HWND(win32.hwnd.get());
+        let ok = unsafe { SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE).as_bool() };
+        let msg = if ok {
+            "[capture] Окно исключено из захвата экрана (WDA_EXCLUDEFROMCAPTURE) ✓ — свои же \
+             перерисовки больше не читаются как «движение» DXGI-захватом."
+                .to_owned()
+        } else {
+            "[capture] WDA_EXCLUDEFROMCAPTURE не поддерживается (Windows старше 2004) — окно \
+             хоста может само провоцировать высокую нагрузку CPU/GPU, пока развёрнуто."
+                .to_owned()
+        };
+        eprintln!("[EvertyDesk] {msg}");
+        host_log.push(format!("[{}] {msg}", timestamp_hms()));
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (frame, host_log);
+    }
+}
+
 fn main() -> eframe::Result<()> {
+    disable_power_throttling();
+
     // Cap rayon thread pool: on many-core servers (32-128 cores) EVRTCK
     // keyframe encoding would otherwise saturate ALL cores. 8 threads give
     // full benefit of parallelism (encode latency ≈ 8× speedup vs single-
@@ -331,9 +619,8 @@ fn main() -> eframe::Result<()> {
     let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(evrtck_threads)
         .spawn_handler(|thread| {
-            let mut b = std::thread::Builder::new().name(
-                thread.name().unwrap_or("evrtck-encode").to_owned(),
-            );
+            let mut b = std::thread::Builder::new()
+                .name(thread.name().unwrap_or("evrtck-encode").to_owned());
             if let Some(stack) = thread.stack_size() {
                 b = b.stack_size(stack);
             }
@@ -808,12 +1095,16 @@ fn load_app_icon() -> Option<egui::IconData> {
 /// Read by update_egui() on the first frame to surface it in the in-app log.
 static GPU_STARTUP_INFO: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// Stores the EcoQoS opt-out result (see `disable_power_throttling`), logged
+/// at process start before any window exists. Read by update_egui() on the
+/// first frame to surface it in the in-app log alongside the GPU info.
+static ECO_QOS_STATUS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// Set to true when Microsoft Basic Render Driver (WARP D3D12) is detected.
 /// WARP does full CPU rendering: even simple egui frames take 10-50ms of CPU.
 /// We use a much larger repaint interval (5 s instead of 0.5 s) to minimise
 /// CPU spend. The recommended fix is to use --host / headless mode instead.
-static IS_WARP_ADAPTER: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static IS_WARP_ADAPTER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn run_gui(renderer: eframe::Renderer) -> eframe::Result<()> {
     // AutoNoVsync: tries Mailbox (no-wait, returns immediately after queuing
@@ -867,8 +1158,8 @@ fn run_gui(renderer: eframe::Renderer) -> eframe::Result<()> {
                 let info = wgpu.adapter.get_info();
 
                 let name_lower = info.name.to_ascii_lowercase();
-                let is_warp = name_lower.contains("microsoft basic render")
-                    || name_lower.contains("warp");
+                let is_warp =
+                    name_lower.contains("microsoft basic render") || name_lower.contains("warp");
                 let is_server_gpu = is_warp
                     || name_lower.contains("aspeed")
                     || name_lower.contains("ast2")
@@ -882,7 +1173,7 @@ fn run_gui(renderer: eframe::Renderer) -> eframe::Result<()> {
                 if is_warp {
                     IS_WARP_ADAPTER.store(true, std::sync::atomic::Ordering::Relaxed);
                     msg.push_str(
-                        "  ⚠ WARP/no-GPU: CPU-rendered, repaint=5s. Use --host for zero overhead."
+                        "  ⚠ WARP/no-GPU: CPU-rendered, repaint=5s. Use --host for zero overhead.",
                     );
                     activate_server_mode();
                 } else if is_server_gpu {
@@ -902,6 +1193,61 @@ fn run_gui(renderer: eframe::Renderer) -> eframe::Result<()> {
         std::process::exit(0);
     }
     result
+}
+
+/// Raises the standalone `--approval-prompt <peer_id>` window (Phase 2,
+/// approval_prompt.rs) for an incoming connection request. Returns whether
+/// it was actually launched — callers should fall back to an in-app
+/// confirmation if not, so approval is never silently impossible.
+///
+/// Detached the same way `--host-agent` itself is (`host_agent::spawn_detached`)
+/// so it survives this process exiting before the user answers.
+/// Queries current OS-service install/run state — see `ServiceHintState`.
+/// Cheap on Windows (a couple of syscalls); shells out to
+/// `systemctl`/`launchctl` on Linux/macOS, so callers must not call this
+/// every frame (see `EvertyDeskApp::refresh_service_hint`).
+fn query_service_hint_state() -> ServiceHintState {
+    #[cfg(windows)]
+    {
+        if winservice::is_service_running() {
+            ServiceHintState::Running
+        } else if winservice::is_service_installed() {
+            ServiceHintState::InstalledNotRunning
+        } else {
+            ServiceHintState::NotInstalled
+        }
+    }
+    #[cfg(unix)]
+    {
+        if host_service_unix::is_service_running() {
+            ServiceHintState::Running
+        } else if host_service_unix::is_service_installed() {
+            ServiceHintState::InstalledNotRunning
+        } else {
+            ServiceHintState::NotInstalled
+        }
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        ServiceHintState::NotInstalled
+    }
+}
+
+fn spawn_approval_prompt_window(peer_id: &str) -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    host_agent::spawn_detached(&exe, &["--approval-prompt", peer_id]).is_ok()
+}
+
+/// Raises the standalone `--session-toolbar <peer_id>` window (session_toolbar.rs)
+/// — an AnyDesk/RustDesk-style floating panel with "take control" and
+/// "disconnect", independent of this window's own visibility.
+fn spawn_session_toolbar_window(peer_id: &str) -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    host_agent::spawn_detached(&exe, &["--session-toolbar", peer_id]).is_ok()
 }
 
 /// Headless host loop — same as `--host` CLI mode, used as auto-fallback
@@ -925,15 +1271,17 @@ fn run_headless_host() {
                 host::HostEvent::IncomingRequest { peer_id, .. } => {
                     eprintln!("[host] Incoming from {peer_id}")
                 }
-                host::HostEvent::ApprovalRequested { peer_id } => {
+                host::HostEvent::ApprovalRequested { peer_id, .. } => {
                     eprintln!(
                         "[host] Approval requested from {peer_id}; GUI confirmation is required"
                     )
                 }
-                host::HostEvent::SessionStarted { peer_id } => {
+                host::HostEvent::SessionStarted { peer_id, .. } => {
                     eprintln!("[host] Session started: {peer_id}")
                 }
-                host::HostEvent::SessionEnded { peer_id, reason } => {
+                host::HostEvent::SessionEnded {
+                    peer_id, reason, ..
+                } => {
                     eprintln!("[host] Session ended: {peer_id} {reason}")
                 }
                 host::HostEvent::VideoTelemetry {
@@ -955,11 +1303,17 @@ fn run_headless_host() {
 /// Visible even on Windows GUI builds (no console). Silently ignored on failure.
 fn perf_log(msg: &str) {
     use std::io::Write;
-    let Some(appdata) = std::env::var_os("APPDATA") else { return };
+    let Some(appdata) = std::env::var_os("APPDATA") else {
+        return;
+    };
     let dir = std::path::Path::new(&appdata).join("EvertyDesk Lite");
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("perf.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         let ts = unix_timestamp_secs();
         let _ = writeln!(f, "{ts}  {msg}");
     }
@@ -1029,6 +1383,165 @@ fn run_cli_connect() -> Option<i32> {
         };
     }
 
+    #[cfg(windows)]
+    if command == "--winservice" {
+        // Phase 3 of TZ_HOST_SERVICE.md: SCM entry point. Only succeeds when
+        // actually launched by the Service Control Manager (see
+        // winservice.rs). This call blocks for the service's lifetime.
+        winservice::run_winservice();
+        return Some(0);
+    }
+
+    #[cfg(windows)]
+    if command == "--install-service" {
+        return Some(match winservice::install_service() {
+            Ok(()) => {
+                println!("Service installed. Start it with: sc start EvertyDeskLiteHostSvc");
+                println!("(or: evertydesk-lite.exe --start-service)");
+                0
+            }
+            Err(e) => {
+                eprintln!("Install failed: {e}");
+                1
+            }
+        });
+    }
+
+    #[cfg(windows)]
+    if command == "--start-service" {
+        return Some(match winservice::start_installed_service() {
+            Ok(()) => {
+                println!("Service start requested.");
+                0
+            }
+            Err(e) => {
+                eprintln!("Start failed: {e}");
+                1
+            }
+        });
+    }
+
+    #[cfg(windows)]
+    if command == "--uninstall-service" {
+        return Some(match winservice::uninstall_service() {
+            Ok(()) => {
+                println!("Service uninstalled.");
+                0
+            }
+            Err(e) => {
+                eprintln!("Uninstall failed: {e}");
+                1
+            }
+        });
+    }
+
+    // Phase 4 of TZ_HOST_SERVICE.md: same command names as the Windows
+    // service (winservice.rs) above, backed by systemd --user (Linux) or
+    // launchd (macOS) instead of the SCM — see host_service_unix.rs. There
+    // is no `--winservice`/Session-0 equivalent here; both platforms already
+    // run user services inside the interactive login session.
+    #[cfg(unix)]
+    if command == "--install-service" {
+        return Some(match host_service_unix::install_service() {
+            Ok(()) => {
+                println!("Service installed. Start it with: evertydesk-lite --start-service");
+                0
+            }
+            Err(e) => {
+                eprintln!("Install failed: {e}");
+                1
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    if command == "--start-service" {
+        return Some(match host_service_unix::start_installed_service() {
+            Ok(()) => {
+                println!("Service start requested.");
+                0
+            }
+            Err(e) => {
+                eprintln!("Start failed: {e}");
+                1
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    if command == "--uninstall-service" {
+        return Some(match host_service_unix::uninstall_service() {
+            Ok(()) => {
+                println!("Service uninstalled.");
+                0
+            }
+            Err(e) => {
+                eprintln!("Uninstall failed: {e}");
+                1
+            }
+        });
+    }
+
+    if command == "--host-agent" {
+        // Phase 1 of TZ_HOST_SERVICE.md: the host running as its own process,
+        // separate from any GUI. See host_agent.rs for the full design —
+        // this call does not return during normal operation (it exits the
+        // process itself once hosting stops).
+        host_agent::run_host_agent();
+        return Some(0);
+    }
+
+    if command == "--approval-prompt" {
+        // Phase 2 of TZ_HOST_SERVICE.md: standalone confirmation window,
+        // raised by the agent process itself when no main GUI is attached
+        // to show the request. See approval_prompt.rs.
+        let peer_id = args.next().unwrap_or_default();
+        if peer_id.is_empty() {
+            eprintln!("Usage: evertydesk-lite --approval-prompt <peer-id>");
+            return Some(2);
+        }
+        #[cfg(feature = "desktop-gui")]
+        {
+            match approval_prompt::run(peer_id) {
+                Ok(()) => return Some(0),
+                Err(e) => {
+                    eprintln!("[approval-prompt] {e:?}");
+                    return Some(1);
+                }
+            }
+        }
+        #[cfg(not(feature = "desktop-gui"))]
+        {
+            eprintln!("[approval-prompt] this build has no GUI (desktop-gui feature off)");
+            return Some(1);
+        }
+    }
+
+    if command == "--session-toolbar" {
+        // AnyDesk/RustDesk-style persistent session toolbar, raised for
+        // every session regardless of GUI attachment. See session_toolbar.rs.
+        let peer_id = args.next().unwrap_or_default();
+        if peer_id.is_empty() {
+            eprintln!("Usage: evertydesk-lite --session-toolbar <peer-id>");
+            return Some(2);
+        }
+        #[cfg(feature = "desktop-gui")]
+        {
+            match session_toolbar::run(peer_id) {
+                Ok(()) => return Some(0),
+                Err(e) => {
+                    eprintln!("[session-toolbar] {e:?}");
+                    return Some(1);
+                }
+            }
+        }
+        #[cfg(not(feature = "desktop-gui"))]
+        {
+            eprintln!("[session-toolbar] this build has no GUI (desktop-gui feature off)");
+            return Some(1);
+        }
+    }
+
     if command == "--host" {
         // Headless host mode: start the host service, stream all events to
         // stderr.  Useful for diagnosing registration issues without the GUI.
@@ -1087,13 +1600,15 @@ fn run_cli_connect() -> Option<i32> {
                     host::HostEvent::IncomingRequest { peer_id, .. } => {
                         eprintln!("[host] Incoming from {peer_id}")
                     }
-                    host::HostEvent::ApprovalRequested { peer_id } => {
+                    host::HostEvent::ApprovalRequested { peer_id, .. } => {
                         eprintln!("[host] Approval requested from {peer_id}; GUI confirmation is required")
                     }
-                    host::HostEvent::SessionStarted { peer_id } => {
+                    host::HostEvent::SessionStarted { peer_id, .. } => {
                         eprintln!("[host] Session started: {peer_id}")
                     }
-                    host::HostEvent::SessionEnded { peer_id, reason } => {
+                    host::HostEvent::SessionEnded {
+                        peer_id, reason, ..
+                    } => {
                         eprintln!("[host] Session ended: {peer_id} {reason}")
                     }
                     host::HostEvent::VideoTelemetry {
@@ -1172,9 +1687,15 @@ fn run_cli_connect() -> Option<i32> {
     let request = ConnectionRequest {
         remote_id,
         password,
+        client_id: config.local_id.clone(),
+        client_name: std::env::var("COMPUTERNAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .unwrap_or_else(|_| "EvertyDesk".to_owned()),
         server: config.server,
         display: config.display,
         control_only: false,
+        audio_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        evrt2_only: false,
     };
 
     match TransportClient::connect_with_progress(request, |pct, message| {
@@ -1205,11 +1726,29 @@ struct EvertyDeskApp {
     frame_limiter_last: Instant,
     /// True after we have logged GPU startup info once (prevents repeats).
     gpu_info_logged: bool,
+    eco_qos_logged: bool,
+    /// True once `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` has been
+    /// applied to this window (Windows only; see `exclude_window_from_capture`).
+    capture_exclusion_applied: bool,
     password: String,
     show_password: bool,
     show_host_password: bool,
     whitelist_new_id: String,
     connect_kind: ConnectKind,
+    /// Per-connection video mode — see `ConnectMode` doc. NOT persisted into
+    /// `self.config.display.codec`: that stays the global compatibility
+    /// default (EVRTCK) so a future normal connection is never silently left
+    /// on whatever codec the last game session happened to pick.
+    connect_mode: ConnectMode,
+    /// Codec used when `connect_mode == Game`.
+    game_codec: GameCodec,
+    /// Additionally run the experimental EVRT2 protocol on top of the game
+    /// session (host keeps the normal pipeline running as fallback/input).
+    game_evrt2: bool,
+    /// Set once per session after we've told the user that a game-mode session
+    /// actually came up on a non-hardware codec — without it the error would be
+    /// rewritten on every single frame.
+    game_mode_downgrade_reported: bool,
     shell_window_open: bool,
     shell_output: String,
     shell_input: String,
@@ -1262,13 +1801,46 @@ struct EvertyDeskApp {
     last_session_summary: Option<SessionSummary>,
     remote_viewer_open: bool,
     remote_viewer_window_spawned: bool,
+    /// Момент создания нативного окна вьюера — используется, чтобы игнорировать
+    /// «призрачный» close_requested() на первых кадрах после show_viewport_immediate
+    /// (известный класс бага egui/winit на Windows: новый viewport иногда
+    /// репортит close на 1-2 кадре создания). Без этой защиты окно «мигало и
+    /// закрывалось» сразу после подключения в обычном режиме.
+    remote_viewer_opened_at: Option<Instant>,
     remote_fullscreen: bool,
     progress: u8,
     events: Vec<String>,
     session_log: Vec<String>,
+    /// Mirrors every `HostEvent::Log` line (the host-side status feed shown
+    /// in the "Хост" log widget — this is what live EVRT2 network testing
+    /// actually reads: STUN/HELLO/MODE_SWITCH/Codec-Race/splice lines) to a
+    /// real file on disk, truncated fresh each app start. Before this,
+    /// `host_log` was capped at 200 lines and only visible through the UI
+    /// widget, so verifying a live test meant someone manually pasting it.
+    /// `None` when the file couldn't be opened (never fatal — logging to
+    /// disk is a convenience, not a requirement for the app to run).
+    log_file: Option<std::fs::File>,
     remote_texture: Option<TextureHandle>,
     app_logo_texture: Option<TextureHandle>,
     pending_image: Option<ColorImage>,
+    /// Экспериментальная кнопка «EVRT2»: отдельная текстура-превью, сознательно
+    /// НЕ смешивается с remote_texture (иначе живое EVRT1-видео мигало бы
+    /// между двумя независимыми потоками). См. SessionEvent::Evrt2ExperimentFrame.
+    evrt2_preview_texture: Option<TextureHandle>,
+    pending_evrt2_image: Option<ColorImage>,
+    evrt2_frame_count: u64,
+    /// ROADMAP.md Phase 1.3: last real Task-01 breach (`DEGRADE_SIGNAL`),
+    /// if any, and when it arrived — `evrt2_preview_window` shows a
+    /// discreet indicator for a short window after receipt, then it fades
+    /// (see `EVRT2_DEGRADE_INDICATOR_TTL`). `None` means no breach has
+    /// been reported yet this session, not "no breach right now" — a
+    /// distinction that matters because we never want to imply a
+    /// guarantee is currently being met when we simply haven't heard
+    /// otherwise.
+    evrt2_last_degrade: Option<(Instant, f32, f32, usize)>,
+    /// Connect-screen checkbox: request an EVRT2-only session (host skips the
+    /// live video pipeline entirely instead of running it alongside EVRT2).
+    evrt2_only_mode: bool,
     last_frame_rgba: Vec<u8>,
     remote_size: [usize; 2],
     text_to_send: String,
@@ -1380,8 +1952,32 @@ struct EvertyDeskApp {
     host_state: HostState,
     /// Log lines received from the host service.
     host_log: Vec<String>,
+    /// Cached OS-service (Phase 3/4, TZ_HOST_SERVICE.md) install/run state —
+    /// re-queried at most every few seconds (see `refresh_service_hint`),
+    /// not every frame: on Linux/macOS the query shells out to
+    /// systemctl/launchctl, which is too slow to run per-frame.
+    service_hint_state: ServiceHintState,
+    service_hint_next_check: Instant,
+    /// Optimistic local mirror of whether the remote client's input is
+    /// currently blocked ("take control"). The real flag
+    /// (`BLOCK_REMOTE_INPUT`) lives in whichever process is actually running
+    /// the session — in agent mode that's not this process — so this can't
+    /// be read back synchronously; it's set on click and reset per session.
+    host_input_blocked_local: bool,
     /// Pending incoming connection (peer_id) waiting for Accept/Reject.
     host_pending_peer: Option<String>,
+    /// True once the standalone `--approval-prompt` window (Phase 2,
+    /// approval_prompt.rs) has been raised for the current `host_pending_peer`
+    /// — either by this process itself (in-process backend) or already by the
+    /// agent (agent backend, which always raises it — see host_agent.rs).
+    /// Suppresses the in-app `incoming_approval_window` modal so the user
+    /// isn't asked twice for the same request.
+    host_approval_shown_externally: bool,
+    /// Set when a new approval request arrives and the standalone window
+    /// above could *not* be raised — triggers a one-shot bring-window-to-front
+    /// + focus fallback so the in-app confirmation modal is seen even if the
+    /// app is minimized/in background (AnyDesk/RustDesk behaviour).
+    host_approval_needs_focus: bool,
     /// Stop signal for the LAN discovery thread (None = not running).
     lan_discovery_stop: Option<Arc<AtomicBool>>,
 
@@ -1659,6 +2255,26 @@ impl EvertyDeskApp {
         let coordinate_mode = config.ui.coordinate_mode;
         let video_fps = config.display.target_fps.clamp(5, 60) as i32;
         let host_service = Some(HostService::start(config.clone()));
+        // Truncated (not appended) so each app run starts a fresh file —
+        // live-testing workflow is "start host, run test, read this file",
+        // not an accumulating history.
+        //
+        // Agent mode (host_agent.rs, Phase 1 of TZ_HOST_SERVICE.md) is the
+        // exception: the agent process owns this file for its whole
+        // lifetime, independent of any one GUI connection, so the GUI must
+        // not also open it here — two processes truncating/writing the same
+        // file would race and lose lines.
+        let agent_backed = host_service.as_ref().is_some_and(|s| s.is_agent_backed());
+        let log_file = if agent_backed {
+            None
+        } else {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open("evertydesk_host_log.txt")
+                .ok()
+        };
         Self {
             config,
             remote_id,
@@ -1667,6 +2283,10 @@ impl EvertyDeskApp {
             show_host_password: false,
             whitelist_new_id: String::new(),
             connect_kind: ConnectKind::Screen,
+            connect_mode: ConnectMode::Normal,
+            game_codec: GameCodec::Auto,
+            game_evrt2: false,
+            game_mode_downgrade_reported: false,
             shell_window_open: false,
             shell_output: String::new(),
             shell_input: String::new(),
@@ -1715,13 +2335,20 @@ impl EvertyDeskApp {
             last_session_summary: None,
             remote_viewer_open: false,
             remote_viewer_window_spawned: false,
+            remote_viewer_opened_at: None,
             remote_fullscreen: false,
             progress: 0,
             events: vec!["App started".to_owned()],
             session_log: vec!["App started".to_owned()],
+            log_file,
             remote_texture: None,
             app_logo_texture: None,
             pending_image: None,
+            evrt2_preview_texture: None,
+            pending_evrt2_image: None,
+            evrt2_frame_count: 0,
+            evrt2_last_degrade: None,
+            evrt2_only_mode: false,
             last_frame_rgba: Vec::new(),
             remote_size: [0, 0],
             text_to_send: String::new(),
@@ -1754,6 +2381,8 @@ impl EvertyDeskApp {
             perf_last_fps: 0.0,
             frame_limiter_last: Instant::now(),
             gpu_info_logged: false,
+            eco_qos_logged: false,
+            capture_exclusion_applied: false,
             screenshot_count: 0,
             live_frame_count: 0,
             screenshot_frame_count: 0,
@@ -1799,7 +2428,12 @@ impl EvertyDeskApp {
             host_service,
             host_state: HostState::Connecting,
             host_log: vec![format!("[{}] Автозапуск доступа...", timestamp_hms())],
+            service_hint_state: query_service_hint_state(),
+            service_hint_next_check: Instant::now() + Duration::from_secs(8),
+            host_input_blocked_local: false,
             host_pending_peer: None,
+            host_approval_shown_externally: false,
+            host_approval_needs_focus: false,
             lan_discovery_stop: None,
             #[cfg(windows)]
             hyperv_vms: Vec::new(),
@@ -1872,8 +2506,8 @@ impl EvertyDeskApp {
             remote_vm_status: String::new(),
             remote_vm_panel_open: false,
             provider_registry: {
-                use std::sync::Arc;
                 use provider_api::ProviderRegistry;
+                use std::sync::Arc;
                 // Только реальные провайдеры. Hyper-V регистрируется в рантайме
                 // на Windows после успешного WMI-скана; VirtualBox — при наличии
                 // VBoxManage. Никаких фейковых демо-провайдеров в продакшене.
@@ -1913,18 +2547,74 @@ impl EvertyDeskApp {
         }
     }
 
+    /// True when the experimental EVRT2 stream should own the main view for
+    /// this session — i.e. game mode with the EVRT2 opt-in checked. When
+    /// false, EVRT2 frames (if any arrive at all, e.g. from the separate
+    /// `evrt2_only_mode` protocol test) stay in the small floating preview
+    /// window and never displace the real session video.
+    fn evrt2_takes_over_view(&self) -> bool {
+        self.connect_mode == ConnectMode::Game && self.game_evrt2
+    }
+
     fn connect(&mut self) {
         let normalized_remote_id = normalize_remote_id(&self.remote_id);
         if is_own_remote_id(&normalized_remote_id, &self.config.local_id) {
             self.set_error("Нельзя подключиться к своему же ID. Откройте EvertyDesk на другом ПК и введите его ID.");
             return;
         }
+        // Per-connection video mode. Applied to a COPY of the display config
+        // so the global default (EVRTCK, max compatibility) is never
+        // overwritten by a one-off game session.
+        //
+        // The codec here is the single lever that picks the host's whole
+        // pipeline: PreferCodec::Auto → EVRTCK tiles, any concrete codec →
+        // the hardware encoder cascade. See ConnectMode's doc comment.
+        let mut display = self.config.display.clone();
+        match self.connect_mode {
+            ConnectMode::Normal => {
+                display.codec = CodecPreference::Evrtck;
+            }
+            ConnectMode::Game => {
+                // Игровой режим НЕ имеет права молча оказаться EVRTCK. Если этот
+                // ПК вообще ничего не умеет декодировать аппаратно, то честного
+                // игрового режима здесь быть не может — отказываемся сразу и
+                // говорим почему, вместо тихого отката, который выглядит как
+                // работающий игровой режим, а на деле им не является.
+                if !crate::video::h264_available()
+                    && !crate::video::h265_available()
+                    && !crate::video::av1_available()
+                {
+                    self.set_error(
+                        "Игровой режим недоступен: на этом ПК нет ни одного аппаратного видеодекодера (H264/H265/AV1). \
+                         Используйте обычный режим — он работает на любом железе.",
+                    );
+                    return;
+                }
+                display.codec = self.game_codec.to_codec_preference();
+                // Game content changes every frame, so the host's static-frame
+                // skip is pure latency with no bandwidth win. The host already
+                // forces this itself for non-EVRTCK clients
+                // (video_pipeline.rs), but setting it here keeps the client's
+                // own request honest rather than relying on that side effect.
+                display.streaming_mode = crate::settings::StreamingMode::Game;
+                // 60fps is both the actual target AND the flag that turns on
+                // the EVRT ultra-low-latency receive path
+                // (transport.rs: `evrt_ull = display_config.target_fps >= 60`).
+                display.target_fps = 60;
+            }
+        }
         let request = ConnectionRequest {
             remote_id: normalized_remote_id.clone(),
             password: self.password.clone(),
+            client_id: self.config.local_id.clone(),
+            client_name: std::env::var("COMPUTERNAME")
+                .or_else(|_| std::env::var("HOSTNAME"))
+                .unwrap_or_else(|_| "EvertyDesk".to_owned()),
             server: self.config.server.clone(),
-            display: self.config.display.clone(),
-            control_only: false,
+            display,
+            control_only: self.evrt2_only_mode,
+            audio_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            evrt2_only: self.evrt2_only_mode,
         };
 
         if request.remote_id.is_empty() {
@@ -1950,6 +2640,9 @@ impl EvertyDeskApp {
         self.remote_id = normalized_remote_id;
         self.save_ui_config();
         self.remote_texture = None;
+        self.evrt2_preview_texture = None;
+        self.pending_evrt2_image = None;
+        self.game_mode_downgrade_reported = false;
         self.remote_size = [0, 0];
         self.last_frame_rgba.clear();
         self.fsr_native_size = None; // сбросить при новом подключении
@@ -2101,6 +2794,20 @@ impl EvertyDeskApp {
                         millis: self.refresh_millis,
                     });
                 }
+                if self.evrt2_only_mode {
+                    self.log("EVRT2-only: запрашиваю экспериментальный поток…".to_owned());
+                    self.send_command(SessionCommand::StartEvrt2Experiment);
+                } else if self.connect_mode == ConnectMode::Game && self.game_evrt2 {
+                    // Full session stays live (input + the normal hardware-codec
+                    // video as fallback) — the experimental EVRT2 stream is
+                    // requested ON TOP and takes over the main view once its
+                    // first frame arrives (see remote_screen_ui).
+                    self.log(
+                        "EVRT2: запрашиваю живой экспериментальный поток поверх игровой сессии…"
+                            .to_owned(),
+                    );
+                    self.send_command(SessionCommand::StartEvrt2Experiment);
+                }
             }
             SessionEvent::Frame {
                 sid,
@@ -2120,6 +2827,24 @@ impl EvertyDeskApp {
                     );
                     self.log(format!("Dropped frame: {}", self.stream_health));
                     return;
+                }
+                // Игровой режим обязан быть аппаратным. Если сюда всё-таки
+                // приехал EVRTCK или софтверный PNG-фолбэк — это НЕ игровой
+                // режим, и молчаливо показывать такую картинку значит вводить
+                // в заблуждение. Говорим прямо и один раз за сессию (иначе
+                // ошибка бы переписывалась на каждом кадре).
+                if self.connect_mode == ConnectMode::Game
+                    && !self.game_mode_downgrade_reported
+                    && (codec.eq_ignore_ascii_case("evrtck") || codec == "PNG")
+                {
+                    self.game_mode_downgrade_reported = true;
+                    let msg = format!(
+                        "Игровой режим не состоялся: хост прислал «{codec}» вместо аппаратного кодека. \
+                         Скорее всего на хосте нет доступного аппаратного энкодера (NVENC / Intel Quick Sync / AMD / VideoToolbox), \
+                         либо на нём старая версия EvertyDesk. Картинка ниже — обычный режим, не игровой."
+                    );
+                    self.log(msg.clone());
+                    self.set_error(&msg);
                 }
                 if codec == "PNG" {
                     // Discard PNG screenshot frames while live video (VP9/H264) is
@@ -2449,7 +3174,11 @@ impl EvertyDeskApp {
                             break;
                         }
                     }
-                    self.log(format!("Capability graph: {} — {}", vm_id, graph.recommended_mode.label()));
+                    self.log(format!(
+                        "Capability graph: {} — {}",
+                        vm_id,
+                        graph.recommended_mode.label()
+                    ));
                 }
             }
             SessionEvent::VmCheckpoints(json) => {
@@ -2459,11 +3188,14 @@ impl EvertyDeskApp {
                     let op = v.get("op").and_then(|x| x.as_str()).unwrap_or("?");
                     let vm_id = v.get("vm_id").and_then(|x| x.as_str()).unwrap_or("?");
                     if ok {
-                        let count = v.get("checkpoints")
+                        let count = v
+                            .get("checkpoints")
                             .and_then(|x| x.as_array())
                             .map(|a| a.len())
                             .unwrap_or(0);
-                        self.log(format!("Checkpoint '{op}' for {vm_id}: {count} checkpoints"));
+                        self.log(format!(
+                            "Checkpoint '{op}' for {vm_id}: {count} checkpoints"
+                        ));
                         // Обновить checkpoint list в remote_vms
                         if op == "list" {
                             for vm in &mut self.remote_vms {
@@ -2478,6 +3210,29 @@ impl EvertyDeskApp {
                         self.log(format!("Checkpoint '{op}' error: {err}"));
                     }
                 }
+            }
+            SessionEvent::Evrt2ExperimentFrame {
+                width,
+                height,
+                rgba,
+            } => {
+                self.evrt2_frame_count += 1;
+                let image = ColorImage::from_rgba_unmultiplied([width, height], &rgba);
+                self.pending_evrt2_image = Some(image);
+                if self.evrt2_frame_count <= 1 || self.evrt2_frame_count % 20 == 0 {
+                    self.log(format!(
+                        "EVRT2 (эксп.): кадр #{} ({width}x{height})",
+                        self.evrt2_frame_count
+                    ));
+                }
+            }
+            SessionEvent::Evrt2Degrade {
+                measured_age_ms,
+                ceiling_ms,
+                tiles,
+            } => {
+                self.evrt2_last_degrade =
+                    Some((Instant::now(), measured_age_ms, ceiling_ms, tiles));
             }
             SessionEvent::Failed(err) => {
                 self.busy = false;
@@ -2660,6 +3415,13 @@ impl EvertyDeskApp {
             return;
         }
 
+        // Чекбокс «Авто-снижать FPS при перегрузке декодера». Если выключен —
+        // не трогаем FPS автоматически (PNG-fallback → live выше остаётся, это
+        // не про качество). Так тумблер реально управляет поведением.
+        if !self.config.display.adaptive_quality {
+            return;
+        }
+
         let stale_queue_lag = self.frame_queue_ms >= 450;
         let dropped_backlog_lag = self.frame_dropped >= 12 && self.frame_queue_ms >= 180;
         let queue_lag = stale_queue_lag || dropped_backlog_lag;
@@ -2741,7 +3503,11 @@ impl EvertyDeskApp {
 }
 
 impl eframe::App for EvertyDeskApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        if !self.capture_exclusion_applied {
+            exclude_window_from_capture(frame, &mut self.host_log);
+            self.capture_exclusion_applied = true;
+        }
         self.update_egui(ui.ctx());
     }
 
@@ -2841,6 +3607,17 @@ fn start_hung_window_guardian() {
 impl EvertyDeskApp {
     #[allow(deprecated)]
     fn update_egui(&mut self, ctx: &egui::Context) {
+        // ── Bring window to front on incoming approval request ────────────────
+        // Like AnyDesk/RustDesk: an unattended (no-password) connection must pull
+        // the confirmation prompt to the foreground even if the app is minimized
+        // or behind other windows. One-shot per request.
+        if self.host_approval_needs_focus {
+            self.host_approval_needs_focus = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            ctx.request_repaint();
+        }
+
         // ── Kill animation-driven infinite repaints ───────────────────────────
         // egui's animate_bool / animate_value_towards call ctx.request_repaint()
         // (no delay) while any animation is in flight.  On a real GPU this
@@ -2868,23 +3645,23 @@ impl EvertyDeskApp {
             });
             let host_session_active = matches!(self.host_state, HostState::Accepting(_));
             let target = if has_input {
-                Duration::ZERO              // respond immediately to user input
+                Duration::ZERO // respond immediately to user input
             } else if IS_WARP_ADAPTER.load(std::sync::atomic::Ordering::Relaxed) {
                 if host_session_active {
-                    Duration::from_millis(50)   // ~20 fps — WARP with active session, keep UI responsive
+                    Duration::from_millis(50) // ~20 fps — WARP with active session, keep UI responsive
                 } else {
-                    Duration::from_millis(500)  // ~2 fps idle — software/WARP (Aspeed, no GPU)
+                    Duration::from_millis(500) // ~2 fps idle — software/WARP (Aspeed, no GPU)
                 }
             } else if server_mode_active() {
                 if host_session_active {
-                    Duration::from_millis(33)   // ~30 fps — server with session
+                    Duration::from_millis(33) // ~30 fps — server with session
                 } else {
-                    Duration::from_millis(200)  // ~5 fps idle — server with real GPU
+                    Duration::from_millis(200) // ~5 fps idle — server with real GPU
                 }
             } else if self.connected || self.busy {
-                Duration::from_millis(16)   // ~60 fps — active remote session
+                Duration::from_millis(16) // ~60 fps — active remote session
             } else {
-                Duration::ZERO  // sentinel: handled below via request_repaint_after
+                Duration::ZERO // sentinel: handled below via request_repaint_after
             };
             if target == Duration::ZERO && !has_input {
                 // Idle client: skip sleep entirely, let eframe wait for OS events.
@@ -2901,11 +3678,8 @@ impl EvertyDeskApp {
 
         // ── Ctrl+Alt+B: toggle remote input block (host mode) ────────────────
         if matches!(self.host_state, HostState::Accepting(_)) {
-            let hotkey = ctx.input(|i| {
-                i.modifiers.ctrl
-                    && i.modifiers.alt
-                    && i.key_pressed(egui::Key::B)
-            });
+            let hotkey =
+                ctx.input(|i| i.modifiers.ctrl && i.modifiers.alt && i.key_pressed(egui::Key::B));
             if hotkey {
                 let now_blocked = !host::is_remote_input_blocked();
                 host::set_remote_input_blocked(now_blocked);
@@ -2928,6 +3702,13 @@ impl EvertyDeskApp {
                 self.gpu_info_logged = true;
             }
         }
+        if !self.eco_qos_logged {
+            if let Some(eco_msg) = ECO_QOS_STATUS.get() {
+                self.log(eco_msg.clone());
+                perf_log(eco_msg);
+                self.eco_qos_logged = true;
+            }
+        }
 
         // ── UI render-rate counter ────────────────────────────────────────────
         self.perf_frame_count += 1;
@@ -2938,7 +3719,9 @@ impl EvertyDeskApp {
             let msg = format!(
                 "[perf] UI render: {:.0} fps (idle={}, server_mode={}) \
                  — expected <1 fps idle, ~30 fps streaming",
-                fps, idle, server_mode_active()
+                fps,
+                idle,
+                server_mode_active()
             );
             self.log(msg.clone());
             perf_log(&msg);
@@ -3006,8 +3789,12 @@ impl EvertyDeskApp {
         // Poll ping result.
         if let Some(rx) = self.ping_rx.take() {
             match rx.try_recv() {
-                Ok(result) => { self.ping_result = Some(result); }
-                Err(mpsc::TryRecvError::Empty) => { self.ping_rx = Some(rx); }
+                Ok(result) => {
+                    self.ping_result = Some(result);
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.ping_rx = Some(rx);
+                }
                 Err(mpsc::TryRecvError::Disconnected) => {}
             }
         }
@@ -3037,10 +3824,28 @@ impl EvertyDeskApp {
         self.poll_hyperv_session(ctx);
         if let Some(image) = self.pending_image.take() {
             if let Some(texture) = self.remote_texture.as_mut() {
-                texture.set(image, remote_texture_options(self.config.display.nearest_neighbour));
+                texture.set(
+                    image,
+                    remote_texture_options(self.config.display.nearest_neighbour),
+                );
             } else {
-                self.remote_texture =
-                    Some(ctx.load_texture("remote-screen", image, remote_texture_options(self.config.display.nearest_neighbour)));
+                self.remote_texture = Some(ctx.load_texture(
+                    "remote-screen",
+                    image,
+                    remote_texture_options(self.config.display.nearest_neighbour),
+                ));
+            }
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+        if let Some(image) = self.pending_evrt2_image.take() {
+            if let Some(texture) = self.evrt2_preview_texture.as_mut() {
+                texture.set(image, egui::TextureOptions::LINEAR);
+            } else {
+                self.evrt2_preview_texture = Some(ctx.load_texture(
+                    "evrt2-experiment-preview",
+                    image,
+                    egui::TextureOptions::LINEAR,
+                ));
             }
             ctx.request_repaint_after(Duration::from_millis(16));
         }
@@ -3128,7 +3933,10 @@ impl EvertyDeskApp {
         if self.pending_vm_action.is_some() {
             self.vm_action_confirm_window(ctx);
         }
-        if self.host_pending_peer.is_some() {
+        // Only the fallback in-app modal — when the standalone window (Phase
+        // 2) was successfully raised, that's the one asking, and this must
+        // not also pop up asking the same question a second time.
+        if self.host_pending_peer.is_some() && !self.host_approval_shown_externally {
             self.incoming_approval_window(ctx);
         }
 
@@ -3165,7 +3973,7 @@ impl EvertyDeskApp {
                         });
                     });
                     ui.add_space(8.0);
-                    let blocked = host::is_remote_input_blocked();
+                    let blocked = self.host_input_blocked_local;
                     let (btn_label, btn_fill) = if blocked {
                         ("🔓 Вернуть управление клиенту", egui::Color32::from_rgb(180, 70, 70))
                     } else {
@@ -3184,7 +3992,77 @@ impl EvertyDeskApp {
                         )
                         .clicked()
                     {
-                        host::set_remote_input_blocked(!blocked);
+                        self.host_input_blocked_local = !blocked;
+                        if let Some(svc) = &self.host_service {
+                            svc.set_input_blocked(self.host_input_blocked_local);
+                        }
+                    }
+
+                    ui.add_space(6.0);
+                    // Принудительно завершить сессию — как «Отключить» в RustDesk.
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("⛔ Отключить клиента")
+                                    .size(11.0)
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(egui::Color32::from_rgb(150, 40, 40))
+                            .min_size(egui::vec2(ui.available_width(), 26.0))
+                            .corner_radius(egui::CornerRadius::same(6)),
+                        )
+                        .clicked()
+                    {
+                        if let Some(svc) = &self.host_service {
+                            svc.kick_active_session();
+                        }
+                        self.host_log.push(format!(
+                            "[{}] Отключение клиента {peer_id} по запросу пользователя",
+                            timestamp_hms()
+                        ));
+                    }
+
+                    // Если пир в белом списке (авто-подтверждение) — дать быстрый
+                    // способ это отозвать, чтобы следующее подключение спрашивало.
+                    let norm = normalize_remote_id(peer_id);
+                    let is_whitelisted = self
+                        .config
+                        .security
+                        .whitelist
+                        .iter()
+                        .any(|w| normalize_remote_id(w) == norm);
+                    if is_whitelisted {
+                        ui.add_space(6.0);
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("🚫 Убрать авто-подтверждение")
+                                        .size(10.0)
+                                        .color(egui::Color32::from_rgb(200, 220, 255)),
+                                )
+                                .fill(egui::Color32::from_rgb(24, 70, 120))
+                                .min_size(egui::vec2(ui.available_width(), 24.0))
+                                .corner_radius(egui::CornerRadius::same(6)),
+                            )
+                            .on_hover_text(
+                                "Этот ID больше не будет подключаться автоматически — \
+                                 следующее подключение потребует подтверждения",
+                            )
+                            .clicked()
+                        {
+                            self.config
+                                .security
+                                .whitelist
+                                .retain(|w| normalize_remote_id(w) != norm);
+                            self.config.save();
+                            if let Some(svc) = &self.host_service {
+                                svc.reconfigure(self.config.clone());
+                            }
+                            self.host_log.push(format!(
+                                "[{}] {peer_id} удалён из белого списка (авто-подтверждение выключено)",
+                                timestamp_hms()
+                            ));
+                        }
                     }
                 });
         }
@@ -3203,10 +4081,7 @@ impl EvertyDeskApp {
             .frame(
                 egui::Frame::NONE
                     .fill(crate::theme::palette().surface)
-                    .stroke(egui::Stroke::new(
-                        1.0,
-                        crate::theme::palette().border,
-                    ))
+                    .stroke(egui::Stroke::new(1.0, crate::theme::palette().border))
                     .corner_radius(egui::CornerRadius::ZERO)
                     .inner_margin(egui::Margin::symmetric(18, 20))
                     .outer_margin(egui::Margin::ZERO),
@@ -3296,8 +4171,13 @@ impl EvertyDeskApp {
     }
 
     fn shutdown(&mut self) {
+        // `detach()`, not `stop()`: closing the GUI must not stop hosting
+        // when the host is running as a separate --host-agent process (the
+        // whole point of Phase 1 — see TZ_HOST_SERVICE.md §1-2). For the
+        // in-process backend `detach()` degrades to `stop()` since there's
+        // no separate process to leave running.
         if let Some(svc) = self.host_service.take() {
-            svc.stop();
+            svc.detach();
         }
         if self.connected || self.busy {
             self.disconnect_session("Application closed");
@@ -3344,9 +4224,17 @@ impl EvertyDeskApp {
         }
 
         // Quick-connect tabs from pinned history entries.
-        struct PinnedEntry { rid: String, note: String, last_unix: u64, count: u32 }
+        struct PinnedEntry {
+            rid: String,
+            note: String,
+            last_unix: u64,
+            count: u32,
+        }
         let pinned: Vec<PinnedEntry> = self
-            .config.ui.history.iter()
+            .config
+            .ui
+            .history
+            .iter()
             .filter(|e| e.pinned)
             .map(|e| PinnedEntry {
                 rid: e.remote_id.clone(),
@@ -3363,7 +4251,9 @@ impl EvertyDeskApp {
                     let key = egui::Key::from_name(&(idx + 1).to_string());
                     if let Some(key) = key {
                         if ui.input(|i| i.key_pressed(key)) {
-                            if self.connected { self.disconnect_session("Отключено"); }
+                            if self.connected {
+                                self.disconnect_session("Отключено");
+                            }
                             self.remote_id = entry.rid.clone();
                             self.last_error = None;
                         }
@@ -3375,13 +4265,27 @@ impl EvertyDeskApp {
             ui.horizontal_wrapped(|ui| {
                 for (idx, entry) in pinned.iter().enumerate() {
                     let is_active = self.connected && self.remote_id == entry.rid;
-                    let label = if entry.note.is_empty() { entry.rid.as_str() } else { entry.note.as_str() };
-                    let shortcut = if idx < 9 { format!(" [Ctrl+{}]", idx + 1) } else { String::new() };
-                    let tab_text = egui::RichText::new(format!("{} {}", if is_active { "🟢" } else { "⬜" }, label))
-                        .size(12.0);
+                    let label = if entry.note.is_empty() {
+                        entry.rid.as_str()
+                    } else {
+                        entry.note.as_str()
+                    };
+                    let shortcut = if idx < 9 {
+                        format!(" [Ctrl+{}]", idx + 1)
+                    } else {
+                        String::new()
+                    };
+                    let tab_text = egui::RichText::new(format!(
+                        "{} {}",
+                        if is_active { "🟢" } else { "⬜" },
+                        label
+                    ))
+                    .size(12.0);
                     let btn = ui.add(egui::Button::new(tab_text).selected(is_active));
                     if btn.clicked() && !self.busy {
-                        if self.connected { self.disconnect_session("Отключено"); }
+                        if self.connected {
+                            self.disconnect_session("Отключено");
+                        }
                         self.remote_id = entry.rid.clone();
                         self.last_error = None;
                         self.status = tr(self.ui_lang, "Готово", "Ready").to_owned();
@@ -3395,9 +4299,17 @@ impl EvertyDeskApp {
                         if elapsed < 3600 {
                             tr(self.ui_lang, "< 1 часа назад", "< 1 hour ago").to_owned()
                         } else if elapsed < 86400 {
-                            format!("{} {}", elapsed / 3600, tr(self.ui_lang, "ч назад", "h ago"))
+                            format!(
+                                "{} {}",
+                                elapsed / 3600,
+                                tr(self.ui_lang, "ч назад", "h ago")
+                            )
                         } else {
-                            format!("{} {}", elapsed / 86400, tr(self.ui_lang, "дн назад", "d ago"))
+                            format!(
+                                "{} {}",
+                                elapsed / 86400,
+                                tr(self.ui_lang, "дн назад", "d ago")
+                            )
                         }
                     } else {
                         String::new()
@@ -3412,7 +4324,10 @@ impl EvertyDeskApp {
                     );
                     btn.on_hover_text(tip);
                 }
-                if ui.small_button(tr(self.ui_lang, "⭐ Управление", "⭐ Manage")).clicked() {
+                if ui
+                    .small_button(tr(self.ui_lang, "⭐ Управление", "⭐ Manage"))
+                    .clicked()
+                {
                     self.mode = AppMode::History;
                 }
             });
@@ -3424,29 +4339,35 @@ impl EvertyDeskApp {
         ui.horizontal(|ui| {
             ui.label(tr(self.ui_lang, "ID удалённого ПК", "Remote PC ID"));
             // Recent connections dropdown
-            let recent: Vec<(String, String)> = self.config.ui.history
+            let recent: Vec<(String, String)> = self
+                .config
+                .ui
+                .history
                 .iter()
                 .take(8)
                 .map(|e| (e.remote_id.clone(), e.note.clone()))
                 .collect();
             if !recent.is_empty() {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.menu_button(tr(self.ui_lang, "▾ Недавние", "▾ Recent"), |ui| {
-                        ui.set_min_width(200.0);
-                        for (rid, note) in &recent {
-                            let label = if note.is_empty() {
-                                format_peer_id(rid)
-                            } else {
-                                format!("{} — {}", format_peer_id(rid), note)
-                            };
-                            if ui.selectable_label(self.remote_id == *rid, label).clicked() {
-                                self.remote_id = rid.clone();
-                                self.last_error = None;
-                                self.status = tr(self.ui_lang, "Готово", "Ready").to_owned();
-                                ui.close();
+                    ui.menu_button(
+                        tr(self.ui_lang, "▾ Недавние", "▾ Recent"),
+                        |ui| {
+                            ui.set_min_width(200.0);
+                            for (rid, note) in &recent {
+                                let label = if note.is_empty() {
+                                    format_peer_id(rid)
+                                } else {
+                                    format!("{} — {}", format_peer_id(rid), note)
+                                };
+                                if ui.selectable_label(self.remote_id == *rid, label).clicked() {
+                                    self.remote_id = rid.clone();
+                                    self.last_error = None;
+                                    self.status = tr(self.ui_lang, "Готово", "Ready").to_owned();
+                                    ui.close();
+                                }
                             }
-                        }
-                    });
+                        },
+                    );
                 });
             }
         });
@@ -3464,16 +4385,99 @@ impl EvertyDeskApp {
         let password_response = compact_text_input(
             ui,
             &mut self.password,
-            tr(self.ui_lang, "Оставьте пустым если не нужен", "Leave empty if not required"),
+            tr(
+                self.ui_lang,
+                "Оставьте пустым если не нужен",
+                "Leave empty if not required",
+            ),
             !self.show_password,
             enabled,
             None,
         );
-        ui.small(tr(self.ui_lang,
+        ui.small(tr(
+            self.ui_lang,
             "Оставьте пустым, если удалённый ПК разрешает подтверждение без пароля.",
             "Leave empty if the remote PC allows approval without a password.",
         ));
-        ui.checkbox(&mut self.show_password, tr(self.ui_lang, "Показать пароль", "Show password"));
+        ui.checkbox(
+            &mut self.show_password,
+            tr(self.ui_lang, "Показать пароль", "Show password"),
+        );
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.label(tr(self.ui_lang, "Режим видео", "Video mode"));
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(
+                    &mut self.connect_mode,
+                    ConnectMode::Normal,
+                    tr(self.ui_lang, "🖥 Обычный", "🖥 Normal"),
+                );
+                ui.selectable_value(
+                    &mut self.connect_mode,
+                    ConnectMode::Game,
+                    tr(self.ui_lang, "🎮 Игровой", "🎮 Game"),
+                );
+            });
+            ui.add_space(4.0);
+            match self.connect_mode {
+                ConnectMode::Normal => {
+                    ui.small(tr(
+                        self.ui_lang,
+                        "EVRTCK — собственный кодек без аппаратных требований. Подключается к любому устройству, включая старые ПК и телефоны без аппаратного декодера.",
+                        "EVRTCK — our own codec with no hardware requirements. Connects to any device, including old PCs and phones with no hardware decoder.",
+                    ));
+                }
+                ConnectMode::Game => {
+                    egui::ComboBox::from_id_salt("game_codec_picker")
+                        .selected_text(self.game_codec.label())
+                        .show_ui(ui, |ui| {
+                            for codec in [
+                                GameCodec::Auto,
+                                GameCodec::H265,
+                                GameCodec::H264,
+                                GameCodec::Av1,
+                            ] {
+                                ui.selectable_value(&mut self.game_codec, codec, codec.label());
+                            }
+                        });
+                    ui.small(self.game_codec.status_text());
+                    ui.add_space(2.0);
+                    ui.small(tr(
+                        self.ui_lang,
+                        "Аппаратный кодек + 60fps + ultra-low-latency UDP. Хост сам подберёт свой энкодер под свою видеокарту (NVIDIA → NVENC, Intel/AMD → Quick Sync/AMF, Apple → VideoToolbox) и никогда не пришлёт кодек, который этот ПК не умеет декодировать.",
+                        "Hardware codec + 60fps + ultra-low-latency UDP. The host picks its own encoder to match its GPU (NVIDIA → NVENC, Intel/AMD → Quick Sync/AMF, Apple → VideoToolbox) and never sends a codec this PC cannot decode.",
+                    ));
+                    ui.add_space(4.0);
+                    ui.checkbox(
+                        &mut self.game_evrt2,
+                        tr(
+                            self.ui_lang,
+                            "🧪 Плюс экспериментальный EVRT2 поверх",
+                            "🧪 Plus experimental EVRT2 on top",
+                        ),
+                    );
+                    if self.game_evrt2 {
+                        ui.small(tr(
+                            self.ui_lang,
+                            "EVRT2 (Attention Map + доп. отказоустойчивость) запускается ВТОРЫМ потоком поверх игровой сессии и забирает картинку себе, как только выйдет на связь. Обычное видео и управление продолжают работать всё это время.",
+                            "EVRT2 (Attention Map + extra resilience) runs as a SECOND stream on top of the game session and takes over the picture once it comes online. The normal video and input keep working throughout.",
+                        ));
+                    }
+                }
+            }
+        });
+        ui.add_space(6.0);
+        ui.checkbox(
+            &mut self.evrt2_only_mode,
+            tr(
+                self.ui_lang,
+                "🧪 EVRT2-only тест (без живого видео, без управления)",
+                "🧪 EVRT2-only test (no live video, no control)",
+            ),
+        );
         if remote_id_response.changed() || password_response.changed() {
             self.last_error = None;
             if !self.connected && !self.busy {
@@ -3524,7 +4528,10 @@ impl EvertyDeskApp {
             } else {
                 tr(self.ui_lang, "🔍 Проверить связь", "🔍 Test connection")
             };
-            if ui.add_enabled(!ping_busy, egui::Button::new(ping_label)).clicked() {
+            if ui
+                .add_enabled(!ping_busy, egui::Button::new(ping_label))
+                .clicked()
+            {
                 self.start_ping();
             }
             if let Some(ref result) = self.ping_result {
@@ -3542,7 +4549,11 @@ impl EvertyDeskApp {
                                 .color(egui::Color32::from_rgb(0xF0, 0x6A, 0x6A))
                                 .size(12.0),
                         )
-                        .on_hover_text(tr(self.ui_lang, "Сервер недоступен", "Server unreachable"));
+                        .on_hover_text(tr(
+                            self.ui_lang,
+                            "Сервер недоступен",
+                            "Server unreachable",
+                        ));
                     }
                 }
             }
@@ -3589,11 +4600,14 @@ impl EvertyDeskApp {
                 }
 
                 // "Wait for peer" — shown when peer ID not found
-                let is_id_not_found = self.last_error.as_deref()
+                let is_id_not_found = self
+                    .last_error
+                    .as_deref()
                     .map(|e| e.contains("ID does not exist"))
                     .unwrap_or(false);
                 if is_id_not_found && !self.wait_for_peer {
-                    if ui.button(tr(self.ui_lang, "🕐 Ждать", "🕐 Wait for them"))
+                    if ui
+                        .button(tr(self.ui_lang, "🕐 Ждать", "🕐 Wait for them"))
                         .on_hover_text(tr(
                             self.ui_lang,
                             "Повторять каждые 15с до 5 минут, пока удалённый не откроет программу",
@@ -3603,7 +4617,8 @@ impl EvertyDeskApp {
                     {
                         self.wait_for_peer = true;
                         self.wait_peer_attempt = 0;
-                        self.reconnect_after = Some(Instant::now() + std::time::Duration::from_secs(15));
+                        self.reconnect_after =
+                            Some(Instant::now() + std::time::Duration::from_secs(15));
                     }
                 }
 
@@ -3628,7 +4643,11 @@ impl EvertyDeskApp {
                     ui.label(countdown_text);
                     if ui
                         .small_button(tr(self.ui_lang, "Сейчас", "Now"))
-                        .on_hover_text(tr(self.ui_lang, "Переподключить сейчас, не ждать", "Reconnect now, don't wait"))
+                        .on_hover_text(tr(
+                            self.ui_lang,
+                            "Переподключить сейчас, не ждать",
+                            "Reconnect now, don't wait",
+                        ))
                         .clicked()
                     {
                         self.reconnect_after = Some(Instant::now());
@@ -4214,9 +5233,9 @@ impl EvertyDeskApp {
                                         crate::theme::tint(t.danger, 0.45),
                                     ))
                                     .min_size(egui::vec2(ui.available_width(), 44.0))
-                                    .corner_radius(egui::CornerRadius::same(
-                                        crate::theme::radius::MD,
-                                    )),
+                                    .corner_radius(
+                                        egui::CornerRadius::same(crate::theme::radius::MD),
+                                    ),
                                 )
                                 .clicked()
                             {
@@ -4234,6 +5253,10 @@ impl EvertyDeskApp {
                             )
                             .clicked()
                             {
+                                // Обычная вкладка — всегда EVRTCK (совместимость
+                                // с любым устройством). Выставляем явно: вкладка
+                                // GAME могла оставить `connect_mode` в Game.
+                                self.connect_mode = ConnectMode::Normal;
                                 self.connect();
                             }
                         }
@@ -4349,46 +5372,128 @@ impl EvertyDeskApp {
         let t = crate::theme::palette();
         ui.add_space(8.0);
         ui.label(
-            egui::RichText::new(self.text("GAME — стриминг с низкой задержкой", "GAME — low-latency streaming"))
-                .size(16.0)
-                .strong()
-                .color(t.accent),
+            egui::RichText::new(self.text(
+                "GAME — стриминг с низкой задержкой",
+                "GAME — low-latency streaming",
+            ))
+            .size(16.0)
+            .strong()
+            .color(t.accent),
         );
         ui.label(
             egui::RichText::new(self.text(
-                "H265 / EVRT UDP · 60fps · 50 Мбит/с",
-                "H265 / EVRT UDP · 60fps · 50 Mbit/s",
+                "Аппаратный кодек · EVRT UDP · 60fps · без EVRTCK",
+                "Hardware codec · EVRT UDP · 60fps · no EVRTCK",
             ))
             .size(11.5)
             .color(t.text_muted),
         );
         ui.add_space(14.0);
+
+        // Инфо-баннер: обе стороны должны быть EvertyDesk Lite для полного набора
+        // возможностей (видео/звук/ввод) — EVRT/EVRTCK работают только между
+        // нашими клиентом и хостом.
+        egui::Frame::NONE
+            .fill(crate::theme::accent_tint(&t, 0.10))
+            .stroke(egui::Stroke::new(1.0, crate::theme::accent_tint(&t, 0.35)))
+            .corner_radius(egui::CornerRadius::same(10))
+            .inner_margin(egui::Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(egui_phosphor::regular::INFO).size(16.0).color(t.accent));
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(self.text(
+                            "Для полной работы изображения, звука и управления обе стороны — и клиент, и хост — должны быть EvertyDesk Lite.",
+                            "For full video, audio and input support, both sides — client and host — must run EvertyDesk Lite.",
+                        ))
+                        .size(12.0)
+                        .color(t.text_weak),
+                    );
+                });
+            });
+
+        ui.add_space(14.0);
         ui.separator();
         ui.add_space(10.0);
 
-        let lbl_id       = self.text("ID удалённого ПК", "Remote PC ID");
-        let hint_id      = self.text("Введите ID", "Enter ID");
-        let lbl_pw       = self.text("Пароль", "Password");
-        let hint_pw      = self.text("Оставьте пустым если не нужен", "Leave empty if not required");
-        let lbl_connect  = self.text("▶  Подключиться в GAME режиме", "▶  Connect in GAME mode");
-        let lbl_retry    = self.text("🔄 Повторить", "🔄 Retry");
-        let lbl_conn_ok  = self.text("Подключено", "Connected");
-        let lbl_disc     = self.text("Отключиться", "Disconnect");
-        let can_connect  = !self.busy && !self.connected;
-        let has_id       = !self.game_remote_id.is_empty();
+        let lbl_id = self.text("ID удалённого ПК", "Remote PC ID");
+        let hint_id = self.text("Введите ID", "Enter ID");
+        let lbl_pw = self.text("Пароль", "Password");
+        let hint_pw = self.text(
+            "Оставьте пустым если не нужен",
+            "Leave empty if not required",
+        );
+        let lbl_connect = self.text("▶  Подключиться в GAME режиме", "▶  Connect in GAME mode");
+        let lbl_retry = self.text("🔄 Повторить", "🔄 Retry");
+        let lbl_conn_ok = self.text("Подключено", "Connected");
+        let lbl_disc = self.text("Отключиться", "Disconnect");
+        let can_connect = !self.busy && !self.connected;
+        let has_id = !self.game_remote_id.is_empty();
 
         ui.label(egui::RichText::new(lbl_id).size(13.0).color(t.text_weak));
-        let id_resp = compact_text_input(ui, &mut self.game_remote_id, hint_id, false, can_connect, Some(16.0));
+        let id_resp = compact_text_input(
+            ui,
+            &mut self.game_remote_id,
+            hint_id,
+            false,
+            can_connect,
+            Some(16.0),
+        );
         ui.add_space(8.0);
         ui.label(egui::RichText::new(lbl_pw).size(13.0).color(t.text_weak));
-        compact_text_input(ui, &mut self.game_password, hint_pw, true, can_connect, Some(16.0));
+        compact_text_input(
+            ui,
+            &mut self.game_password,
+            hint_pw,
+            true,
+            can_connect,
+            Some(16.0),
+        );
+
+        ui.add_space(12.0);
+        ui.label(
+            egui::RichText::new(self.text("Кодек", "Codec"))
+                .size(13.0)
+                .color(t.text_weak),
+        );
+        let game_codec = self.game_codec;
+        ui.add_enabled_ui(can_connect, |ui| {
+            egui::ComboBox::from_id_salt("game_tab_codec_picker")
+                .selected_text(game_codec.label())
+                .show_ui(ui, |ui| {
+                    for codec in [
+                        GameCodec::Auto,
+                        GameCodec::H265,
+                        GameCodec::H264,
+                        GameCodec::Av1,
+                    ] {
+                        ui.selectable_value(&mut self.game_codec, codec, codec.label());
+                    }
+                });
+        });
+        ui.label(
+            egui::RichText::new(self.game_codec.status_text())
+                .size(11.5)
+                .color(t.text_muted),
+        );
+        ui.add_space(6.0);
+        let lbl_evrt2 = self.text(
+            "🧪 Плюс экспериментальный EVRT2 поверх",
+            "🧪 Plus experimental EVRT2 on top",
+        );
+        ui.add_enabled_ui(can_connect, |ui| {
+            ui.checkbox(&mut self.game_evrt2, lbl_evrt2);
+        });
         ui.add_space(16.0);
 
         let connect_clicked = ui
             .add_enabled(
                 can_connect && has_id,
                 egui::Button::new(
-                    egui::RichText::new(lbl_connect).size(14.0).color(t.accent_fg),
+                    egui::RichText::new(lbl_connect)
+                        .size(14.0)
+                        .color(t.accent_fg),
                 )
                 .min_size(egui::vec2(f32::INFINITY, 44.0))
                 .fill(t.accent)
@@ -4396,7 +5501,9 @@ impl EvertyDeskApp {
                 .corner_radius(egui::CornerRadius::same(12)),
             )
             .clicked();
-        if connect_clicked || (id_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+        if connect_clicked
+            || (id_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+        {
             self.connect_game();
         }
 
@@ -4431,6 +5538,13 @@ impl EvertyDeskApp {
     fn connect_game(&mut self) {
         self.remote_id = self.game_remote_id.clone();
         self.password = self.game_password.clone();
+        // ЭТО и делает вкладку игровой. Раньше здесь менялся только
+        // `streaming_mode` — а он влияет исключительно на пропуск статичных
+        // кадров НА ХОСТЕ и к выбору кодека отношения не имеет. Кодек же
+        // оставался дефолтным (EVRTCK), и хост честно отдавал EVRTCK, хотя
+        // панель обещала «H265 / EVRT UDP · 60fps». `connect()` выставит по
+        // этому полю конкретный аппаратный кодек, 60fps и ultra-low-latency.
+        self.connect_mode = ConnectMode::Game;
         let saved_mode = self.config.display.streaming_mode;
         self.config.display.streaming_mode = crate::settings::StreamingMode::Game;
         self.connect();
@@ -4531,60 +5645,83 @@ impl EvertyDeskApp {
                 }
             });
         });
-        if let Some(video_status) = &self.host_video_status {
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(format!("Видео: {video_status}"))
-                    .monospace()
-                    .size(10.5)
-                    .color(egui::Color32::from_rgb(120, 130, 145)),
-            );
+        if self.config.ui.show_tech_info {
+            if let Some(video_status) = &self.host_video_status {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!("Видео: {video_status}"))
+                        .monospace()
+                        .size(10.5)
+                        .color(egui::Color32::from_rgb(120, 130, 145)),
+                );
+            }
         }
 
-        // Pending incoming connection
-        if let Some(peer_id) = self.host_pending_peer.clone() {
-            let t = crate::theme::palette();
-            ui.add_space(theme::space::SM);
-            egui::Frame::group(ui.style())
-                .fill(crate::theme::accent_tint(&t, 0.12))
-                .stroke(egui::Stroke::new(1.0, crate::theme::tint(t.accent, 0.45)))
-                .corner_radius(egui::CornerRadius::same(theme::radius::LG))
-                .inner_margin(egui::Margin::same(theme::space::MD as i8))
-                .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(format!("📡 Входящий запрос от: {peer_id}"))
-                            .strong()
-                            .color(t.text),
-                    );
-                    ui.add_space(theme::space::SM);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("✓ Принять").color(t.accent_fg),
-                                )
-                                .min_size(egui::vec2(100.0, 28.0))
-                                .fill(t.accent),
-                            )
-                            .clicked()
-                        {
-                            // TODO: full relay session acceptance
-                            self.host_pending_peer = None;
-                        }
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("✗ Отклонить").color(t.danger),
-                                )
-                                .min_size(egui::vec2(100.0, 28.0))
-                                .fill(crate::theme::tint(t.danger, 0.14)),
-                            )
-                            .clicked()
-                        {
-                            self.host_pending_peer = None;
-                        }
+        // ── OS-service hint (Phase 3/4, TZ_HOST_SERVICE.md) ───────────────────
+        // Same idea as RustDesk's "enable unattended access" banner: hosting
+        // inside the GUI process today stops the instant this window closes;
+        // installing the service keeps it running independently.
+        self.refresh_service_hint();
+        match self.service_hint_state {
+            ServiceHintState::Running => {}
+            ServiceHintState::Installing => {
+                ui.add_space(theme::space::SM);
+                ui.label(
+                    egui::RichText::new("⏳ Установка/запуск службы...")
+                        .size(12.0)
+                        .color(crate::theme::palette().text_weak),
+                );
+            }
+            ServiceHintState::NotInstalled | ServiceHintState::InstalledNotRunning => {
+                let t = crate::theme::palette();
+                ui.add_space(theme::space::SM);
+                egui::Frame::group(ui.style())
+                    .fill(crate::theme::accent_tint(&t, 0.10))
+                    .stroke(egui::Stroke::new(1.0, crate::theme::tint(t.accent, 0.35)))
+                    .corner_radius(egui::CornerRadius::same(theme::radius::LG))
+                    .inner_margin(egui::Margin::same(theme::space::MD as i8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Хост работает в графическом процессе — закрытие окна остановит доступ.",
+                                    )
+                                    .size(12.5)
+                                    .color(t.text),
+                                );
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Установите службу, чтобы доступ работал и без открытого окна (как в RustDesk).",
+                                    )
+                                    .size(11.5)
+                                    .color(t.text_weak),
+                                );
+                            });
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if self.service_hint_state == ServiceHintState::NotInstalled {
+                                    if ui
+                                        .add(
+                                            egui::Button::new("⬆ Установить службу")
+                                                .min_size(egui::vec2(170.0, 30.0)),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.request_install_service();
+                                    }
+                                } else if ui
+                                    .add(
+                                        egui::Button::new("▶ Запустить службу")
+                                            .min_size(egui::vec2(170.0, 30.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    self.request_start_service();
+                                }
+                            });
+                        });
                     });
-                });
+            }
         }
 
         // Host log
@@ -5263,7 +6400,11 @@ impl EvertyDeskApp {
                 ui.horizontal(|ui| {
                     // Back / exit fullscreen button
                     if fullscreen {
-                        if ui.small_button("< Назад").on_hover_text("Выйти из полного экрана").clicked() {
+                        if ui
+                            .small_button("< Назад")
+                            .on_hover_text("Выйти из полного экрана")
+                            .clicked()
+                        {
                             self.vm_console_fullscreen = false;
                         }
                         ui.separator();
@@ -5284,7 +6425,11 @@ impl EvertyDeskApp {
                                 hyperv::VmProvider::VirtualBox => "VirtualBox",
                                 hyperv::VmProvider::VMware => "VMware",
                             };
-                            ui.label(egui::RichText::new(provider_lbl).size(10.5).color(palette.text_muted));
+                            ui.label(
+                                egui::RichText::new(provider_lbl)
+                                    .size(10.5)
+                                    .color(palette.text_muted),
+                            );
 
                             ui.separator();
 
@@ -5297,28 +6442,63 @@ impl EvertyDeskApp {
                             match vm_state {
                                 hyperv::VmState::Off | hyperv::VmState::Saved => {
                                     if matches!(vm_provider, hyperv::VmProvider::HyperV) {
-                                        if ui.small_button("Старт").on_hover_text("Запустить VM").clicked() {
-                                            hyperv::request_power_action(&wmi_path, hyperv::VmPowerAction::Start);
+                                        if ui
+                                            .small_button("Старт")
+                                            .on_hover_text("Запустить VM")
+                                            .clicked()
+                                        {
+                                            hyperv::request_power_action(
+                                                &wmi_path,
+                                                hyperv::VmPowerAction::Start,
+                                            );
                                         }
-                                    } else if matches!(vm_provider, hyperv::VmProvider::VirtualBox) {
-                                        if ui.small_button("Старт").on_hover_text("Запустить VM (headless)").clicked() {
+                                    } else if matches!(vm_provider, hyperv::VmProvider::VirtualBox)
+                                    {
+                                        if ui
+                                            .small_button("Старт")
+                                            .on_hover_text("Запустить VM (headless)")
+                                            .clicked()
+                                        {
                                             virtualbox::start_vm(&vm_id);
                                         }
                                     }
                                 }
                                 hyperv::VmState::Running | hyperv::VmState::Paused => {
                                     if matches!(vm_provider, hyperv::VmProvider::HyperV) {
-                                        if ui.small_button("Стоп").on_hover_text("Выключить VM").clicked() {
-                                            hyperv::request_power_action(&wmi_path, hyperv::VmPowerAction::Stop);
+                                        if ui
+                                            .small_button("Стоп")
+                                            .on_hover_text("Выключить VM")
+                                            .clicked()
+                                        {
+                                            hyperv::request_power_action(
+                                                &wmi_path,
+                                                hyperv::VmPowerAction::Stop,
+                                            );
                                         }
-                                        if ui.small_button("Ребут").on_hover_text("Перезапустить VM").clicked() {
-                                            hyperv::request_power_action(&wmi_path, hyperv::VmPowerAction::Restart);
+                                        if ui
+                                            .small_button("Ребут")
+                                            .on_hover_text("Перезапустить VM")
+                                            .clicked()
+                                        {
+                                            hyperv::request_power_action(
+                                                &wmi_path,
+                                                hyperv::VmPowerAction::Restart,
+                                            );
                                         }
-                                    } else if matches!(vm_provider, hyperv::VmProvider::VirtualBox) {
-                                        if ui.small_button("Стоп").on_hover_text("Выключить VM (poweroff)").clicked() {
+                                    } else if matches!(vm_provider, hyperv::VmProvider::VirtualBox)
+                                    {
+                                        if ui
+                                            .small_button("Стоп")
+                                            .on_hover_text("Выключить VM (poweroff)")
+                                            .clicked()
+                                        {
                                             virtualbox::stop_vm(&vm_id);
                                         }
-                                        if ui.small_button("Ребут").on_hover_text("Перезапустить VM (reset)").clicked() {
+                                        if ui
+                                            .small_button("Ребут")
+                                            .on_hover_text("Перезапустить VM (reset)")
+                                            .clicked()
+                                        {
                                             virtualbox::reset_vm(&vm_id);
                                         }
                                     }
@@ -5355,24 +6535,40 @@ impl EvertyDeskApp {
                             session.send(hyperv::HyperVCmd::ReleaseKey(0x5A));
                             session.send(hyperv::HyperVCmd::ReleaseKey(0x11));
                         }
-                        if ui.small_button("Alt+Tab").on_hover_text("Alt+Tab в гостевой ОС").clicked() {
+                        if ui
+                            .small_button("Alt+Tab")
+                            .on_hover_text("Alt+Tab в гостевой ОС")
+                            .clicked()
+                        {
                             session.send(hyperv::HyperVCmd::PressKey(0x12));
                             session.send(hyperv::HyperVCmd::PressKey(0x09));
                             session.send(hyperv::HyperVCmd::ReleaseKey(0x09));
                             session.send(hyperv::HyperVCmd::ReleaseKey(0x12));
                         }
-                        if ui.small_button("Caps").on_hover_text("Переключить Caps Lock").clicked() {
+                        if ui
+                            .small_button("Caps")
+                            .on_hover_text("Переключить Caps Lock")
+                            .clicked()
+                        {
                             session.send(hyperv::HyperVCmd::PressKey(0x14));
                             session.send(hyperv::HyperVCmd::ReleaseKey(0x14));
                         }
                         if ui.small_button("Ctrl+Alt+Del").clicked() {
                             session.send(hyperv::HyperVCmd::CtrlAltDel);
                         }
-                        if ui.small_button("Win").on_hover_text("Клавиша Windows").clicked() {
+                        if ui
+                            .small_button("Win")
+                            .on_hover_text("Клавиша Windows")
+                            .clicked()
+                        {
                             session.send(hyperv::HyperVCmd::PressKey(0x5B));
                             session.send(hyperv::HyperVCmd::ReleaseKey(0x5B));
                         }
-                        if ui.small_button("Alt+F4").on_hover_text("Закрыть активное окно в VM").clicked() {
+                        if ui
+                            .small_button("Alt+F4")
+                            .on_hover_text("Закрыть активное окно в VM")
+                            .clicked()
+                        {
                             session.send(hyperv::HyperVCmd::PressKey(0x12));
                             session.send(hyperv::HyperVCmd::PressKey(0x73));
                             session.send(hyperv::HyperVCmd::ReleaseKey(0x73));
@@ -5383,18 +6579,28 @@ impl EvertyDeskApp {
 
                     // VirtualBox toolbar buttons
                     if let Some(vsession) = &self.vbox_session {
-                        if ui.small_button("Ctrl+V").on_hover_text("Вставить текст из буфера обмена").clicked() {
+                        if ui
+                            .small_button("Ctrl+V")
+                            .on_hover_text("Вставить текст из буфера обмена")
+                            .clicked()
+                        {
                             let text = clipboard_read_text();
                             if !text.is_empty() {
                                 vsession.send(virtualbox::VboxCmd::PutString(text));
                             }
                         }
-                        if ui.small_button("Ctrl+Alt+Del").on_hover_text("Ctrl+Alt+Del в VM").clicked() {
+                        if ui
+                            .small_button("Ctrl+Alt+Del")
+                            .on_hover_text("Ctrl+Alt+Del в VM")
+                            .clicked()
+                        {
                             // PS/2: Ctrl=0x1D, Alt=0x38, Del=0xE0 0x53
                             vsession.send(virtualbox::VboxCmd::PutScancodes(vec![0x1D], vec![]));
                             vsession.send(virtualbox::VboxCmd::PutScancodes(vec![0x38], vec![]));
-                            vsession.send(virtualbox::VboxCmd::PutScancodes(vec![0xE0, 0x53], vec![]));
-                            vsession.send(virtualbox::VboxCmd::PutScancodes(vec![], vec![0xE0, 0xD3]));
+                            vsession
+                                .send(virtualbox::VboxCmd::PutScancodes(vec![0xE0, 0x53], vec![]));
+                            vsession
+                                .send(virtualbox::VboxCmd::PutScancodes(vec![], vec![0xE0, 0xD3]));
                             vsession.send(virtualbox::VboxCmd::PutScancodes(vec![], vec![0xB8]));
                             vsession.send(virtualbox::VboxCmd::PutScancodes(vec![], vec![0x9D]));
                         }
@@ -5404,19 +6610,29 @@ impl EvertyDeskApp {
                                 let vm_id = vm.id.clone();
                                 let is_running = matches!(vm.state, hyperv::VmState::Running);
                                 if let Some(&port) = self.vbox_vrde_ports.get(&vm_id) {
-                                    if ui.small_button(format!("IR:{port}"))
-                                        .on_hover_text(format!("Подключиться встроенным IronRDP на порту {port}"))
+                                    if ui
+                                        .small_button(format!("IR:{port}"))
+                                        .on_hover_text(format!(
+                                            "Подключиться встроенным IronRDP на порту {port}"
+                                        ))
                                         .clicked()
                                     {
                                         self.start_vbox_vrde_session(port);
                                     }
                                 } else {
-                                    if ui.small_button("IR+")
-                                        .on_hover_text("Включить VRDE и подключиться встроенным IronRDP")
+                                    if ui
+                                        .small_button("IR+")
+                                        .on_hover_text(
+                                            "Включить VRDE и подключиться встроенным IronRDP",
+                                        )
                                         .clicked()
                                     {
                                         let port = Self::vbox_vrde_port(&vm_id);
-                                        self.begin_vbox_vrde_connect(vm_id.clone(), port, is_running);
+                                        self.begin_vbox_vrde_connect(
+                                            vm_id.clone(),
+                                            port,
+                                            is_running,
+                                        );
                                     }
                                 }
                             }
@@ -5427,7 +6643,13 @@ impl EvertyDeskApp {
                     // Fullscreen toggle (right side)
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         #[cfg(windows)]
-                        if vm_icon_button(ui, egui_phosphor::regular::GEAR, "Настройки подключения (VRDE)").clicked() {
+                        if vm_icon_button(
+                            ui,
+                            egui_phosphor::regular::GEAR,
+                            "Настройки подключения (VRDE)",
+                        )
+                        .clicked()
+                        {
                             self.vbox_vrde_settings_open = !self.vbox_vrde_settings_open;
                         }
                         let fs_label = if fullscreen {
@@ -5435,7 +6657,11 @@ impl EvertyDeskApp {
                         } else {
                             egui_phosphor::regular::CORNERS_OUT
                         };
-                        let fs_tip = if fullscreen { "Выйти из полного экрана" } else { "Развернуть консоль" };
+                        let fs_tip = if fullscreen {
+                            "Выйти из полного экрана"
+                        } else {
+                            "Развернуть консоль"
+                        };
                         if vm_icon_button(ui, fs_label, fs_tip).clicked() {
                             self.vm_console_fullscreen = !self.vm_console_fullscreen;
                         }
@@ -5519,7 +6745,9 @@ impl EvertyDeskApp {
         if let Some(warning) = self.vbox_mouse_warning.clone() {
             ui.add_space(2.0);
             egui::Frame::NONE
-                .fill(egui::Color32::from_rgba_unmultiplied(0x60, 0x40, 0x00, 0x40))
+                .fill(egui::Color32::from_rgba_unmultiplied(
+                    0x60, 0x40, 0x00, 0x40,
+                ))
                 .corner_radius(egui::CornerRadius::same(4))
                 .inner_margin(egui::Margin::symmetric(8, 4))
                 .show(ui, |ui| {
@@ -5600,9 +6828,7 @@ impl EvertyDeskApp {
                 let mut outside = false;
                 for ev in &i.raw.events {
                     if let egui::Event::PointerButton {
-                        pos,
-                        pressed: true,
-                        ..
+                        pos, pressed: true, ..
                     } = ev
                     {
                         if rect.contains(*pos) {
@@ -5647,10 +6873,9 @@ impl EvertyDeskApp {
                     let mut mouse_cmds = Vec::new();
                     let mut last_pointer_pos = self.vm_console_last_pointer_pos;
                     let mut pending_pointer_move: Option<(u32, u32)> = None;
-                    let (guest_w_px, guest_h_px) = self.hyperv_guest_size.unwrap_or((
-                        tex_size[0].max(1) as u32,
-                        tex_size[1].max(1) as u32,
-                    ));
+                    let (guest_w_px, guest_h_px) = self
+                        .hyperv_guest_size
+                        .unwrap_or((tex_size[0].max(1) as u32, tex_size[1].max(1) as u32));
 
                     let to_hyperv_abs = |pos: egui::Pos2| -> Option<(u32, u32)> {
                         if !rect.contains(pos) || rect.width() <= 0.0 || rect.height() <= 0.0 {
@@ -5667,17 +6892,18 @@ impl EvertyDeskApp {
                         Some((nx, ny))
                     };
 
-                    let flush_move = |cmds: &mut Vec<hyperv::HyperVCmd>,
-                                      last_pointer_pos: &mut Option<(u16, u16)>,
-                                      pending: &mut Option<(u32, u32)>| {
-                        if let Some((nx, ny)) = pending.take() {
-                            let pos_key = (nx as u16, ny as u16);
-                            if *last_pointer_pos != Some(pos_key) {
-                                cmds.push(hyperv::HyperVCmd::MoveMouse(nx, ny));
-                                *last_pointer_pos = Some(pos_key);
+                    let flush_move =
+                        |cmds: &mut Vec<hyperv::HyperVCmd>,
+                         last_pointer_pos: &mut Option<(u16, u16)>,
+                         pending: &mut Option<(u32, u32)>| {
+                            if let Some((nx, ny)) = pending.take() {
+                                let pos_key = (nx as u16, ny as u16);
+                                if *last_pointer_pos != Some(pos_key) {
+                                    cmds.push(hyperv::HyperVCmd::MoveMouse(nx, ny));
+                                    *last_pointer_pos = Some(pos_key);
+                                }
                             }
-                        }
-                    };
+                        };
 
                     ui.input(|i| {
                         for ev in &i.raw.events {
@@ -5753,32 +6979,67 @@ impl EvertyDeskApp {
                                     for c in t.chars() {
                                         match crate::vm_bridge::char_to_vk_shift(c) {
                                             Some((vk, shift)) => {
-                                                if shift { session.send(hyperv::HyperVCmd::PressKey(VK_SHIFT)); }
+                                                if shift {
+                                                    session.send(hyperv::HyperVCmd::PressKey(
+                                                        VK_SHIFT,
+                                                    ));
+                                                }
                                                 session.send(hyperv::HyperVCmd::PressKey(vk));
                                                 session.send(hyperv::HyperVCmd::ReleaseKey(vk));
-                                                if shift { session.send(hyperv::HyperVCmd::ReleaseKey(VK_SHIFT)); }
+                                                if shift {
+                                                    session.send(hyperv::HyperVCmd::ReleaseKey(
+                                                        VK_SHIFT,
+                                                    ));
+                                                }
                                             }
                                             None => {
-                                                session.send(hyperv::HyperVCmd::TypeText(c.to_string()));
+                                                session.send(hyperv::HyperVCmd::TypeText(
+                                                    c.to_string(),
+                                                ));
                                             }
                                         }
                                     }
                                 }
-                                egui::Event::Key { key, pressed, modifiers, .. } => {
-                                    let has_combo = modifiers.ctrl || modifiers.alt || modifiers.command;
-                                    let vk_opt = egui_key_to_vkcode(*key)
-                                        .or_else(|| if has_combo { egui_letter_to_vkcode(*key) } else { None });
-                                    let Some(vk) = vk_opt else { continue; };
+                                egui::Event::Key {
+                                    key,
+                                    pressed,
+                                    modifiers,
+                                    ..
+                                } => {
+                                    let has_combo =
+                                        modifiers.ctrl || modifiers.alt || modifiers.command;
+                                    let vk_opt = egui_key_to_vkcode(*key).or_else(|| {
+                                        if has_combo {
+                                            egui_letter_to_vkcode(*key)
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                    let Some(vk) = vk_opt else {
+                                        continue;
+                                    };
                                     let mut mods: Vec<u32> = Vec::new();
-                                    if modifiers.ctrl    { mods.push(0x11); }
-                                    if modifiers.alt     { mods.push(0x12); }
-                                    if modifiers.shift   { mods.push(VK_SHIFT); }
-                                    if modifiers.command { mods.push(0x5B); }
+                                    if modifiers.ctrl {
+                                        mods.push(0x11);
+                                    }
+                                    if modifiers.alt {
+                                        mods.push(0x12);
+                                    }
+                                    if modifiers.shift {
+                                        mods.push(VK_SHIFT);
+                                    }
+                                    if modifiers.command {
+                                        mods.push(0x5B);
+                                    }
                                     if *pressed {
-                                        for m in &mods { session.send(hyperv::HyperVCmd::PressKey(*m)); }
+                                        for m in &mods {
+                                            session.send(hyperv::HyperVCmd::PressKey(*m));
+                                        }
                                         session.send(hyperv::HyperVCmd::PressKey(vk));
                                         session.send(hyperv::HyperVCmd::ReleaseKey(vk));
-                                        for m in mods.iter().rev() { session.send(hyperv::HyperVCmd::ReleaseKey(*m)); }
+                                        for m in mods.iter().rev() {
+                                            session.send(hyperv::HyperVCmd::ReleaseKey(*m));
+                                        }
                                     }
                                 }
                                 _ => {}
@@ -5793,8 +7054,10 @@ impl EvertyDeskApp {
                 if vm_console_focused {
                     if let Some(pos) = resp.hover_pos() {
                         if rect.contains(pos) {
-                            let nx = ((pos.x - rect.left()) / rect.width() * 65535.0).clamp(0.0, 65535.0) as u32;
-                            let ny = ((pos.y - rect.top()) / rect.height() * 65535.0).clamp(0.0, 65535.0) as u32;
+                            let nx = ((pos.x - rect.left()) / rect.width() * 65535.0)
+                                .clamp(0.0, 65535.0) as u32;
+                            let ny = ((pos.y - rect.top()) / rect.height() * 65535.0)
+                                .clamp(0.0, 65535.0) as u32;
                             vsession.send(virtualbox::VboxCmd::MoveMouseAbs(nx, ny));
                         }
                     }
@@ -5814,10 +7077,15 @@ impl EvertyDeskApp {
                                 egui::Event::Text(t) if !t.is_empty() => {
                                     vsession.send(virtualbox::VboxCmd::PutString(t.clone()));
                                 }
-                                egui::Event::Key { key, pressed: true, .. } => {
+                                egui::Event::Key {
+                                    key, pressed: true, ..
+                                } => {
                                     if let Some(kid) = egui_key_to_vbox_key_id(*key) {
-                                        if let Some((make, brk)) = virtualbox::special_key_to_scancodes(kid) {
-                                            vsession.send(virtualbox::VboxCmd::PutScancodes(make, brk));
+                                        if let Some((make, brk)) =
+                                            virtualbox::special_key_to_scancodes(kid)
+                                        {
+                                            vsession
+                                                .send(virtualbox::VboxCmd::PutScancodes(make, brk));
                                         }
                                     }
                                 }
@@ -5865,7 +7133,10 @@ impl EvertyDeskApp {
                                     if let Some((gx, gy)) = pending_pointer_move.take() {
                                         let pos = (gx, gy);
                                         if last_pointer_pos != Some(pos) {
-                                            vrde_cmds.push(vbox_rdp::VrdeCmd::MouseMove { x: gx, y: gy });
+                                            vrde_cmds.push(vbox_rdp::VrdeCmd::MouseMove {
+                                                x: gx,
+                                                y: gy,
+                                            });
                                             last_pointer_pos = Some(pos);
                                         }
                                     }
@@ -5875,12 +7146,16 @@ impl EvertyDeskApp {
                                         tex_size[0] as f32,
                                         tex_size[1] as f32,
                                     ) {
-                                        let Some(button) = egui_pointer_to_vrde_button(*button) else {
+                                        let Some(button) = egui_pointer_to_vrde_button(*button)
+                                        else {
                                             continue;
                                         };
                                         let pos = (gx, gy);
                                         if last_pointer_pos != Some(pos) {
-                                            vrde_cmds.push(vbox_rdp::VrdeCmd::MouseMove { x: gx, y: gy });
+                                            vrde_cmds.push(vbox_rdp::VrdeCmd::MouseMove {
+                                                x: gx,
+                                                y: gy,
+                                            });
                                             last_pointer_pos = Some(pos);
                                         }
                                         vrde_cmds.push(vbox_rdp::VrdeCmd::MouseButton {
@@ -5893,7 +7168,10 @@ impl EvertyDeskApp {
                                     if let Some((gx, gy)) = pending_pointer_move.take() {
                                         let pos = (gx, gy);
                                         if last_pointer_pos != Some(pos) {
-                                            vrde_cmds.push(vbox_rdp::VrdeCmd::MouseMove { x: gx, y: gy });
+                                            vrde_cmds.push(vbox_rdp::VrdeCmd::MouseMove {
+                                                x: gx,
+                                                y: gy,
+                                            });
                                             last_pointer_pos = Some(pos);
                                         }
                                     }
@@ -5904,14 +7182,28 @@ impl EvertyDeskApp {
                                         // nothing). Route ASCII through the scancode path that
                                         // is known to work; only non-ASCII (Cyrillic etc., no
                                         // US-layout scancode) falls back to Unicode.
-                                        if let Some((scancode, shift, extended)) = vbox_rdp::char_to_rdp_scancode(ch) {
+                                        if let Some((scancode, shift, extended)) =
+                                            vbox_rdp::char_to_rdp_scancode(ch)
+                                        {
                                             if shift {
-                                                vrde_cmds.push(vbox_rdp::VrdeCmd::KeyDown { scancode: 0x2A, extended: false });
+                                                vrde_cmds.push(vbox_rdp::VrdeCmd::KeyDown {
+                                                    scancode: 0x2A,
+                                                    extended: false,
+                                                });
                                             }
-                                            vrde_cmds.push(vbox_rdp::VrdeCmd::KeyDown { scancode, extended });
-                                            vrde_cmds.push(vbox_rdp::VrdeCmd::KeyUp { scancode, extended });
+                                            vrde_cmds.push(vbox_rdp::VrdeCmd::KeyDown {
+                                                scancode,
+                                                extended,
+                                            });
+                                            vrde_cmds.push(vbox_rdp::VrdeCmd::KeyUp {
+                                                scancode,
+                                                extended,
+                                            });
                                             if shift {
-                                                vrde_cmds.push(vbox_rdp::VrdeCmd::KeyUp { scancode: 0x2A, extended: false });
+                                                vrde_cmds.push(vbox_rdp::VrdeCmd::KeyUp {
+                                                    scancode: 0x2A,
+                                                    extended: false,
+                                                });
                                             }
                                         } else {
                                             vrde_cmds.push(vbox_rdp::VrdeCmd::Text(ch.to_string()));
@@ -5922,7 +7214,10 @@ impl EvertyDeskApp {
                                     if let Some((gx, gy)) = pending_pointer_move.take() {
                                         let pos = (gx, gy);
                                         if last_pointer_pos != Some(pos) {
-                                            vrde_cmds.push(vbox_rdp::VrdeCmd::MouseMove { x: gx, y: gy });
+                                            vrde_cmds.push(vbox_rdp::VrdeCmd::MouseMove {
+                                                x: gx,
+                                                y: gy,
+                                            });
                                             last_pointer_pos = Some(pos);
                                         }
                                     }
@@ -5942,26 +7237,40 @@ impl EvertyDeskApp {
                                         // single byte (see ironrdp_pdu::input::mouse::MousePdu::encode),
                                         // so the encodable range is -255..=255 regardless
                                         // of how large `notches` is.
-                                        let wheel_delta = (notches * 120.0).clamp(-255.0, 255.0) as i16;
+                                        let wheel_delta =
+                                            (notches * 120.0).clamp(-255.0, 255.0) as i16;
                                         if wheel_delta != 0 {
-                                            vrde_cmds.push(vbox_rdp::VrdeCmd::MouseWheel { delta: wheel_delta });
+                                            vrde_cmds.push(vbox_rdp::VrdeCmd::MouseWheel {
+                                                delta: wheel_delta,
+                                            });
                                         }
                                     }
                                 }
-                                egui::Event::Key { key, pressed, modifiers, .. } => {
+                                egui::Event::Key {
+                                    key,
+                                    pressed,
+                                    modifiers,
+                                    ..
+                                } => {
                                     if let Some((gx, gy)) = pending_pointer_move.take() {
                                         let pos = (gx, gy);
                                         if last_pointer_pos != Some(pos) {
-                                            vrde_cmds.push(vbox_rdp::VrdeCmd::MouseMove { x: gx, y: gy });
+                                            vrde_cmds.push(vbox_rdp::VrdeCmd::MouseMove {
+                                                x: gx,
+                                                y: gy,
+                                            });
                                             last_pointer_pos = Some(pos);
                                         }
                                     }
-                                    let combo = modifiers.ctrl || modifiers.alt || modifiers.command;
+                                    let combo =
+                                        modifiers.ctrl || modifiers.alt || modifiers.command;
                                     if has_text && !combo && egui_key_is_plain_text(*key) {
                                         continue;
                                     }
 
-                                    if let Some((scancode, extended)) = egui_key_to_rdp_scancode(*key) {
+                                    if let Some((scancode, extended)) =
+                                        egui_key_to_rdp_scancode(*key)
+                                    {
                                         let mut mods = Vec::new();
                                         if modifiers.ctrl {
                                             mods.push((0x1D, false));
@@ -5983,9 +7292,15 @@ impl EvertyDeskApp {
                                                     extended: *m_extended,
                                                 });
                                             }
-                                            vrde_cmds.push(vbox_rdp::VrdeCmd::KeyDown { scancode, extended });
+                                            vrde_cmds.push(vbox_rdp::VrdeCmd::KeyDown {
+                                                scancode,
+                                                extended,
+                                            });
                                         } else {
-                                            vrde_cmds.push(vbox_rdp::VrdeCmd::KeyUp { scancode, extended });
+                                            vrde_cmds.push(vbox_rdp::VrdeCmd::KeyUp {
+                                                scancode,
+                                                extended,
+                                            });
                                             for (m_scancode, m_extended) in mods.iter().rev() {
                                                 vrde_cmds.push(vbox_rdp::VrdeCmd::KeyUp {
                                                     scancode: *m_scancode,
@@ -6024,15 +7339,28 @@ impl EvertyDeskApp {
             // Bottom status bar
             ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                 egui::Frame::NONE
-                    .fill(egui::Color32::from_rgba_unmultiplied(0x0D, 0x12, 0x1C, 0xCC))
+                    .fill(egui::Color32::from_rgba_unmultiplied(
+                        0x0D, 0x12, 0x1C, 0xCC,
+                    ))
                     .inner_margin(egui::Margin::symmetric(8, 3))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
                             if self.hyperv_fps_display > 0.0 {
-                                ui.label(egui::RichText::new(format!("{:.1} fps", self.hyperv_fps_display)).size(10.5).color(
-                                    if self.hyperv_fps_display >= 1.5 { palette.success } else { palette.warning }
-                                ));
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{:.1} fps",
+                                        self.hyperv_fps_display
+                                    ))
+                                    .size(10.5)
+                                    .color(
+                                        if self.hyperv_fps_display >= 1.5 {
+                                            palette.success
+                                        } else {
+                                            palette.warning
+                                        },
+                                    ),
+                                );
                                 ui.separator();
                             }
                             if let Some(idx) = self.hyperv_console_vm {
@@ -6042,12 +7370,18 @@ impl EvertyDeskApp {
                                         hyperv::VmProvider::VirtualBox => "VirtualBox",
                                         hyperv::VmProvider::VMware => "VMware",
                                     };
-                                    ui.label(egui::RichText::new(p).size(10.5).color(palette.text_muted));
+                                    ui.label(
+                                        egui::RichText::new(p).size(10.5).color(palette.text_muted),
+                                    );
                                 }
                             }
                             if let Some(tex) = &self.hyperv_texture {
                                 let [w, h] = tex.size();
-                                ui.label(egui::RichText::new(format!("{}x{}", w, h)).size(10.5).color(palette.text_muted));
+                                ui.label(
+                                    egui::RichText::new(format!("{}x{}", w, h))
+                                        .size(10.5)
+                                        .color(palette.text_muted),
+                                );
                             }
                         });
                     });
@@ -6058,7 +7392,11 @@ impl EvertyDeskApp {
                 egui::Rect::from_min_size(ui.cursor().min, avail),
                 egui::Sense::hover(),
             );
-            ui.painter().rect_filled(r.rect, egui::CornerRadius::same(0), egui::Color32::from_rgb(0x0D, 0x12, 0x1C));
+            ui.painter().rect_filled(
+                r.rect,
+                egui::CornerRadius::same(0),
+                egui::Color32::from_rgb(0x0D, 0x12, 0x1C),
+            );
             ui.painter().text(
                 r.rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -6068,7 +7406,6 @@ impl EvertyDeskApp {
             );
         }
     }
-
 
     /// Universal Provider Dashboard — shows all registered providers and their VMs.
     /// Запустить фоновый rebuild дашборда. Вызовы провайдеров (WMI/VBoxManage)
@@ -6093,7 +7430,10 @@ impl EvertyDeskApp {
                     for vm in p.list_vms(&host.host_id).unwrap_or_default() {
                         total_vms += 1;
                         let badge = p.get_capabilities(&vm.vm_id).ok().map(|g| {
-                            (g.recommended_mode.label().to_owned(), g.recommended_mode.badge_rgb())
+                            (
+                                g.recommended_mode.label().to_owned(),
+                                g.recommended_mode.badge_rgb(),
+                            )
                         });
                         let ip = vm.primary_ip().map(|s| s.to_owned());
                         let name = vm.name.clone();
@@ -6157,10 +7497,7 @@ impl EvertyDeskApp {
 
     #[cfg(windows)]
     fn vbox_vrde_port(vm_id: &str) -> u16 {
-        3390 + (vm_id
-            .bytes()
-            .fold(0u16, |a, b| a.wrapping_add(b as u16))
-            % 10)
+        3390 + (vm_id.bytes().fold(0u16, |a, b| a.wrapping_add(b as u16)) % 10)
     }
 
     #[cfg(windows)]
@@ -6303,7 +7640,9 @@ impl EvertyDeskApp {
         if stale && self.dashboard_load_rx.is_none() && !self.hyperv_loading {
             self.start_dashboard_rebuild();
         }
-        let Some(snapshot) = &self.dashboard_snapshot else { return; };
+        let Some(snapshot) = &self.dashboard_snapshot else {
+            return;
+        };
 
         if snapshot.providers.is_empty() {
             ui.label(
@@ -6378,12 +7717,15 @@ impl EvertyDeskApp {
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             let (dot_color, state_label) = match vm.power_state {
-                                provider_api::PowerState::Running =>
-                                    (crate::theme::palette().success, "Running"),
-                                provider_api::PowerState::Stopped =>
-                                    (crate::theme::palette().text_weak, "Stopped"),
-                                provider_api::PowerState::Paused =>
-                                    (crate::theme::palette().warning, "Paused"),
+                                provider_api::PowerState::Running => {
+                                    (crate::theme::palette().success, "Running")
+                                }
+                                provider_api::PowerState::Stopped => {
+                                    (crate::theme::palette().text_weak, "Stopped")
+                                }
+                                provider_api::PowerState::Paused => {
+                                    (crate::theme::palette().warning, "Paused")
+                                }
                                 _ => (crate::theme::palette().text_weak, "Unknown"),
                             };
                             paint_status_dot(ui, dot_color);
@@ -6462,7 +7804,8 @@ impl EvertyDeskApp {
                     self.vbox_vrde_enable_rx = Some(rx);
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.hyperv_status = "VRDE: поток включения завершился без результата".to_owned();
+                    self.hyperv_status =
+                        "VRDE: поток включения завершился без результата".to_owned();
                     ctx.request_repaint();
                 }
             }
@@ -6525,7 +7868,8 @@ impl EvertyDeskApp {
                     self.hyperv_last_frame = std::time::Instant::now();
                     let fps_elapsed = self.hyperv_fps_window.elapsed();
                     if fps_elapsed >= Duration::from_secs(1) {
-                        self.hyperv_fps_display = self.hyperv_frame_count as f32 / fps_elapsed.as_secs_f32();
+                        self.hyperv_fps_display =
+                            self.hyperv_frame_count as f32 / fps_elapsed.as_secs_f32();
                         self.hyperv_frame_count = 0;
                         self.hyperv_fps_window = std::time::Instant::now();
                     }
@@ -6537,7 +7881,9 @@ impl EvertyDeskApp {
                 {
                     if let Some(vm_idx) = self.hyperv_console_vm {
                         if let Some(vm) = self.hyperv_vms.get(vm_idx).cloned() {
-                            if let Some(s) = self.hyperv_session.take() { s.stop(); }
+                            if let Some(s) = self.hyperv_session.take() {
+                                s.stop();
+                            }
                             self.hyperv_fps_display = 0.0;
                             self.hyperv_last_frame = std::time::Instant::now();
                             self.hyperv_status = "Авто-реконнект...".to_owned();
@@ -6558,11 +7904,8 @@ impl EvertyDeskApp {
                 let (wu, hu) = (w as usize, h as usize);
                 if rgba.len() == wu * hu * 4 {
                     let img = egui::ColorImage::from_rgba_unmultiplied([wu, hu], &rgba);
-                    self.hyperv_texture = Some(ctx.load_texture(
-                        "vbox_frame",
-                        img,
-                        egui::TextureOptions::LINEAR,
-                    ));
+                    self.hyperv_texture =
+                        Some(ctx.load_texture("vbox_frame", img, egui::TextureOptions::LINEAR));
                 }
                 ctx.request_repaint();
             }
@@ -6648,7 +7991,8 @@ impl EvertyDeskApp {
                 if dead {
                     if let Some(port) = self.vbox_vrde_active_port {
                         vbox_rdp::log_from_ui("VRDE: [main] reconnect trigger = session thread exited (channel disconnected, seen via frame channel)");
-                        self.hyperv_status = "VRDE: сессия завершилась, переподключаюсь...".to_owned();
+                        self.hyperv_status =
+                            "VRDE: сессия завершилась, переподключаюсь...".to_owned();
                         self.vbox_vrde_active_port = None;
                         self.start_vbox_vrde_session(port);
                         self.vbox_vrde_last_frame = std::time::Instant::now();
@@ -6704,7 +8048,8 @@ impl EvertyDeskApp {
                         self.hyperv_frame_count += 1;
                         let fps_elapsed = self.hyperv_fps_window.elapsed();
                         if fps_elapsed >= Duration::from_secs(1) {
-                            self.hyperv_fps_display = self.hyperv_frame_count as f32 / fps_elapsed.as_secs_f32();
+                            self.hyperv_fps_display =
+                                self.hyperv_frame_count as f32 / fps_elapsed.as_secs_f32();
                             self.hyperv_frame_count = 0;
                             self.hyperv_fps_window = std::time::Instant::now();
                         }
@@ -6725,7 +8070,8 @@ impl EvertyDeskApp {
                 // fires on an actual measured drop in real pixel data) and is
                 // the correct primary signal; this is a true last-resort for
                 // a socket that goes silently dead for a very long time.
-                let stuck_regardless = self.vbox_vrde_last_frame.elapsed() > Duration::from_secs(60);
+                let stuck_regardless =
+                    self.vbox_vrde_last_frame.elapsed() > Duration::from_secs(60);
 
                 if stuck_regardless {
                     if let Some(port) = self.vbox_vrde_active_port {
@@ -6835,7 +8181,10 @@ impl EvertyDeskApp {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let cutoff = now_unix.saturating_sub(90 * 24 * 3600);
-            self.config.ui.history.retain(|e| e.pinned || e.last_connected_unix >= cutoff);
+            self.config
+                .ui
+                .history
+                .retain(|e| e.pinned || e.last_connected_unix >= cutoff);
         }
 
         // Search bar.
@@ -6844,13 +8193,20 @@ impl EvertyDeskApp {
             compact_text_input(
                 ui,
                 &mut self.history_search,
-                tr(self.ui_lang, "Поиск по ID или заметке…", "Search by ID or note…"),
+                tr(
+                    self.ui_lang,
+                    "Поиск по ID или заметке…",
+                    "Search by ID or note…",
+                ),
                 false,
                 true,
                 Some(13.0),
             );
             if !self.history_search.is_empty()
-                && ui.small_button("✕").on_hover_text(tr(self.ui_lang, "Очистить", "Clear")).clicked()
+                && ui
+                    .small_button("✕")
+                    .on_hover_text(tr(self.ui_lang, "Очистить", "Clear"))
+                    .clicked()
             {
                 self.history_search.clear();
             }
@@ -6877,7 +8233,8 @@ impl EvertyDeskApp {
 
         // Pinned entries first, then by last_connected descending.
         self.config.ui.history.sort_by(|a, b| {
-            b.pinned.cmp(&a.pinned)
+            b.pinned
+                .cmp(&a.pinned)
                 .then(b.last_connected_unix.cmp(&a.last_connected_unix))
         });
 
@@ -6964,12 +8321,20 @@ impl EvertyDeskApp {
                             }
                             // Add to contacts — only if not already there
                             let norm = normalize_remote_id(&entry.remote_id);
-                            let already_contact = self.config.ui.contacts.iter()
+                            let already_contact = self
+                                .config
+                                .ui
+                                .contacts
+                                .iter()
                                 .any(|c| normalize_remote_id(&c.remote_id) == norm);
                             if !already_contact {
                                 if ui
                                     .small_button("★")
-                                    .on_hover_text(tr(self.ui_lang, "Добавить в контакты", "Add to contacts"))
+                                    .on_hover_text(tr(
+                                        self.ui_lang,
+                                        "Добавить в контакты",
+                                        "Add to contacts",
+                                    ))
                                     .clicked()
                                 {
                                     add_contact_id = Some(entry.remote_id.clone());
@@ -6997,7 +8362,13 @@ impl EvertyDeskApp {
         });
 
         if let Some(id) = toggle_pin {
-            if let Some(e) = self.config.ui.history.iter_mut().find(|e| e.remote_id == id) {
+            if let Some(e) = self
+                .config
+                .ui
+                .history
+                .iter_mut()
+                .find(|e| e.remote_id == id)
+            {
                 e.pinned = !e.pinned;
             }
         }
@@ -7006,7 +8377,11 @@ impl EvertyDeskApp {
         }
         if let Some(id) = add_contact_id {
             // Add a local contact entry (note: not synced to address book server).
-            let note = self.config.ui.history.iter()
+            let note = self
+                .config
+                .ui
+                .history
+                .iter()
                 .find(|e| e.remote_id == id)
                 .map(|e| e.note.clone())
                 .unwrap_or_default();
@@ -7054,7 +8429,8 @@ impl EvertyDeskApp {
             .show(ctx, |ui| {
                 ui.set_width(360.0);
                 ui.horizontal(|ui| {
-                    let (r, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
+                    let (r, _) =
+                        ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
                     ui.painter().rect_filled(
                         r,
                         egui::CornerRadius::same(crate::theme::radius::LG),
@@ -7069,7 +8445,12 @@ impl EvertyDeskApp {
                     );
                     ui.add_space(4.0);
                     ui.vertical(|ui| {
-                        ui.label(egui::RichText::new("Подтвердите действие").size(17.0).strong().color(t.text));
+                        ui.label(
+                            egui::RichText::new("Подтвердите действие")
+                                .size(17.0)
+                                .strong()
+                                .color(t.text),
+                        );
                         ui.label(
                             egui::RichText::new(vm_name.split(" · ").next().unwrap_or(&vm_name))
                                 .size(12.0)
@@ -7089,7 +8470,10 @@ impl EvertyDeskApp {
                     if ui
                         .add(
                             egui::Button::new(
-                                egui::RichText::new("Подтвердить").size(14.0).strong().color(t.accent_fg),
+                                egui::RichText::new("Подтвердить")
+                                    .size(14.0)
+                                    .strong()
+                                    .color(t.accent_fg),
                             )
                             .fill(accent)
                             .min_size(egui::vec2(btn_w, 42.0))
@@ -7104,9 +8488,11 @@ impl EvertyDeskApp {
                     }
                     if ui
                         .add(
-                            egui::Button::new(egui::RichText::new("Отмена").size(14.0).color(t.text))
-                                .min_size(egui::vec2(btn_w, 42.0))
-                                .corner_radius(egui::CornerRadius::same(crate::theme::radius::MD)),
+                            egui::Button::new(
+                                egui::RichText::new("Отмена").size(14.0).color(t.text),
+                            )
+                            .min_size(egui::vec2(btn_w, 42.0))
+                            .corner_radius(egui::CornerRadius::same(crate::theme::radius::MD)),
                         )
                         .clicked()
                     {
@@ -7159,7 +8545,8 @@ impl EvertyDeskApp {
 
                 // Шапка: иконка-аватар + заголовок.
                 ui.horizontal(|ui| {
-                    let (r, _) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
+                    let (r, _) =
+                        ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
                     ui.painter().rect_filled(
                         r,
                         egui::CornerRadius::same(crate::theme::radius::LG),
@@ -7188,7 +8575,11 @@ impl EvertyDeskApp {
                         ui.label(egui::RichText::new(name).size(16.0).strong().color(t.text));
                         ui.add_space(2.0);
                     }
-                    ui.label(egui::RichText::new(id_caption).size(11.0).color(t.text_muted));
+                    ui.label(
+                        egui::RichText::new(id_caption)
+                            .size(11.0)
+                            .color(t.text_muted),
+                    );
                     ui.label(
                         egui::RichText::new(format_peer_id(&peer_id))
                             .size(22.0)
@@ -7206,7 +8597,10 @@ impl EvertyDeskApp {
                     if ui
                         .add(
                             egui::Button::new(
-                                egui::RichText::new(allow_txt).size(14.0).strong().color(t.accent_fg),
+                                egui::RichText::new(allow_txt)
+                                    .size(14.0)
+                                    .strong()
+                                    .color(t.accent_fg),
                             )
                             .fill(t.accent)
                             .min_size(egui::vec2(btn_w, 42.0))
@@ -7217,7 +8611,7 @@ impl EvertyDeskApp {
                         if let Some(svc) = &self.host_service {
                             svc.approve_incoming(&peer_id, true);
                         }
-                        self.host_pending_peer = None;
+                        self.clear_pending_approval();
                     }
                     if ui
                         .add(
@@ -7234,35 +8628,12 @@ impl EvertyDeskApp {
                         if let Some(svc) = &self.host_service {
                             svc.approve_incoming(&peer_id, false);
                         }
-                        self.host_pending_peer = None;
+                        self.clear_pending_approval();
                     }
                 });
-
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(6.0);
-
-                // "Always allow" — добавить в белый список и принять.
-                let always_txt = self.text("✅ Всегда разрешать", "✅ Always allow");
-                let always_hint = self.text(
-                    "Добавить в белый список — больше не будет спрашивать",
-                    "Add to whitelist — won't ask again",
-                );
-                if ui
-                    .button(egui::RichText::new(always_txt).size(12.0))
-                    .on_hover_text(always_hint)
-                    .clicked()
-                {
-                    let norm = normalize_remote_id(&peer_id);
-                    if !self.config.security.whitelist.iter().any(|w| normalize_remote_id(w) == norm) {
-                        self.config.security.whitelist.push(peer_id.clone());
-                        let _ = self.config.save();
-                    }
-                    if let Some(svc) = &self.host_service {
-                        svc.approve_incoming(&peer_id, true);
-                    }
-                    self.host_pending_peer = None;
-                }
+                // Кнопка «Всегда разрешать» убрана намеренно: каждое подключение
+                // без пароля должно подтверждаться явно. Кто хочет доступ без
+                // подтверждения — задаёт пароль (тогда окна вообще не будет).
             });
     }
 
@@ -7402,10 +8773,7 @@ impl EvertyDeskApp {
                 )
                 .min_size(egui::vec2(180.0, 54.0))
                 .fill(crate::theme::palette().surface)
-                .stroke(egui::Stroke::new(
-                    1.0,
-                    crate::theme::palette().border,
-                ))
+                .stroke(egui::Stroke::new(1.0, crate::theme::palette().border))
                 .corner_radius(egui::CornerRadius::same(10));
                 if ui.add(button).clicked() {
                     if service_running {
@@ -7423,14 +8791,16 @@ impl EvertyDeskApp {
                     .size(13.0)
                     .color(crate::theme::palette().text_weak),
             );
-            if let Some(video_status) = &self.host_video_status {
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(format!("Video: {video_status}"))
-                        .monospace()
-                        .size(10.5)
-                        .color(crate::theme::palette().text_weak),
-                );
+            if self.config.ui.show_tech_info {
+                if let Some(video_status) = &self.host_video_status {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(format!("Video: {video_status}"))
+                            .monospace()
+                            .size(10.5)
+                            .color(crate::theme::palette().text_weak),
+                    );
+                }
             }
         });
 
@@ -7588,19 +8958,14 @@ impl EvertyDeskApp {
         row.show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(icon)
-                        .size(22.0)
-                        .color(if granted { p.success } else { p.accent }),
-                );
+                ui.label(egui::RichText::new(icon).size(22.0).color(if granted {
+                    p.success
+                } else {
+                    p.accent
+                }));
                 ui.add_space(12.0);
                 ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new(title)
-                            .size(15.0)
-                            .strong()
-                            .color(p.text),
-                    );
+                    ui.label(egui::RichText::new(title).size(15.0).strong().color(p.text));
                     ui.label(egui::RichText::new(desc).size(12.5).color(p.text_weak));
                 });
 
@@ -7665,6 +9030,70 @@ impl EvertyDeskApp {
         }
     }
 
+    /// Clears an answered/timed-out/cancelled approval request — whichever
+    /// UI answered it (in-app modal or the standalone Phase 2 window).
+    fn clear_pending_approval(&mut self) {
+        self.host_pending_peer = None;
+        self.host_approval_shown_externally = false;
+    }
+
+    /// Re-queries `service_hint_state` at most every few seconds - see its
+    /// field doc comment for why this is not done every frame.
+    fn refresh_service_hint(&mut self) {
+        if Instant::now() < self.service_hint_next_check {
+            return;
+        }
+        self.service_hint_state = query_service_hint_state();
+        self.service_hint_next_check = Instant::now() + Duration::from_secs(8);
+    }
+
+    /// Install-service button (Phase 3/4, TZ_HOST_SERVICE.md) - one click,
+    /// like RustDesk's unattended-access hint. On Windows this is a single
+    /// UAC prompt (ShellExecuteW runas); on Linux/macOS it needs no
+    /// elevation at all (systemd --user / launchd LaunchAgent are per-user).
+    fn request_install_service(&mut self) {
+        self.service_hint_state = ServiceHintState::Installing;
+        #[cfg(windows)]
+        {
+            if let Err(e) = winservice::relaunch_elevated(&["--install-service"]) {
+                self.host_log
+                    .push(format!("[{}] Установка службы: {e}", timestamp_hms()));
+            }
+        }
+        #[cfg(unix)]
+        {
+            if let Err(e) = host_service_unix::install_service() {
+                self.host_log
+                    .push(format!("[{}] Установка службы: {e}", timestamp_hms()));
+            }
+        }
+        // Re-check soon regardless of platform/outcome - the elevated
+        // process (Windows) or systemctl/launchctl call (Linux/macOS) needs
+        // a moment to actually land.
+        self.service_hint_next_check = Instant::now() + Duration::from_secs(2);
+    }
+
+    /// Start-service button - shown when installed but not currently
+    /// running (e.g. the user stopped it manually, or it failed to start).
+    fn request_start_service(&mut self) {
+        self.service_hint_state = ServiceHintState::Installing;
+        #[cfg(windows)]
+        {
+            if let Err(e) = winservice::relaunch_elevated(&["--start-service"]) {
+                self.host_log
+                    .push(format!("[{}] Запуск службы: {e}", timestamp_hms()));
+            }
+        }
+        #[cfg(unix)]
+        {
+            if let Err(e) = host_service_unix::start_installed_service() {
+                self.host_log
+                    .push(format!("[{}] Запуск службы: {e}", timestamp_hms()));
+            }
+        }
+        self.service_hint_next_check = Instant::now() + Duration::from_secs(2);
+    }
+
     fn stop_host_service(&mut self) {
         if let Some(svc) = self.host_service.take() {
             svc.stop();
@@ -7677,7 +9106,7 @@ impl EvertyDeskApp {
         }
         host::set_remote_input_blocked(false);
         self.host_state = HostState::Idle;
-        self.host_pending_peer = None;
+        self.clear_pending_approval();
         self.host_video_status = None;
     }
 
@@ -7713,46 +9142,77 @@ impl EvertyDeskApp {
                 ));
                 self.host_status = format!("Incoming connection: authenticating {peer_id}");
             }
-            HostEvent::ApprovalRequested { peer_id } => {
+            HostEvent::ApprovalRequested { peer_id, .. } => {
+                // ApprovalRequested приходит ТОЛЬКО при подключении без пароля
+                // (host.rs: с верным паролем сессия стартует сразу, без запроса).
+                // Здесь мы ВСЕГДА показываем окно приглашения — пользователь
+                // должен видеть и явно разрешить каждое подключение без пароля.
+                // Раньше whitelist авто-подтверждал молча, из-за чего к хосту
+                // могли подключиться без единого предупреждения — это убрано.
                 self.host_log.push(format!(
-                    "[{}] Запрос подтверждения от {peer_id}",
+                    "[{}] Запрос подтверждения от {peer_id} (без пароля)",
                     timestamp_hms()
                 ));
-                let norm = normalize_remote_id(&peer_id);
-                let whitelisted = self
-                    .config
-                    .security
-                    .whitelist
-                    .iter()
-                    .any(|w| normalize_remote_id(w) == norm);
-                if whitelisted {
-                    self.host_log.push(format!(
-                        "[{}] {peer_id} в белом списке — авто-подтверждение",
-                        timestamp_hms()
-                    ));
-                    if let Some(svc) = &self.host_service {
-                        svc.approve_incoming(&peer_id, true);
-                    }
-                    self.host_status = format!("Auto-approved: {peer_id}");
+                self.host_pending_peer = Some(peer_id.clone());
+                self.host_status = format!("Требуется подтверждение: {peer_id}");
+
+                // Phase 2 (TZ_HOST_SERVICE.md): a real separate OS window,
+                // like AnyDesk/RustDesk — not an overlay inside this window,
+                // which is invisible whenever this window is minimized or
+                // behind others (the exact case that most needs a hint).
+                let agent_backed = self
+                    .host_service
+                    .as_ref()
+                    .is_some_and(|s| s.is_agent_backed());
+                self.host_approval_shown_externally = if agent_backed {
+                    // host_agent.rs already raises the standalone prompt for
+                    // every ApprovalRequested regardless of GUI attachment —
+                    // don't raise a second one for the same request.
+                    true
                 } else {
-                    self.host_pending_peer = Some(peer_id.clone());
-                    self.host_status = format!("Требуется подтверждение: {peer_id}");
+                    spawn_approval_prompt_window(&peer_id)
+                };
+                if !self.host_approval_shown_externally {
+                    // Couldn't raise the separate window (e.g. current_exe()
+                    // failed) — fall back to the in-app modal, pulling this
+                    // window to the front for it even if minimized/behind
+                    // others (one-shot, see update_egui()).
+                    self.host_approval_needs_focus = true;
                 }
+                // Переключить на вкладку хоста, чтобы окно не потерялось.
+                self.mode = AppMode::Host;
             }
-            HostEvent::SessionStarted { peer_id } => {
+            HostEvent::SessionStarted { peer_id, .. } => {
                 self.host_log
                     .push(format!("[{}] Сессия с {peer_id} начата", timestamp_hms()));
-                self.host_pending_peer = None;
+                self.clear_pending_approval();
                 self.host_status = format!("Connected: {peer_id}");
                 self.host_video_status = None;
+                self.host_input_blocked_local = false;
+                // AnyDesk/RustDesk-style: a persistent session toolbar that
+                // survives this window being minimized/closed. In agent mode
+                // host_agent.rs's forwarder already raises it for every
+                // session regardless of GUI attachment — don't duplicate it.
+                let agent_backed = self
+                    .host_service
+                    .as_ref()
+                    .is_some_and(|s| s.is_agent_backed());
+                if !agent_backed {
+                    spawn_session_toolbar_window(&peer_id);
+                }
             }
-            HostEvent::SessionEnded { peer_id, reason } => {
+            HostEvent::SessionEnded {
+                peer_id, reason, ..
+            } => {
                 self.host_log.push(format!(
                     "[{}] Сессия с {peer_id} завершена {reason}",
                     timestamp_hms(),
                 ));
                 self.host_video_status = None;
-                host::set_remote_input_blocked(false);
+                self.host_input_blocked_local = false;
+                if let Some(svc) = &self.host_service {
+                    svc.set_input_blocked(false);
+                }
             }
             HostEvent::VideoTelemetry {
                 summary,
@@ -7764,7 +9224,13 @@ impl EvertyDeskApp {
                 }
             }
             HostEvent::Log(msg) => {
-                self.host_log.push(format!("[{}] {msg}", timestamp_hms()));
+                let line = format!("[{}] {msg}", timestamp_hms());
+                if let Some(file) = self.log_file.as_mut() {
+                    use std::io::Write;
+                    let _ = writeln!(file, "{line}");
+                    let _ = file.flush();
+                }
+                self.host_log.push(line);
                 if self.host_log.len() > 200 {
                     self.host_log.drain(0..50);
                 }
@@ -7975,22 +9441,37 @@ impl EvertyDeskApp {
     fn remote_video_profile_menu_ui(&mut self, ui: &mut egui::Ui) {
         // Quick presets row
         ui.horizontal(|ui| {
-            if ui.button(tr(self.ui_lang, "🎯 Поддержка", "🎯 Support"))
-                .on_hover_text(tr(self.ui_lang, "15 fps · авто кодек (поддержка и офис)", "15 fps · auto codec (support & office)"))
+            if ui
+                .button(tr(self.ui_lang, "🎯 Поддержка", "🎯 Support"))
+                .on_hover_text(tr(
+                    self.ui_lang,
+                    "15 fps · авто кодек (поддержка и офис)",
+                    "15 fps · auto codec (support & office)",
+                ))
                 .clicked()
             {
                 self.set_remote_video_profile(15, CodecPreference::Auto);
                 ui.close();
             }
-            if ui.button(tr(self.ui_lang, "⚖️ Баланс", "⚖️ Balance"))
-                .on_hover_text(tr(self.ui_lang, "30 fps · авто кодек", "30 fps · auto codec"))
+            if ui
+                .button(tr(self.ui_lang, "⚖️ Баланс", "⚖️ Balance"))
+                .on_hover_text(tr(
+                    self.ui_lang,
+                    "30 fps · авто кодек",
+                    "30 fps · auto codec",
+                ))
                 .clicked()
             {
                 self.set_remote_video_profile(30, CodecPreference::Auto);
                 ui.close();
             }
-            if ui.button(tr(self.ui_lang, "🎮 Игры", "🎮 Game"))
-                .on_hover_text(tr(self.ui_lang, "60 fps · H264 (минимальная задержка)", "60 fps · H264 (lowest latency)"))
+            if ui
+                .button(tr(self.ui_lang, "🎮 Игры", "🎮 Game"))
+                .on_hover_text(tr(
+                    self.ui_lang,
+                    "60 fps · H264 (минимальная задержка)",
+                    "60 fps · H264 (lowest latency)",
+                ))
                 .clicked()
             {
                 self.set_remote_video_profile(60, CodecPreference::H264);
@@ -8011,28 +9492,9 @@ impl EvertyDeskApp {
             }
         });
 
-        ui.separator();
-        ui.label(tr(self.ui_lang, "Кодек", "Codec"));
-        for codec in [
-            CodecPreference::Auto,
-            CodecPreference::H264,
-            CodecPreference::H265,
-            CodecPreference::Av1,
-            CodecPreference::Vp9,
-        ] {
-            let label = match codec {
-                CodecPreference::Av1 if !crate::video::av1_available() => tr(self.ui_lang, "AV1 (эксп.)", "AV1 (exp.)"),
-                CodecPreference::H265 if !crate::video::h265_available() => tr(self.ui_lang, "H265 (если доступен)", "H265 (if available)"),
-                _ => codec.label(),
-            };
-            if ui
-                .selectable_label(self.config.display.codec == codec, label)
-                .clicked()
-            {
-                self.set_remote_video_profile(self.video_fps, codec);
-                ui.close();
-            }
-        }
+        // Выбор кодека убран: кодек согласуется автоматически между хостом и
+        // клиентом (по реальным аппаратным возможностям обеих сторон). Ручной
+        // выбор только путал — клиент не может знать, что поддерживает хост.
     }
 
     fn remote_more_menu_ui(&mut self, ui: &mut egui::Ui) {
@@ -8092,18 +9554,27 @@ impl EvertyDeskApp {
             self.request_visual_refresh_after_input();
             ui.close();
         }
-        if ui.button(tr(self.ui_lang, "Заблокировать экран", "Lock screen")).clicked() {
+        if ui
+            .button(tr(self.ui_lang, "Заблокировать экран", "Lock screen"))
+            .clicked()
+        {
             self.send_command(SessionCommand::KeyControl(ControlKey::LockScreen));
             self.request_visual_refresh_after_input();
             ui.close();
         }
 
         ui.separator();
-        if ui.button(tr(self.ui_lang, "Сохранить лог", "Save log")).clicked() {
+        if ui
+            .button(tr(self.ui_lang, "Сохранить лог", "Save log"))
+            .clicked()
+        {
             self.save_session_log_file();
             ui.close();
         }
-        if ui.button(tr(self.ui_lang, "Собрать отчёт", "Save report")).clicked() {
+        if ui
+            .button(tr(self.ui_lang, "Собрать отчёт", "Save report"))
+            .clicked()
+        {
             self.save_support_report();
             ui.close();
         }
@@ -8113,9 +9584,16 @@ impl EvertyDeskApp {
             ui.label(format!("{}: {x}, {y}", tr(self.ui_lang, "Мышь", "Mouse")));
         }
         if let Some(age) = self.last_screenshot_age_ms() {
-            ui.label(format!("{}: {age} ms", tr(self.ui_lang, "Возраст кадра", "Frame age")));
+            ui.label(format!(
+                "{}: {age} ms",
+                tr(self.ui_lang, "Возраст кадра", "Frame age")
+            ));
         }
-        ui.label(format!("{}: {}", tr(self.ui_lang, "Событий ввода", "Input events"), self.input_events_sent));
+        ui.label(format!(
+            "{}: {}",
+            tr(self.ui_lang, "Событий ввода", "Input events"),
+            self.input_events_sent
+        ));
     }
 
     fn refresh_remote_screen(&mut self) {
@@ -8145,12 +9623,14 @@ impl EvertyDeskApp {
         ui.horizontal(|ui| {
             // ── Группа: навигация / сеанс ─────────────────────────────────────
             if !detached_window
-                && remote_icon_button(ui, ph::ARROW_LEFT, "Свернуть экран (сеанс активен)").clicked()
+                && remote_icon_button(ui, ph::ARROW_LEFT, "Свернуть экран (сеанс активен)")
+                    .clicked()
             {
                 self.close_remote_viewer_panel();
                 return;
             }
-            if remote_icon_button_danger(ui, ph::SIGN_OUT, "Завершить удалённый сеанс").clicked() {
+            if remote_icon_button_danger(ui, ph::SIGN_OUT, "Завершить удалённый сеанс").clicked()
+            {
                 self.remote_viewer_open = false;
                 self.remote_input_focused = false;
                 self.release_remote_modifiers();
@@ -8166,7 +9646,11 @@ impl EvertyDeskApp {
             toolbar_sep(ui);
             self.remote_display_selector_ui(
                 ui,
-                if detached_window { "remote-display" } else { "software-remote-display" },
+                if detached_window {
+                    "remote-display"
+                } else {
+                    "software-remote-display"
+                },
             );
 
             // ── Группа: ввод текста / буфер ───────────────────────────────────
@@ -8191,19 +9675,35 @@ impl EvertyDeskApp {
                 self.send_command(SessionCommand::KeyText(text));
                 self.request_visual_refresh_after_input();
             }
-            if remote_icon_button(ui, ph::CLIPBOARD, "Вставить локальный буфер в удалённый").clicked() {
+            if remote_icon_button(ui, ph::CLIPBOARD, "Вставить локальный буфер в удалённый")
+                .clicked()
+            {
                 self.paste_local_clipboard_to_remote();
             }
 
             // ── Группа: вид / захват ──────────────────────────────────────────
             toolbar_sep(ui);
-            if remote_icon_button(ui, ph::ARROWS_CLOCKWISE, "Обновить live-video и контрольный кадр").clicked() {
+            if remote_icon_button(
+                ui,
+                ph::ARROWS_CLOCKWISE,
+                "Обновить live-video и контрольный кадр",
+            )
+            .clicked()
+            {
                 self.refresh_remote_screen();
             }
-            if remote_icon_button(ui, ph::CAMERA, "Сохранить текущий кадр (PNG)").clicked() {
+            if remote_icon_button(ui, ph::CAMERA, "Сохранить текущий кадр (PNG)").clicked()
+            {
                 self.save_current_frame_png();
             }
-            if remote_icon_toggle(ui, ph::ARROWS_IN, self.fit_to_window, "Вписать экран в окно").clicked() {
+            if remote_icon_toggle(
+                ui,
+                ph::ARROWS_IN,
+                self.fit_to_window,
+                "Вписать экран в окно",
+            )
+            .clicked()
+            {
                 self.fit_to_window = !self.fit_to_window;
                 self.save_ui_config();
             }
@@ -8212,7 +9712,14 @@ impl EvertyDeskApp {
             }
             // Метрики/диагностика — открывает перемещаемое плавающее окно
             // поверх экрана (заменяет прежнюю нижнюю панель).
-            if remote_icon_toggle(ui, ph::GAUGE, self.show_stream_info, "Метрики потока (плавающее окно)").clicked() {
+            if remote_icon_toggle(
+                ui,
+                ph::GAUGE,
+                self.show_stream_info,
+                "Метрики потока (плавающее окно)",
+            )
+            .clicked()
+            {
                 self.show_stream_info = !self.show_stream_info;
             }
             // View-only mode: disables all mouse+keyboard input forwarding.
@@ -8220,7 +9727,10 @@ impl EvertyDeskApp {
                 ui,
                 ph::EYE,
                 self.view_only,
-                self.text("Только просмотр (ввод заблокирован)", "View-only (input disabled)"),
+                self.text(
+                    "Только просмотр (ввод заблокирован)",
+                    "View-only (input disabled)",
+                ),
             )
             .clicked()
             {
@@ -8229,6 +9739,19 @@ impl EvertyDeskApp {
                     self.remote_input_focused = false;
                     self.release_remote_modifiers();
                 }
+            }
+            // Экспериментальная кнопка: отдельный EVRT2 UDP-сокет + EVRTCK-
+            // стрим параллельно живой сессии. Не заменяет и не трогает
+            // текущий видеопоток — только для проверки нового транспорта.
+            if remote_icon_button(
+                ui,
+                ph::FLASK,
+                "EVRT2 (экспериментально) — отдельный тестовый поток",
+            )
+            .clicked()
+            {
+                self.send_command(SessionCommand::StartEvrt2Experiment);
+                self.log("EVRT2 (эксп.): запрос отправлен хосту".to_owned());
             }
 
             // ── Правая группа: профиль AV, VM, меню (заполняет пространство) ──
@@ -8241,7 +9764,12 @@ impl EvertyDeskApp {
                 if let Some(started) = self.session_started_at {
                     let secs = started.elapsed().as_secs();
                     let timer_str = if secs >= 3600 {
-                        format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+                        format!(
+                            "{:02}:{:02}:{:02}",
+                            secs / 3600,
+                            (secs % 3600) / 60,
+                            secs % 60
+                        )
                     } else {
                         format!("{:02}:{:02}", secs / 60, secs % 60)
                     };
@@ -8271,7 +9799,11 @@ impl EvertyDeskApp {
                 let quality_badge = {
                     let codec = {
                         let lf = self.last_frame_codec.as_str();
-                        if lf == "none" { self.config.display.codec.label() } else { lf }
+                        if lf == "none" {
+                            self.config.display.codec.label()
+                        } else {
+                            lf
+                        }
                     };
                     // Actual measured receive FPS (updated every 750 ms).
                     let fps_str = if self.display_fps > 0.5 {
@@ -8279,7 +9811,10 @@ impl EvertyDeskApp {
                     } else {
                         format!("{}", self.video_fps)
                     };
-                    let lat = self.latency_ms.map(|ms| format!(" · {ms}ms")).unwrap_or_default();
+                    let lat = self
+                        .latency_ms
+                        .map(|ms| format!(" · {ms}ms"))
+                        .unwrap_or_default();
                     let bw = if self.stream_input_kbps > 0 {
                         if self.stream_input_kbps >= 1000 {
                             format!(" · {:.1}M", self.stream_input_kbps as f32 / 1000.0)
@@ -8295,22 +9830,35 @@ impl EvertyDeskApp {
                     } else if self.display_fps > 0.5 && self.display_fps < 30.0 {
                         egui::Color32::from_rgb(0xFF, 0xB7, 0x47) // amber — 15-29 fps
                     } else {
-                        self.latency_ms.map(|ms| {
-                            if ms < 80 { egui::Color32::from_rgb(0x4C, 0xBF, 0x7A) }
-                            else if ms < 200 { egui::Color32::from_rgb(0xFF, 0xB7, 0x47) }
-                            else { egui::Color32::from_rgb(0xF0, 0x6A, 0x6A) }
-                        }).unwrap_or(t.text)
+                        self.latency_ms
+                            .map(|ms| {
+                                if ms < 80 {
+                                    egui::Color32::from_rgb(0x4C, 0xBF, 0x7A)
+                                } else if ms < 200 {
+                                    egui::Color32::from_rgb(0xFF, 0xB7, 0x47)
+                                } else {
+                                    egui::Color32::from_rgb(0xF0, 0x6A, 0x6A)
+                                }
+                            })
+                            .unwrap_or(t.text)
                     };
                     egui::RichText::new(format!(
                         "{}  {} · {}fps{}{}",
-                        ph::SLIDERS_HORIZONTAL, codec, fps_str, lat, bw
+                        ph::SLIDERS_HORIZONTAL,
+                        codec,
+                        fps_str,
+                        lat,
+                        bw
                     ))
                     .size(12.5)
                     .color(color)
                 };
                 ui.menu_button(quality_badge, |ui| self.remote_video_profile_menu_ui(ui))
                     .response
-                    .on_hover_text(self.text("Кодек · FPS (реальный) · Задержка · Трафик (вход)", "Codec · FPS (actual) · Latency · Bandwidth (in)"));
+                    .on_hover_text(self.text(
+                        "Кодек · FPS (реальный) · Задержка · Трафик (вход)",
+                        "Codec · FPS (actual) · Latency · Bandwidth (in)",
+                    ));
             });
         });
     }
@@ -8336,23 +9884,21 @@ impl EvertyDeskApp {
                             .strong()
                             .color(crate::theme::palette().text),
                     );
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if ui.button("↻").on_hover_text("Обновить список").clicked() {
-                                self.send_command(SessionCommand::ListVms);
-                            }
-                            if !self.remote_attached_vm.is_empty()
-                                && ui
-                                    .button("⏏ Экран хоста")
-                                    .on_hover_text("Отключиться от VM, вернуть экран хоста")
-                                    .clicked()
-                            {
-                                self.remote_attached_vm.clear();
-                                self.send_command(SessionCommand::AttachVm(String::new()));
-                            }
-                        },
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("↻").on_hover_text("Обновить список").clicked()
+                        {
+                            self.send_command(SessionCommand::ListVms);
+                        }
+                        if !self.remote_attached_vm.is_empty()
+                            && ui
+                                .button("⏏ Экран хоста")
+                                .on_hover_text("Отключиться от VM, вернуть экран хоста")
+                                .clicked()
+                        {
+                            self.remote_attached_vm.clear();
+                            self.send_command(SessionCommand::AttachVm(String::new()));
+                        }
+                    });
                 });
 
                 if !self.remote_vm_status.is_empty() {
@@ -8434,7 +9980,10 @@ impl EvertyDeskApp {
         // Активная VM подсвечивается акцентной подложкой + рамкой; остальные —
         // на приподнятой поверхности. Адаптивно к тёмной/светлой теме.
         let (card_fill, card_stroke) = if is_attached {
-            (crate::theme::accent_tint(&t, 0.14), egui::Stroke::new(1.2, t.accent))
+            (
+                crate::theme::accent_tint(&t, 0.14),
+                egui::Stroke::new(1.2, t.accent),
+            )
         } else {
             (t.surface_raised, egui::Stroke::new(1.0, t.border))
         };
@@ -8765,21 +10314,18 @@ impl EvertyDeskApp {
             self.wheel_accum = egui::Vec2::ZERO;
         }
         // Show shortcut help on ? key when not capturing remote input.
-        if !self.remote_input_focused
-            && ctx.input(|i| i.key_pressed(egui::Key::Questionmark))
-        {
+        if !self.remote_input_focused && ctx.input(|i| i.key_pressed(egui::Key::Questionmark)) {
             self.show_shortcuts_help = !self.show_shortcuts_help;
         }
         self.shortcuts_help_window(ctx);
 
         // In fullscreen, auto-hide the toolbar after 2s — reveal on mouse near top.
         let show_toolbar = !self.remote_fullscreen || {
-            let near_top = ctx.input(|i| {
-                i.pointer.latest_pos()
-                    .map(|p| p.y < 56.0)
-                    .unwrap_or(false)
-            });
-            if near_top { self.toolbar_last_active = Instant::now(); }
+            let near_top =
+                ctx.input(|i| i.pointer.latest_pos().map(|p| p.y < 56.0).unwrap_or(false));
+            if near_top {
+                self.toolbar_last_active = Instant::now();
+            }
             self.toolbar_last_active.elapsed().as_secs_f32() < 2.0
         };
         if show_toolbar {
@@ -8791,6 +10337,12 @@ impl EvertyDeskApp {
 
         // ── Плавающее перемещаемое окно с метриками (вместо нижней панели) ────
         self.stream_info_window(ctx);
+        // In EVRT2 game-mode, the experimental stream IS the primary view
+        // (remote_screen_ui picks it up directly) — showing the small
+        // floating preview on top of itself would be redundant.
+        if !self.evrt2_takes_over_view() {
+            self.evrt2_preview_window(ctx);
+        }
 
         // No frame margin — the remote screen + its letterbox backdrop should
         // reach the panel edges (toolbar above, status bar below) with no app
@@ -8818,16 +10370,66 @@ impl EvertyDeskApp {
             .show(ctx, |ui| {
                 let rows: &[(&str, &str, &str, &str)] = &[
                     ("?", "?", "Горячие клавиши", "Show shortcuts"),
-                    ("Ctrl+Esc", "Ctrl+Esc", "Освободить захват ввода", "Release keyboard capture"),
-                    ("F11", "F11", "Полный экран (вне захвата)", "Fullscreen (outside capture)"),
-                    ("Ctrl+C/V/X/Z", "Ctrl+C/V/X/Z", "Буфер: копировать/вставить/вырезать/отмена", "Clipboard: copy/paste/cut/undo"),
-                    ("Win+любая", "Win+any", "Отправить Win+клавишу удалённому ПК", "Send Win+key to remote"),
-                    ("Esc", "Esc", "Отправить Esc удалённому ПК (вим/диалоги)", "Send Esc to remote (vi/dialogs)"),
-                    ("Мышь внутри экрана → клик", "Click inside screen", "Захватить ввод клавиатуры", "Capture keyboard input"),
-                    ("глаз ☞ тулбар", "Eye ☞ toolbar", "Режим «только просмотр»", "Toggle view-only mode"),
-                    ("Камера ☞ тулбар", "Camera ☞ toolbar", "Сохранить кадр PNG", "Save frame as PNG"),
-                    ("⏱ таймер ☞ тулбар", "⏱ timer ☞ toolbar", "Время текущего сеанса", "Current session duration"),
-                    ("Ctrl+1…9", "Ctrl+1…9", "Быстрое подключение к закреплённому ID", "Quick-connect to pinned ID"),
+                    (
+                        "Ctrl+Esc",
+                        "Ctrl+Esc",
+                        "Освободить захват ввода",
+                        "Release keyboard capture",
+                    ),
+                    (
+                        "F11",
+                        "F11",
+                        "Полный экран (вне захвата)",
+                        "Fullscreen (outside capture)",
+                    ),
+                    (
+                        "Ctrl+C/V/X/Z",
+                        "Ctrl+C/V/X/Z",
+                        "Буфер: копировать/вставить/вырезать/отмена",
+                        "Clipboard: copy/paste/cut/undo",
+                    ),
+                    (
+                        "Win+любая",
+                        "Win+any",
+                        "Отправить Win+клавишу удалённому ПК",
+                        "Send Win+key to remote",
+                    ),
+                    (
+                        "Esc",
+                        "Esc",
+                        "Отправить Esc удалённому ПК (вим/диалоги)",
+                        "Send Esc to remote (vi/dialogs)",
+                    ),
+                    (
+                        "Мышь внутри экрана → клик",
+                        "Click inside screen",
+                        "Захватить ввод клавиатуры",
+                        "Capture keyboard input",
+                    ),
+                    (
+                        "глаз ☞ тулбар",
+                        "Eye ☞ toolbar",
+                        "Режим «только просмотр»",
+                        "Toggle view-only mode",
+                    ),
+                    (
+                        "Камера ☞ тулбар",
+                        "Camera ☞ toolbar",
+                        "Сохранить кадр PNG",
+                        "Save frame as PNG",
+                    ),
+                    (
+                        "⏱ таймер ☞ тулбар",
+                        "⏱ timer ☞ toolbar",
+                        "Время текущего сеанса",
+                        "Current session duration",
+                    ),
+                    (
+                        "Ctrl+1…9",
+                        "Ctrl+1…9",
+                        "Быстрое подключение к закреплённому ID",
+                        "Quick-connect to pinned ID",
+                    ),
                 ];
                 egui::Grid::new("shortcuts-grid")
                     .num_columns(2)
@@ -8835,8 +10437,14 @@ impl EvertyDeskApp {
                     .spacing([16.0, 4.0])
                     .show(ui, |ui| {
                         for &(key_ru, key_en, desc_ru, desc_en) in rows {
-                            let key = match lang { UiLang::Ru => key_ru, UiLang::En => key_en };
-                            let desc = match lang { UiLang::Ru => desc_ru, UiLang::En => desc_en };
+                            let key = match lang {
+                                UiLang::Ru => key_ru,
+                                UiLang::En => key_en,
+                            };
+                            let desc = match lang {
+                                UiLang::Ru => desc_ru,
+                                UiLang::En => desc_en,
+                            };
                             ui.label(egui::RichText::new(key).monospace().strong());
                             ui.label(desc);
                             ui.end_row();
@@ -8847,6 +10455,72 @@ impl EvertyDeskApp {
     }
 
     /// Красивое окно с детальной диагностикой стрима (по кнопке ℹ Детали).
+    /// Экспериментальная кнопка «EVRT2»: маленькое плавающее превью
+    /// отдельного EVRT2-потока. Намеренно НЕ заменяет и не пересекается с
+    /// живым remote_texture — см. поле evrt2_preview_texture.
+    fn evrt2_preview_window(&mut self, ctx: &egui::Context) {
+        let Some(texture) = self.evrt2_preview_texture.as_ref() else {
+            return;
+        };
+        let mut open = true;
+        egui::Window::new("🧪 EVRT2 (эксп.) — предпросмотр")
+            .open(&mut open)
+            .resizable(true)
+            .collapsible(true)
+            .default_width(320.0)
+            .default_pos(egui::pos2(80.0, 420.0))
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Кадров получено: {}  ·  {}×{}",
+                        self.evrt2_frame_count,
+                        texture.size()[0],
+                        texture.size()[1]
+                    ))
+                    .size(11.0)
+                    .color(crate::theme::palette().text_weak),
+                );
+                // ROADMAP.md Phase 1.3 — Task-01 § Breach Handling: "client
+                // displays a visible degradation indicator (not a full
+                // stall — a discreet marker)". Shown for a short window
+                // after a real DEGRADE_SIGNAL arrives, then fades — this is
+                // NOT a persistent health badge (it would otherwise falsely
+                // imply "currently fine" the instant it disappears, which
+                // this codebase's own honesty conventions elsewhere
+                // explicitly avoid — see evrt2_scheduler.rs's "must not
+                // become an excuse to fabricate").
+                if let Some((at, measured_age_ms, ceiling_ms, tiles)) = self.evrt2_last_degrade {
+                    if at.elapsed() < EVRT2_DEGRADE_INDICATOR_TTL {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("⚠")
+                                    .size(13.0)
+                                    .color(crate::theme::palette().warning),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Task-01: регион задержан {measured_age_ms:.1}мс > потолок {ceiling_ms:.1}мс ({tiles} тайлов)"
+                                ))
+                                .size(11.0)
+                                .color(crate::theme::palette().warning),
+                            );
+                        });
+                        // Keep repainting while the indicator is visible so
+                        // it actually fades on schedule instead of only
+                        // updating on the next unrelated redraw.
+                        ctx.request_repaint_after(Duration::from_millis(200));
+                    }
+                }
+                let avail_w = ui.available_width().min(400.0);
+                let aspect = texture.size()[1] as f32 / texture.size()[0] as f32;
+                ui.image((texture.id(), egui::vec2(avail_w, avail_w * aspect)));
+            });
+        if !open {
+            self.evrt2_preview_texture = None;
+        }
+    }
+
     fn stream_info_window(&mut self, ctx: &egui::Context) {
         if !self.show_stream_info {
             return;
@@ -9075,10 +10749,23 @@ impl EvertyDeskApp {
         if !self.remote_viewer_window_spawned {
             builder = builder.with_inner_size(remote_viewer_initial_size(self.remote_size));
             self.remote_viewer_window_spawned = true;
+            self.remote_viewer_opened_at = Some(Instant::now());
         }
 
         ctx.show_viewport_immediate(viewport_id, builder, |ctx, _class| {
-            if ctx.input(|input| input.viewport().close_requested()) {
+            // Grace period: игнорируем close_requested() в первые ~400мс после
+            // создания окна — это фильтрует «призрачный» close на первом кадре
+            // нового viewport (egui/winit), из-за которого окно закрывалось
+            // сразу после подключения. Настоящий клик по X пользователь
+            // физически не успеет сделать за 400мс от создания окна.
+            let just_spawned = self
+                .remote_viewer_opened_at
+                .map(|t| t.elapsed() < std::time::Duration::from_millis(400))
+                .unwrap_or(false);
+            if just_spawned {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+            if !just_spawned && ctx.input(|input| input.viewport().close_requested()) {
                 self.remote_viewer_open = false;
                 self.remote_viewer_window_spawned = false;
                 self.remote_input_focused = false;
@@ -9102,12 +10789,11 @@ impl EvertyDeskApp {
 
             // In fullscreen, auto-hide the toolbar after 2s — reveal on mouse near top.
             let show_toolbar = !self.remote_fullscreen || {
-                let near_top = ctx.input(|i| {
-                    i.pointer.latest_pos()
-                        .map(|p| p.y < 56.0)
-                        .unwrap_or(false)
-                });
-                if near_top { self.toolbar_last_active = Instant::now(); }
+                let near_top =
+                    ctx.input(|i| i.pointer.latest_pos().map(|p| p.y < 56.0).unwrap_or(false));
+                if near_top {
+                    self.toolbar_last_active = Instant::now();
+                }
                 self.toolbar_last_active.elapsed().as_secs_f32() < 2.0
             };
             if show_toolbar {
@@ -9119,6 +10805,9 @@ impl EvertyDeskApp {
 
             // ── Плавающее перемещаемое окно с метриками (вместо нижней панели) ──
             self.stream_info_window(ctx);
+            if !self.evrt2_takes_over_view() {
+                self.evrt2_preview_window(ctx);
+            }
 
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(0x07, 0x0A, 0x0F)))
@@ -9131,9 +10820,29 @@ impl EvertyDeskApp {
     fn remote_screen_ui(&mut self, ui: &mut egui::Ui) {
         let available_size = ui.available_size_before_wrap();
         let available_width = available_size.x.max(1.0);
-        let Some(texture) = self.remote_texture.clone() else {
+        // EVRT2 game-mode: once the experimental stream has produced at
+        // least one frame, show it as the primary view instead of the
+        // classic remote_texture — falls back to remote_texture until then
+        // (UDP candidate race/first IDR takes a moment), so the view never
+        // goes blank while EVRT2 is still coming online. Scaling below still
+        // uses self.remote_size (the classic pipeline's own reported
+        // resolution, still updating underneath since EVRT1 stays active as
+        // fallback/input path) — if EVRT2's own encode resolution differs
+        // (e.g. downscaled), the picture may show slight letterbox/stretch
+        // vs a pixel-perfect match; mouse-coordinate mapping is unaffected
+        // either way since it goes through the unchanged EVRT1 input channel.
+        let evrt2_active = self.evrt2_takes_over_view();
+        let texture_source = if evrt2_active {
+            self.evrt2_preview_texture
+                .clone()
+                .or_else(|| self.remote_texture.clone())
+        } else {
+            self.remote_texture.clone()
+        };
+        let Some(texture) = texture_source else {
             let full_rect = ui.available_rect_before_wrap();
-            ui.painter().rect_filled(full_rect, 0.0, egui::Color32::from_rgb(0x07, 0x0A, 0x0F));
+            ui.painter()
+                .rect_filled(full_rect, 0.0, egui::Color32::from_rgb(0x07, 0x0A, 0x0F));
             ui.allocate_new_ui(egui::UiBuilder::new().max_rect(full_rect), |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space((full_rect.height() * 0.5 - 28.0).max(0.0));
@@ -9212,11 +10921,8 @@ impl EvertyDeskApp {
         let full_rect = ui.available_rect_before_wrap();
 
         // Letterbox backdrop — fills the entire central panel.
-        ui.painter().rect_filled(
-            full_rect,
-            0.0,
-            egui::Color32::from_rgb(0x07, 0x0A, 0x0F),
-        );
+        ui.painter()
+            .rect_filled(full_rect, 0.0, egui::Color32::from_rgb(0x07, 0x0A, 0x0F));
 
         // Centre the scaled remote frame in the available space.
         let img_min = full_rect.min
@@ -9277,7 +10983,11 @@ impl EvertyDeskApp {
             // screen — the bottom status bar that used to host this is gone.
             let painter = ui.painter();
             let pad = egui::vec2(8.0, 4.0);
-            let text = tr(self.ui_lang, "⌨ ввод захвачен · Ctrl+Esc", "⌨ input captured · Ctrl+Esc");
+            let text = tr(
+                self.ui_lang,
+                "⌨ ввод захвачен · Ctrl+Esc",
+                "⌨ input captured · Ctrl+Esc",
+            );
             let font = egui::FontId::proportional(11.5);
             let galley = painter.layout_no_wrap(
                 text.to_owned(),
@@ -9490,13 +11200,24 @@ impl EvertyDeskApp {
                         // not as bare text characters.
                         let text = egui_key_to_text(key).unwrap();
                         let mut mods = Vec::new();
-                        if modifiers.ctrl { mods.push(ControlKey::Control); }
+                        if modifiers.ctrl {
+                            mods.push(ControlKey::Control);
+                        }
                         // egui uses `command` for the OS command key (Win on Windows,
                         // Cmd on macOS). Forward it as Meta so Win+key reaches remote.
-                        if modifiers.command { mods.push(ControlKey::Meta); }
-                        if modifiers.alt { mods.push(ControlKey::Alt); }
-                        if modifiers.shift { mods.push(ControlKey::Shift); }
-                        self.send_command(SessionCommand::KeyTextWithModifiers { text, modifiers: mods });
+                        if modifiers.command {
+                            mods.push(ControlKey::Meta);
+                        }
+                        if modifiers.alt {
+                            mods.push(ControlKey::Alt);
+                        }
+                        if modifiers.shift {
+                            mods.push(ControlKey::Shift);
+                        }
+                        self.send_command(SessionCommand::KeyTextWithModifiers {
+                            text,
+                            modifiers: mods,
+                        });
                         self.request_visual_refresh_after_input();
                     } else if let Some(control_key) = egui_key_to_control_key(key) {
                         self.send_command(SessionCommand::KeyControl(control_key));
@@ -10245,23 +11966,32 @@ fn clipboard_read_text() -> String {
 fn egui_key_to_vkcode(key: egui::Key) -> Option<u32> {
     use egui::Key::*;
     Some(match key {
-        Escape    => 0x1B,
-        Enter     => 0x0D,
+        Escape => 0x1B,
+        Enter => 0x0D,
         Backspace => 0x08,
-        Tab       => 0x09,
-        Delete    => 0x2E,
-        Insert    => 0x2D,
-        Home      => 0x24,
-        End       => 0x23,
-        PageUp    => 0x21,
-        PageDown  => 0x22,
-        ArrowLeft  => 0x25,
-        ArrowUp    => 0x26,
+        Tab => 0x09,
+        Delete => 0x2E,
+        Insert => 0x2D,
+        Home => 0x24,
+        End => 0x23,
+        PageUp => 0x21,
+        PageDown => 0x22,
+        ArrowLeft => 0x25,
+        ArrowUp => 0x26,
         ArrowRight => 0x27,
-        ArrowDown  => 0x28,
-        F1  => 0x70, F2  => 0x71, F3  => 0x72, F4  => 0x73,
-        F5  => 0x74, F6  => 0x75, F7  => 0x76, F8  => 0x77,
-        F9  => 0x78, F10 => 0x79, F11 => 0x7A, F12 => 0x7B,
+        ArrowDown => 0x28,
+        F1 => 0x70,
+        F2 => 0x71,
+        F3 => 0x72,
+        F4 => 0x73,
+        F5 => 0x74,
+        F6 => 0x75,
+        F7 => 0x76,
+        F8 => 0x77,
+        F9 => 0x78,
+        F10 => 0x79,
+        F11 => 0x7A,
+        F12 => 0x7B,
         // Printable keys handled by TypeText — don't double-send
         _ => return None,
     })
@@ -10272,15 +12002,42 @@ fn egui_key_to_vkcode(key: egui::Key) -> Option<u32> {
 fn egui_letter_to_vkcode(key: egui::Key) -> Option<u32> {
     use egui::Key::*;
     Some(match key {
-        A => 0x41, B => 0x42, C => 0x43, D => 0x44, E => 0x45,
-        F => 0x46, G => 0x47, H => 0x48, I => 0x49, J => 0x4A,
-        K => 0x4B, L => 0x4C, M => 0x4D, N => 0x4E, O => 0x4F,
-        P => 0x50, Q => 0x51, R => 0x52, S => 0x53, T => 0x54,
-        U => 0x55, V => 0x56, W => 0x57, X => 0x58, Y => 0x59,
+        A => 0x41,
+        B => 0x42,
+        C => 0x43,
+        D => 0x44,
+        E => 0x45,
+        F => 0x46,
+        G => 0x47,
+        H => 0x48,
+        I => 0x49,
+        J => 0x4A,
+        K => 0x4B,
+        L => 0x4C,
+        M => 0x4D,
+        N => 0x4E,
+        O => 0x4F,
+        P => 0x50,
+        Q => 0x51,
+        R => 0x52,
+        S => 0x53,
+        T => 0x54,
+        U => 0x55,
+        V => 0x56,
+        W => 0x57,
+        X => 0x58,
+        Y => 0x59,
         Z => 0x5A,
-        Num0 => 0x30, Num1 => 0x31, Num2 => 0x32, Num3 => 0x33,
-        Num4 => 0x34, Num5 => 0x35, Num6 => 0x36, Num7 => 0x37,
-        Num8 => 0x38, Num9 => 0x39,
+        Num0 => 0x30,
+        Num1 => 0x31,
+        Num2 => 0x32,
+        Num3 => 0x33,
+        Num4 => 0x34,
+        Num5 => 0x35,
+        Num6 => 0x36,
+        Num7 => 0x37,
+        Num8 => 0x38,
+        Num9 => 0x39,
         Space => 0x20,
         _ => return None,
     })
@@ -10292,23 +12049,32 @@ fn egui_letter_to_vkcode(key: egui::Key) -> Option<u32> {
 fn egui_key_to_vbox_key_id(key: egui::Key) -> Option<u8> {
     use egui::Key::*;
     Some(match key {
-        Escape    => 0x01,
+        Escape => 0x01,
         Backspace => 0x0E,
-        Tab       => 0x0F,
-        Enter     => 0x1C,
-        Insert    => 0x52,
-        Delete    => 0x53,
-        Home      => 0x47,
-        End       => 0x4F,
-        PageUp    => 0x49,
-        PageDown  => 0x51,
-        ArrowLeft  => 0x4B,
+        Tab => 0x0F,
+        Enter => 0x1C,
+        Insert => 0x52,
+        Delete => 0x53,
+        Home => 0x47,
+        End => 0x4F,
+        PageUp => 0x49,
+        PageDown => 0x51,
+        ArrowLeft => 0x4B,
         ArrowRight => 0x4D,
-        ArrowUp    => 0x48,
-        ArrowDown  => 0x50,
-        F1  => 0x3B, F2  => 0x3C, F3  => 0x3D, F4  => 0x3E,
-        F5  => 0x3F, F6  => 0x40, F7  => 0x41, F8  => 0x42,
-        F9  => 0x43, F10 => 0x44, F11 => 0x57, F12 => 0x58,
+        ArrowUp => 0x48,
+        ArrowDown => 0x50,
+        F1 => 0x3B,
+        F2 => 0x3C,
+        F3 => 0x3D,
+        F4 => 0x3E,
+        F5 => 0x3F,
+        F6 => 0x40,
+        F7 => 0x41,
+        F8 => 0x42,
+        F9 => 0x43,
+        F10 => 0x44,
+        F11 => 0x57,
+        F12 => 0x58,
         _ => return None,
     })
 }
@@ -10344,10 +12110,10 @@ fn pointer_to_guest_pixel(
         return None;
     }
 
-    let gx = ((pos.x - image_rect.left()) / image_rect.width() * guest_w)
-        .clamp(0.0, guest_w - 1.0) as u16;
-    let gy = ((pos.y - image_rect.top()) / image_rect.height() * guest_h)
-        .clamp(0.0, guest_h - 1.0) as u16;
+    let gx = ((pos.x - image_rect.left()) / image_rect.width() * guest_w).clamp(0.0, guest_w - 1.0)
+        as u16;
+    let gy = ((pos.y - image_rect.top()) / image_rect.height() * guest_h).clamp(0.0, guest_h - 1.0)
+        as u16;
     Some((gx, gy))
 }
 
@@ -10364,9 +12130,41 @@ fn egui_key_is_plain_text(key: egui::Key) -> bool {
     use egui::Key::*;
     matches!(
         key,
-        A | B | C | D | E | F | G | H | I | J | K | L | M | N | O | P | Q | R | S | T | U
-            | V | W | X | Y | Z
-            | Num0 | Num1 | Num2 | Num3 | Num4 | Num5 | Num6 | Num7 | Num8 | Num9
+        A | B
+            | C
+            | D
+            | E
+            | F
+            | G
+            | H
+            | I
+            | J
+            | K
+            | L
+            | M
+            | N
+            | O
+            | P
+            | Q
+            | R
+            | S
+            | T
+            | U
+            | V
+            | W
+            | X
+            | Y
+            | Z
+            | Num0
+            | Num1
+            | Num2
+            | Num3
+            | Num4
+            | Num5
+            | Num6
+            | Num7
+            | Num8
+            | Num9
             | Space
     )
 }
@@ -10535,10 +12333,10 @@ fn configure_icon_fonts(ctx: &egui::Context) {
     style.text_styles = {
         use egui::{FontFamily::Proportional, FontId, TextStyle::*};
         [
-            (Heading,   FontId::new(18.0, Proportional)),
-            (Body,      FontId::new(15.0, Proportional)),
-            (Button,    FontId::new(15.0, Proportional)),
-            (Small,     FontId::new(13.0, Proportional)),
+            (Heading, FontId::new(18.0, Proportional)),
+            (Body, FontId::new(15.0, Proportional)),
+            (Button, FontId::new(15.0, Proportional)),
+            (Small, FontId::new(13.0, Proportional)),
             (Monospace, FontId::new(13.0, egui::FontFamily::Monospace)),
         ]
         .into()
@@ -10581,10 +12379,13 @@ fn tweak_default_font_scale(fonts: &mut egui::FontDefinitions) {
     // Render Ubuntu Light at 1.1× in the font atlas then display at 1.0×.
     // ab_glyph gets more coverage pixels to blend → smoother AA output.
     if let Some(fd) = fonts.font_data.get_mut("Ubuntu-Light") {
-        replace_font_tweak(fd, egui::FontTweak {
-            scale: 1.1,
-            ..Default::default()
-        });
+        replace_font_tweak(
+            fd,
+            egui::FontTweak {
+                scale: 1.1,
+                ..Default::default()
+            },
+        );
     }
 }
 
@@ -10595,12 +12396,13 @@ fn replace_font_tweak(fd: &mut std::sync::Arc<egui::FontData>, tweak: egui::Font
 }
 
 #[cfg(windows)]
-fn vm_icon_button(ui: &mut egui::Ui, icon: &str, tooltip: impl Into<egui::WidgetText>) -> egui::Response {
-    ui.add(
-        egui::Button::new(egui::RichText::new(icon).size(15.0))
-            .min_size(egui::vec2(26.0, 24.0)),
-    )
-    .on_hover_text(tooltip)
+fn vm_icon_button(
+    ui: &mut egui::Ui,
+    icon: &str,
+    tooltip: impl Into<egui::WidgetText>,
+) -> egui::Response {
+    ui.add(egui::Button::new(egui::RichText::new(icon).size(15.0)).min_size(egui::vec2(26.0, 24.0)))
+        .on_hover_text(tooltip)
 }
 
 #[cfg(windows)]
@@ -10612,8 +12414,7 @@ fn vm_icon_button_enabled(
 ) -> egui::Response {
     ui.add_enabled(
         enabled,
-        egui::Button::new(egui::RichText::new(icon).size(15.0))
-            .min_size(egui::vec2(26.0, 24.0)),
+        egui::Button::new(egui::RichText::new(icon).size(15.0)).min_size(egui::vec2(26.0, 24.0)),
     )
     .on_hover_text(tooltip)
 }
@@ -11011,29 +12812,85 @@ fn remember_history(history: &mut Vec<ConnectionHistoryEntry>, id: &str) {
 
 fn friendly_error(error: &str, lang: UiLang) -> String {
     if error.contains("Wrong Password") {
-        tr(lang, "Неверный пароль. Проверьте пароль на удаленном ПК.", "Wrong password. Check the password on the remote PC.").to_owned()
+        tr(
+            lang,
+            "Неверный пароль. Проверьте пароль на удаленном ПК.",
+            "Wrong password. Check the password on the remote PC.",
+        )
+        .to_owned()
     } else if error.contains("Offline:") || error.contains("Rendezvous refused: Offline") {
-        tr(lang, "Удаленный ID сейчас не в сети.", "Remote ID is currently offline.").to_owned()
+        tr(
+            lang,
+            "Удаленный ID сейчас не в сети.",
+            "Remote ID is currently offline.",
+        )
+        .to_owned()
     } else if error.contains("ID does not exist") {
-        tr(lang, "Такой ID не найден на сервере.", "This ID was not found on the server.").to_owned()
+        tr(
+            lang,
+            "Такой ID не найден на сервере.",
+            "This ID was not found on the server.",
+        )
+        .to_owned()
     } else if error.contains("Введите ID") || error.contains("Enter ID") {
         error.to_owned()
     } else if error.contains("Введите пароль") || error.contains("Enter password") {
         error.to_owned()
     } else if error.contains("Background task stopped unexpectedly") {
-        tr(lang, "Соединение неожиданно остановилось.", "Connection stopped unexpectedly.").to_owned()
+        tr(
+            lang,
+            "Соединение неожиданно остановилось.",
+            "Connection stopped unexpectedly.",
+        )
+        .to_owned()
     } else if error.contains("tls") || error.contains("TLS") || error.contains("certificate") {
-        tr(lang, "Ошибка TLS/сертификата. Проверьте настройки сервера.", "TLS/certificate error. Check your server settings.").to_owned()
-    } else if error.contains("timed out") || error.contains("timeout") || error.contains("Connection timed out") {
-        tr(lang, "Таймаут подключения. Проверьте сеть или попробуйте ещё раз.", "Connection timed out. Check your network or try again.").to_owned()
+        tr(
+            lang,
+            "Ошибка TLS/сертификата. Проверьте настройки сервера.",
+            "TLS/certificate error. Check your server settings.",
+        )
+        .to_owned()
+    } else if error.contains("timed out")
+        || error.contains("timeout")
+        || error.contains("Connection timed out")
+    {
+        tr(
+            lang,
+            "Таймаут подключения. Проверьте сеть или попробуйте ещё раз.",
+            "Connection timed out. Check your network or try again.",
+        )
+        .to_owned()
     } else if error.contains("Connection refused") || error.contains("connection refused") {
-        tr(lang, "Сервер недоступен. Проверьте адрес и порт.", "Server refused the connection. Check the address and port.").to_owned()
+        tr(
+            lang,
+            "Сервер недоступен. Проверьте адрес и порт.",
+            "Server refused the connection. Check the address and port.",
+        )
+        .to_owned()
     } else if error.contains("relay") || error.contains("Relay") {
-        tr(lang, "Сервер-ретранслятор недоступен. Попробуйте позже.", "Relay server is unreachable. Try again later.").to_owned()
-    } else if error.contains("Protocol") || error.contains("protocol") || error.contains("version mismatch") {
-        tr(lang, "Несовместимая версия протокола.", "Protocol version mismatch.").to_owned()
+        tr(
+            lang,
+            "Сервер-ретранслятор недоступен. Попробуйте позже.",
+            "Relay server is unreachable. Try again later.",
+        )
+        .to_owned()
+    } else if error.contains("Protocol")
+        || error.contains("protocol")
+        || error.contains("version mismatch")
+    {
+        tr(
+            lang,
+            "Несовместимая версия протокола.",
+            "Protocol version mismatch.",
+        )
+        .to_owned()
     } else if error.contains("Network unreachable") || error.contains("No route to host") {
-        tr(lang, "Нет сети. Проверьте подключение к интернету.", "No network. Check your internet connection.").to_owned()
+        tr(
+            lang,
+            "Нет сети. Проверьте подключение к интернету.",
+            "No network. Check your internet connection.",
+        )
+        .to_owned()
     } else {
         error.to_owned()
     }

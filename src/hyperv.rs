@@ -13,23 +13,16 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 use windows::{
     core::{BSTR, PCWSTR},
-    Win32::{
-        System::{
-            Com::{
-                CoCreateInstance, CoInitializeEx, CoSetProxyBlanket, CLSCTX_INPROC_SERVER,
-                COINIT_MULTITHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL,
-                RPC_C_IMP_LEVEL_IMPERSONATE, SAFEARRAY, VARIANT, VT_ARRAY, VT_BSTR, VT_I4,
-                VT_BOOL, VT_I1, VT_UI1, VT_UI2, VT_UI4,
-            },
-            Ole::{
-                SafeArrayAccessData, SafeArrayGetLBound, SafeArrayGetUBound,
-                SafeArrayUnaccessData,
-            },
-            Wmi::{
-                IEnumWbemClassObject, IWbemClassObject, IWbemLocator, IWbemServices,
-                WbemLocator, WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY,
-                WBEM_GENERIC_FLAG_TYPE,
-            },
+    Win32::System::{
+        Com::{
+            CoCreateInstance, CoInitializeEx, CoSetProxyBlanket, CLSCTX_INPROC_SERVER,
+            COINIT_MULTITHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
+            SAFEARRAY, VARIANT, VT_ARRAY, VT_BOOL, VT_BSTR, VT_I1, VT_I4, VT_UI1, VT_UI2, VT_UI4,
+        },
+        Ole::{SafeArrayAccessData, SafeArrayGetLBound, SafeArrayGetUBound, SafeArrayUnaccessData},
+        Wmi::{
+            IEnumWbemClassObject, IWbemClassObject, IWbemLocator, IWbemServices, WbemLocator,
+            WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY, WBEM_GENERIC_FLAG_TYPE,
         },
     },
 };
@@ -169,14 +162,10 @@ impl Wmi {
         unsafe {
             let query = BSTR::from(wql);
             let wql_str = BSTR::from("WQL");
-            let flags = WBEM_GENERIC_FLAG_TYPE(
-                WBEM_FLAG_FORWARD_ONLY.0 | WBEM_FLAG_RETURN_IMMEDIATELY.0,
-            );
+            let flags =
+                WBEM_GENERIC_FLAG_TYPE(WBEM_FLAG_FORWARD_ONLY.0 | WBEM_FLAG_RETURN_IMMEDIATELY.0);
 
-            let Ok(enumerator) =
-                self.svc
-                    .ExecQuery(&wql_str, &query, flags, None)
-            else {
+            let Ok(enumerator) = self.svc.ExecQuery(&wql_str, &query, flags, None) else {
                 return vec![];
             };
 
@@ -313,7 +302,8 @@ unsafe fn wmi_val_to_variant(val: &WmiVal) -> VARIANT {
         }
         WmiVal::Bool(v) => {
             inner.vt = VT_BOOL;
-            inner.Anonymous.boolVal = windows::Win32::Foundation::VARIANT_BOOL(if *v { -1 } else { 0 });
+            inner.Anonymous.boolVal =
+                windows::Win32::Foundation::VARIANT_BOOL(if *v { -1 } else { 0 });
         }
         WmiVal::I8(v) => {
             inner.vt = VT_I1;
@@ -349,8 +339,8 @@ unsafe fn variant_to_wmi_val(var: &VARIANT) -> Option<WmiVal> {
             let s = inner.Anonymous.bstrVal.to_string();
             Some(WmiVal::Str(s))
         }
-        3 => Some(WmiVal::I32(inner.Anonymous.lVal)),  // VT_I4
-        16 => Some(WmiVal::I8(inner.Anonymous.cVal as i8)),  // VT_I1
+        3 => Some(WmiVal::I32(inner.Anonymous.lVal)), // VT_I4
+        16 => Some(WmiVal::I8(inner.Anonymous.cVal as i8)), // VT_I1
         11 => Some(WmiVal::Bool(inner.Anonymous.boolVal.0 != 0)), // VT_BOOL
         19 => Some(WmiVal::U32(inner.Anonymous.ulVal)), // VT_UI4
         18 => Some(WmiVal::U16(inner.Anonymous.uiVal)), // VT_UI2
@@ -414,14 +404,8 @@ unsafe fn read_all_properties(obj: &IWbemClassObject) -> HashMap<String, WmiVal>
 unsafe fn read_named_property(obj: &IWbemClassObject, name: &str) -> Option<WmiVal> {
     let name_w = wide_null(name);
     let mut var = VARIANT::default();
-    obj.Get(
-        PCWSTR(name_w.as_ptr()),
-        0,
-        &mut var,
-        None,
-        None,
-    )
-    .ok()?;
+    obj.Get(PCWSTR(name_w.as_ptr()), 0, &mut var, None, None)
+        .ok()?;
     variant_to_wmi_val(&var)
 }
 
@@ -458,7 +442,10 @@ fn obj_path_class(path: &str) -> &str {
         // Absolute path: \\SERVER\namespace:ClassName.key=val
         // The ONE legitimate colon is the namespace separator before the class name.
         let after_colon = path.find(':').map(|i| &path[i + 1..]).unwrap_or(path);
-        after_colon.find('.').map(|i| &after_colon[..i]).unwrap_or(after_colon)
+        after_colon
+            .find('.')
+            .map(|i| &after_colon[..i])
+            .unwrap_or(after_colon)
     } else {
         // Relative path: ClassName.key="val",key2="Microsoft:something"
         // Class name is everything before the first dot.
@@ -510,7 +497,11 @@ fn list_virtualbox_vms() -> Vec<VmInfo> {
             name: v.name,
             wmi_path: v.id.clone(),
             id: v.id,
-            state: if v.running { VmState::Running } else { VmState::Off },
+            state: if v.running {
+                VmState::Running
+            } else {
+                VmState::Off
+            },
             provider: VmProvider::VirtualBox,
             console_mode: ConsoleMode::Other,
         })
@@ -577,7 +568,10 @@ fn query_heartbeat_map(wmi: &Wmi) -> HashMap<String, ConsoleMode> {
     rows.into_iter()
         .filter_map(|mut row| {
             let name = row.remove("Name")?.as_str()?.to_owned();
-            let heartbeat = row.remove("Heartbeat").and_then(|v| v.as_u32()).unwrap_or(0);
+            let heartbeat = row
+                .remove("Heartbeat")
+                .and_then(|v| v.as_u32())
+                .unwrap_or(0);
             // 2 = Ok (IS running), 6 = Error, 12 = NoContact, 0 = Unknown/not available
             let mode = if heartbeat == 2 {
                 ConsoleMode::EnhancedSession
@@ -590,7 +584,9 @@ fn query_heartbeat_map(wmi: &Wmi) -> HashMap<String, ConsoleMode> {
 }
 
 fn list_vms_com() -> Vec<VmInfo> {
-    let Some(wmi) = Wmi::connect() else { return vec![] };
+    let Some(wmi) = Wmi::connect() else {
+        return vec![];
+    };
     // НЕ проецируем __PATH в SELECT: у virtualization-провайдера это может
     // вернуть 0 строк. read_all_properties дочитывает __PATH через obj.Get.
     let console_modes = query_heartbeat_map(&wmi);
@@ -607,13 +603,18 @@ fn list_vms_com() -> Vec<VmInfo> {
             let wmi_path = take_non_empty_string(&mut row, "__PATH")
                 .or_else(|| take_non_empty_string(&mut row, "__RELPATH"))
                 .unwrap_or_else(|| vm_computer_system_path(&id));
-            let console_mode = console_modes.get(&id).cloned().unwrap_or(ConsoleMode::ThumbnailOnly);
+            let console_mode = console_modes
+                .get(&id)
+                .cloned()
+                .unwrap_or(ConsoleMode::ThumbnailOnly);
             Some(VmInfo {
                 name: row.remove("ElementName")?.as_str()?.to_owned(),
                 id,
                 wmi_path,
                 state: VmState::from_u32(
-                    row.remove("EnabledState").and_then(|v| v.as_u32()).unwrap_or(0),
+                    row.remove("EnabledState")
+                        .and_then(|v| v.as_u32())
+                        .unwrap_or(0),
                 ),
                 provider: VmProvider::HyperV,
                 console_mode,
@@ -717,8 +718,12 @@ fn is_vm_row(row: &HashMap<String, WmiVal>) -> bool {
 }
 
 fn take_non_empty_string(row: &mut HashMap<String, WmiVal>, key: &str) -> Option<String> {
-    row.remove(key)
-        .and_then(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned))
+    row.remove(key).and_then(|v| {
+        v.as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    })
 }
 
 fn vm_computer_system_path(vm_id: &str) -> String {
@@ -765,25 +770,25 @@ pub enum VmPowerAction {
 impl VmPowerAction {
     pub fn from_str(s: &str) -> Option<Self> {
         Some(match s {
-            "start"    => Self::Start,
-            "stop"     => Self::Stop,
+            "start" => Self::Start,
+            "stop" => Self::Stop,
             "shutdown" => Self::Shutdown,
-            "restart"  => Self::Restart,
-            "pause"    => Self::Pause,
-            "resume"   => Self::Resume,
-            "save"     => Self::Save,
+            "restart" => Self::Restart,
+            "pause" => Self::Pause,
+            "resume" => Self::Resume,
+            "save" => Self::Save,
             _ => return None,
         })
     }
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Start    => "Start",
-            Self::Stop     => "Force Off",
+            Self::Start => "Start",
+            Self::Stop => "Force Off",
             Self::Shutdown => "Shutdown",
-            Self::Restart  => "Restart",
-            Self::Pause    => "Pause",
-            Self::Resume   => "Resume",
-            Self::Save     => "Save",
+            Self::Restart => "Restart",
+            Self::Pause => "Pause",
+            Self::Resume => "Resume",
+            Self::Save => "Save",
         }
     }
 }
@@ -792,19 +797,65 @@ impl VmPowerAction {
 pub fn request_power_action(vm_wmi_path: &str, action: VmPowerAction) {
     let path = vm_wmi_path.to_owned();
     std::thread::spawn(move || {
-        let Some(wmi) = Wmi::connect() else { return; };
+        let Some(wmi) = Wmi::connect() else {
+            return;
+        };
         match action {
-            VmPowerAction::Start    => { let _ = wmi.exec_method_result(&path, "RequestStateChange", &[("RequestedState", WmiVal::I32(2))]); }
-            VmPowerAction::Stop     => { let _ = wmi.exec_method_result(&path, "RequestStateChange", &[("RequestedState", WmiVal::I32(3))]); }
-            VmPowerAction::Shutdown => { let _ = wmi.exec_method_result(&path, "RequestStateChange", &[("RequestedState", WmiVal::I32(4))]); }
-            VmPowerAction::Pause    => { let _ = wmi.exec_method_result(&path, "RequestStateChange", &[("RequestedState", WmiVal::I32(9))]); }
-            VmPowerAction::Resume   => { let _ = wmi.exec_method_result(&path, "RequestStateChange", &[("RequestedState", WmiVal::I32(2))]); }
-            VmPowerAction::Save     => { let _ = wmi.exec_method_result(&path, "RequestStateChange", &[("RequestedState", WmiVal::I32(32770))]); }
-            VmPowerAction::Restart  => {
+            VmPowerAction::Start => {
+                let _ = wmi.exec_method_result(
+                    &path,
+                    "RequestStateChange",
+                    &[("RequestedState", WmiVal::I32(2))],
+                );
+            }
+            VmPowerAction::Stop => {
+                let _ = wmi.exec_method_result(
+                    &path,
+                    "RequestStateChange",
+                    &[("RequestedState", WmiVal::I32(3))],
+                );
+            }
+            VmPowerAction::Shutdown => {
+                let _ = wmi.exec_method_result(
+                    &path,
+                    "RequestStateChange",
+                    &[("RequestedState", WmiVal::I32(4))],
+                );
+            }
+            VmPowerAction::Pause => {
+                let _ = wmi.exec_method_result(
+                    &path,
+                    "RequestStateChange",
+                    &[("RequestedState", WmiVal::I32(9))],
+                );
+            }
+            VmPowerAction::Resume => {
+                let _ = wmi.exec_method_result(
+                    &path,
+                    "RequestStateChange",
+                    &[("RequestedState", WmiVal::I32(2))],
+                );
+            }
+            VmPowerAction::Save => {
+                let _ = wmi.exec_method_result(
+                    &path,
+                    "RequestStateChange",
+                    &[("RequestedState", WmiVal::I32(32770))],
+                );
+            }
+            VmPowerAction::Restart => {
                 // Stop then start — both async, give stop time to complete
-                let _ = wmi.exec_method_result(&path, "RequestStateChange", &[("RequestedState", WmiVal::I32(3))]);
+                let _ = wmi.exec_method_result(
+                    &path,
+                    "RequestStateChange",
+                    &[("RequestedState", WmiVal::I32(3))],
+                );
                 std::thread::sleep(Duration::from_secs(4));
-                let _ = wmi.exec_method_result(&path, "RequestStateChange", &[("RequestedState", WmiVal::I32(2))]);
+                let _ = wmi.exec_method_result(
+                    &path,
+                    "RequestStateChange",
+                    &[("RequestedState", WmiVal::I32(2))],
+                );
             }
         }
     });
@@ -830,7 +881,9 @@ pub struct CheckpointInfo {
 /// Получить список чекпоинтов VM.
 /// Возвращает пустой вектор если VM не найдена, WMI недоступна, или чекпоинтов нет.
 pub fn list_checkpoints(vm_id: &str) -> Vec<CheckpointInfo> {
-    let Some(wmi) = Wmi::connect() else { return Vec::new() };
+    let Some(wmi) = Wmi::connect() else {
+        return Vec::new();
+    };
     // Чекпоинты — Msvm_VirtualSystemSettingData с VirtualSystemIdentifier = vm_guid
     // И VirtualSystemType != 'Microsoft:Hyper-V:System:Realized' (это основная конфигурация).
     // Snapshot types: 'Microsoft:Hyper-V:Snapshot:Realized', 'Microsoft:Hyper-V:Snapshot:Recovery'
@@ -926,9 +979,7 @@ pub fn create_checkpoint(vm_wmi_path: &str, name: Option<&str>) -> Result<String
         .exec_method_result(&svc_path, "CreateSnapshot", &in_params)
         .map_err(|e| format!("CreateSnapshot: {e}"))?;
 
-    let display_name = name
-        .unwrap_or("Checkpoint")
-        .to_owned();
+    let display_name = name.unwrap_or("Checkpoint").to_owned();
     Ok(display_name)
 }
 
@@ -955,7 +1006,10 @@ pub fn delete_checkpoint(snapshot_wmi_path: &str) -> Result<(), String> {
     wmi.exec_method_result(
         &svc_path,
         "DestroySnapshot",
-        &[("AffectedSnapshot", WmiVal::Str(snapshot_wmi_path.to_owned()))],
+        &[(
+            "AffectedSnapshot",
+            WmiVal::Str(snapshot_wmi_path.to_owned()),
+        )],
     )
     .map(|_| ())
     .map_err(|e| format!("DestroySnapshot: {e}"))
@@ -984,7 +1038,12 @@ pub fn video_resolution(vm_id: &str) -> Option<(u16, u16)> {
     }
 }
 
-pub fn capture_screen(vm_id: &str, vm_wmi_path: &str, width: u16, height: u16) -> Result<Vec<u8>, String> {
+pub fn capture_screen(
+    vm_id: &str,
+    vm_wmi_path: &str,
+    width: u16,
+    height: u16,
+) -> Result<Vec<u8>, String> {
     let wmi = Wmi::connect().ok_or_else(|| "WMI connect failed".to_owned())?;
 
     // Get the management service path (singleton)
@@ -1135,8 +1194,12 @@ pub fn type_text(vm_id: &str, text: &str) -> Result<(), String> {
     let wmi = Wmi::connect().ok_or_else(|| "WMI connect failed".to_owned())?;
     let path = find_device_path(&wmi, "Msvm_Keyboard", vm_id)
         .ok_or_else(|| "Msvm_Keyboard не найден".to_owned())?;
-    wmi.exec_method_result(&path, "TypeText", &[("asciiText", WmiVal::Str(text.to_owned()))])
-        .map(|_| ())
+    wmi.exec_method_result(
+        &path,
+        "TypeText",
+        &[("asciiText", WmiVal::Str(text.to_owned()))],
+    )
+    .map(|_| ())
 }
 
 fn kbd_exec(vm_id: &str, method: &str, scan_code: u32) -> Result<(), String> {
@@ -1282,9 +1345,7 @@ fn mouse_click_button_exec(wmi: &Wmi, mouse: &MouseDevice, button: u32) -> Resul
                 &[("ButtonIndex", WmiVal::I32(button as i32))],
             )
             .and_then(|out| check_wmi_return("ClickButton", out))
-            .map_err(|i32_err| {
-                format!("ClickButton U32 failed: {u32_err}; I32 failed: {i32_err}")
-            }),
+            .map_err(|i32_err| format!("ClickButton U32 failed: {u32_err}; I32 failed: {i32_err}")),
     }
 }
 
@@ -1326,24 +1387,33 @@ fn find_device_path(wmi: &Wmi, class: &str, vm_id: &str) -> Option<String> {
         for row in rows {
             // Filter by SystemName when scanning all
             if q.contains("SELECT * FROM") && !q.contains("WHERE") {
-                let sn = row.get("SystemName").and_then(|v| v.as_str().map(|s| s.to_owned()));
+                let sn = row
+                    .get("SystemName")
+                    .and_then(|v| v.as_str().map(|s| s.to_owned()));
                 if sn.as_deref() != Some(vm_id) {
                     continue;
                 }
             }
             // Prefer __PATH, fall back to __RELPATH, else build from DeviceID
-            if let Some(p) = row.get("__PATH").and_then(|v| v.as_str().map(|s| s.to_owned()))
+            if let Some(p) = row
+                .get("__PATH")
+                .and_then(|v| v.as_str().map(|s| s.to_owned()))
                 .filter(|s| !s.is_empty())
             {
                 return Some(p);
             }
-            if let Some(p) = row.get("__RELPATH").and_then(|v| v.as_str().map(|s| s.to_owned()))
+            if let Some(p) = row
+                .get("__RELPATH")
+                .and_then(|v| v.as_str().map(|s| s.to_owned()))
                 .filter(|s| !s.is_empty())
             {
                 return Some(p);
             }
             // Build path manually from key properties
-            if let Some(dev_id) = row.get("DeviceID").and_then(|v| v.as_str().map(|s| s.to_owned())) {
+            if let Some(dev_id) = row
+                .get("DeviceID")
+                .and_then(|v| v.as_str().map(|s| s.to_owned()))
+            {
                 let path = format!(
                     "{class}.CreationClassName=\"{class}\",DeviceID=\"{}\",\
                      SystemCreationClassName=\"Msvm_ComputerSystem\",SystemName=\"{vm_id}\"",
@@ -1369,7 +1439,13 @@ struct DevicePaths {
 impl DevicePaths {
     fn resolve(vm_id: &str) -> (Self, Option<String>) {
         let Some(wmi) = Wmi::connect() else {
-            return (Self { keyboard: None, mouse: None }, Some("WMI connect failed".into()));
+            return (
+                Self {
+                    keyboard: None,
+                    mouse: None,
+                },
+                Some("WMI connect failed".into()),
+            );
         };
         let keyboard = find_device_path(&wmi, "Msvm_Keyboard", vm_id);
         let mouse = find_mouse_device(&wmi, vm_id);
@@ -1858,7 +1934,8 @@ impl HyperVSession {
 
     pub fn stop(self) {
         // Signal capture-thread to exit on its next loop iteration.
-        self.stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.stop_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         // Signal input-thread to exit (unblocks recv()).
         let _ = self.cmd_tx.send(HyperVCmd::Stop);
         // Dropping cmd_tx also causes input-thread recv() to return Err → exit.
@@ -1886,7 +1963,9 @@ impl HyperVProvider {
         }
     }
     pub fn with_id(id: &str) -> Self {
-        Self { provider_id: id.to_owned() }
+        Self {
+            provider_id: id.to_owned(),
+        }
     }
 
     /// Convert hyperv::VmInfo to universal provider_api::VmInfo.
@@ -1973,7 +2052,9 @@ impl crate::provider_api::VirtualizationProvider for HyperVProvider {
         &self.provider_id
     }
 
-    fn list_hosts(&self) -> crate::provider_api::ProviderResult<Vec<crate::provider_api::HostInfo>> {
+    fn list_hosts(
+        &self,
+    ) -> crate::provider_api::ProviderResult<Vec<crate::provider_api::HostInfo>> {
         use crate::provider_api::{HostInfo, ProviderType};
         // For local Hyper-V we return a single host entry for the local machine.
         let hostname = std::env::var("COMPUTERNAME")
@@ -2003,7 +2084,10 @@ impl crate::provider_api::VirtualizationProvider for HyperVProvider {
             .collect())
     }
 
-    fn get_vm(&self, vm_id: &str) -> crate::provider_api::ProviderResult<crate::provider_api::VmInfo> {
+    fn get_vm(
+        &self,
+        vm_id: &str,
+    ) -> crate::provider_api::ProviderResult<crate::provider_api::VmInfo> {
         let real_id = vm_id.strip_prefix("hyperv:").unwrap_or(vm_id);
         let vms = list_vms();
         vms.iter()
@@ -2025,16 +2109,13 @@ impl crate::provider_api::VirtualizationProvider for HyperVProvider {
         Ok(crate::capability_engine::evaluate(vm))
     }
 
-    fn power_action(
-        &self,
-        vm_id: &str,
-        action: &str,
-    ) -> crate::provider_api::ProviderResult<()> {
+    fn power_action(&self, vm_id: &str, action: &str) -> crate::provider_api::ProviderResult<()> {
         let real_id = vm_id.strip_prefix("hyperv:").unwrap_or(vm_id);
-        let action_enum = VmPowerAction::from_str(action)
-            .ok_or_else(|| crate::provider_api::ProviderError::NotSupported(
-                format!("Unknown power action: {action}"),
-            ))?;
+        let action_enum = VmPowerAction::from_str(action).ok_or_else(|| {
+            crate::provider_api::ProviderError::NotSupported(format!(
+                "Unknown power action: {action}"
+            ))
+        })?;
         let vm_path = format!(
             "Msvm_ComputerSystem.CreationClassName=\"Msvm_ComputerSystem\",Name=\"{real_id}\""
         );
@@ -2063,12 +2144,13 @@ impl crate::provider_api::VirtualizationProvider for HyperVProvider {
         let vm_path = format!(
             "Msvm_ComputerSystem.CreationClassName=\"Msvm_ComputerSystem\",Name=\"{real_id}\""
         );
-        let snap_name = create_checkpoint(&vm_path, name)
-            .map_err(|e| crate::provider_api::ProviderError::NativeError {
+        let snap_name = create_checkpoint(&vm_path, name).map_err(|e| {
+            crate::provider_api::ProviderError::NativeError {
                 provider: "hyperv".to_owned(),
                 code: "CREATE_CHECKPOINT_FAILED".to_owned(),
                 message: e,
-            })?;
+            }
+        })?;
         Ok(crate::provider_api::SnapshotInfo {
             snapshot_id: format!("hyperv:new:{snap_name}"),
             provider_native_id: snap_name.clone(),
@@ -2089,12 +2171,11 @@ impl crate::provider_api::VirtualizationProvider for HyperVProvider {
     ) -> crate::provider_api::ProviderResult<()> {
         // snapshot_id is the WMI path (stored in provider_native_id)
         let wmi_path = snapshot_id.strip_prefix("hyperv:").unwrap_or(snapshot_id);
-        apply_checkpoint(wmi_path)
-            .map_err(|e| crate::provider_api::ProviderError::NativeError {
-                provider: "hyperv".to_owned(),
-                code: "APPLY_CHECKPOINT_FAILED".to_owned(),
-                message: e,
-            })
+        apply_checkpoint(wmi_path).map_err(|e| crate::provider_api::ProviderError::NativeError {
+            provider: "hyperv".to_owned(),
+            code: "APPLY_CHECKPOINT_FAILED".to_owned(),
+            message: e,
+        })
     }
 
     fn delete_snapshot(
@@ -2103,12 +2184,11 @@ impl crate::provider_api::VirtualizationProvider for HyperVProvider {
         snapshot_id: &str,
     ) -> crate::provider_api::ProviderResult<()> {
         let wmi_path = snapshot_id.strip_prefix("hyperv:").unwrap_or(snapshot_id);
-        delete_checkpoint(wmi_path)
-            .map_err(|e| crate::provider_api::ProviderError::NativeError {
-                provider: "hyperv".to_owned(),
-                code: "DELETE_CHECKPOINT_FAILED".to_owned(),
-                message: e,
-            })
+        delete_checkpoint(wmi_path).map_err(|e| crate::provider_api::ProviderError::NativeError {
+            provider: "hyperv".to_owned(),
+            code: "DELETE_CHECKPOINT_FAILED".to_owned(),
+            message: e,
+        })
     }
 
     fn get_preview_frame(
@@ -2121,12 +2201,13 @@ impl crate::provider_api::VirtualizationProvider for HyperVProvider {
         let vm_path = format!(
             "Msvm_ComputerSystem.CreationClassName=\"Msvm_ComputerSystem\",Name=\"{real_id}\""
         );
-        let rgba = capture_screen(real_id, &vm_path, width as u16, height as u16)
-            .map_err(|e| crate::provider_api::ProviderError::NativeError {
+        let rgba = capture_screen(real_id, &vm_path, width as u16, height as u16).map_err(|e| {
+            crate::provider_api::ProviderError::NativeError {
                 provider: "hyperv".to_owned(),
                 code: "PREVIEW_CAPTURE_FAILED".to_owned(),
                 message: e,
-            })?;
+            }
+        })?;
         // Convert RGBA → BGRA as required by pipeline
         let bgra: Vec<u8> = rgba
             .chunks_exact(4)

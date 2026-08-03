@@ -123,7 +123,10 @@ pub fn choose_backend(
                 warnings: vec![],
             };
         }
-        if matches!(cap.state, CapabilityState::Unsupported | CapabilityState::BlockedByPolicy) {
+        if matches!(
+            cap.state,
+            CapabilityState::Unsupported | CapabilityState::BlockedByPolicy
+        ) {
             return BackendDecision {
                 selected_mode: SessionMode::Offline,
                 fallback_modes: vec![],
@@ -150,15 +153,15 @@ pub fn choose_backend(
     // Auto mode: score all candidates, apply policy + client filter, pick best
     let all_candidates: Vec<(SessionMode, &Capability, i32)> = vec![
         (SessionMode::ProviderNativeConsole, &graph.experimental, 100),
-        (SessionMode::EnhancedSession,       &graph.enhanced_session, 95),
-        (SessionMode::WebMksConsole,         &graph.webmks_console, 95),
-        (SessionMode::SpiceConsole,          &graph.spice_console, 90),
-        (SessionMode::VncConsole,            &graph.vnc_console, 85),
-        (SessionMode::RdpRelay,              &graph.rdp_relay, 80),
-        (SessionMode::WebConsole,            &graph.web_console, 75),
-        (SessionMode::SerialConsole,         &graph.serial_console, 55),
-        (SessionMode::BasicRescue,           &graph.keyboard_rescue, 50),
-        (SessionMode::PreviewOnly,           &graph.preview, 20),
+        (SessionMode::EnhancedSession, &graph.enhanced_session, 95),
+        (SessionMode::WebMksConsole, &graph.webmks_console, 95),
+        (SessionMode::SpiceConsole, &graph.spice_console, 90),
+        (SessionMode::VncConsole, &graph.vnc_console, 85),
+        (SessionMode::RdpRelay, &graph.rdp_relay, 80),
+        (SessionMode::WebConsole, &graph.web_console, 75),
+        (SessionMode::SerialConsole, &graph.serial_console, 55),
+        (SessionMode::BasicRescue, &graph.keyboard_rescue, 50),
+        (SessionMode::PreviewOnly, &graph.preview, 20),
     ];
 
     let mut scored: Vec<BackendScore> = all_candidates
@@ -207,7 +210,8 @@ pub fn choose_backend(
         return BackendDecision {
             selected_mode: SessionMode::Offline,
             fallback_modes: vec![],
-            reason: "No accessible backend available — VM may be offline or access blocked".to_owned(),
+            reason: "No accessible backend available — VM may be offline or access blocked"
+                .to_owned(),
             warnings: vec![],
         };
     }
@@ -233,19 +237,18 @@ pub fn choose_backend(
 /// Get the relevant Capability for a given SessionMode from the graph.
 pub fn mode_capability<'a>(graph: &'a VmCapabilityGraph, mode: &SessionMode) -> &'a Capability {
     match mode {
-        SessionMode::PreviewOnly        => &graph.preview,
-        SessionMode::BasicRescue        => &graph.keyboard_rescue,
-        SessionMode::RdpRelay           => &graph.rdp_relay,
-        SessionMode::VncConsole         => &graph.vnc_console,
-        SessionMode::SpiceConsole       => &graph.spice_console,
-        SessionMode::WebConsole         => &graph.web_console,
-        SessionMode::WebMksConsole      => &graph.webmks_console,
-        SessionMode::SerialConsole      => &graph.serial_console,
-        SessionMode::EnhancedSession    => &graph.enhanced_session,
+        SessionMode::PreviewOnly => &graph.preview,
+        SessionMode::BasicRescue => &graph.keyboard_rescue,
+        SessionMode::RdpRelay => &graph.rdp_relay,
+        SessionMode::VncConsole => &graph.vnc_console,
+        SessionMode::SpiceConsole => &graph.spice_console,
+        SessionMode::WebConsole => &graph.web_console,
+        SessionMode::WebMksConsole => &graph.webmks_console,
+        SessionMode::SerialConsole => &graph.serial_console,
+        SessionMode::EnhancedSession => &graph.enhanced_session,
         SessionMode::ProviderNativeConsole => &graph.experimental,
-        SessionMode::ExperimentalHvSocket |
-        SessionMode::Experimental(_)    => &graph.hv_socket,
-        SessionMode::Offline            => &graph.preview, // offline has no specific cap
+        SessionMode::ExperimentalHvSocket | SessionMode::Experimental(_) => &graph.hv_socket,
+        SessionMode::Offline => &graph.preview, // offline has no specific cap
     }
 }
 
@@ -281,13 +284,13 @@ pub fn explain_unavailability(graph: &VmCapabilityGraph) -> ExplainResult {
 
     // Check each interactive mode
     let interactive_modes: &[(SessionMode, &Capability)] = &[
-        (SessionMode::EnhancedSession,  &graph.enhanced_session),
-        (SessionMode::RdpRelay,         &graph.rdp_relay),
-        (SessionMode::VncConsole,       &graph.vnc_console),
-        (SessionMode::SpiceConsole,     &graph.spice_console),
-        (SessionMode::WebMksConsole,    &graph.webmks_console),
-        (SessionMode::SerialConsole,    &graph.serial_console),
-        (SessionMode::BasicRescue,      &graph.keyboard_rescue),
+        (SessionMode::EnhancedSession, &graph.enhanced_session),
+        (SessionMode::RdpRelay, &graph.rdp_relay),
+        (SessionMode::VncConsole, &graph.vnc_console),
+        (SessionMode::SpiceConsole, &graph.spice_console),
+        (SessionMode::WebMksConsole, &graph.webmks_console),
+        (SessionMode::SerialConsole, &graph.serial_console),
+        (SessionMode::BasicRescue, &graph.keyboard_rescue),
     ];
 
     let mut any_available = false;
@@ -338,25 +341,34 @@ pub fn explain_unavailability(graph: &VmCapabilityGraph) -> ExplainResult {
 
 /// Serialize ExplainResult to JSON for the Explain API (§60.5, §52.1).
 pub fn explain_to_json(vm_id: &str, result: &ExplainResult) -> String {
-    let reasons: Vec<serde_json::Value> = result.reasons.iter().map(|r| {
-        serde_json::json!({
-            "code": r.code,
-            "message": r.message,
-            "remediation": r.remediation,
+    let reasons: Vec<serde_json::Value> = result
+        .reasons
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "code": r.code,
+                "message": r.message,
+                "remediation": r.remediation,
+            })
         })
-    }).collect();
-    let actions: Vec<serde_json::Value> = result.recommended_actions.iter().map(|a| {
-        serde_json::json!({
-            "label": a.label,
-            "mode": a.mode.as_ref().map(|m| m.label()),
+        .collect();
+    let actions: Vec<serde_json::Value> = result
+        .recommended_actions
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "label": a.label,
+                "mode": a.mode.as_ref().map(|m| m.label()),
+            })
         })
-    }).collect();
+        .collect();
     serde_json::json!({
         "vm_id": vm_id,
         "summary": result.summary,
         "reasons": reasons,
         "recommended_actions": actions,
-    }).to_string()
+    })
+    .to_string()
 }
 
 // ── Policy Engine skeleton ────────────────────────────────────────────────────
@@ -413,28 +425,29 @@ pub enum AuditEventType {
 impl AuditEventType {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::SessionStarted    => "session.started",
-            Self::SessionEnded      => "session.ended",
-            Self::SessionRevoked    => "session.revoked",
+            Self::SessionStarted => "session.started",
+            Self::SessionEnded => "session.ended",
+            Self::SessionRevoked => "session.revoked",
             Self::PowerActionRequested => "power.action_requested",
-            Self::SnapshotCreated   => "snapshot.created",
-            Self::SnapshotApplied   => "snapshot.applied",
-            Self::SnapshotDeleted   => "snapshot.deleted",
-            Self::RescueInputSent   => "rescue.input_sent",
-            Self::ClipboardEvent    => "clipboard.event",
-            Self::PolicyDenied      => "policy.denied",
+            Self::SnapshotCreated => "snapshot.created",
+            Self::SnapshotApplied => "snapshot.applied",
+            Self::SnapshotDeleted => "snapshot.deleted",
+            Self::RescueInputSent => "rescue.input_sent",
+            Self::ClipboardEvent => "clipboard.event",
+            Self::PolicyDenied => "policy.denied",
             Self::ApprovalRequested => "approval.requested",
-            Self::ApprovalGranted   => "approval.granted",
-            Self::ApprovalDenied    => "approval.denied",
+            Self::ApprovalGranted => "approval.granted",
+            Self::ApprovalDenied => "approval.denied",
         }
     }
     pub fn severity(&self) -> &'static str {
         match self {
             Self::SessionStarted | Self::SessionEnded => "info",
-            Self::PowerActionRequested | Self::SnapshotApplied
-            | Self::SnapshotDeleted | Self::RescueInputSent => "warning",
-            Self::SessionRevoked | Self::PolicyDenied
-            | Self::ApprovalDenied => "error",
+            Self::PowerActionRequested
+            | Self::SnapshotApplied
+            | Self::SnapshotDeleted
+            | Self::RescueInputSent => "warning",
+            Self::SessionRevoked | Self::PolicyDenied | Self::ApprovalDenied => "error",
             _ => "info",
         }
     }
@@ -487,7 +500,8 @@ fn uuid_v4_simple() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+    format!(
+        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
         (t >> 32) as u32,
         (t >> 16) as u16 & 0xFFFF,
         t as u16 & 0x0FFF,

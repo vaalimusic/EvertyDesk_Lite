@@ -25,24 +25,31 @@ succeeding EVRT (2025). Designed and authored by **Arthur Valiev**.
 ```
 evrt2/
   README.md               ← this file
+  ROADMAP.md              ← implementation status + phased plan
   spec/
     EVRT2_OVERVIEW.md     ← high-level architecture
     EVRT2_PACKET.md       ← binary packet format (wire spec)
-    EVRT2_SDUDP.md        ← Super Dynamic UDP transport layer
-    EVRT2_SECURITY.md     ← auth, encryption, session tokens
+    EVRT2_SECURITY.md     ← auth, encryption, session tokens (both implemented)
   codec/
     EVRT2CKMAX.md         ← codec overview and design goals
-    SILICON_PROBE.md      ← hardware detection and delegation
-    AR2R47_MODES.md       ← three codec operating modes
+    SILICON_PROBE.md      ← hardware detection and delegation, by fact (Phase 6.6)
   transport/
-    SDUDP.md              ← SD-UDP packet scheduling, jitter, FEC
-    FEEDBACK.md           ← receiver feedback loop v2
-    RELAY_TUNNEL.md       ← EVRT2 over TCP relay (fallback path)
+    SDUDP.md              ← SD-UDP scheduling, jitter, FEC, liveness
+    FEEDBACK.md           ← receiver feedback loop v2, by fact (Phase 6.6)
+    RELAY_TUNNEL.md       ← EVRT2 over TCP relay (fallback path, Phase 5.3)
   modes/
-    AR_STATIC.md          ← AR mode: desktop/support, lossless
-    2R_DYNAMIC.md         ← 2R mode: video/animation
-    47_GAMING.md          ← 47 mode: gaming, no compromises
+    AR2R47_MODES.md       ← the three operating modes (AR / 2R / 47)
+  tasks/
+    01_ABSOLUTE_NO_DELAY_VISIBLE_REGION.md    ← Task-01 (implemented)
+    02_SILICON_MARGINAL_UTILITY_SCHEDULER.md  ← Task-02 (implemented)
 ```
+
+As of ROADMAP.md Phase 6.6 (July 2026), every file this spec family
+references has been written — `SILICON_PROBE.md` and `FEEDBACK.md` were
+the last two, written by fact of implementation rather than up front, so
+they document what actually ships (including the gaps between the design
+in `SDUDP.md`/`02_SILICON_MARGINAL_UTILITY_SCHEDULER.md` and the real
+code) instead of a plan.
 
 ---
 
@@ -108,5 +115,25 @@ creator of EVRT, EVRTCK, and the EvertyDesk platform.
 
 ## Current status
 
-Specification phase. No production code yet.
+Reference implementation in progress (EvertyDesk Lite, Rust) — the
+protocol core is implemented, unit-tested, and **live-verified**
+end-to-end (PC host ↔ Android phone over real WiFi, July 2026):
+
+| Layer | Module | Status |
+|-------|--------|--------|
+| Wire format (32-byte header, magic `EVR2`) | `src/evrt2_packet.rs` | ✅ tested |
+| XOR FEC + length-prefix recovery | `src/evrt2_fec.rs` | ✅ tested |
+| Adaptive jitter buffer | `src/evrt2_jitter.rs` | ✅ live |
+| AR2R47 mode state machine | `src/evrt2_modes.rs` | ✅ tested, not yet driving a live session |
+| Task-01 scheduler (visible region, send order, breach) | `src/evrt2_scheduler.rs` | ✅ live |
+| Attention Map (motion + focus + surprise) | `src/evrt2_attention.rs` | ✅ live |
+| SD-UDP session engine (handshake, reassembly, FEC, transport-agnostic UDP/relay) | `src/evrt2_session.rs` | ✅ live |
+| RELAY_WRAP (EVRT2 over TCP relay, symmetric-NAT fallback) | `src/evrt2_session.rs` + `evrt2_experiment.rs` | ⚠️ tested, partially live (see ROADMAP.md 5.3) |
+| Execution Capability registry (Task-02) | `src/execution_capability.rs` | ✅ in production EVRTCK path |
+| EVRT2-only live session mode | `src/evrt2_experiment.rs` | ✅ live |
+| Attention Priority Field (u4 wire encoding) | `src/evrt2_apf.rs` | ✅ live |
+| AuthTag (HMAC-SHA256) + ENCRYPTED (NaCl secretbox) | `src/evrt2_crypto.rs` | ✅ live |
+
+See [`ROADMAP.md`](ROADMAP.md) for what is implemented versus still
+specification-only, and the phased plan forward.
 Existing EVRT + EVRTCK clients continue to operate unchanged.

@@ -124,7 +124,9 @@ pub fn is_available() -> bool {
 pub fn start_vm(uuid: &str) {
     let uuid = uuid.to_owned();
     thread::spawn(move || {
-        let Some(vbm) = vboxmanage() else { return; };
+        let Some(vbm) = vboxmanage() else {
+            return;
+        };
         let mut cmd = Command::new(&vbm);
         cmd.args(["startvm", &uuid, "--type", "headless"]);
         let _ = output_timeout(cmd, Duration::from_secs(30));
@@ -135,7 +137,9 @@ pub fn start_vm(uuid: &str) {
 pub fn stop_vm(uuid: &str) {
     let uuid = uuid.to_owned();
     thread::spawn(move || {
-        let Some(vbm) = vboxmanage() else { return; };
+        let Some(vbm) = vboxmanage() else {
+            return;
+        };
         let mut cmd = Command::new(&vbm);
         cmd.args(["controlvm", &uuid, "poweroff"]);
         let _ = output_timeout(cmd, Duration::from_secs(15));
@@ -146,7 +150,9 @@ pub fn stop_vm(uuid: &str) {
 pub fn reset_vm(uuid: &str) {
     let uuid = uuid.to_owned();
     thread::spawn(move || {
-        let Some(vbm) = vboxmanage() else { return; };
+        let Some(vbm) = vboxmanage() else {
+            return;
+        };
         let mut cmd = Command::new(&vbm);
         cmd.args(["controlvm", &uuid, "reset"]);
         let _ = output_timeout(cmd, Duration::from_secs(15));
@@ -325,7 +331,10 @@ pub fn enable_vrde(uuid: &str, port: u16, vm_running: bool) -> bool {
         r1.map(|o| o.status.success()).unwrap_or(false)
             && r2.map(|o| o.status.success()).unwrap_or(false)
     } else {
-        let out = vbm_run(&vbm, &["modifyvm", uuid, "--vrde", "on", "--vrdeports", &port_s]);
+        let out = vbm_run(
+            &vbm,
+            &["modifyvm", uuid, "--vrde", "on", "--vrdeports", &port_s],
+        );
         let _ = vbm_run(
             &vbm,
             &["modifyvm", uuid, "--vrdeproperty", "Security/Method=tls"],
@@ -403,11 +412,7 @@ pub fn launch_rdp(port: u16) {
     #[cfg(target_os = "linux")]
     {
         if Command::new("xfreerdp")
-            .args([
-                &format!("/v:{addr}"),
-                "/cert:ignore",
-                "/dynamic-resolution",
-            ])
+            .args([&format!("/v:{addr}"), "/cert:ignore", "/dynamic-resolution"])
             .spawn()
             .is_err()
         {
@@ -416,9 +421,7 @@ pub fn launch_rdp(port: u16) {
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = Command::new("open")
-            .arg(format!("rdp://{addr}"))
-            .spawn();
+        let _ = Command::new("open").arg(format!("rdp://{addr}")).spawn();
     }
 }
 
@@ -486,7 +489,11 @@ impl VboxSession {
             }
         });
 
-        VboxSession { cmd_tx, frame_rx, status_rx }
+        VboxSession {
+            cmd_tx,
+            frame_rx,
+            status_rx,
+        }
     }
 
     pub fn send(&self, cmd: VboxCmd) {
@@ -513,22 +520,34 @@ fn vbox_mousemoveabs(uuid: &str, x: u32, y: u32) -> Result<(), String> {
     let (xs, ys) = (x.to_string(), y.to_string());
     let out = vbm_run(&vbm, &["controlvm", uuid, "mousemoveabs", &xs, &ys])
         .ok_or_else(|| "mousemoveabs: таймаут".to_owned())?;
-    if out.status.success() { Ok(()) } else { Err("mousemoveabs failed".to_owned()) }
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err("mousemoveabs failed".to_owned())
+    }
 }
 
 fn vbox_mousebutton(uuid: &str, btn: &str) -> Result<(), String> {
     let vbm = vboxmanage().ok_or_else(|| "VBoxManage не найден".to_owned())?;
     let out = vbm_run(&vbm, &["controlvm", uuid, "mousebutton", btn])
         .ok_or_else(|| "mousebutton: таймаут".to_owned())?;
-    if out.status.success() { Ok(()) } else { Err(format!("mousebutton {btn} failed")) }
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!("mousebutton {btn} failed"))
+    }
 }
 
 /// PS/2 Set-1 scancode pair for a special key (make, break). Abstracted over
 /// the actual key type so this module stays free of egui/eframe dependencies.
 /// Returns None for printable/unmapped keys (caller uses put_string instead).
 pub fn special_key_to_scancodes(key_id: u8) -> Option<(Vec<u8>, Vec<u8>)> {
-    fn simple(code: u8) -> (Vec<u8>, Vec<u8>) { (vec![code], vec![code | 0x80]) }
-    fn ext(code: u8) -> (Vec<u8>, Vec<u8>) { (vec![0xE0, code], vec![0xE0, code | 0x80]) }
+    fn simple(code: u8) -> (Vec<u8>, Vec<u8>) {
+        (vec![code], vec![code | 0x80])
+    }
+    fn ext(code: u8) -> (Vec<u8>, Vec<u8>) {
+        (vec![0xE0, code], vec![0xE0, code | 0x80])
+    }
     Some(match key_id {
         0x01 => simple(0x01), // Escape
         0x0E => simple(0x0E), // Backspace

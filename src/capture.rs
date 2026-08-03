@@ -81,7 +81,7 @@ mod tests {
 
 #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
 mod win {
-    use std::{cell::RefCell, mem::size_of};
+    use std::{cell::RefCell, mem::size_of, sync::OnceLock, time::Instant};
 
     use windows::core::{ComInterface, Error as WinError, HRESULT, PCWSTR};
     use windows::Win32::{
@@ -97,15 +97,16 @@ mod win {
             Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0},
             Direct3D11::{
                 D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource,
-                ID3D11Texture2D, D3D11_BIND_FLAG, D3D11_CPU_ACCESS_READ,
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ,
-                D3D11_RESOURCE_MISC_FLAG, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-                D3D11_USAGE_STAGING,
+                ID3D11Texture2D, D3D11_BIND_FLAG, D3D11_BIND_RENDER_TARGET, D3D11_CPU_ACCESS_FLAG,
+                D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
+                D3D11_MAP_READ, D3D11_RESOURCE_MISC_FLAG, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
+                D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
             },
             Dxgi::{
                 Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC},
-                IDXGIAdapter, IDXGIDevice, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
-                DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+                IDXGIAdapter, IDXGIDevice, IDXGIKeyedMutex, IDXGIOutput1, IDXGIOutputDuplication,
+                IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
+                DXGI_OUTDUPL_FRAME_INFO,
             },
         },
         UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN},
@@ -119,12 +120,43 @@ mod win {
         static DISPLAY_INFO_CACHE: RefCell<Vec<CaptureDisplay>> = const { RefCell::new(Vec::new()) };
     }
 
+    /// ROADMAP.md task #29 — `capture_cost_ms` (measured around the whole
+    /// `capture_display_into*` call from `evrt2_experiment.rs`) was found to
+    /// vary wildly between runs (6ms best case, 80-160ms other runs) with no
+    /// established cause. Rather than guess again, this breaks the single
+    /// number down into its real sub-costs — `AcquireNextFrame`, the
+    /// zero-copy shared-texture `CopyResource`+`Flush()`, the staging
+    /// `CopyResource`, the `Map()` wait (the one call that can genuinely
+    /// block on GPU completion), and the final CPU `memcpy` — gated behind
+    /// an env var so it costs nothing when not explicitly asked for.
+    fn capture_timing_debug() -> bool {
+        static FLAG: OnceLock<bool> = OnceLock::new();
+        *FLAG.get_or_init(|| std::env::var("EVRTDESK_CAPTURE_DEBUG").as_deref() == Ok("1"))
+    }
+
     pub fn capture_into(out: &mut Vec<u8>) -> Option<(u32, u32)> {
         capture_display_into(0, out)
     }
 
     pub fn capture_display_into(display: i32, out: &mut Vec<u8>) -> Option<(u32, u32)> {
-        unsafe { capture_into_inner(display, out) }
+        unsafe { capture_into_inner(display, out, false).map(|(w, h, _)| (w, h)) }
+    }
+
+    /// Same capture as `capture_display_into`, but also asks the DXGI backend
+    /// to keep a GPU-shareable copy of the frame (a persistent D3D11 texture
+    /// created with `D3D11_RESOURCE_MISC_SHARED`) and return its shared
+    /// HANDLE, cast to `isize` for cross-thread storage — the value is an
+    /// opaque OS handle, not a pointer that needs `Send`-checked access.
+    ///
+    /// Returns `None` for the handle on the GDI fallback path (no D3D11
+    /// device there) or if the shared texture couldn't be created — callers
+    /// must fall back to the CPU `bgra` bytes in `out` in that case, exactly
+    /// as `capture_display_into` callers already do.
+    pub fn capture_display_into_shared(
+        display: i32,
+        out: &mut Vec<u8>,
+    ) -> Option<(u32, u32, Option<isize>)> {
+        unsafe { capture_into_inner(display, out, true) }
     }
 
     /// Leak the DXGI D3D11 device held by this thread's capture state.
@@ -139,24 +171,32 @@ mod win {
         });
     }
 
-    unsafe fn capture_into_inner(display: i32, out: &mut Vec<u8>) -> Option<(u32, u32)> {
+    unsafe fn capture_into_inner(
+        display: i32,
+        out: &mut Vec<u8>,
+        want_shared: bool,
+    ) -> Option<(u32, u32, Option<isize>)> {
         let info = cached_display_info(display)?;
         if info.width <= 0 || info.height <= 0 {
             invalidate_display_info_cache();
             return None;
         }
 
-        if let Some(size) =
-            capture_dxgi_into(out, info.index, info.width as u32, info.height as u32)
-        {
-            return Some(size);
+        if let Some(result) = capture_dxgi_into(
+            out,
+            info.index,
+            info.width as u32,
+            info.height as u32,
+            want_shared,
+        ) {
+            return Some(result);
         }
 
         let result = capture_gdi_into(out, &info);
         if result.is_none() {
             invalidate_display_info_cache();
         }
-        result
+        result.map(|(w, h)| (w, h, None))
     }
 
     fn cached_display_info(display: i32) -> Option<CaptureDisplay> {
@@ -194,7 +234,8 @@ mod win {
         display: i32,
         width: u32,
         height: u32,
-    ) -> Option<(u32, u32)> {
+        want_shared: bool,
+    ) -> Option<(u32, u32, Option<isize>)> {
         DXGI_CAPTURE.with(|cell| {
             let recreate = cell
                 .borrow()
@@ -206,15 +247,23 @@ mod win {
             }
 
             let result = match cell.borrow_mut().as_mut() {
-                Some(capture) => capture.capture_into(out),
+                Some(capture) => capture.capture_into(out, want_shared),
                 None => return None,
             };
 
             match result {
-                DxgiCaptureResult::Frame { width, height } => Some((width, height)),
-                DxgiCaptureResult::NoChange { width, height } => {
+                DxgiCaptureResult::Frame {
+                    width,
+                    height,
+                    shared,
+                } => Some((width, height, shared)),
+                DxgiCaptureResult::NoChange {
+                    width,
+                    height,
+                    shared,
+                } => {
                     if out.len() == frame_byte_len(width, height)? {
-                        Some((width, height))
+                        Some((width, height, shared))
                     } else {
                         None
                     }
@@ -250,8 +299,16 @@ mod win {
     }
 
     enum DxgiCaptureResult {
-        Frame { width: u32, height: u32 },
-        NoChange { width: u32, height: u32 },
+        Frame {
+            width: u32,
+            height: u32,
+            shared: Option<isize>,
+        },
+        NoChange {
+            width: u32,
+            height: u32,
+            shared: Option<isize>,
+        },
         Unavailable,
     }
 
@@ -263,6 +320,37 @@ mod win {
         context: ID3D11DeviceContext,
         duplication: IDXGIOutputDuplication,
         staging: Option<ID3D11Texture2D>,
+        /// GPU-shareable texture + its shared HANDLE (as `isize`) + its
+        /// `IDXGIKeyedMutex`, lazily created only when a caller asks for
+        /// `want_shared`. Reused across frames as long as its size matches
+        /// — the HANDLE stays valid for the texture object's lifetime, so
+        /// it's fetched once, not every frame. See `ensure_shared_texture`.
+        ///
+        /// Live-found (EVRT2 "teleport" bug — the screen briefly flashing
+        /// an older frame): this texture is written here (capture's own
+        /// D3D11 device) and read on a COMPLETELY DIFFERENT D3D11 device
+        /// (NVENC's own, via `OpenSharedResource` in `nvenc_shim.cpp`).
+        /// `Flush()` alone (the previous synchronization, or lack of it —
+        /// see the comment at the `CopyResource` call site below) only
+        /// guarantees the WRITER's own command queue submitted the work;
+        /// it does NOT guarantee a DIFFERENT device's read waits for that
+        /// work to actually finish on the GPU. Before today's dedicated
+        /// capture-thread refactor (ROADMAP.md Phase 6.8), capture and the
+        /// NVENC-encode dispatch ran sequentially on the SAME thread,
+        /// which incidentally gave enough of a scheduling gap that this
+        /// race almost never fired in practice. Now that capture runs
+        /// continuously on its own thread, independently paced from the
+        /// encode dispatch, the window for NVENC to read this texture
+        /// WHILE (or just before) a new `CopyResource` finishes landing on
+        /// the GPU is real and hit in practice. The keyed mutex (created
+        /// with `D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX`) is Microsoft's
+        /// own documented mechanism for exactly this cross-device
+        /// hand-off: the writer holds key 0 while copying and releases
+        /// key 1 when done; the reader (nvenc_shim.cpp) acquires key 1
+        /// (blocking until the writer's release) before reading and
+        /// releases key 0 when finished, so a read can never observe a
+        /// torn or stale in-flight write.
+        shared: Option<(ID3D11Texture2D, isize, IDXGIKeyedMutex)>,
     }
 
     impl DxgiCapture {
@@ -304,6 +392,7 @@ mod win {
                 context,
                 duplication,
                 staging: None,
+                shared: None,
             })
         }
 
@@ -311,37 +400,57 @@ mod win {
             self.display == display && self.width == width && self.height == height
         }
 
-        unsafe fn capture_into(&mut self, out: &mut Vec<u8>) -> DxgiCaptureResult {
-            match self.capture_frame(out) {
-                Ok(true) => DxgiCaptureResult::Frame {
+        unsafe fn capture_into(
+            &mut self,
+            out: &mut Vec<u8>,
+            want_shared: bool,
+        ) -> DxgiCaptureResult {
+            match self.capture_frame(out, want_shared) {
+                Ok((true, shared)) => DxgiCaptureResult::Frame {
                     width: self.width,
                     height: self.height,
+                    shared,
                 },
-                Ok(false) => DxgiCaptureResult::NoChange {
+                Ok((false, shared)) => DxgiCaptureResult::NoChange {
                     width: self.width,
                     height: self.height,
+                    shared,
                 },
-                Err(err) if err.code() == DXGI_ERROR_WAIT_TIMEOUT => DxgiCaptureResult::NoChange {
-                    width: self.width,
-                    height: self.height,
-                },
+                Err(err) if err.code() == DXGI_ERROR_WAIT_TIMEOUT => {
+                    // No new frame this poll — the shared texture (if any)
+                    // still holds the last frame's content, so it's still a
+                    // valid handle for a caller that just wants to re-encode
+                    // the unchanged picture (e.g. NVENC keepalive).
+                    DxgiCaptureResult::NoChange {
+                        width: self.width,
+                        height: self.height,
+                        shared: self.shared.as_ref().map(|(_, handle, _)| *handle),
+                    }
+                }
                 Err(err) if err.code() == DXGI_ERROR_ACCESS_LOST => DxgiCaptureResult::Unavailable,
                 Err(_) => DxgiCaptureResult::Unavailable,
             }
         }
 
-        unsafe fn capture_frame(&mut self, out: &mut Vec<u8>) -> Result<bool, WinError> {
+        unsafe fn capture_frame(
+            &mut self,
+            out: &mut Vec<u8>,
+            want_shared: bool,
+        ) -> Result<(bool, Option<isize>), WinError> {
+            let debug = capture_timing_debug();
+            let t0 = Instant::now();
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource: Option<IDXGIResource> = None;
             self.duplication
                 .AcquireNextFrame(0, &mut info, &mut resource)?;
             let _release = DuplicationFrameGuard(self.duplication.clone());
+            let t_acquire = t0.elapsed();
 
             let Some(resource) = resource else {
-                return Ok(false);
+                return Ok((false, None));
             };
             if info.AccumulatedFrames == 0 && info.LastMouseUpdateTime == 0 {
-                return Ok(false);
+                return Ok((false, None));
             }
 
             let texture: ID3D11Texture2D = resource.cast()?;
@@ -356,22 +465,150 @@ mod win {
                 return Err(WinError::from(E_DXGI_CAPTURE_INIT));
             }
 
-            let staging = self.ensure_staging(desc)?;
             let src: ID3D11Resource = texture.cast()?;
+
+            // Zero-copy path: while the DXGI frame resource is still valid
+            // (before DuplicationFrameGuard::drop releases it), do a GPU->GPU
+            // copy into a persistent shared texture NVENC can open on its own
+            // device via OpenSharedResource — no CPU roundtrip for this copy.
+            // Synchronized via the shared texture's own `IDXGIKeyedMutex` —
+            // see `shared`'s doc comment (on the `DxgiCapture` struct) for
+            // the full "teleport" bug story this replaced a plain `Flush()`
+            // for. Key protocol: this thread (the writer) always acquires
+            // key 0 before copying and releases key 1 when done, handing
+            // off to the reader (NVENC, in `nvenc_shim.cpp`), which
+            // acquires key 1 before reading and releases key 0 back when
+            // finished — so a read can never observe a torn/in-flight
+            // write, on any device.
+            let t1 = Instant::now();
+            let shared_handle = if want_shared {
+                match self.ensure_shared_texture(desc) {
+                    Ok((shared_tex, handle, keyed_mutex)) => {
+                        // Live-found: an earlier version of this used a
+                        // 1000ms bound here, reasoned as "just a safety
+                        // net, should never actually wait that long" — it
+                        // was WRONG. This capture thread and NVENC's own
+                        // read (on its own worker thread, driven by the
+                        // separately-paced main send loop) run at
+                        // DIFFERENT, independent cadences by design (the
+                        // whole point of `evrt2_experiment.rs`'s own
+                        // capture-thread refactor earlier this session —
+                        // see that fix's doc comment) — a 1000ms bound
+                        // still lets this thread's write cadence get
+                        // dragged down to however slow the READER happens
+                        // to be that cycle, up to a full second, live-
+                        // confirmed to make the whole stream visibly grind
+                        // to a crawl even though `decoded_fps` kept
+                        // reporting ~60 (frames WERE flowing, just each one
+                        // took ages to actually get captured). A capture
+                        // thread must never wait on a consumer, full stop
+                        // — try once (0ms — D3D11's own "non-blocking
+                        // attempt" convention for `AcquireSync`), and if
+                        // the reader still holds the lock, just skip this
+                        // capture's shared-texture update entirely. The
+                        // CPU staging-copy path below is completely
+                        // unaffected (no lock involved), so
+                        // EVRTCK/attention-map input keeps flowing either
+                        // way — a skipped update here only means NVENC's
+                        // NEXT read sees one more repeat of its last-known
+                        // content instead of the newest, cosmetically
+                        // identical to how the existing "reuse last frame"
+                        // cache already behaves when capture has nothing
+                        // new at all.
+                        match keyed_mutex.AcquireSync(0, 0) {
+                            Ok(()) => {
+                                let shared_dst: ID3D11Resource = shared_tex.cast()?;
+                                self.context.CopyResource(&shared_dst, &src);
+                                self.context.Flush();
+                                let _ = keyed_mutex.ReleaseSync(1);
+                                Some(handle)
+                            }
+                            Err(_) => None,
+                        }
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            let t_shared = t1.elapsed();
+
+            let t2 = Instant::now();
+            let staging = self.ensure_staging(desc)?;
             let dst: ID3D11Resource = staging.cast()?;
             self.context.CopyResource(&dst, &src);
+            let t_staging_copy = t2.elapsed();
 
+            let t3 = Instant::now();
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             self.context
                 .Map(&dst, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            let t_map = t3.elapsed();
             let _map = MappedResourceGuard {
                 context: &self.context,
                 resource: &dst,
             };
 
+            let t4 = Instant::now();
             copy_mapped_bgra(desc.Width, desc.Height, mapped, out)
                 .ok_or_else(|| WinError::from(E_DXGI_CAPTURE_INIT))?;
-            Ok(true)
+            let t_memcpy = t4.elapsed();
+
+            if debug {
+                eprintln!(
+                    "[capture-debug] acquire={:.2}ms shared_copy_flush={:.2}ms staging_copy={:.2}ms map={:.2}ms memcpy={:.2}ms total={:.2}ms",
+                    t_acquire.as_secs_f32() * 1000.0,
+                    t_shared.as_secs_f32() * 1000.0,
+                    t_staging_copy.as_secs_f32() * 1000.0,
+                    t_map.as_secs_f32() * 1000.0,
+                    t_memcpy.as_secs_f32() * 1000.0,
+                    t0.elapsed().as_secs_f32() * 1000.0,
+                );
+            }
+            Ok((true, shared_handle))
+        }
+
+        unsafe fn ensure_shared_texture(
+            &mut self,
+            src_desc: D3D11_TEXTURE2D_DESC,
+        ) -> Result<(ID3D11Texture2D, isize, IDXGIKeyedMutex), WinError> {
+            if let Some((texture, handle, keyed_mutex)) = &self.shared {
+                let mut desc = D3D11_TEXTURE2D_DESC::default();
+                texture.GetDesc(&mut desc);
+                if desc.Width == src_desc.Width && desc.Height == src_desc.Height {
+                    return Ok((texture.clone(), *handle, keyed_mutex.clone()));
+                }
+            }
+
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: src_desc.Width,
+                Height: src_desc.Height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: src_desc.Format,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_RENDER_TARGET,
+                CPUAccessFlags: D3D11_CPU_ACCESS_FLAG(0),
+                // See `shared`'s own doc comment for why this is a keyed
+                // mutex, not plain `D3D11_RESOURCE_MISC_SHARED` — the two
+                // are mutually exclusive per D3D11's own docs (this flag
+                // already implies shareability).
+                MiscFlags: D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
+            };
+            let mut shared_tex = None;
+            self.device
+                .CreateTexture2D(&desc, None, Some(&mut shared_tex))?;
+            let shared_tex = shared_tex.ok_or_else(|| WinError::from(E_DXGI_CAPTURE_INIT))?;
+            let dxgi_resource: IDXGIResource = shared_tex.cast()?;
+            let handle = dxgi_resource.GetSharedHandle()?;
+            let handle_val = handle.0 as isize;
+            let keyed_mutex: IDXGIKeyedMutex = shared_tex.cast()?;
+            self.shared = Some((shared_tex.clone(), handle_val, keyed_mutex.clone()));
+            Ok((shared_tex, handle_val, keyed_mutex))
         }
 
         unsafe fn ensure_staging(
@@ -967,6 +1204,25 @@ pub fn capture_display_into(display: i32, pixels: &mut Vec<u8>) -> Option<(u32, 
     }
 }
 
+/// Same as `capture_display_into`, but on Windows also returns a GPU shared
+/// texture handle (see `win::capture_display_into_shared`) for zero-copy
+/// consumers like NVENC. On every other platform this is just a thin
+/// wrapper — the handle is always `None` there.
+#[allow(unused)]
+pub fn capture_display_into_shared(
+    display: i32,
+    pixels: &mut Vec<u8>,
+) -> Option<(u32, u32, Option<isize>)> {
+    #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
+    return win::capture_display_into_shared(display, pixels);
+
+    #[cfg(not(all(target_os = "windows", feature = "live-vp9-mf")))]
+    {
+        let size = capture_display_into(display, pixels)?;
+        Some((size.0, size.1, None))
+    }
+}
+
 /// Return the primary display size without a full capture.
 #[allow(unused)]
 pub fn screen_size() -> Option<(u32, u32)> {
@@ -987,12 +1243,37 @@ pub fn screen_size() -> Option<(u32, u32)> {
     #[cfg(target_os = "macos")]
     return macos_coregraphics::screen_size();
 
+    #[cfg(target_os = "android")]
+    {
+        let packed = ANDROID_SCREEN.load(std::sync::atomic::Ordering::Relaxed);
+        if packed != 0 {
+            return Some(((packed >> 32) as u32, (packed & 0xFFFF_FFFF) as u32));
+        }
+        return None;
+    }
+
     #[cfg(not(any(
         all(target_os = "windows", feature = "live-vp9-mf"),
         target_os = "macos",
-        target_os = "linux"
+        target_os = "linux",
+        target_os = "android",
     )))]
     None
+}
+
+/// Размер экрана Android-хоста (упаковано w<<32|h). Задаётся из Kotlin через JNI
+/// перед стартом хоста — чтобы анонсировать клиенту реальный размер экрана ТВ,
+/// а не fallback 1920×1080. 0 = ещё не задан.
+#[cfg(target_os = "android")]
+pub static ANDROID_SCREEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Сохранить размер экрана Android-хоста (вызывается из JNI).
+#[cfg(target_os = "android")]
+pub fn set_android_screen(width: u32, height: u32) {
+    ANDROID_SCREEN.store(
+        ((width as u64) << 32) | (height as u64),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 #[allow(unused)]

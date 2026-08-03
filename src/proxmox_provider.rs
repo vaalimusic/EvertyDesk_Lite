@@ -101,10 +101,7 @@ impl VirtualizationProvider for ProxmoxProvider {
         }
         // TODO Phase 1.3: GET /api2/json/nodes
         Ok(vec![HostInfo {
-            host_id: format!(
-                "{}-node-01",
-                self.provider_id
-            ),
+            host_id: format!("{}-node-01", self.provider_id),
             hostname: if self.config.node.is_empty() {
                 self.config
                     .api_url
@@ -150,7 +147,11 @@ impl VirtualizationProvider for ProxmoxProvider {
                 Some("Connect Proxmox API to enable full probe"),
             )
         } else {
-            Capability::unsupported("VNC_DISABLED_BY_CONFIG", "VNC disabled in provider config", None)
+            Capability::unsupported(
+                "VNC_DISABLED_BY_CONFIG",
+                "VNC disabled in provider config",
+                None,
+            )
         };
         let spice = if self.config.spice_enabled {
             Capability::degraded(
@@ -159,7 +160,11 @@ impl VirtualizationProvider for ProxmoxProvider {
                 None,
             )
         } else {
-            Capability::unsupported("SPICE_DISABLED", "SPICE not configured for this provider", None)
+            Capability::unsupported(
+                "SPICE_DISABLED",
+                "SPICE not configured for this provider",
+                None,
+            )
         };
         let serial = if self.config.serial_enabled {
             Capability::degraded(
@@ -227,7 +232,9 @@ impl VirtualizationProvider for ProxmoxProvider {
 
     fn power_action(&self, vm_id: &str, action: &str) -> ProviderResult<()> {
         if !self.is_reachable() {
-            return Err(ProviderError::Unavailable("Proxmox API unreachable".to_owned()));
+            return Err(ProviderError::Unavailable(
+                "Proxmox API unreachable".to_owned(),
+            ));
         }
         // TODO Phase 1.3: POST /api2/json/nodes/{node}/qemu/{vmid}/status/{action}
         let _ = (vm_id, action);
@@ -239,7 +246,9 @@ impl VirtualizationProvider for ProxmoxProvider {
     fn list_snapshots(&self, vm_id: &str) -> ProviderResult<Vec<SnapshotInfo>> {
         // TODO Phase 1.3: GET /api2/json/nodes/{node}/qemu/{vmid}/snapshot
         let _ = vm_id;
-        Err(ProviderError::NotSupported("Proxmox snapshots: Phase 1.3".to_owned()))
+        Err(ProviderError::NotSupported(
+            "Proxmox snapshots: Phase 1.3".to_owned(),
+        ))
     }
 
     fn manifest(&self) -> serde_json::Value {

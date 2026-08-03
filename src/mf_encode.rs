@@ -27,9 +27,8 @@ mod inner {
                 MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
                 MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO, MFT_REGISTER_TYPE_INFO,
                 MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
-                MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-                MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-                MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
+                MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO,
+                MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
             },
             System::Com::{
                 CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED, VARIANT, VARIANT_0,
@@ -70,11 +69,7 @@ mod inner {
                 });
             }
             if self.av1 {
-                codecs.push(if self.hardware_av1 {
-                    "AV1(hw)"
-                } else {
-                    "AV1"
-                });
+                codecs.push(if self.hardware_av1 { "AV1(hw)" } else { "AV1" });
             }
             if codecs.is_empty() {
                 "Media Foundation encode: unavailable".to_owned()

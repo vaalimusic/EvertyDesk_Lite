@@ -21,10 +21,7 @@ pub(crate) fn settings_section(
 ) {
     egui::Frame::NONE
         .fill(crate::theme::palette().surface)
-        .stroke(egui::Stroke::new(
-            1.0,
-            crate::theme::palette().border,
-        ))
+        .stroke(egui::Stroke::new(1.0, crate::theme::palette().border))
         .corner_radius(egui::CornerRadius::same(12))
         .inner_margin(egui::Margin::same(14))
         .show(ui, |ui| {
@@ -138,8 +135,10 @@ pub(crate) fn primary_connect_button(ui: &mut egui::Ui, text: &str, icon: &str) 
     );
 
     let fg = t.accent_fg;
-    let icon_rect =
-        egui::Rect::from_min_size(rect.min + egui::vec2(18.0, (BTN_H - 20.0) / 2.0), egui::vec2(20.0, 20.0));
+    let icon_rect = egui::Rect::from_min_size(
+        rect.min + egui::vec2(18.0, (BTN_H - 20.0) / 2.0),
+        egui::vec2(20.0, 20.0),
+    );
     draw_line_icon(ui.painter(), icon_rect, icon, fg);
     ui.painter().text(
         rect.center(),
@@ -222,10 +221,7 @@ pub(crate) fn mode_segment_button(
 pub(crate) fn status_pill(ui: &mut egui::Ui, label: &str, dot: egui::Color32) {
     egui::Frame::NONE
         .fill(crate::theme::palette().surface)
-        .stroke(egui::Stroke::new(
-            1.0,
-            crate::theme::palette().border,
-        ))
+        .stroke(egui::Stroke::new(1.0, crate::theme::palette().border))
         .corner_radius(egui::CornerRadius::same(20))
         .inner_margin(egui::Margin::symmetric(14, 8))
         .show(ui, |ui| {
@@ -561,20 +557,34 @@ fn draw_line_icon(p: &egui::Painter, rect: egui::Rect, icon: &str, color: egui::
         }
         "game-controller" => {
             let body = egui::Rect::from_center_size(c, egui::vec2(18.0, 11.0));
-            p.rect_stroke(body, egui::CornerRadius::same(4), stroke, egui::StrokeKind::Inside);
+            p.rect_stroke(
+                body,
+                egui::CornerRadius::same(4),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
             let lx = c.x - 5.5;
-            p.line_segment([egui::pos2(lx, c.y - 3.5), egui::pos2(lx, c.y + 3.5)], stroke);
-            p.line_segment([egui::pos2(lx - 3.5, c.y), egui::pos2(lx + 3.5, c.y)], stroke);
+            p.line_segment(
+                [egui::pos2(lx, c.y - 3.5), egui::pos2(lx, c.y + 3.5)],
+                stroke,
+            );
+            p.line_segment(
+                [egui::pos2(lx - 3.5, c.y), egui::pos2(lx + 3.5, c.y)],
+                stroke,
+            );
             p.circle_stroke(c + egui::vec2(5.5, 0.0), 2.0, stroke);
         }
         "server" => {
             // Сервер: три горизонтальные «полки»
             for dy in [-5.0_f32, 0.0, 5.0] {
-                let r = egui::Rect::from_center_size(
-                    c + egui::vec2(0.0, dy),
-                    egui::vec2(18.0, 3.5),
+                let r =
+                    egui::Rect::from_center_size(c + egui::vec2(0.0, dy), egui::vec2(18.0, 3.5));
+                p.rect_stroke(
+                    r,
+                    egui::CornerRadius::same(2),
+                    stroke,
+                    egui::StrokeKind::Inside,
                 );
-                p.rect_stroke(r, egui::CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
                 p.circle_stroke(c + egui::vec2(6.5, dy), 0.9, stroke);
             }
         }

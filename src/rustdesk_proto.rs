@@ -343,6 +343,14 @@ pub struct LoginRequest {
     pub version: String,
     #[prost(string, tag = "13")]
     pub my_platform: String,
+    /// EvertyDesk extension (not part of upstream RustDesk wire format — both
+    /// ends here are our own client/host): client wants an EVRT2-only test
+    /// session. Host skips starting the live EVRT1 video_pipeline entirely
+    /// (no capture, no NVENC/encoder loop) and goes straight into the
+    /// experimental EVRT2 capture→encode→UDP loop instead, so the two never
+    /// compete for the same desktop-capture source or CPU/GPU encode time.
+    #[prost(bool, tag = "20")]
+    pub evrt2_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
@@ -781,7 +789,7 @@ pub struct Misc {
     #[prost(
         oneof = "misc::Union",
         tags = "5, 7, 10, 12, 28, 30, 31, 35, 37, 100, 101, 102, 110, 111, 112, 113, \
-                114, 115, 116, 117, 118, 119, 120"
+                114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126"
     )]
     pub union: Option<misc::Union>,
 }
@@ -826,6 +834,56 @@ pub mod misc {
         /// Клиент показывает в --diagnose отчёте — видно скорость БЕЗ консоли хоста.
         #[prost(string, tag = "102")]
         HostTelemetry(String),
+        /// Аудио через TCP relay — зеркало EVRT-аудио для сессий, где EVRT UDP
+        /// недоступен (WAN без punch, symmetric NAT). Raw PCM i16 stereo 48kHz,
+        /// тот же формат, что и EVRT TypeAudioFrame, тот же фрейм 1920 байт
+        /// (480 сэмплов). Клиент кладёт кадры в ту же очередь, что и EVRT-путь
+        /// (evrt_audio::push_android_audio) — EvrtAudioPlayer транспорт-агностичен.
+        // NB: inside a prost `oneof`, a Vec<u8> variant MUST use the explicit
+        // `bytes = "vec"` form. Plain `#[prost(bytes, ...)]` (which works fine on
+        // ordinary message fields) makes the oneof derive emit a variant that
+        // encodes with a tag the decoder can't match — the frame arrives but
+        // `union` comes back None ("unknown tag"), silently dropping the audio.
+        #[prost(bytes = "vec", tag = "121")]
+        TcpAudioFrame(Vec<u8>),
+        /// Клиент → хост: установить системную громкость хоста, 0..100 (%).
+        /// Тачпад/удалённый клиент управляет громкостью удалённого ПК.
+        #[prost(uint32, tag = "122")]
+        SetHostVolume(u32),
+        /// EVRTCK-кадр через TCP relay — фоллбэк, когда прямой EVRT UDP
+        /// недоступен (WAN без punch, symmetric NAT). Раньше в этом случае
+        /// «обычный режим» тихо скатывался на H264/H265 через TCP (что и
+        /// привело к крашу системного HEVC-декодера на некоторых машинах —
+        /// см. preferred_codec в transport.rs). Теперь тайловый EVRTCK-кодек
+        /// едет тем же TCP-каналом что и видео/звук — self-describing wire-
+        /// формат (magic+version+dims в самих байтах), декодер тот же
+        /// EvrtckDecoder, что и на EVRT UDP пути.
+        #[prost(bytes = "vec", tag = "123")]
+        TcpEvrtckFrame(Vec<u8>),
+        /// Экспериментальная кнопка «EVRT2» в режиме игры: клиент → хост,
+        /// «подними отдельный EVRT2 UDP-сокет и начни стримить туда».
+        /// Полностью параллельно живому EVRT1-пути — не трогает
+        /// video_pipeline.rs/encode_loop. См. evrt2_experiment.rs.
+        #[prost(bool, tag = "124")]
+        Evrt2ExperimentRequest(bool),
+        /// Хост → клиент: EVRT2-сокет поднят, список кандидатов
+        /// "ip1:port,ip2:port,..." — тот же формат и источник (LAN/VPN +
+        /// STUN), что и EvrtEndpoints для EVRT1, потому что relay-адрес
+        /// клиента ≠ реальный IP хоста в общем случае.
+        #[prost(string, tag = "125")]
+        Evrt2ExperimentEndpoints(String),
+        /// ROADMAP.md Phase 5.3 — RELAY_WRAP (EVRT2_PACKET.md 0x0C): raw
+        /// EVRT2 wire packet (32-byte header + payload, exactly what would
+        /// otherwise go out `Evrt2Session`'s own UDP socket), tunneled
+        /// opaquely over this already-proven TCP relay connection when
+        /// `race_hello_candidates` (Phase 5.2) finds no UDP path at all —
+        /// symmetric NAT on either end, or a client on carrier-grade NAT
+        /// mobile data with no usable public/LAN candidate. Same precedent
+        /// as `TcpEvrtckFrame` above for EVRT1's own TCP fallback: carry the
+        /// codec's native bytes unchanged instead of re-deriving a second
+        /// wire format for the relay path. See transport/RELAY_TUNNEL.md.
+        #[prost(bytes = "vec", tag = "126")]
+        Evrt2RelayWrap(Vec<u8>),
         // ── Agentless VM-доступ через хост (киллер-фича) ──────────────────────
         // Клиент подключается к хосту-гипервизору и через него видит/управляет
         // виртуальными машинами БЕЗ установки агента в гость. Хост подменяет
@@ -1012,6 +1070,43 @@ mod tests {
             decoded.union,
             Some(rendezvous_message::Union::PunchHoleRequest(_))
         ));
+    }
+
+    /// ROADMAP.md Phase 5.3 — regression test for a real bug found during
+    /// live testing: `Misc`'s `#[prost(oneof = "misc::Union", tags = "...")]`
+    /// attribute lists every oneof variant's tag EXCEPT the one on
+    /// `Evrt2RelayWrap` (126) — prost's decoder only recognizes a field tag
+    /// as belonging to a oneof if it's in this outer list; encoding still
+    /// worked fine (it uses the variant's own `#[prost(..., tag = "126")]`
+    /// directly), but decoding silently treated the field as unknown and
+    /// dropped it, so `union` came back `None`. This is exactly why the
+    /// existing relay loopback tests (`evrt2_session.rs`) never caught it —
+    /// they exercise `Transport::Relay`'s raw byte channels directly,
+    /// entirely below this protobuf envelope layer. Every other oneof
+    /// variant's tag already round-trips correctly (proven by the live
+    /// session working for every other Misc field this whole time), so this
+    /// one test is enough to lock in the fix, not a signal that the whole
+    /// oneof needs auditing.
+    #[test]
+    fn evrt2_relay_wrap_round_trips_through_the_real_peer_message_envelope() {
+        let payload = vec![0xDEu8, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03];
+        let message = PeerMessage {
+            union: Some(peer_message::Union::Misc(Misc {
+                union: Some(misc::Union::Evrt2RelayWrap(payload.clone())),
+            })),
+        };
+
+        let encoded = encode_peer_message(&message);
+        let decoded = decode_peer_message(&encoded).expect("must decode");
+
+        match decoded.union {
+            Some(peer_message::Union::Misc(Misc {
+                union: Some(misc::Union::Evrt2RelayWrap(bytes)),
+            })) => {
+                assert_eq!(bytes, payload);
+            }
+            other => panic!("expected Misc(Evrt2RelayWrap), got {other:?}"),
+        }
     }
 
     #[test]

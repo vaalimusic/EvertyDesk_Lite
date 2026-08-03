@@ -237,7 +237,9 @@ impl VirtualizationProvider for LibvirtProvider {
 
     fn power_action(&self, vm_id: &str, action: &str) -> ProviderResult<()> {
         if !self.is_reachable() {
-            return Err(ProviderError::Unavailable("libvirt URI not configured".to_owned()));
+            return Err(ProviderError::Unavailable(
+                "libvirt URI not configured".to_owned(),
+            ));
         }
         // TODO Phase 1.4: map action → virDomain{Create,Destroy,Reboot,Suspend,Resume}
         // Action map:

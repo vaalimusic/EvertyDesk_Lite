@@ -25,9 +25,8 @@
 use wgpu;
 
 use crate::evrtck::{
-    encode_frame, encode_pframe_from_dirty_indices, nop_packet_data,
-    tile_is_dirty, tiles_in_dim, EvrtckEncoderBackend, EvrtckPacket, FrameStats,
-    TILE_SIZE,
+    encode_frame, encode_pframe_from_dirty_indices, nop_packet_data, tile_is_dirty, tiles_in_dim,
+    EvrtckEncoderBackend, EvrtckPacket, FrameStats, TILE_SIZE,
 };
 
 // ── WGSL dirty-tile detection shader ─────────────────────────────────────────
@@ -77,66 +76,58 @@ fn main(
 // ── GPU state ─────────────────────────────────────────────────────────────────
 
 struct GpuCtx {
-    device:        wgpu::Device,
-    queue:         wgpu::Queue,
-    pipeline:      wgpu::ComputePipeline,
-    bgl:           wgpu::BindGroupLayout,
-    cur_buf:       wgpu::Buffer,
-    prv_buf:       wgpu::Buffer,
-    dirty_buf:     wgpu::Buffer,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    pipeline: wgpu::ComputePipeline,
+    bgl: wgpu::BindGroupLayout,
+    cur_buf: wgpu::Buffer,
+    prv_buf: wgpu::Buffer,
+    dirty_buf: wgpu::Buffer,
     dirty_staging: wgpu::Buffer,
-    params_buf:    wgpu::Buffer,
+    params_buf: wgpu::Buffer,
 }
 
 // ── Encoder ───────────────────────────────────────────────────────────────────
 
 pub struct WgpuEvrtckEncoder {
-    gpu:              GpuCtx,
-    prev_cpu:         Vec<u8>,
-    width:            usize,
-    height:           usize,
-    tiles_x:          usize,
-    tiles_y:          usize,
-    tile_count:       usize,
+    gpu: GpuCtx,
+    prev_cpu: Vec<u8>,
+    width: usize,
+    height: usize,
+    tiles_x: usize,
+    tiles_y: usize,
+    tile_count: usize,
     pending_keyframe: bool,
     /// Visible Region anchor, tile coords. See EVRT2CKMAX-TASK-01.
-    focus:            Option<(usize, usize)>,
+    focus: Option<(usize, usize)>,
 }
 
 impl WgpuEvrtckEncoder {
     /// Try to init a GPU backend. Returns `None` if no GPU found or any step
     /// fails or panics — the CPU backend is always the fallback.
     pub fn try_new(width: usize, height: usize) -> Option<Self> {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Self::init(width, height)
-        }))
-        .ok()
-        .flatten()
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Self::init(width, height)))
+            .ok()
+            .flatten()
     }
 
     fn init(width: usize, height: usize) -> Option<Self> {
-        let instance = wgpu::Instance::new(
-            wgpu::InstanceDescriptor::new_without_display_handle(),
-        );
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
 
-        let adapter = pollster::block_on(instance.request_adapter(
-            &wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            },
-        ))
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))
         .ok()?;
 
         let info = adapter.get_info();
         let adapter_label = format!("{} ({:?})", info.name, info.backend);
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("evrtck-compute"),
-                ..Default::default()
-            },
-        ))
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("evrtck-compute"),
+            ..Default::default()
+        }))
         .ok()?;
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -213,7 +204,7 @@ impl WgpuEvrtckEncoder {
         let tiles_y = tiles_in_dim(height);
         let tile_count = tiles_x * tiles_y;
         let frame_bytes = (width * height * 4) as u64;
-        let tile_bytes  = (tile_count * 4) as u64; // u32 per tile
+        let tile_bytes = (tile_count * 4) as u64; // u32 per tile
 
         let frame_usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
 
@@ -250,17 +241,27 @@ impl WgpuEvrtckEncoder {
             mapped_at_creation: false,
         });
         let mut p = [0u8; 16];
-        p[0..4].copy_from_slice(&(width   as u32).to_le_bytes());
-        p[4..8].copy_from_slice(&(height  as u32).to_le_bytes());
+        p[0..4].copy_from_slice(&(width as u32).to_le_bytes());
+        p[4..8].copy_from_slice(&(height as u32).to_le_bytes());
         p[8..12].copy_from_slice(&(tiles_x as u32).to_le_bytes());
         queue.write_buffer(&params_buf, 0, &p);
 
-        eprintln!("[evrtck] WGPU backend: {} — {}×{} ({} tiles)", adapter_label, width, height, tile_count);
+        eprintln!(
+            "[evrtck] WGPU backend: {} — {}×{} ({} tiles)",
+            adapter_label, width, height, tile_count
+        );
 
         Some(Self {
             gpu: GpuCtx {
-                device, queue, pipeline, bgl,
-                cur_buf, prv_buf, dirty_buf, dirty_staging, params_buf,
+                device,
+                queue,
+                pipeline,
+                bgl,
+                cur_buf,
+                prv_buf,
+                dirty_buf,
+                dirty_staging,
+                params_buf,
             },
             prev_cpu: vec![0u8; width * height * 4],
             width,
@@ -295,16 +296,30 @@ impl WgpuEvrtckEncoder {
             label: None,
             layout: &gpu.bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: gpu.params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: gpu.cur_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: gpu.prv_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: gpu.dirty_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: gpu.params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: gpu.cur_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: gpu.prv_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: gpu.dirty_buf.as_entire_binding(),
+                },
             ],
         });
 
-        let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("evrtck-dirty-enc"),
-        });
+        let mut enc = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("evrtck-dirty-enc"),
+            });
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("evrtck-dirty-pass"),
@@ -381,8 +396,21 @@ impl WgpuEvrtckEncoder {
         let is_kf = self.pending_keyframe;
         self.pending_keyframe = false;
         let placeholder = vec![0u8; self.width * self.height * 4];
-        let (data, stats) = encode_frame(&placeholder, &self.prev_cpu, self.width, self.height, frame_id, is_kf, self.focus);
-        let pkt = EvrtckPacket { frame_id, width: self.width as u32, height: self.height as u32, data };
+        let (data, stats) = encode_frame(
+            &placeholder,
+            &self.prev_cpu,
+            self.width,
+            self.height,
+            frame_id,
+            is_kf,
+            self.focus,
+        );
+        let pkt = EvrtckPacket {
+            frame_id,
+            width: self.width as u32,
+            height: self.height as u32,
+            data,
+        };
         (pkt, stats)
     }
 }
@@ -402,10 +430,25 @@ impl EvrtckEncoderBackend for WgpuEvrtckEncoder {
 
         // Keyframe: full CPU encode — all tiles dirty, GPU detect unnecessary.
         if is_kf {
-            let (data, stats) =
-                encode_frame(bgra, &self.prev_cpu, self.width, self.height, frame_id, true, self.focus);
+            let (data, stats) = encode_frame(
+                bgra,
+                &self.prev_cpu,
+                self.width,
+                self.height,
+                frame_id,
+                true,
+                self.focus,
+            );
             self.prev_cpu.copy_from_slice(bgra);
-            return (EvrtckPacket { frame_id, width: self.width as u32, height: self.height as u32, data }, stats);
+            return (
+                EvrtckPacket {
+                    frame_id,
+                    width: self.width as u32,
+                    height: self.height as u32,
+                    data,
+                },
+                stats,
+            );
         }
 
         // NOP fast path: identical frame — skip GPU entirely, 20-byte packet.
@@ -413,19 +456,43 @@ impl EvrtckEncoderBackend for WgpuEvrtckEncoder {
             let data = nop_packet_data(frame_id, self.width, self.height);
             let stats = FrameStats {
                 total_tiles: self.tile_count as u32,
-                dirty_tiles: 0, solid_tiles: 0, delta_tiles: 0,
+                dirty_tiles: 0,
+                solid_tiles: 0,
+                delta_tiles: 0,
                 encoded_bytes: 20,
             };
-            return (EvrtckPacket { frame_id, width: self.width as u32, height: self.height as u32, data }, stats);
+            return (
+                EvrtckPacket {
+                    frame_id,
+                    width: self.width as u32,
+                    height: self.height as u32,
+                    data,
+                },
+                stats,
+            );
         }
 
         // Phase 2A: GPU dirty detection → CPU encode dirty tiles only.
         let dirty_indices = self.gpu_dirty_tiles(bgra, &self.prev_cpu);
         let (data, stats) = encode_pframe_from_dirty_indices(
-            bgra, &self.prev_cpu, self.width, self.height, frame_id, dirty_indices, self.focus,
+            bgra,
+            &self.prev_cpu,
+            self.width,
+            self.height,
+            frame_id,
+            dirty_indices,
+            self.focus,
         );
         self.prev_cpu.copy_from_slice(bgra);
-        (EvrtckPacket { frame_id, width: self.width as u32, height: self.height as u32, data }, stats)
+        (
+            EvrtckPacket {
+                frame_id,
+                width: self.width as u32,
+                height: self.height as u32,
+                data,
+            },
+            stats,
+        )
     }
 
     fn request_keyframe(&mut self) {
@@ -433,8 +500,12 @@ impl EvrtckEncoderBackend for WgpuEvrtckEncoder {
         self.pending_keyframe = true;
     }
 
-    fn width(&self)  -> usize { self.width  }
-    fn height(&self) -> usize { self.height }
+    fn width(&self) -> usize {
+        self.width
+    }
+    fn height(&self) -> usize {
+        self.height
+    }
 
     fn dirty_ratio(&self, bgra: &[u8]) -> f32 {
         // GPU upload overhead (~1.4 ms) is still slower than dirty_ratio alone
@@ -442,7 +513,9 @@ impl EvrtckEncoderBackend for WgpuEvrtckEncoder {
         let tiles_x = tiles_in_dim(self.width);
         let tiles_y = tiles_in_dim(self.height);
         let total = tiles_x * tiles_y;
-        if total == 0 { return 0.0; }
+        if total == 0 {
+            return 0.0;
+        }
 
         let mut dirty = 0u32;
         for ty in 0..tiles_y {
@@ -457,5 +530,9 @@ impl EvrtckEncoderBackend for WgpuEvrtckEncoder {
 
     fn set_focus(&mut self, focus_tile: Option<(usize, usize)>) {
         self.focus = focus_tile;
+    }
+
+    fn is_gpu(&self) -> bool {
+        true
     }
 }

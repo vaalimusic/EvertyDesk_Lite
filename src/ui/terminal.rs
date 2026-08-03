@@ -501,8 +501,7 @@ fn terminal_text_edit_scope<R>(
         let visuals = ui.visuals_mut();
         visuals.extreme_bg_color = egui::Color32::TRANSPARENT;
         visuals.selection.bg_fill = egui::Color32::from_rgb(0x19, 0x5B, 0x45);
-        visuals.selection.stroke =
-            egui::Stroke::new(1.0, crate::theme::palette().success);
+        visuals.selection.stroke = egui::Stroke::new(1.0, crate::theme::palette().success);
 
         visuals.widgets.noninteractive.bg_fill = egui::Color32::TRANSPARENT;
         visuals.widgets.noninteractive.weak_bg_fill = egui::Color32::TRANSPARENT;

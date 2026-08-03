@@ -133,12 +133,12 @@ pub enum BackendError {
 impl std::fmt::Display for BackendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotReachable(s)  => write!(f, "Backend not reachable: {s}"),
-            Self::AuthFailed(s)    => write!(f, "Auth failed: {s}"),
-            Self::OpenFailed(s)    => write!(f, "Session open failed: {s}"),
+            Self::NotReachable(s) => write!(f, "Backend not reachable: {s}"),
+            Self::AuthFailed(s) => write!(f, "Auth failed: {s}"),
+            Self::OpenFailed(s) => write!(f, "Session open failed: {s}"),
             Self::ProviderError(s) => write!(f, "Provider error: {s}"),
-            Self::SessionExpired   => write!(f, "Session expired or revoked"),
-            Self::BadConfig(s)     => write!(f, "Bad config: {s}"),
+            Self::SessionExpired => write!(f, "Session expired or revoked"),
+            Self::BadConfig(s) => write!(f, "Bad config: {s}"),
         }
     }
 }
@@ -219,7 +219,10 @@ pub struct PreviewOnlyBackend {
 
 impl PreviewOnlyBackend {
     pub fn new(vm_id: &str) -> Self {
-        Self { vm_id: vm_id.to_owned(), opened: false }
+        Self {
+            vm_id: vm_id.to_owned(),
+            opened: false,
+        }
     }
 }
 
@@ -286,7 +289,9 @@ impl SessionBackend for RdpRelayBackend {
 
     fn probe(&self) -> Result<(), BackendError> {
         if self.guest_ip.is_empty() {
-            return Err(BackendError::NotReachable("RDP_NO_GUEST_IP: guest IP unknown".to_owned()));
+            return Err(BackendError::NotReachable(
+                "RDP_NO_GUEST_IP: guest IP unknown".to_owned(),
+            ));
         }
         // TODO Phase 3: TCP probe to guest_ip:guest_port (port 3389)
         Ok(())
@@ -360,7 +365,9 @@ impl SessionBackend for VncConsoleBackend {
 
     fn probe(&self) -> Result<(), BackendError> {
         if self.vnc_host.is_empty() {
-            return Err(BackendError::NotReachable("VNC host not configured".to_owned()));
+            return Err(BackendError::NotReachable(
+                "VNC host not configured".to_owned(),
+            ));
         }
         // TODO Phase 1.3/1.4: TCP probe to vnc_host:vnc_port
         Ok(())

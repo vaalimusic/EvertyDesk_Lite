@@ -10,12 +10,12 @@
 //! 4. Отправлять ввод: `session.send(VrdeCmd::...)`
 
 use std::{
-    fs::{File, OpenOptions},
     fmt,
+    fs::{File, OpenOptions},
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
     path::PathBuf,
-    sync::{Arc, Mutex, mpsc},
+    sync::{mpsc, Arc, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -43,48 +43,69 @@ impl<S: Read> Read for SpyStream<S> {
 }
 
 impl<S: Write> Write for SpyStream<S> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { self.inner.write(buf) }
-    fn flush(&mut self) -> std::io::Result<()> { self.inner.flush() }
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
-use ironrdp_blocking::{Framed, Upgraded, connect_begin, mark_as_upgraded, single_sequence_step};
+use ironrdp_blocking::{connect_begin, mark_as_upgraded, single_sequence_step, Framed, Upgraded};
 use ironrdp_connector::{
+    connection_activation::{ConnectionActivationSequence, ConnectionActivationState},
     BitmapConfig, ClientConnector, ClientConnectorState, Config, ConnectionResult, Credentials,
     DesktopSize,
-    connection_activation::{ConnectionActivationSequence, ConnectionActivationState},
 };
 use ironrdp_core::WriteBuf;
+use ironrdp_graphics::{image_processing::PixelFormat, pointer::DecodedPointer};
 use ironrdp_pdu::{
     gcc::KeyboardType,
     input::{
-        InputEvent, InputEventPdu, ScanCodePdu, UnicodePdu,
         fast_path::{FastPathInputEvent, KeyboardFlags as FastKeyboardFlags},
         mouse::{MousePdu, PointerFlags},
         scan_code::KeyboardFlags as SlowKeyboardFlags,
         unicode::KeyboardFlags as SlowUnicodeFlags,
+        InputEvent, InputEventPdu, ScanCodePdu, UnicodePdu,
     },
     rdp::{capability_sets::MajorPlatformType, headers::ShareDataPdu},
 };
-use ironrdp_session::{ActiveStage, ActiveStageOutput, image::DecodedImage};
-use ironrdp_graphics::{image_processing::PixelFormat, pointer::DecodedPointer};
+use ironrdp_session::{image::DecodedImage, ActiveStage, ActiveStageOutput};
 
 // ── Команды в сессию ─────────────────────────────────────────────────────────
 
 pub enum VrdeCmd {
     /// Движение мыши (координаты в пикселях экрана гостя).
-    MouseMove { x: u16, y: u16 },
+    MouseMove {
+        x: u16,
+        y: u16,
+    },
     /// Кнопка мыши: 0=левая, 1=правая, 2=средняя; down=true/false.
-    MouseButton { button: u8, down: bool },
+    MouseButton {
+        button: u8,
+        down: bool,
+    },
     /// Вертикальная прокрутка. Положительное = вверх, по аналогии с Windows
     /// WHEEL_DELTA (120 на одно "деление" колеса).
-    MouseWheel { delta: i16 },
+    MouseWheel {
+        delta: i16,
+    },
     /// Нажатие клавиши (скан-код PS/2 Set-1, совместимый с Windows RDP).
-    KeyDown { scancode: u8, extended: bool },
+    KeyDown {
+        scancode: u8,
+        extended: bool,
+    },
     /// Отпускание клавиши.
-    KeyUp { scancode: u8, extended: bool },
+    KeyUp {
+        scancode: u8,
+        extended: bool,
+    },
     /// Печатный текст через RDP Unicode keyboard events.
     Text(String),
-    Resize { width: u16, height: u16 },
+    Resize {
+        width: u16,
+        height: u16,
+    },
     /// Закрыть сессию.
     Stop,
 }
@@ -149,7 +170,12 @@ pub struct VrdeSession {
 
 impl VrdeSession {
     /// Подключиться к VRDE-серверу VirtualBox на `host:port`.
-    pub fn connect(host: &str, port: u16, desktop_size: (u16, u16), settings: VrdeSettings) -> Self {
+    pub fn connect(
+        host: &str,
+        port: u16,
+        desktop_size: (u16, u16),
+        settings: VrdeSettings,
+    ) -> Self {
         install_panic_logging_hook();
         let (cmd_tx, cmd_rx) = mpsc::channel::<VrdeCmd>();
         let (frame_tx, frame_rx) = mpsc::sync_channel::<(u32, u32, Vec<u8>)>(2);
@@ -171,7 +197,15 @@ impl VrdeSession {
                 // the actual cause. Catching it here and writing it to the
                 // SAME log file closes that gap.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    vrde_thread(host, port, desktop_size, settings, cmd_rx, frame_tx, status_tx);
+                    vrde_thread(
+                        host,
+                        port,
+                        desktop_size,
+                        settings,
+                        cmd_rx,
+                        frame_tx,
+                        status_tx,
+                    );
                 }));
                 if let Err(payload) = result {
                     let msg = if let Some(s) = payload.downcast_ref::<&str>() {
@@ -186,7 +220,11 @@ impl VrdeSession {
             })
             .expect("spawn vbox-vrde thread");
 
-        VrdeSession { cmd_tx, frame_rx, status_rx }
+        VrdeSession {
+            cmd_tx,
+            frame_rx,
+            status_rx,
+        }
     }
 
     pub fn send(&self, cmd: VrdeCmd) {
@@ -261,8 +299,10 @@ fn vbox_connect_finalize<S: Read + Write>(
 
     loop {
         // Save finalization state before the step that might fail.
-        if let ClientConnectorState::ConnectionFinalization { ref connection_activation, .. } =
-            connector.state
+        if let ClientConnectorState::ConnectionFinalization {
+            ref connection_activation,
+            ..
+        } = connector.state
         {
             if let ConnectionActivationState::ConnectionFinalization {
                 io_channel_id,
@@ -369,7 +409,10 @@ fn vrde_thread(
     let (desktop_width, desktop_height) = sanitize_desktop_size(desktop_size.0, desktop_size.1);
 
     let config = Config {
-        desktop_size: DesktopSize { width: desktop_width, height: desktop_height },
+        desktop_size: DesktopSize {
+            width: desktop_width,
+            height: desktop_height,
+        },
         desktop_scale_factor: 0,
         // VirtualBox VRDE требует TLS; plain PROTOCOL_RDP отклоняется.
         enable_tls: true,
@@ -483,7 +526,11 @@ fn vrde_thread(
 
     // Spy wrapper для диагностики — логирует первые 4096 байтов от сервера
     let spy_log: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let spy = SpyStream { inner: tls_stream, log: Arc::clone(&spy_log), limit: 4096 };
+    let spy = SpyStream {
+        inner: tls_stream,
+        log: Arc::clone(&spy_log),
+        limit: 4096,
+    };
     // Начинаем с пустым буфером — TLS поток начинается заново
     let mut tls_framed = Framed::new(spy);
 
@@ -507,7 +554,11 @@ fn vrde_thread(
             let hex_info = if log.is_empty() {
                 " [нет байтов от VRDE до ошибки]".to_owned()
             } else {
-                let hex: String = log.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+                let hex: String = log
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 format!(" [{}б: {}]", log.len(), hex)
             };
             drop(log);
@@ -538,8 +589,14 @@ fn vrde_thread(
     // tolerance, bounded reactivation reads).
     {
         let (spy, _) = tls_framed.get_inner();
-        let _ = spy.inner.get_ref().set_read_timeout(Some(Duration::from_millis(8)));
-        let _ = spy.inner.get_ref().set_write_timeout(Some(Duration::from_secs(5)));
+        let _ = spy
+            .inner
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_millis(8)));
+        let _ = spy
+            .inner
+            .get_ref()
+            .set_write_timeout(Some(Duration::from_secs(5)));
     }
 
     let mut cur_mouse_x: u16 = 0;
@@ -653,7 +710,9 @@ fn vrde_thread(
                     }
                     // If cursor shape is known, emit a frame so the cursor appears
                     // at the new position immediately (no bitmap PDU needed).
-                    if cursor_shape.is_some() { had_update = true; }
+                    if cursor_shape.is_some() {
+                        had_update = true;
+                    }
                 }
                 Ok(VrdeCmd::MouseButton { button, down }) => {
                     cmd_count += 1;
@@ -663,7 +722,11 @@ fn vrde_thread(
                         1 => PointerFlags::RIGHT_BUTTON,
                         _ => PointerFlags::MIDDLE_BUTTON_OR_WHEEL,
                     };
-                    let flags = if down { btn_flag | PointerFlags::DOWN } else { btn_flag };
+                    let flags = if down {
+                        btn_flag | PointerFlags::DOWN
+                    } else {
+                        btn_flag
+                    };
                     match emit_mouse_event(
                         &active,
                         &mut tls_framed,
@@ -788,7 +851,15 @@ fn vrde_thread(
                 transient_reads += 1;
                 // Flush a cursor-only frame when the mouse moved but no bitmap PDU arrived.
                 if had_update {
-                    if send_frame(&image, &cursor_shape, cur_mouse_x, cur_mouse_y, &frame_tx, &mut log_file, &mut send_diag_logged) {
+                    if send_frame(
+                        &image,
+                        &cursor_shape,
+                        cur_mouse_x,
+                        cur_mouse_y,
+                        &frame_tx,
+                        &mut log_file,
+                        &mut send_diag_logged,
+                    ) {
                         frames_sent += 1;
                     } else {
                         frame_drops += 1;
@@ -844,15 +915,13 @@ fn vrde_thread(
 
         for output in outputs {
             match output {
-                ActiveStageOutput::ResponseFrame(bytes) => {
-                    match tls_framed.write_all(&bytes) {
-                        Ok(()) => write_ok += 1,
-                        Err(e) => {
-                            write_err += 1;
-                            diag!("VRDE response write error: {e}");
-                        }
+                ActiveStageOutput::ResponseFrame(bytes) => match tls_framed.write_all(&bytes) {
+                    Ok(()) => write_ok += 1,
+                    Err(e) => {
+                        write_err += 1;
+                        diag!("VRDE response write error: {e}");
                     }
-                }
+                },
                 ActiveStageOutput::GraphicsUpdate(_) => {
                     had_update = true;
                     graphics_updates += 1;
@@ -862,7 +931,9 @@ fn vrde_thread(
                         let nonzero = data.iter().any(|&b| b != 0);
                         diag!(
                             "VRDE: первое GraphicsUpdate, image {}x{}, nonzero_bytes={}",
-                            image.width(), image.height(), nonzero
+                            image.width(),
+                            image.height(),
+                            nonzero
                         );
                     }
                 }
@@ -907,7 +978,10 @@ fn vrde_thread(
                         // and let the normal reconnect path recover", which is
                         // strictly better even though reactivation normally
                         // completes in well under 100ms.
-                        let _ = spy.inner.get_ref().set_read_timeout(Some(Duration::from_millis(100)));
+                        let _ = spy
+                            .inner
+                            .get_ref()
+                            .set_read_timeout(Some(Duration::from_millis(100)));
                     }
                     match vbox_reactivate(&mut *cas, &mut tls_framed) {
                         Ok(new_share_id) => {
@@ -921,11 +995,13 @@ fn vrde_thread(
                     }
                     {
                         let (spy, _) = tls_framed.get_inner();
-                        let _ = spy.inner.get_ref().set_read_timeout(Some(Duration::from_millis(8)));
+                        let _ = spy
+                            .inner
+                            .get_ref()
+                            .set_read_timeout(Some(Duration::from_millis(8)));
                     }
                 }
-                ActiveStageOutput::MultitransportRequest(_)
-                | ActiveStageOutput::AutoDetect(_) => {}
+                ActiveStageOutput::MultitransportRequest(_) | ActiveStageOutput::AutoDetect(_) => {}
             }
         }
 
@@ -967,7 +1043,15 @@ fn vrde_thread(
                 }
             }
 
-            if send_frame(&image, &cursor_shape, cur_mouse_x, cur_mouse_y, &frame_tx, &mut log_file, &mut send_diag_logged) {
+            if send_frame(
+                &image,
+                &cursor_shape,
+                cur_mouse_x,
+                cur_mouse_y,
+                &frame_tx,
+                &mut log_file,
+                &mut send_diag_logged,
+            ) {
                 frames_sent += 1;
             } else {
                 frame_drops += 1;
@@ -985,11 +1069,7 @@ fn vrde_log_path() -> Option<PathBuf> {
 
 fn open_vrde_log() -> Option<File> {
     let path = vrde_log_path()?;
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .ok()
+    OpenOptions::new().create(true).append(true).open(path).ok()
 }
 
 /// Append a timestamped line to the same VRDE log file the session thread
@@ -1382,21 +1462,34 @@ pub(crate) fn composite_cursor(
                 continue;
             }
             let si = ((py * cw + px) * 4) as usize;
-            if si + 3 >= cursor.bitmap_data.len() { break; }
+            if si + 3 >= cursor.bitmap_data.len() {
+                break;
+            }
             let ca = cursor.bitmap_data[si + 3];
-            if ca == 0 { continue; }
+            if ca == 0 {
+                continue;
+            }
             let di = (dy as usize * img_w + dx as usize) * 4;
-            if di + 2 >= rgba.len() { break; }
-            let (cr, cg, cb) = (cursor.bitmap_data[si], cursor.bitmap_data[si+1], cursor.bitmap_data[si+2]);
+            if di + 2 >= rgba.len() {
+                break;
+            }
+            let (cr, cg, cb) = (
+                cursor.bitmap_data[si],
+                cursor.bitmap_data[si + 1],
+                cursor.bitmap_data[si + 2],
+            );
             if ca == 255 {
-                rgba[di] = cr; rgba[di+1] = cg; rgba[di+2] = cb; rgba[di+3] = 255;
+                rgba[di] = cr;
+                rgba[di + 1] = cg;
+                rgba[di + 2] = cb;
+                rgba[di + 3] = 255;
             } else {
                 let a = ca as u16;
                 let ia = 255 - a;
-                rgba[di]   = ((cr as u16 * a + rgba[di]   as u16 * ia) / 255) as u8;
-                rgba[di+1] = ((cg as u16 * a + rgba[di+1] as u16 * ia) / 255) as u8;
-                rgba[di+2] = ((cb as u16 * a + rgba[di+2] as u16 * ia) / 255) as u8;
-                rgba[di+3] = 255;
+                rgba[di] = ((cr as u16 * a + rgba[di] as u16 * ia) / 255) as u8;
+                rgba[di + 1] = ((cg as u16 * a + rgba[di + 1] as u16 * ia) / 255) as u8;
+                rgba[di + 2] = ((cb as u16 * a + rgba[di + 2] as u16 * ia) / 255) as u8;
+                rgba[di + 3] = 255;
             }
         }
     }
@@ -1425,7 +1518,13 @@ fn send_frame(
         let pixel_at = |px: usize, py: usize| -> String {
             let off = (py * w + px) * 4;
             if off + 4 <= rgba.len() {
-                format!("{:02x}{:02x}{:02x}{:02x}", rgba[off], rgba[off + 1], rgba[off + 2], rgba[off + 3])
+                format!(
+                    "{:02x}{:02x}{:02x}{:02x}",
+                    rgba[off],
+                    rgba[off + 1],
+                    rgba[off + 2],
+                    rgba[off + 3]
+                )
             } else {
                 "??".to_owned()
             }
@@ -1475,9 +1574,9 @@ fn vbox_reactivate<S: Read + Write>(
     cas: &mut ConnectionActivationSequence,
     framed: &mut Framed<S>,
 ) -> Result<u32, String> {
-    use std::error::Error as StdError;
-    use ironrdp_connector::Sequence;
     use ironrdp_connector::connection_activation::ConnectionActivationState;
+    use ironrdp_connector::Sequence;
+    use std::error::Error as StdError;
 
     let mut buf = WriteBuf::new();
     let mut saved_share_id: Option<u32> = None;
@@ -1508,8 +1607,10 @@ fn vbox_reactivate<S: Read + Write>(
                 match framed.read_by_hint(hint) {
                     Ok(pdu) => break pdu,
                     Err(e)
-                        if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
-                            && Instant::now() < deadline =>
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) && Instant::now() < deadline =>
                     {
                         continue;
                     }
@@ -1561,7 +1662,9 @@ fn vbox_reactivate<S: Read + Write>(
 
         // Forward any response bytes to the server.
         if let Some(len) = written.size() {
-            framed.write_all(&buf[..len]).map_err(|e| format!("write: {e}"))?;
+            framed
+                .write_all(&buf[..len])
+                .map_err(|e| format!("write: {e}"))?;
         }
 
         // Done when state is Finalized.

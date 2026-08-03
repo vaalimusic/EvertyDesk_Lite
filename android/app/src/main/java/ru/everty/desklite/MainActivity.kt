@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.res.Configuration
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -12,6 +13,8 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.util.Log
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
@@ -21,6 +24,7 @@ import android.graphics.SurfaceTexture
 import android.view.Surface
 import android.view.TextureView
 import android.view.View
+import android.view.WindowManager
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.inputmethod.InputMethodManager
@@ -102,13 +106,45 @@ class MainActivity : Activity() {
     private val PREF_AB_LOCAL_CONTACTS = "address_book_local_contacts"
     private val PREF_SAVED_PASSWORDS = "saved_passwords"  // JSON {id: password}
     private val PREF_NATURAL_SCROLL = "natural_scroll"    // true = Mac natural (default)
-    private val PREF_CODEC = "codec"                       // EVRTCK | H264 | H265 | AV1
+    private val PREF_SHOW_TECH_INFO = "show_tech_info"     // fps/битрейт оверлей; default OFF
+    private val PREF_TOUCH_SENSITIVITY = "touch_sensitivity" // 0..100, default 42 (≈1.35x)
+    private val PREF_TOUCH_ACCEL = "touch_accel"            // ускорение курсора; default ON
+    private val PREF_HOST_PASSWORD = "host_password"       // пароль для входящих в хост-режиме
 
     // ID текущего удалённого хоста — используется для уведомления хоста через агент
     private var currentRemoteId = ""
 
     // Кодек активной сессии — нужен для выбора между Surface и bitmap режимами
     private var activeCodec = "EVRTCK"
+
+    // ── Состояние жизненного цикла игровой сессии ─────────────────────────────
+    // Пароль текущей сессии — сохраняется для «Переподключиться» после разрыва.
+    private var currentSessionPassword = ""
+    // true пока открыт игровой экран стрима (showGameRemoteScreen). Используется
+    // lifecycle-обработчиками, чтобы отличать сессию от обычных экранов.
+    private var gameSessionActive = false
+    // Пользователь сам нажал «Выход» — тогда разрыв это НЕ ошибка, не показываем
+    // экран «Соединение потеряно».
+    private var userInitiatedDisconnect = false
+    // Сессия хоть раз была установлена — чтобы «разрыв» отличать от «ещё не
+    // подключились» (последнее не должно показывать экран потери связи).
+    private var sessionWasConnected = false
+    // Приложение свёрнуто во время активной сессии — при возврате возобновляем.
+    private var sessionBackgrounded = false
+    // Экран «Соединение потеряно» уже показан — чтобы не дублировать.
+    private var connectionLostShown = false
+    // Runnable статус-тика игровой сессии — храним, чтобы снимать при lifecycle.
+    private var gameStatusTick: Runnable? = null
+
+    // Громкость хоста (0..100), управляется ползунком в режиме тачпада.
+    private var hostVolumePercent = 50
+    private var volumeSendRunnable: Runnable? = null
+    // Ссылка на активный ползунок громкости — для синхронизации с кнопками телефона.
+    private var hostVolumeSlider: android.widget.SeekBar? = null
+
+    // Чувствительность курсора тачпада: percent 0..100 ↔ множитель 0.6..2.4.
+    private fun sensitivityPercent(): Int = prefs.getInt(PREF_TOUCH_SENSITIVITY, 42).coerceIn(0, 100)
+    private fun sensitivityFromPercent(p: Int): Float = 0.6f + (p / 100f) * (2.4f - 0.6f)
 
     private val defaultApiUrl = "https://desk.everty.ru"
     private val defaultIdServer = "edesk.server1.everty.ru"
@@ -122,10 +158,43 @@ class MainActivity : Activity() {
         showConnectScreen()
     }
 
+    // ── Полноэкранный (immersive) режим для игровой сессии ───────────────────
+    // Системные бары прячутся на время стрима и возвращаются свайпом от края
+    // (transient) — стандартное поведение полноэкранных игр и видеоплееров.
+    private fun enterImmersiveMode() {
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            window.setDecorFitsSystemWindows(false)
+            window.insetsController?.let {
+                it.hide(android.view.WindowInsets.Type.systemBars())
+                it.systemBarsBehavior =
+                    android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                or View.SYSTEM_UI_FLAG_FULLSCREEN
+                or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION)
+        }
+    }
+
+    private fun exitImmersiveMode() {
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            window.setDecorFitsSystemWindows(true)
+            window.insetsController?.show(android.view.WindowInsets.Type.systemBars())
+        } else {
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
+        }
+    }
+
     // ── Экран подключения ─────────────────────────────────────────────────────
     private fun showConnectScreen() {
         rightClickPending = false
         rightClickBtn = null
+        exitImmersiveMode()
 
         val col = showAppScreen(
             active = "connect",
@@ -237,6 +306,310 @@ class MainActivity : Activity() {
             recent.forEach { remoteId ->
                 col.addView(recentSessionCard(remoteId, idInput, pwInput, statusLabel))
                 col.addView(vSpace(dp(8)))
+            }
+        }
+    }
+
+    // ── Хост-режим (тачпад): устройство принимает подключения ─────────────────
+    private var hostTick: Runnable? = null
+    private var hostRunning = false
+
+    /** Пароль для входящих подключений в хост-режиме (6 цифр, персистентный). */
+    private fun hostPassword(): String {
+        val existing = prefs.getString(PREF_HOST_PASSWORD, "").orEmpty()
+        if (existing.length == 6) return existing
+        val generated = (100000..999999).random().toString()
+        prefs.edit().putString(PREF_HOST_PASSWORD, generated).apply()
+        return generated
+    }
+
+    private fun showHostScreen() {
+        exitImmersiveMode()
+        hostTick?.let { handler.removeCallbacks(it) }
+        hostTick = null
+
+        val col = showAppScreen(
+            active = "host",
+            title = "Хост — тачпад",
+            subtitle = "Управляйте этим устройством с телефона как трекпадом",
+        )
+
+        val myId = localDeviceId()
+        val myPw = hostPassword()
+        val (sw, sh) = screenSizePx()
+
+        // ── Инфо-баннер: чем является режим ───────────────────────────────────
+        val infoCard = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            background = roundedBg(Color.argb(0x22, 0x12, 0xC9, 0x72), 18, Color.argb(0x55, 0x12, 0xC9, 0x72))
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+        }
+        infoCard.addView(TextView(this).apply {
+            text = "🖱️"
+            textSize = 22f
+        })
+        infoCard.addView(vSpaceH(dp(12)))
+        infoCard.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(TextView(this@MainActivity).apply {
+                text = "Только режим трекпада"
+                setTextColor(textMain)
+                textSize = 14f
+                typeface = Typeface.DEFAULT_BOLD
+            })
+            addView(TextView(this@MainActivity).apply {
+                text = "Изображение и звук не передаются. Режим нужен для удобного управления ТВ или устройством с проблемным тачскрином — телефон работает как трекпад."
+                setTextColor(textSoft)
+                textSize = 12f
+                setLineSpacing(dp(2).toFloat(), 1f)
+            })
+        }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        col.addView(infoCard, matchWrap())
+        col.addView(vSpace(dp(16)))
+
+        // ── Карточка с ID и паролем ───────────────────────────────────────────
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = roundedBg(cardBg, 20, lineSoft)
+            setPadding(dp(18), dp(16), dp(18), dp(16))
+        }
+        card.addView(label("ID этого устройства"))
+        card.addView(TextView(this).apply {
+            text = myId
+            setTextColor(textMain)
+            textSize = 30f
+            typeface = Typeface.DEFAULT_BOLD
+            letterSpacing = 0.08f
+        })
+        card.addView(vSpace(dp(12)))
+        card.addView(label("Пароль"))
+        val pwRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val pwText = TextView(this).apply {
+            text = myPw
+            setTextColor(brandGreen)
+            textSize = 26f
+            typeface = Typeface.DEFAULT_BOLD
+            letterSpacing = 0.12f
+        }
+        val regen = makeSecondaryButton("↻ Сменить") {
+            val np = (100000..999999).random().toString()
+            prefs.edit().putString(PREF_HOST_PASSWORD, np).apply()
+            pwText.text = np
+            if (hostRunning) {
+                // Перезапустить хост с новым паролем.
+                stopHostMode()
+                startHostMode()
+            }
+        }
+        pwRow.addView(pwText, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        pwRow.addView(regen)
+        card.addView(pwRow)
+        col.addView(card, matchWrap())
+        col.addView(vSpace(dp(16)))
+
+        // ── Статус службы доступности ─────────────────────────────────────────
+        val accStatus = TextView(this).apply {
+            textSize = 13f
+            gravity = Gravity.CENTER
+        }
+        col.addView(accStatus, matchWrap())
+        col.addView(vSpace(dp(8)))
+        val accBtn = makeSecondaryButton("Включить службу управления") {
+            openAccessibilitySettings()
+        }
+        col.addView(accBtn, LinearLayout.LayoutParams(MATCH_PARENT, dp(48)))
+        col.addView(vSpace(dp(16)))
+
+        // ── Старт / Стоп ──────────────────────────────────────────────────────
+        val statusLabel = TextView(this).apply {
+            text = " "
+            setTextColor(textSoft)
+            textSize = 13f
+            gravity = Gravity.CENTER
+        }
+        val startBtn = makePrimaryButton("Запустить хост") { startHostMode() }
+            .apply { textSize = 17f }
+        val stopBtn = makeSecondaryButton("Остановить") { stopHostMode() }
+
+        col.addView(startBtn, LinearLayout.LayoutParams(MATCH_PARENT, dp(52)))
+        col.addView(vSpace(dp(10)))
+        col.addView(stopBtn, LinearLayout.LayoutParams(MATCH_PARENT, dp(46)))
+        col.addView(vSpace(dp(12)))
+        col.addView(statusLabel, matchWrap())
+
+        // ТВ-пульт: без стартового фокуса непонятно, куда жать. Фокусируем
+        // самую нужную кнопку — включить доступность, если ещё не включена,
+        // иначе «Запустить хост».
+        accBtn.isFocusable = true
+        startBtn.isFocusable = true
+        handler.post {
+            if (!EvertyInputService.isRunning()) accBtn.requestFocus() else startBtn.requestFocus()
+        }
+
+        col.addView(vSpace(dp(20)))
+        col.addView(sectionHeader("Как пользоваться"))
+        col.addView(vSpace(dp(10)))
+        col.addView(hostStep(1, "Включите службу управления", "Один раз — в системных настройках доступности."))
+        col.addView(vSpace(dp(8)))
+        col.addView(hostStep(2, "Запустите хост", "Кнопка выше. Появится курсор и значок в шторке."))
+        col.addView(vSpace(dp(8)))
+        col.addView(hostStep(3, "Подключитесь с телефона", "«Тачпад без картинки» → ID $myId и пароль."))
+        col.addView(vSpace(dp(8)))
+        col.addView(hostStep(4, "Смотрите на этот экран", "Телефон двигает курсор как трекпад ноутбука."))
+
+        col.addView(vSpace(dp(14)))
+        col.addView(TextView(this).apply {
+            setTextColor(Color.rgb(0x8A, 0x94, 0x90))
+            textSize = 11f
+            gravity = Gravity.CENTER
+            text = "Разрешение экрана ${sw}×${sh} передаётся клиенту для точного позиционирования курсора"
+        }, matchWrap())
+
+        // Тикер: обновляет статус доступности и хоста.
+        val tick = object : Runnable {
+            override fun run() {
+                val accOn = EvertyInputService.isRunning()
+                accStatus.text = if (accOn) "✓ Служба управления включена" else "⚠ Служба управления выключена"
+                accStatus.setTextColor(if (accOn) brandGreen else Color.rgb(0xE3, 0x8A, 0x2F))
+                accBtn.visibility = if (accOn) View.GONE else View.VISIBLE
+                startBtn.visibility = if (hostRunning) View.GONE else View.VISIBLE
+                stopBtn.visibility = if (hostRunning) View.VISIBLE else View.GONE
+                if (hostRunning) {
+                    statusLabel.text = "● ${client.hostStatus()}"
+                    statusLabel.setTextColor(brandGreen)
+                }
+                handler.postDelayed(this, 800)
+            }
+        }
+        hostTick = tick
+        handler.post(tick)
+    }
+
+    private fun screenSizePx(): Pair<Int, Int> {
+        val dm = resources.displayMetrics
+        return Pair(dm.widthPixels, dm.heightPixels)
+    }
+
+    /** Строка шага с зелёным номером-кружком, заголовком и подписью. */
+    private fun hostStep(num: Int, title: String, subtitle: String): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            val badge = TextView(this@MainActivity).apply {
+                text = num.toString()
+                setTextColor(Color.WHITE)
+                textSize = 14f
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+                background = roundedBg(brandGreen, 999)
+            }
+            addView(badge, LinearLayout.LayoutParams(dp(28), dp(28)))
+            addView(vSpaceH(dp(12)))
+            addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(TextView(this@MainActivity).apply {
+                    text = title
+                    setTextColor(textMain)
+                    textSize = 14f
+                    typeface = Typeface.DEFAULT_BOLD
+                })
+                addView(TextView(this@MainActivity).apply {
+                    text = subtitle
+                    setTextColor(textSoft)
+                    textSize = 12f
+                })
+            }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        }
+
+    /**
+     * Открывает настройки доступности, чтобы включить EvertyInputService.
+     * На некоторых прошивках (MIUI TV/PatchWall и др.) стандартный
+     * ACTION_ACCESSIBILITY_SETTINGS не резолвится в системный экран — пробуем
+     * по цепочке несколько путей, прежде чем сдаться.
+     */
+    private fun openAccessibilitySettings() {
+        val attempts = listOf(
+            android.content.Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS),
+            // Некоторые прошивки резолвят только с явным пакетом настроек.
+            android.content.Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                .setPackage("com.android.tv.settings"),
+            android.content.Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                .setPackage("com.android.settings"),
+            // Фолбэк: страница приложения — оттуда обычно можно дойти до
+            // «Специальные возможности» вручную.
+            android.content.Intent(
+                android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                android.net.Uri.fromParts("package", packageName, null),
+            ),
+            // Последний фолбэк: общий экран настроек системы.
+            android.content.Intent(android.provider.Settings.ACTION_SETTINGS),
+        )
+        for (intent in attempts) {
+            intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            try {
+                startActivity(intent)
+                android.widget.Toast.makeText(
+                    this,
+                    "Найдите «Специальные возможности» → «EvertyDesk — управление хостом» и включите",
+                    android.widget.Toast.LENGTH_LONG,
+                ).show()
+                return
+            } catch (e: Exception) {
+                // пробуем следующий вариант
+            }
+        }
+        android.widget.Toast.makeText(
+            this,
+            "Не удалось открыть настройки — откройте вручную: Настройки → Специальные возможности",
+            android.widget.Toast.LENGTH_LONG,
+        ).show()
+    }
+
+    private fun startHostMode() {
+        if (!EvertyInputService.isRunning()) {
+            android.widget.Toast.makeText(
+                this,
+                "Сначала включите службу управления",
+                android.widget.Toast.LENGTH_LONG,
+            ).show()
+            openAccessibilitySettings()
+            return
+        }
+        requestNotificationPermissionIfNeeded()
+        val (sw, sh) = screenSizePx()
+        val ok = client.startTouchpadHost(
+            localDeviceId(),
+            hostPassword(),
+            defaultIdServer,
+            defaultRelayServer,
+            defaultPublicKey,
+            sw,
+            sh,
+        )
+        hostRunning = ok
+        if (ok) EvertyInputService.setHostActive(true) // курсор + уведомление
+        android.widget.Toast.makeText(
+            this,
+            if (ok) "Хост запущен — ждём подключения" else "Не удалось запустить хост",
+            android.widget.Toast.LENGTH_SHORT,
+        ).show()
+    }
+
+    private fun stopHostMode() {
+        client.stopHost()
+        hostRunning = false
+        EvertyInputService.setHostActive(false) // прячем курсор + убираем уведомление
+        android.widget.Toast.makeText(this, "Хост остановлен", android.widget.Toast.LENGTH_SHORT).show()
+    }
+
+    private fun requestNotificationPermissionIfNeeded() {
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            val perm = android.Manifest.permission.POST_NOTIFICATIONS
+            if (checkSelfPermission(perm) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                runCatching { requestPermissions(arrayOf(perm), 7011) }
             }
         }
     }
@@ -773,52 +1146,47 @@ class MainActivity : Activity() {
         col.addView(vSpace(dp(8)))
         col.addView(label("Отключите, если скролл ощущается перевёрнутым на вашем хосте"), matchWrap())
 
-        // ── Кодек ────────────────────────────────────────────────────────────
+        // ── Отображение ───────────────────────────────────────────────────────
         col.addView(vSpace(dp(24)))
-        col.addView(sectionHeader("Кодек видео"))
-        col.addView(vSpace(dp(8)))
-        col.addView(TextView(this).apply {
-            text = "Выбранный кодек используется при следующем подключении. EVRTCK — лучший выбор для LAN и прямых соединений."
-            setTextColor(textSoft)
-            textSize = 12f
-            setLineSpacing(0f, 1.2f)
-        }, matchWrap())
+        col.addView(sectionHeader("Отображение"))
         col.addView(vSpace(dp(12)))
 
-        val codecs = listOf("EVRTCK", "H264", "H265", "AV1")
-        val codecLabels = mapOf("EVRTCK" to "EVRTCK\nLAN / прямой", "H264" to "H264\nСовместимость", "H265" to "H265\nКачество/фильмы", "AV1" to "AV1\nЭффективность")
-        val codecBtnRow = LinearLayout(this).apply {
+        val techInfoRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
+            gravity = Gravity.CENTER_VERTICAL
+            background = roundedBg(cardBg, 18, lineSoft)
+            setPadding(dp(16), dp(14), dp(16), dp(14))
         }
-        val codecBtns = mutableMapOf<String, Button>()
+        val techInfoSwitch = android.widget.Switch(this).apply {
+            isChecked = prefs.getBoolean(PREF_SHOW_TECH_INFO, false)
+        }
+        val techInfoLabel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        techInfoLabel.addView(TextView(this).apply {
+            text = "Техническая информация"
+            setTextColor(textMain)
+            textSize = 15f
+        })
+        techInfoLabel.addView(TextView(this).apply {
+            text = "fps, задержка, битрейт поверх экрана сессии"
+            setTextColor(textSoft)
+            textSize = 12f
+        })
+        techInfoRow.addView(techInfoLabel,
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        techInfoRow.addView(techInfoSwitch)
+        techInfoSwitch.setOnCheckedChangeListener { _, isChecked ->
+            prefs.edit().putBoolean(PREF_SHOW_TECH_INFO, isChecked).apply()
+        }
+        col.addView(techInfoRow, matchWrap())
+        col.addView(vSpace(dp(8)))
+        col.addView(label("По умолчанию выключено — не мешает во время игры"), matchWrap())
 
-        fun updateCodecButtons(selected: String) {
-            codecs.forEach { c ->
-                codecBtns[c]?.apply {
-                    background = if (c == selected) roundedBg(brandGreen, 14) else roundedBg(cardBg, 14, lineSoft)
-                    setTextColor(if (c == selected) Color.WHITE else textMain)
-                }
-            }
-        }
-
-        codecs.forEach { c ->
-            val btn = Button(this).apply {
-                text = codecLabels[c] ?: c
-                textSize = 10f
-                isAllCaps = false
-                setOnClickListener {
-                    prefs.edit().putString(PREF_CODEC, c).apply()
-                    updateCodecButtons(c)
-                }
-            }
-            codecBtns[c] = btn
-            codecBtnRow.addView(btn, LinearLayout.LayoutParams(0, dp(64), 1f).also {
-                it.setMargins(dp(2), 0, dp(2), 0)
-            })
-        }
-        updateCodecButtons(selectedCodec())
-        col.addView(codecBtnRow, matchWrap())
+        // Секция «Кодек видео» убрана: кодек согласуется автоматически по
+        // реальным возможностям обеих сторон. В игровом режиме выбор доступен
+        // на экране подключения (с проверкой аппаратной поддержки). Ручной
+        // выбор в настройках только дублировал и путал.
     }
 
     // ── Игровой режим ─────────────────────────────────────────────────────────
@@ -847,6 +1215,13 @@ class MainActivity : Activity() {
             textSize = 12f
             setLineSpacing(0f, 1.2f)
         }, matchWrap())
+        infoCard.addView(vSpace(dp(8)))
+        infoCard.addView(TextView(this).apply {
+            text = "ℹ️  Для полной работы изображения, звука и управления и клиент, и хост должны быть EvertyDesk Lite."
+            setTextColor(Color.rgb(0x9F, 0xE8, 0xC0))
+            textSize = 11.5f
+            setLineSpacing(0f, 1.2f)
+        }, matchWrap())
         col.addView(infoCard, matchWrap())
         col.addView(vSpace(dp(20)))
 
@@ -864,38 +1239,74 @@ class MainActivity : Activity() {
         col.addView(pwInput, matchWrap())
         col.addView(vSpace(dp(20)))
 
-        // Выбор кодека для игрового режима
+        // Выбор кодека для игрового режима.
+        // Кнопка активна только если у устройства есть НАСТОЯЩИЙ аппаратный
+        // декодер (см. VideoDecoder.isDecodeSupported). Софтверный декодер
+        // (например dav1d для AV1) не тянет 60fps-стрим — честнее сразу
+        // показать «нет поддержки», чем дать подключиться к чёрному экрану.
         col.addView(label("Кодек (рекомендуется H265)"))
         col.addView(vSpace(dp(8)))
-        val gameCodecs = listOf("H265", "AV1", "EVRTCK")
+        val hwH265 = VideoDecoder.isDecodeSupported("video/hevc")
+        val hwAv1 = VideoDecoder.isDecodeSupported("video/av01")
+        data class CodecOption(val id: String, val title: String, val subtitle: String, val supported: Boolean)
+        val gameCodecOptions = listOf(
+            CodecOption("H265", "H265", if (hwH265) "Рекомендуется" else "Нет аппаратной\nподдержки", hwH265),
+            CodecOption("AV1", "AV1", if (hwAv1) "Современные GPU" else "Нет аппаратной\nподдержки", hwAv1),
+            CodecOption("EVRTCK", "EVRTCK", "LAN / без потерь", true),
+        )
         var gameCodec = prefs.getString("game_codec", "H265") ?: "H265"
+        // Сохранённый выбор мог стать недоступным (другой телефон, миграция
+        // данных) — тихо возвращаемся к лучшему поддерживаемому варианту.
+        if (gameCodecOptions.firstOrNull { it.id == gameCodec }?.supported != true) {
+            gameCodec = if (hwH265) "H265" else "EVRTCK"
+            prefs.edit().putString("game_codec", gameCodec).apply()
+        }
         val gameCodecRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
         }
         val gameCodecBtns = mutableMapOf<String, Button>()
 
         fun updateGameCodecBtns(sel: String) {
-            gameCodecs.forEach { c ->
-                gameCodecBtns[c]?.apply {
-                    background = if (c == sel) roundedBg(brandGreen, 14) else roundedBg(cardBg, 14, lineSoft)
-                    setTextColor(if (c == sel) Color.WHITE else textMain)
+            gameCodecOptions.forEach { opt ->
+                gameCodecBtns[opt.id]?.apply {
+                    background = when {
+                        !opt.supported -> roundedBg(cardBg, 14, lineSoft)
+                        opt.id == sel -> roundedBg(brandGreen, 14)
+                        else -> roundedBg(cardBg, 14, lineSoft)
+                    }
+                    setTextColor(
+                        when {
+                            !opt.supported -> textSoft
+                            opt.id == sel -> Color.WHITE
+                            else -> textMain
+                        }
+                    )
+                    alpha = if (opt.supported) 1f else 0.45f
                 }
             }
         }
 
-        gameCodecs.forEach { c ->
+        gameCodecOptions.forEach { opt ->
             val btn = Button(this).apply {
-                text = c
-                textSize = 11f
+                text = "${opt.title}\n${opt.subtitle}"
+                textSize = 10f
                 isAllCaps = false
                 setOnClickListener {
-                    gameCodec = c
-                    prefs.edit().putString("game_codec", c).apply()
-                    updateGameCodecBtns(c)
+                    if (!opt.supported) {
+                        android.widget.Toast.makeText(
+                            this@MainActivity,
+                            "На этом устройстве нет аппаратного декодера ${opt.title} — используется ${gameCodec}",
+                            android.widget.Toast.LENGTH_LONG
+                        ).show()
+                        return@setOnClickListener
+                    }
+                    gameCodec = opt.id
+                    prefs.edit().putString("game_codec", opt.id).apply()
+                    updateGameCodecBtns(opt.id)
                 }
             }
-            gameCodecBtns[c] = btn
-            gameCodecRow.addView(btn, LinearLayout.LayoutParams(0, dp(44), 1f).also {
+            gameCodecBtns[opt.id] = btn
+            gameCodecRow.addView(btn, LinearLayout.LayoutParams(0, dp(56), 1f).also {
                 it.setMargins(dp(2), 0, dp(2), 0)
             })
         }
@@ -910,6 +1321,24 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
         }
 
+        // EVRT2-only тест: отдельный вход, БЕЗ живого EVRT1-видео вообще —
+        // хост пропускает video_pipeline целиком (см. host.rs evrt2_only),
+        // так что нет конкуренции за захват экрана/CPU с обычным стримом.
+        var evrt2OnlyMode = false
+        val evrt2OnlyRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val evrt2OnlyCheck = android.widget.CheckBox(this).apply {
+            setTextColor(textMain)
+            text = "🧪  EVRT2-only тест (без живого видео)"
+            textSize = 13f
+            setOnCheckedChangeListener { _, checked -> evrt2OnlyMode = checked }
+        }
+        evrt2OnlyRow.addView(evrt2OnlyCheck, matchWrap())
+        col.addView(evrt2OnlyRow, matchWrap())
+        col.addView(vSpace(dp(8)))
+
         col.addView(makePrimaryButton("▶  Запустить игровой стрим") {
             val id = idInput.text.toString().filter { it.isDigit() }
             if (id.isEmpty()) {
@@ -918,14 +1347,15 @@ class MainActivity : Activity() {
                 return@makePrimaryButton
             }
             prefs.edit().putString(PREF_LAST_ID, id).apply()
-            statusLabel.text = "Подключение (${gameCodec})..."
+            val effectiveCodec = if (evrt2OnlyMode) "EVRT2ONLY" else gameCodec
+            statusLabel.text = "Подключение (${effectiveCodec})..."
             statusLabel.setTextColor(textSoft)
             val pw = pwInput.text.toString()
             val dm = android.util.DisplayMetrics()
             @Suppress("DEPRECATION")
             windowManager.defaultDisplay.getRealMetrics(dm)
             client.setMaxResolution(dm.widthPixels, dm.heightPixels)
-            val started = client.start(id, pw, apiUrl(), idServer(), relayServer(), publicKey(), gameCodec)
+            val started = client.start(id, pw, apiUrl(), idServer(), relayServer(), publicKey(), effectiveCodec)
             if (!started) {
                 statusLabel.text = "Не удалось запустить сессию"
                 statusLabel.setTextColor(Color.rgb(0xE3, 0x4B, 0x2F))
@@ -934,7 +1364,13 @@ class MainActivity : Activity() {
             rememberRecentSession(id)
             if (pw.isNotEmpty()) savePassword(id, pw)
             currentRemoteId = id
-            activeCodec = gameCodec
+            currentSessionPassword = pw
+            activeCodec = effectiveCodec
+            // Новая сессия — сбрасываем флаги lifecycle-состояния.
+            userInitiatedDisconnect = false
+            sessionWasConnected = false
+            sessionBackgrounded = false
+            connectionLostShown = false
             showGameRemoteScreen()
         }.apply { textSize = 16f }, LinearLayout.LayoutParams(MATCH_PARENT, dp(56)))
 
@@ -947,14 +1383,20 @@ class MainActivity : Activity() {
         root.removeAllViews()
         kbVisible = false
         touchpadView = null
+        gameSessionActive = true
+        enterImmersiveMode()
 
         val useHardware = activeCodec != "EVRTCK"
 
-        // TextureView — unlike SurfaceView, resize doesn't destroy/recreate the surface,
-        // so the decoder survives onVideoRectChanged without a 2-second IDR wait.
-        var textureView: TextureView? = null
+        // ROADMAP.md task #30: VideoGLSurfaceView, not TextureView — see its
+        // own doc comment for the live investigation that led here. Resize
+        // (via onVideoRectChanged below) still doesn't destroy/recreate the
+        // decode surface, same property TextureView was originally chosen
+        // for — GLSurfaceView's own Surface/EGL setup is independent of
+        // this view's on-screen layout size.
+        var textureView: VideoGLSurfaceView? = null
         if (useHardware) {
-            val tv = TextureView(this).apply {
+            val tv = VideoGLSurfaceView(this).apply {
                 layoutParams = FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)
                 keepScreenOn = true
             }
@@ -970,6 +1412,7 @@ class MainActivity : Activity() {
                 isHardwareDecodeMode = true
                 setBackgroundColor(Color.TRANSPARENT)
                 onVideoRectChanged = { rect ->
+                    Log.i("EvdGameScreen", "onVideoRectChanged x=${rect.x} y=${rect.y} w=${rect.width} h=${rect.height}")
                     textureView?.layoutParams = FrameLayout.LayoutParams(rect.width, rect.height).apply {
                         leftMargin = rect.x
                         topMargin = rect.y
@@ -984,20 +1427,21 @@ class MainActivity : Activity() {
             VideoDecoder.onDimensionsAvailable = { w, h ->
                 handler.post { rv.setHardwareDimensions(w, h) }
             }
-            textureView?.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
-                override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
-                    // Re-arm onDimensionsAvailable — releaseAll() might have cleared it
-                    VideoDecoder.onDimensionsAvailable = { dw, dh ->
-                        handler.post { rv.setHardwareDimensions(dw, dh) }
+            textureView?.onSurfaceReady = { surface ->
+                Log.i("EvdGameScreen", "GL surface ready tvVisibility=${textureView?.visibility} tvW=${textureView?.width} tvH=${textureView?.height} tvAlpha=${textureView?.alpha}")
+                // Re-arm onDimensionsAvailable — releaseAll() might have cleared it
+                VideoDecoder.onDimensionsAvailable = { dw, dh ->
+                    Log.i("EvdGameScreen", "onDimensionsAvailable dw=$dw dh=$dh")
+                    handler.post {
+                        rv.setHardwareDimensions(dw, dh)
+                        Log.i("EvdGameScreen", "after setHardwareDimensions: rvW=${rv.width} rvH=${rv.height} tvVisibility=${textureView?.visibility} tvW=${textureView?.width} tvH=${textureView?.height} tvLeft=${textureView?.left} tvTop=${textureView?.top} tvAlpha=${textureView?.alpha}")
                     }
-                    VideoDecoder.setSurface(Surface(st))
                 }
-                override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
-                override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
-                    VideoDecoder.releaseAll()
-                    return true
-                }
-                override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+                VideoDecoder.setSurface(surface)
+            }
+            textureView?.onSurfaceGone = {
+                Log.i("EvdGameScreen", "GL surface gone")
+                VideoDecoder.releaseAll()
             }
         }
 
@@ -1013,6 +1457,97 @@ class MainActivity : Activity() {
             setPadding(dp(10), dp(6), dp(10), dp(6))
         }
         root.addView(overlay, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.START))
+
+        // EVRT2 (эксп.) превью — отдельный ImageView и отдельный буфер (client.pollEvrt2Frame),
+        // никогда не смешивается с live-видео в RemoteView/pixels. В режиме
+        // EVRT2-only живого видео за ним нет вообще — растягиваем на весь
+        // экран вместо маленького угла, чтобы реально было видно картинку.
+        val evrt2OnlySession = activeCodec == "EVRT2ONLY"
+        val evrt2Preview = android.widget.ImageView(this).apply {
+            visibility = View.GONE
+            scaleType = if (evrt2OnlySession) {
+                android.widget.ImageView.ScaleType.FIT_CENTER
+            } else {
+                android.widget.ImageView.ScaleType.FIT_CENTER
+            }
+            setBackgroundColor(Color.BLACK)
+        }
+        if (evrt2OnlySession) {
+            root.addView(evrt2Preview, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+        } else {
+            root.addView(evrt2Preview, FrameLayout.LayoutParams(dp(160), dp(100), Gravity.TOP or Gravity.END).also {
+                it.setMargins(0, dp(50), dp(8), 0)
+            })
+        }
+        // Текстовый статус EVRT2-эксперимента (подключение, MODE_SWITCH, APF,
+        // счётчик кадров, EVRT Gain, ошибки декодирования) — раньше эти
+        // сообщения (SessionEvent::Info) на Android никуда не доходили,
+        // проваливались в catch-all внутри collect_events. Небольшая полоска
+        // поверх превью, чтобы реально было видно, что происходит на проводе.
+        val evrt2StatusText = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.argb(0xAA, 0, 0, 0))
+            textSize = 10f
+            setPadding(dp(6), dp(3), dp(6), dp(3))
+            visibility = View.GONE
+        }
+        root.addView(evrt2StatusText, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.BOTTOM or Gravity.START).also {
+            it.setMargins(dp(4), 0, 0, dp(4))
+        })
+
+        var evrt2Pixels = IntArray(0)
+        var evrt2Bitmap: Bitmap? = null
+        var lastEvrt2Status = ""
+        // H265 A/B test (ROADMAP.md Phase 6.3'): H265 silicon frames never
+        // go through pollEvrt2Frame at all — they're decoded straight into
+        // this screen's own TextureView via MediaCodec Surface (see the
+        // Rust client's IS_H265 branch), the same TextureView `useHardware`
+        // already set up above. `evrt2Preview` sits ON TOP of that
+        // TextureView (added after it, MATCH_PARENT) and, without this,
+        // would freeze on the last EVRTCK/H264 frame it ever received and
+        // permanently hide the live H265 video underneath — the fps counter
+        // in evrt2StatusText would keep climbing while the picture stayed
+        // static, which is exactly what a live phone test caught. Fix:
+        // once no new EVRTCK-path frame has arrived for a bit, get out of
+        // the way so the TextureView shows through; a fresh EVRTCK frame
+        // (e.g. this session's initial Ar-mode keyframe, or a codec-race
+        // win) brings the bitmap overlay back immediately.
+        var lastEvrt2BitmapFrameAt = 0L
+        val evrt2BitmapStaleAfterMs = 500L
+        val evrt2PollRunnable = object : Runnable {
+            override fun run() {
+                val size = client.evrt2FrameSize()
+                if (size != null) {
+                    val (w, h) = size
+                    if (w > 0 && h > 0) {
+                        if (evrt2Pixels.size < w * h || evrt2Bitmap?.width != w || evrt2Bitmap?.height != h) {
+                            evrt2Pixels = IntArray(w * h)
+                            evrt2Bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                        }
+                        if (client.pollEvrt2Frame(evrt2Pixels) != null) {
+                            evrt2Bitmap?.setPixels(evrt2Pixels, 0, w, 0, 0, w, h)
+                            evrt2Preview.setImageBitmap(evrt2Bitmap)
+                            if (evrt2Preview.visibility != View.VISIBLE) evrt2Preview.visibility = View.VISIBLE
+                            lastEvrt2BitmapFrameAt = SystemClock.elapsedRealtime()
+                        }
+                    }
+                }
+                if (evrt2Preview.visibility == View.VISIBLE &&
+                    lastEvrt2BitmapFrameAt != 0L &&
+                    SystemClock.elapsedRealtime() - lastEvrt2BitmapFrameAt > evrt2BitmapStaleAfterMs
+                ) {
+                    evrt2Preview.visibility = View.GONE
+                }
+                val status = client.evrt2Status()
+                if (status.isNotEmpty() && status != lastEvrt2Status) {
+                    lastEvrt2Status = status
+                    evrt2StatusText.text = status
+                    evrt2StatusText.visibility = View.VISIBLE
+                }
+                handler.postDelayed(this, 100)
+            }
+        }
+        handler.post(evrt2PollRunnable)
 
         // Геймпад-оверлей (скрыт по умолчанию)
         val gamepadOverlay = buildGamepadOverlay()
@@ -1060,7 +1595,21 @@ class MainActivity : Activity() {
         val discBtn = makeToolBtn("✕  Выход", Color.rgb(0x66, 0x22, 0x22))
         discBtn.setOnClickListener { disconnect() }
 
-        listOf(gamepadBtn, kbBtn, zoomBtn, rotBtn, muteBtn, discBtn).forEach { btn ->
+        // Экспериментальная кнопка: отдельный EVRT2 UDP-сокет + EVRTCK-стрим
+        // параллельно живой сессии. Не заменяет и не трогает текущий поток.
+        val evrt2Btn = makeToolBtn("🧪  EVRT2", Color.rgb(0x2C, 0x22, 0x55))
+        evrt2Btn.setOnClickListener {
+            client.startEvrt2Experiment()
+            android.widget.Toast.makeText(
+                this, "EVRT2 (эксп.): запрос отправлен хосту", android.widget.Toast.LENGTH_SHORT,
+            ).show()
+        }
+
+        // «⛶» — спрятать панель и статус, оставив чистую картинку стрима.
+        // Listener назначается ниже, когда bottomBar уже создан.
+        val fsBtn = makeToolBtn("⛶", Color.rgb(0x33, 0x2C, 0x55))
+
+        listOf(gamepadBtn, kbBtn, zoomBtn, rotBtn, muteBtn, evrt2Btn, fsBtn, discBtn).forEach { btn ->
             toolbar.addView(btn, LinearLayout.LayoutParams(0, dp(40), 1f).also {
                 it.setMargins(dp(3), 0, dp(3), 0)
             })
@@ -1073,6 +1622,31 @@ class MainActivity : Activity() {
         bottomBar.addView(toolbar, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         root.addView(bottomBar, FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.BOTTOM))
 
+        // Полноэкранный режим внутри сессии: панель и статус скрываются,
+        // в углу остаётся маленькая полупрозрачная кнопка возврата.
+        val restoreBtn = Button(this).apply {
+            text = "⛶"
+            textSize = 16f
+            isAllCaps = false
+            alpha = 0.35f
+            setTextColor(Color.WHITE)
+            background = roundedBg(Color.argb(0x99, 0x10, 0x18, 0x22), 20)
+            visibility = View.GONE
+        }
+        fun setFullscreen(on: Boolean) {
+            bottomBar.visibility = if (on) View.GONE else View.VISIBLE
+            overlay.visibility = if (on) View.GONE else View.VISIBLE
+            restoreBtn.visibility = if (on) View.VISIBLE else View.GONE
+        }
+        restoreBtn.setOnClickListener { setFullscreen(false) }
+        root.addView(
+            restoreBtn,
+            FrameLayout.LayoutParams(dp(44), dp(44), Gravity.BOTTOM or Gravity.END).also {
+                it.setMargins(0, 0, dp(10), dp(10))
+            }
+        )
+        fsBtn.setOnClickListener { setFullscreen(true) }
+
         rv.setRightClickCallback { _, _ -> false }
         rv.startRendering()
 
@@ -1084,30 +1658,53 @@ class MainActivity : Activity() {
             var hostNotified = false
             var authWatchTicks = 0
             override fun run() {
+                // Пользователь вышел или ушли на экран потери связи — прекращаем тик.
+                if (!gameSessionActive || userInitiatedDisconnect) return
+
                 val connected = client.isConnected()
                 val status = client.status()
-                if (!connected) {
+
+                if (connected) {
+                    authWatchTicks = 99
+                    sessionWasConnected = true
+                } else {
                     authWatchTicks++
+                    // Ошибка пароля/доступа — отдельный поток (диалог пароля).
                     if (authWatchTicks in 2..30 && looksLikeAuthError(status)) {
                         handleAuthFailure(currentRemoteId)
                         return
                     }
-                } else {
-                    authWatchTicks = 99
+                    // Сессия была установлена и внезапно оборвалась (не по нашей
+                    // инициативе, не ошибка пароля) — показываем экран потери связи.
+                    // Пока приложение свёрнуто (sessionBackgrounded) НЕ считаем это
+                    // разрывом — onStart разберётся при возврате.
+                    if (sessionWasConnected && !sessionBackgrounded && !connectionLostShown) {
+                        showConnectionLostScreen()
+                        return
+                    }
                 }
+
                 val statusText = if (connected) "● $status" else status
-                overlay.text = if (useHardware && connected) {
+                val showTech = prefs.getBoolean(PREF_SHOW_TECH_INFO, false)
+                overlay.text = if (useHardware && connected && showTech) {
                     "$statusText  |  ${PerfStats.summary()}"
                 } else {
                     statusText
                 }
+                // Подключено + техинфо выключена → чистый экран без оверлея.
+                // Пока подключаемся или техинфо включена → показываем.
+                overlay.visibility = if (connected && !showTech) View.GONE else View.VISIBLE
                 if (connected && !hostNotified) {
                     hostNotified = true
                     notifySessionConnected(currentRemoteId)
+                    if (activeCodec == "EVRT2ONLY") {
+                        client.startEvrt2Experiment()
+                    }
                 }
                 handler.postDelayed(this, 500)
             }
         }
+        gameStatusTick = statusTick
         handler.post(statusTick)
     }
 
@@ -1205,7 +1802,10 @@ class MainActivity : Activity() {
         password: String,
         statusLabel: TextView,
         touchpadOnly: Boolean = false,
-        codec: String = selectedCodec(),
+        // Обычный режим («Подключиться») чётко = EVRTCK: прямой EVRT когда
+        // возможно (LAN/WiFi), иначе автоматический откат на TCP relay
+        // (мобильный интернет, без прямой связи с хостом) — работает всегда.
+        codec: String = "EVRTCK",
     ) {
         // Сообщить хосту размер экрана — pipeline сделает downscale до него.
         val dm = android.util.DisplayMetrics()
@@ -1261,6 +1861,7 @@ class MainActivity : Activity() {
                 isHardwareDecodeMode = true
                 setBackgroundColor(Color.TRANSPARENT)
                 onVideoRectChanged = { rect ->
+                    Log.i("EvdGameScreen", "onVideoRectChanged x=${rect.x} y=${rect.y} w=${rect.width} h=${rect.height}")
                     textureView?.layoutParams = FrameLayout.LayoutParams(rect.width, rect.height).apply {
                         leftMargin = rect.x
                         topMargin = rect.y
@@ -1394,14 +1995,21 @@ class MainActivity : Activity() {
                 }
 
                 val statusText = if (connected) "● $status" else status
-                overlay.text = if (useHardware && connected) {
+                val showTech = prefs.getBoolean(PREF_SHOW_TECH_INFO, false)
+                overlay.text = if (useHardware && connected && showTech) {
                     "$statusText  |  ${PerfStats.summary()}"
                 } else {
                     statusText
                 }
+                // Подключено + техинфо выключена → чистый экран без оверлея.
+                // Пока подключаемся или техинфо включена → показываем.
+                overlay.visibility = if (connected && !showTech) View.GONE else View.VISIBLE
                 if (connected && !hostNotified) {
                     hostNotified = true
                     notifySessionConnected(currentRemoteId)
+                    if (activeCodec == "EVRT2ONLY") {
+                        client.startEvrt2Experiment()
+                    }
                 }
                 handler.postDelayed(this, 500)
             }
@@ -1409,14 +2017,30 @@ class MainActivity : Activity() {
         handler.post(statusTick)
     }
 
+    /**
+     * FLAG_SECURE на окне: система отказывается делать скриншот/запись экрана.
+     * На тачпаде это гасит случайный скриншот от системного жеста «3 пальца вниз»
+     * (MIUI и др.) — снимать в слепом тачпаде всё равно нечего.
+     */
+    private fun setSecureScreen(on: Boolean) {
+        if (on) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        }
+    }
+
     private fun showTouchpadScreen() {
         root.removeAllViews()
         kbVisible = false
         remoteView = null
+        setSecureScreen(true)
 
         val tv = TouchpadView(this, client).apply {
             layoutParams = FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)
             setNaturalScroll(prefs.getBoolean(PREF_NATURAL_SCROLL, true))
+            setSensitivity(sensitivityFromPercent(sensitivityPercent()))
+            setAccelEnabled(prefs.getBoolean(PREF_TOUCH_ACCEL, true))
         }
         touchpadView = tv
         root.addView(tv)
@@ -1441,47 +2065,187 @@ class MainActivity : Activity() {
             FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.TOP or Gravity.START),
         )
 
+        // ── Панель громкости хоста (выезжает по кнопке 🔊) ────────────────────
+        val volumePanel = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = roundedBg(Color.argb(0xF2, 0x14, 0x1B, 0x18), 16)
+            setPadding(dp(16), dp(10), dp(16), dp(10))
+            visibility = View.GONE
+        }
+        val volIcon = TextView(this).apply {
+            text = "🔊"
+            textSize = 20f
+        }
+        val volValue = TextView(this).apply {
+            text = "${hostVolumePercent}%"
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            gravity = Gravity.CENTER
+            minWidth = dp(44)
+        }
+        val volSeek = android.widget.SeekBar(this).apply {
+            max = 100
+            progress = hostVolumePercent
+            hostVolumeSlider = this
+            setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: android.widget.SeekBar, p: Int, fromUser: Boolean) {
+                    volValue.text = "$p%"
+                    volIcon.text = when { p == 0 -> "🔇"; p < 50 -> "🔉"; else -> "🔊" }
+                    if (fromUser) {
+                        hostVolumePercent = p
+                        // Троттлинг: слать хосту не чаще, чем раз в ~120мс.
+                        volumeSendRunnable?.let { handler.removeCallbacks(it) }
+                        val r = Runnable { client.setHostVolume(p) }
+                        volumeSendRunnable = r
+                        handler.postDelayed(r, 120)
+                    }
+                }
+                override fun onStartTrackingTouch(sb: android.widget.SeekBar) {}
+                override fun onStopTrackingTouch(sb: android.widget.SeekBar) {
+                    volumeSendRunnable?.let { handler.removeCallbacks(it) }
+                    client.setHostVolume(sb.progress) // финальное значение — сразу
+                }
+            })
+        }
+        volumePanel.addView(volIcon)
+        volumePanel.addView(vSpaceH(dp(12)))
+        volumePanel.addView(volSeek, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        volumePanel.addView(vSpaceH(dp(12)))
+        volumePanel.addView(volValue)
+
+        // ── Панель чувствительности курсора (выезжает по кнопке 🎯) ───────────
+        val sensPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = roundedBg(Color.argb(0xF2, 0x14, 0x1B, 0x18), 16)
+            setPadding(dp(16), dp(10), dp(16), dp(10))
+            visibility = View.GONE
+        }
+        val sensIcon = TextView(this).apply {
+            text = "🎯"
+            textSize = 20f
+        }
+        val sensValue = TextView(this).apply {
+            text = "${sensitivityPercent()}%"
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            gravity = Gravity.CENTER
+            minWidth = dp(44)
+        }
+        val sensSeek = android.widget.SeekBar(this).apply {
+            max = 100
+            progress = sensitivityPercent()
+            setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: android.widget.SeekBar, p: Int, fromUser: Boolean) {
+                    sensValue.text = "$p%"
+                    if (fromUser) {
+                        prefs.edit().putInt(PREF_TOUCH_SENSITIVITY, p).apply()
+                        touchpadView?.setSensitivity(sensitivityFromPercent(p))
+                    }
+                }
+                override fun onStartTrackingTouch(sb: android.widget.SeekBar) {}
+                override fun onStopTrackingTouch(sb: android.widget.SeekBar) {}
+            })
+        }
+        // Чип «Ускорение» — вкл/выкл кривую акселерации (точность vs скорость).
+        val accelChip = TextView(this).apply {
+            text = "⚡"
+            textSize = 17f
+            gravity = Gravity.CENTER
+            setPadding(dp(10), dp(4), dp(10), dp(4))
+            var on = prefs.getBoolean(PREF_TOUCH_ACCEL, true)
+            fun render() {
+                background = roundedBg(if (on) brandGreen else Color.rgb(0x2E, 0x2A, 0x44), 12)
+                setTextColor(if (on) Color.BLACK else Color.rgb(0xAA, 0xB4, 0xC0))
+            }
+            render()
+            setOnClickListener {
+                on = !on
+                prefs.edit().putBoolean(PREF_TOUCH_ACCEL, on).apply()
+                touchpadView?.setAccelEnabled(on)
+                render()
+                android.widget.Toast.makeText(
+                    this@MainActivity,
+                    if (on) "Ускорение курсора включено" else "Ускорение выключено (1:1)",
+                    android.widget.Toast.LENGTH_SHORT,
+                ).show()
+            }
+        }
+        sensPanel.addView(sensIcon)
+        sensPanel.addView(vSpaceH(dp(12)))
+        sensPanel.addView(sensSeek, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        sensPanel.addView(vSpaceH(dp(12)))
+        sensPanel.addView(sensValue)
+        sensPanel.addView(vSpaceH(dp(10)))
+        sensPanel.addView(accelChip)
+
+        // ── Тулбар: аккуратные иконочные кнопки в едином стиле ────────────────
         val toolbar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(toolbarBg)
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(6), dp(6), dp(6), dp(6))
+            setPadding(dp(6), dp(8), dp(6), dp(8))
         }
 
-        val rcBtn = makeToolBtn("ПКМ", Color.rgb(0x44, 0x44, 0x55))
+        val rcBtn = makeToolBtn("⊡\nПКМ", Color.rgb(0x2A, 0x33, 0x44))
         rcBtn.setOnClickListener { tv.rightClickAtCursor() }
 
-        val kbBtn = makeToolBtn("Клав.", Color.rgb(0x22, 0x44, 0x55))
+        val kbBtn = makeToolBtn("⌨\nКлав.", Color.rgb(0x22, 0x3A, 0x44))
         kbBtn.setOnClickListener { toggleKeyboard() }
 
-        val centerBtn = makeToolBtn("Центр", Color.rgb(0x22, 0x44, 0x33))
+        val centerBtn = makeToolBtn("⊹\nЦентр", Color.rgb(0x22, 0x3E, 0x30))
         centerBtn.setOnClickListener { tv.centerCursor() }
 
-        val rotBtn = makeRotateBtn()
+        val volIdle = Color.rgb(0x2E, 0x2A, 0x44)
+        val sensIdle = Color.rgb(0x22, 0x3E, 0x44)
+        var volumeShown = false
+        var sensShown = false
+        val volBtn = makeToolBtn("🔊\nЗвук", volIdle)
+        val sensBtn = makeToolBtn("🎯\nСкор.", sensIdle)
+        // Панели взаимоисключающие — открытие одной закрывает другую.
+        fun syncPanels() {
+            volumePanel.visibility = if (volumeShown) View.VISIBLE else View.GONE
+            sensPanel.visibility = if (sensShown) View.VISIBLE else View.GONE
+            volBtn.background = roundedBg(if (volumeShown) brandGreen else volIdle, 14)
+            sensBtn.background = roundedBg(if (sensShown) brandGreen else sensIdle, 14)
+        }
+        volBtn.setOnClickListener {
+            volumeShown = !volumeShown
+            if (volumeShown) sensShown = false
+            syncPanels()
+        }
+        sensBtn.setOnClickListener {
+            sensShown = !sensShown
+            if (sensShown) volumeShown = false
+            syncPanels()
+        }
 
-        val discBtn = makeToolBtn("Выход", Color.rgb(0x66, 0x22, 0x22))
+        val discBtn = makeToolBtn("✕\nВыход", Color.rgb(0x5A, 0x24, 0x24))
         discBtn.setOnClickListener { disconnect() }
 
-        toolbar.addView(rcBtn, LinearLayout.LayoutParams(0, dp(40), 1f).also {
+        val toolBtnLp = { LinearLayout.LayoutParams(0, dp(50), 1f).also {
             it.setMargins(dp(3), 0, dp(3), 0)
-        })
-        toolbar.addView(kbBtn, LinearLayout.LayoutParams(0, dp(40), 1f).also {
-            it.setMargins(dp(3), 0, dp(3), 0)
-        })
-        toolbar.addView(centerBtn, LinearLayout.LayoutParams(0, dp(40), 1f).also {
-            it.setMargins(dp(3), 0, dp(3), 0)
-        })
-        toolbar.addView(rotBtn, LinearLayout.LayoutParams(0, dp(40), 1f).also {
-            it.setMargins(dp(3), 0, dp(3), 0)
-        })
-        toolbar.addView(discBtn, LinearLayout.LayoutParams(0, dp(40), 1f).also {
-            it.setMargins(dp(3), 0, dp(3), 0)
-        })
+        } }
+        listOf(rcBtn, kbBtn, centerBtn, volBtn, sensBtn, discBtn).forEach { btn ->
+            btn.textSize = 10f
+            toolbar.addView(btn, toolBtnLp())
+        }
 
         val bottomBar = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
         bottomBar.addView(specRow, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        // Компактная плашка громкости над тулбаром, прижата к правому краю —
+        // не перекрывает область тачпада.
+        bottomBar.addView(volumePanel, LinearLayout.LayoutParams(dp(300), dp(52)).also {
+            it.gravity = Gravity.END
+            it.setMargins(dp(10), 0, dp(10), dp(8))
+        })
+        bottomBar.addView(sensPanel, LinearLayout.LayoutParams(dp(320), dp(52)).also {
+            it.gravity = Gravity.END
+            it.setMargins(dp(10), 0, dp(10), dp(8))
+        })
         bottomBar.addView(toolbar, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         root.addView(
             bottomBar,
@@ -1504,10 +2268,16 @@ class MainActivity : Activity() {
                     authWatchTicks = 99
                 }
                 tv.refreshRemoteSize()
+                val showTech = prefs.getBoolean(PREF_SHOW_TECH_INFO, false)
                 overlay.text = if (connected) "● $status" else status
+                // Подключено + техинфо выключена → скрываем оверлей, чистый тачпад.
+                overlay.visibility = if (connected && !showTech) View.GONE else View.VISIBLE
                 if (connected && !hostNotified) {
                     hostNotified = true
                     notifySessionConnected(currentRemoteId)
+                    if (activeCodec == "EVRT2ONLY") {
+                        client.startEvrt2Experiment()
+                    }
                 }
                 handler.postDelayed(this, 500)
             }
@@ -1515,9 +2285,30 @@ class MainActivity : Activity() {
         handler.post(statusTick)
     }
 
-    private fun selectedCodec(): String = prefs.getString(PREF_CODEC, "EVRTCK") ?: "EVRTCK"
-
     private fun disconnect() {
+        // Пользователь сам завершает — разрыв не считается ошибкой.
+        userInitiatedDisconnect = true
+        gameSessionActive = false
+        tearDownSession()
+        exitImmersiveMode()
+
+        // Ждём ~700ms пока поток старой сессии обработает Close и закроет TCP-сокет к relay.
+        // Без паузы повторное подключение приходит пока старый сокет жив — relay/хост отклоняют.
+        root.removeAllViews()
+        root.setBackgroundColor(brandBg)
+        root.addView(
+            centeredStatusView("✓", "Сеанс завершён", "Соединение закрыто"),
+            FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT, Gravity.CENTER),
+        )
+        handler.postDelayed({ showConnectScreen() }, 700)
+    }
+
+    /** Единая точка освобождения ресурсов сессии (без смены экрана). */
+    private fun tearDownSession() {
+        setSecureScreen(false)
+        gameStatusTick?.let { handler.removeCallbacks(it) }
+        gameStatusTick = null
+        hostVolumeSlider = null
         audioPlayer?.stop()
         audioPlayer = null
         remoteView?.stopRendering()
@@ -1531,21 +2322,140 @@ class MainActivity : Activity() {
         touchpadView = null
         activeCodec = "EVRTCK"
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_USER
+    }
 
-        // Ждём ~700ms пока поток старой сессии обработает Close и закроет TCP-сокет к relay.
-        // Без паузы повторное подключение приходит пока старый сокет жив — relay/хост отклоняют.
+    /** Красивая центрированная карточка: крупная иконка + заголовок + подпись. */
+    private fun centeredStatusView(icon: String, title: String, subtitle: String): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            addView(TextView(this@MainActivity).apply {
+                text = icon
+                textSize = 56f
+                gravity = Gravity.CENTER
+                setTextColor(brandGreen)
+            })
+            addView(vSpace(dp(14)))
+            addView(TextView(this@MainActivity).apply {
+                text = title
+                textSize = 21f
+                typeface = Typeface.DEFAULT_BOLD
+                gravity = Gravity.CENTER
+                setTextColor(textMain)
+            })
+            addView(vSpace(dp(6)))
+            addView(TextView(this@MainActivity).apply {
+                text = subtitle
+                textSize = 14f
+                gravity = Gravity.CENTER
+                setTextColor(textSoft)
+            })
+        }
+
+    // ── Экран «Соединение потеряно» (внезапный разрыв, не по нашей воле) ────────
+    private fun showConnectionLostScreen() {
+        if (connectionLostShown) return
+        connectionLostShown = true
+        gameSessionActive = false
+        // Освобождаем видео/аудио, но НЕ сбрасываем currentRemoteId/пароль —
+        // они нужны для «Переподключиться».
+        gameStatusTick?.let { handler.removeCallbacks(it) }
+        gameStatusTick = null
+        audioPlayer?.stop()
+        audioPlayer = null
+        remoteView?.stopRendering()
+        VideoDecoder.releaseAll()
+        client.stop()
+        remoteView = null
+        touchpadView = null
+        exitImmersiveMode()
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_USER
+
+        root.removeAllViews()
+        root.setBackgroundColor(brandBg)
+
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(dp(32), dp(32), dp(32), dp(32))
+        }
+        col.addView(TextView(this).apply {
+            text = "📡"
+            textSize = 60f
+            gravity = Gravity.CENTER
+        })
+        col.addView(vSpace(dp(8)))
+        col.addView(TextView(this).apply {
+            text = "⚠️"
+            textSize = 34f
+            gravity = Gravity.CENTER
+        })
+        col.addView(vSpace(dp(14)))
+        col.addView(TextView(this).apply {
+            text = "Соединение потеряно"
+            textSize = 22f
+            typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            setTextColor(Color.rgb(0xE3, 0x8A, 0x2F))
+        })
+        col.addView(vSpace(dp(6)))
+        col.addView(TextView(this).apply {
+            text = "Связь с удалённым компьютером прервалась.\nПроверьте сеть и попробуйте снова."
+            textSize = 14f
+            gravity = Gravity.CENTER
+            setLineSpacing(0f, 1.25f)
+            setTextColor(textSoft)
+        })
+        col.addView(vSpace(dp(24)))
+        col.addView(makePrimaryButton("🔄  Переподключиться") {
+            reconnectGameSession()
+        }, LinearLayout.LayoutParams(MATCH_PARENT, dp(54)))
+        col.addView(vSpace(dp(10)))
+        col.addView(makeSecondaryButton("✕  Выйти на главный экран") {
+            connectionLostShown = false
+            showConnectScreen()
+        }, LinearLayout.LayoutParams(MATCH_PARENT, dp(48)))
+
+        val lp = FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT, Gravity.CENTER).apply {
+            val m = dp(20); setMargins(m, m, m, m)
+        }
+        root.addView(col, lp)
+    }
+
+    /** Повторное подключение к той же сессии (после разрыва или из фона). */
+    private fun reconnectGameSession() {
+        val id = currentRemoteId
+        if (id.isEmpty()) { showConnectScreen(); return }
+
+        connectionLostShown = false
+        userInitiatedDisconnect = false
+        sessionWasConnected = false
+        sessionBackgrounded = false
+
+        // Экран «Переподключение…» с индикатором.
         root.removeAllViews()
         root.setBackgroundColor(brandBg)
         root.addView(
-            TextView(this).apply {
-                text = "Завершение сеанса…"
-                setTextColor(textSoft)
-                textSize = 17f
-                gravity = Gravity.CENTER
-            },
+            centeredStatusView("🔄", "Переподключение…", "ID $id"),
             FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT, Gravity.CENTER),
         )
-        handler.postDelayed({ showConnectScreen() }, 700)
+
+        // Небольшая пауза, чтобы старый сокет к relay успел закрыться.
+        handler.postDelayed({
+            client.stop()
+            val dm = android.util.DisplayMetrics()
+            @Suppress("DEPRECATION")
+            windowManager.defaultDisplay.getRealMetrics(dm)
+            client.setMaxResolution(dm.widthPixels, dm.heightPixels)
+            val started = client.start(
+                id, currentSessionPassword, apiUrl(), idServer(), relayServer(), publicKey(), activeCodec
+            )
+            if (started) {
+                showGameRemoteScreen()
+            } else {
+                showConnectionLostScreen()
+            }
+        }, 600)
     }
 
     // ── Auth failure ──────────────────────────────────────────────────────────
@@ -1559,6 +2469,10 @@ class MainActivity : Activity() {
     /** Вызывается когда в статусе обнаружена ошибка аутентификации.
      *  Останавливает сессию, удаляет устаревший пароль, показывает диалог. */
     private fun handleAuthFailure(id: String) {
+        gameSessionActive = false
+        userInitiatedDisconnect = true // не показывать экран потери связи
+        gameStatusTick?.let { handler.removeCallbacks(it) }
+        gameStatusTick = null
         audioPlayer?.stop()
         audioPlayer = null
         remoteView?.stopRendering()
@@ -1569,6 +2483,7 @@ class MainActivity : Activity() {
         remoteView = null
         touchpadView = null
         activeCodec = "EVRTCK"
+        exitImmersiveMode()
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_USER
 
         handler.postDelayed({
@@ -1649,7 +2564,78 @@ class MainActivity : Activity() {
         pwInput.requestFocus()
     }
 
+    // ── Кнопки громкости телефона → громкость хоста (в активной сессии) ───────
+    // Пока идёт удалённая сессия, аппаратные качельки громкости управляют
+    // громкостью удалённого ПК, а не локального телефона. Вне сессии — обычное
+    // поведение (возвращаем super).
+    override fun onKeyDown(keyCode: Int, event: android.view.KeyEvent): Boolean {
+        if (client.isConnected() && (touchpadView != null || gameSessionActive)) {
+            when (keyCode) {
+                android.view.KeyEvent.KEYCODE_VOLUME_UP -> {
+                    adjustHostVolume(+5); return true
+                }
+                android.view.KeyEvent.KEYCODE_VOLUME_DOWN -> {
+                    adjustHostVolume(-5); return true
+                }
+            }
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
+    // Гасим и onKeyUp, иначе система покажет свой индикатор громкости.
+    override fun onKeyUp(keyCode: Int, event: android.view.KeyEvent): Boolean {
+        if (client.isConnected() && (touchpadView != null || gameSessionActive) &&
+            (keyCode == android.view.KeyEvent.KEYCODE_VOLUME_UP ||
+             keyCode == android.view.KeyEvent.KEYCODE_VOLUME_DOWN)) {
+            return true
+        }
+        return super.onKeyUp(keyCode, event)
+    }
+
+    private fun adjustHostVolume(delta: Int) {
+        hostVolumePercent = (hostVolumePercent + delta).coerceIn(0, 100)
+        client.setHostVolume(hostVolumePercent)
+        hostVolumeSlider?.progress = hostVolumePercent   // синхронизируем ползунок, если открыт
+        android.widget.Toast.makeText(
+            this, "Громкость ПК: ${hostVolumePercent}%", android.widget.Toast.LENGTH_SHORT
+        ).show()
+    }
+
+    // ── Свернули приложение во время игровой сессии ───────────────────────────
+    // Сессию НЕ рвём — TCP-соединение к relay живёт в фоновом потоке. Помечаем
+    // фоновое состояние, чтобы statusTick не принял временное отсутствие рендера
+    // за разрыв. Видео-декодер освободится сам, когда TextureView уничтожит
+    // Surface (onSurfaceTextureDestroyed → releaseAll).
+    override fun onStop() {
+        super.onStop()
+        if (gameSessionActive && !userInitiatedDisconnect) {
+            sessionBackgrounded = true
+            gameStatusTick?.let { handler.removeCallbacks(it) }
+            audioPlayer?.stop()  // звук в фоне не нужен; возобновим при возврате
+        }
+    }
+
+    // ── Вернулись в приложение ────────────────────────────────────────────────
+    override fun onStart() {
+        super.onStart()
+        if (sessionBackgrounded) {
+            sessionBackgrounded = false
+            if (client.isConnected()) {
+                // Сессия пережила сворачивание — пересобираем игровой экран:
+                // свежий Surface, новый декодер (получит IDR от хоста ~1–2 с),
+                // перезапуск статус-тика и аудио (showGameRemoteScreen сам
+                // пересоздаёт audioPlayer).
+                showGameRemoteScreen()
+            } else {
+                // Пока были в фоне, соединение оборвалось (сеть/Android убил фон).
+                showConnectionLostScreen()
+            }
+        }
+    }
+
     override fun onDestroy() {
+        gameSessionActive = false
+        gameStatusTick?.let { handler.removeCallbacks(it) }
         remoteView?.stopRendering()
         touchpadView = null
         client.stop()
@@ -1669,6 +2655,9 @@ class MainActivity : Activity() {
 
     // ── helpers ───────────────────────────────────────────────────────────────
     private fun showAppScreen(active: String, title: String, subtitle: String): LinearLayout {
+        // Гасим UI-тикер хоста при уходе с его экрана (сам хост работает в фоне).
+        hostTick?.let { handler.removeCallbacks(it) }
+        hostTick = null
         root.removeAllViews()
         root.setBackgroundColor(brandBg)
 
@@ -1731,6 +2720,7 @@ class MainActivity : Activity() {
         row.addView(navButton("Подключение", active == "connect") { showConnectScreen() })
         row.addView(navButton("Контакты", active == "contacts") { showContactsScreen() })
         row.addView(navButton("Игра", active == "game") { showGameScreen() })
+        row.addView(navButton("Хост", active == "host") { showHostScreen() })
         row.addView(navButton("Настройки", active == "settings") { showSettingsScreen() })
         row.addView(navButton("О нас", active == "about") { showAboutScreen() })
         return HorizontalScrollView(this).apply {
@@ -1979,6 +2969,11 @@ class MainActivity : Activity() {
     /** Вертикальный пробел для LinearLayout с ориентацией VERTICAL */
     private fun vSpace(h: Int) = View(this).apply {
         layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, h)
+    }
+
+    /** Горизонтальный отступ фиксированной ширины. */
+    private fun vSpaceH(w: Int) = View(this).apply {
+        layoutParams = LinearLayout.LayoutParams(w, WRAP_CONTENT)
     }
 
     private fun matchWrap() = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)

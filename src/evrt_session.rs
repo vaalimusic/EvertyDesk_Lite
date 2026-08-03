@@ -53,7 +53,6 @@ fn is_lan_ip(addr: &std::net::IpAddr) -> bool {
     }
 }
 
-
 const IDLE_TIMEOUT: Duration = Duration::from_secs(4);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
 const SPIN_THRESHOLD: Duration = Duration::from_micros(100);
@@ -124,14 +123,25 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
     // ── Windows performance hints ─────────────────────────────────────────────
     let _perf = WindowsPerfHints::enable(&events);
 
-    let net_type = if is_lan_ip(&peer_addr.ip()) { "LAN ✅" } else { "WAN/relay" };
+    let net_type = if is_lan_ip(&peer_addr.ip()) {
+        "LAN ✅"
+    } else {
+        "WAN/relay"
+    };
     // Determine game mode once at session start (first SetClientCodec was H265/H264/AV1, not Auto/VP9).
     // In game mode: pacing at LAN speed, adaptive relief disabled.
     let is_game_mode = !want_evrtck.load(Ordering::Relaxed);
-    evrt_log(&events, format!(
-        "EVRT session → {peer_addr} [{net_type}] mode={}",
-        if is_game_mode { "GAME (50Mbps pacing, relief off)" } else { "NORMAL" }
-    ));
+    evrt_log(
+        &events,
+        format!(
+            "EVRT session → {peer_addr} [{net_type}] mode={}",
+            if is_game_mode {
+                "GAME (50Mbps pacing, relief off)"
+            } else {
+                "NORMAL"
+            }
+        ),
+    );
     bitrate_scale_milli.store(1_000, Ordering::Relaxed);
     let socket_ref = SockRef::from(socket.as_ref());
     let _ = socket_ref.set_send_buffer_size(4 * 1024 * 1024);
@@ -151,7 +161,10 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
     let (encode_w, encode_h) = {
         let packed = actual_encode_res.load(Ordering::Relaxed);
         if packed != 0 {
-            (((packed >> 32) & 0xFFFF_FFFF) as u32, (packed & 0xFFFF_FFFF) as u32)
+            (
+                ((packed >> 32) & 0xFFFF_FFFF) as u32,
+                (packed & 0xFFFF_FFFF) as u32,
+            )
         } else {
             let max_packed = client_max_res.load(Ordering::Relaxed);
             if max_packed != 0 {
@@ -169,19 +182,31 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
         }
     };
     let bitrate = crate::host::h264_target_bitrate_bps_pub(
-        encode_w, encode_h, fps, quality_milli.load(Ordering::Relaxed),
+        encode_w,
+        encode_h,
+        fps,
+        quality_milli.load(Ordering::Relaxed),
     );
 
     // Начальный кодек: если клиент поддерживает EVRTCK — "EVRTCK",
     // иначе берём из конфига хоста. Реальный кодек подтверждается первым кадром
     // от pipeline; при отличии evrt_session шлёт TYPE_CODEC_CONFIG.
+    //
+    // H265 объявляется только при ЯВНОМ выборе пользователя — см. тот же принцип
+    // в transport.rs::preferred_codec (TCP-путь). Windows' Media Foundation HEVC
+    // decoder extension (HEVCDECODER_STORE.dll) жёстко валит клиентский процесс
+    // (0xc0000005 при открытии/первом кадре) на некоторых системах; раньше
+    // catch-all `_ => "H265"` объявлял H265 даже для CodecPreference::Evrtck/Auto
+    // (дефолтный конфиг хоста), из-за чего обычное подключение молча ловило этот
+    // краш ещё до того, как pipeline успевал закоммитить реальный кодек (H264) и
+    // прислать TYPE_CODEC_CONFIG — живо воспроизведено на связке dev-ПК↔Intel-ПК.
     let initial_codec: &'static str = if want_evrtck.load(Ordering::Relaxed) {
         "EVRTCK"
     } else {
         match config.display.codec {
-            CodecPreference::H264 => "H264",
+            CodecPreference::H265 => "H265",
             CodecPreference::Av1 => "AV1",
-            _ => "H265",
+            _ => "H264",
         }
     };
 
@@ -217,7 +242,10 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
     let mut ctrl_wait_pkts = 0u32;
     loop {
         if stop.load(Ordering::Relaxed) {
-            evrt_log(&events, format!("EVRT TYPE_CTRL wait: stop set after {ctrl_wait_pkts} pkts"));
+            evrt_log(
+                &events,
+                format!("EVRT TYPE_CTRL wait: stop set after {ctrl_wait_pkts} pkts"),
+            );
             return Err("stopped before client connected".into());
         }
         if Instant::now() > deadline {
@@ -242,8 +270,7 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
                             evrt::parse_control(&pkt.payload)
                         {
                             if fb.max_width > 0 && fb.max_height > 0 {
-                                let packed =
-                                    ((fb.max_width as u64) << 32) | (fb.max_height as u64);
+                                let packed = ((fb.max_width as u64) << 32) | (fb.max_height as u64);
                                 client_max_res.store(packed, Ordering::Relaxed);
                                 evrt_log(
                                     &events,
@@ -255,7 +282,10 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
                             }
                         }
                     }
-                    evrt_log(&events, format!("EVRT: client confirmed after {ctrl_wait_pkts} pkts"));
+                    evrt_log(
+                        &events,
+                        format!("EVRT: client confirmed after {ctrl_wait_pkts} pkts"),
+                    );
                     break;
                 }
                 evrt_log(&events, format!("EVRT TYPE_CTRL wait: pkt#{ctrl_wait_pkts} len={len} ptype={ptype:?} auth={} — not confirmed",
@@ -291,10 +321,14 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
                 session_cfg.width = new_w;
                 session_cfg.height = new_h;
                 session_cfg.bitrate = crate::host::h264_target_bitrate_bps_pub(
-                    new_w, new_h, fps, quality_milli.load(Ordering::Relaxed),
+                    new_w,
+                    new_h,
+                    fps,
+                    quality_milli.load(Ordering::Relaxed),
                 );
                 let corrected = evrt::build_session_config_authenticated(
-                    &session_cfg.to_json(), session_token.as_deref(),
+                    &session_cfg.to_json(),
+                    session_token.as_deref(),
                 );
                 send_udp(&socket, &corrected, peer_addr)?;
                 thread::sleep(Duration::from_millis(5));
@@ -310,7 +344,9 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
         &events,
         format!(
             "EVRT SessionConfig: {}×{}@{} {:.1}Mbps {}",
-            session_cfg.width, session_cfg.height, fps,
+            session_cfg.width,
+            session_cfg.height,
+            fps,
             session_cfg.bitrate as f64 / 1_000_000.0,
             session_cfg.codec,
         ),
@@ -339,11 +375,9 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
                 match recv_sock.recv_from(&mut buf) {
                     Ok((len, src)) if src == peer_addr => {
                         last_pkt = Instant::now();
-                        if let Some(pkt) = evrt::parse_authenticated(
-                            &buf,
-                            len,
-                            recv_session_token.as_deref(),
-                        ) {
+                        if let Some(pkt) =
+                            evrt::parse_authenticated(&buf, len, recv_session_token.as_deref())
+                        {
                             if pkt.packet_type == evrt::TYPE_CONTROL {
                                 if !evrt::control_token_matches(
                                     &pkt.payload,
@@ -391,6 +425,7 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
                 audio_stop,
                 audio_session_token,
                 audio_events,
+                None,
             );
         });
     }
@@ -472,7 +507,10 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
                         .unwrap_or_else(|| AdaptiveRelief::bitrate_scale_milli(step));
                     bitrate_scale_milli.store(scale_milli, Ordering::Relaxed);
                     let enc = actual_encode_res.load(Ordering::Relaxed);
-                    let (ew, eh) = (((enc >> 32) & 0xFFFF_FFFF) as u32, (enc & 0xFFFF_FFFF) as u32);
+                    let (ew, eh) = (
+                        ((enc >> 32) & 0xFFFF_FFFF) as u32,
+                        (enc & 0xFFFF_FFFF) as u32,
+                    );
                     evrt_log(
                         &events,
                         format!(
@@ -483,7 +521,8 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
                             fb.pressure.as_str(),
                             fb.decode_fps,
                             fb.present_delta_ms,
-                            ew, eh,
+                            ew,
+                            eh,
                         ),
                     );
                 }
@@ -517,10 +556,13 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
                     let h = (packed & 0xFFFF_FFFF) as u32;
                     // Обновить session_cfg если разрешение encode изменилось
                     if session_cfg.width != w || session_cfg.height != h {
-                        evrt_log(&events, format!(
-                            "EVRT: encode res changed {}×{} → {}×{} (downscale active)",
-                            session_cfg.width, session_cfg.height, w, h
-                        ));
+                        evrt_log(
+                            &events,
+                            format!(
+                                "EVRT: encode res changed {}×{} → {}×{} (downscale active)",
+                                session_cfg.width, session_cfg.height, w, h
+                            ),
+                        );
                         session_cfg.width = w;
                         session_cfg.height = h;
                     }
@@ -528,7 +570,12 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
                 } else {
                     (screen_w, screen_h)
                 };
-                crate::host::h264_target_bitrate_bps_pub(bw, bh, cur_fps, quality_milli.load(Ordering::Relaxed))
+                crate::host::h264_target_bitrate_bps_pub(
+                    bw,
+                    bh,
+                    cur_fps,
+                    quality_milli.load(Ordering::Relaxed),
+                )
             };
             let cur_bps = scale_bitrate_bps(cur_bps, bitrate_scale_milli.load(Ordering::Relaxed));
             // EVRTCK: 100 Mbps pacing. Game mode: 50 Mbps LAN pacing (never throttle).
@@ -547,10 +594,7 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
             };
             let _ = send_udp(
                 &socket,
-                &evrt::build_session_config_authenticated(
-                    &upd.to_json(),
-                    session_token.as_deref(),
-                ),
+                &evrt::build_session_config_authenticated(&upd.to_json(), session_token.as_deref()),
                 peer_addr,
             );
             last_keepalive = Instant::now();
@@ -590,7 +634,15 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
             thread::sleep(Duration::from_millis(2));
             let _ = send_udp(&socket, &name_pkt, peer_addr);
 
-            evrt_log(&events, format!("EVRT: codec {} → {} (pacing={:.0}Mbps)", prev, current_codec, pacing_bps as f64 / 1e6));
+            evrt_log(
+                &events,
+                format!(
+                    "EVRT: codec {} → {} (pacing={:.0}Mbps)",
+                    prev,
+                    current_codec,
+                    pacing_bps as f64 / 1e6
+                ),
+            );
 
             if frame.is_idr {
                 // Кадр-триггер сам является IDR — используем его напрямую после CODEC_CONFIG.
@@ -615,10 +667,25 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
             waiting_for_idr = false;
             {
                 let enc = actual_encode_res.load(Ordering::Relaxed);
-                let (ew, eh) = (((enc >> 32) & 0xFFFF_FFFF) as u32, (enc & 0xFFFF_FFFF) as u32);
-                let res_str = if ew > 0 { format!(" enc={}×{}", ew, eh) } else { String::new() };
-                evrt_log(&events, format!("EVRT: sending IDR frame id={} bytes={} codec={}{} → {peer_addr}",
-                    frame.frame_id, frame.bytes.len(), &current_codec, res_str));
+                let (ew, eh) = (
+                    ((enc >> 32) & 0xFFFF_FFFF) as u32,
+                    (enc & 0xFFFF_FFFF) as u32,
+                );
+                let res_str = if ew > 0 {
+                    format!(" enc={}×{}", ew, eh)
+                } else {
+                    String::new()
+                };
+                evrt_log(
+                    &events,
+                    format!(
+                        "EVRT: sending IDR frame id={} bytes={} codec={}{} → {peer_addr}",
+                        frame.frame_id,
+                        frame.bytes.len(),
+                        &current_codec,
+                        res_str
+                    ),
+                );
             }
             // CodecConfig (SPS/PPS) перед IDR — только для H264/H265, не EVRTCK.
             // SPS/PPS отличается от имени кодека: начинается с 0x00 0x00 0x00 0x01 (NAL).
@@ -696,18 +763,22 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
             let sent_fps = (sent_frames_since as f32 / elapsed.as_secs_f32()).round() as u32;
             sent_frames_since = 0;
             sent_fps_window = Instant::now();
-            evrt_log(&events, format!(
-                "EVRT sent_fps={} target={} codec={}",
-                sent_fps,
-                target_fps.load(Ordering::Relaxed),
-                &current_codec,
-            ));
+            evrt_log(
+                &events,
+                format!(
+                    "EVRT sent_fps={} target={} codec={}",
+                    sent_fps,
+                    target_fps.load(Ordering::Relaxed),
+                    &current_codec,
+                ),
+            );
         }
     }
 
     let _ = events.send(HostEvent::SessionEnded {
         peer_id: peer_id.clone(),
         reason: "EVRT".into(),
+        session_id: 0,
     });
     let _ = events.send(HostEvent::StateChanged(crate::host::HostState::Ready));
 
@@ -719,7 +790,7 @@ pub fn run_evrt_session(params: EvrtSessionParams) -> Result<(), String> {
 
 // ─── Windows performance hints ────────────────────────────────────────────────
 
-struct WindowsPerfHints {
+pub(crate) struct WindowsPerfHints {
     #[cfg(target_os = "windows")]
     timer_raised: bool,
     #[cfg(target_os = "windows")]
@@ -727,7 +798,7 @@ struct WindowsPerfHints {
 }
 
 impl WindowsPerfHints {
-    fn enable(events: &Sender<HostEvent>) -> Self {
+    pub(crate) fn enable(events: &Sender<HostEvent>) -> Self {
         #[cfg(target_os = "windows")]
         {
             use std::os::raw::c_uint;

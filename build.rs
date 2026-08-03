@@ -8,6 +8,13 @@ fn main() {
     println!("cargo:rerun-if-env-changed=NVIDIA_VIDEO_CODEC_SDK");
     println!("cargo:rustc-check-cfg=cfg(nv_codec_sdk_present)");
     println!("cargo:rustc-check-cfg=cfg(nvenc_api_ffi)");
+    println!("cargo:rustc-check-cfg=cfg(onevpl_ffi)");
+
+    // oneVPL собирается ВСЕГДА на Windows и не зависит от наличия NVIDIA SDK,
+    // поэтому стоит до раннего `return` ниже (тот срабатывает, когда NV SDK не
+    // найден). Заголовки лежат в репозитории (vendor/onevpl, MIT), внешний SDK
+    // не нужен — сборка одинаково работает на любой машине.
+    compile_onevpl_shim();
 
     let Some(sdk) = find_nv_codec_sdk() else {
         return;
@@ -99,6 +106,40 @@ fn is_nv_codec_sdk(path: &PathBuf) -> bool {
 fn sdk_version(path: &PathBuf) -> Option<String> {
     let name = path.file_name()?.to_str()?;
     name.strip_prefix("Video_Codec_SDK_").map(str::to_owned)
+}
+
+/// Собрать шим Intel oneVPL / Media SDK.
+///
+/// В отличие от NVENC, внешний SDK не ищется: официальные заголовки (MIT)
+/// лежат в `vendor/onevpl`. Так сборка не зависит от того, установлен ли у
+/// собирающего Intel SDK, а раскладку структур гарантирует компилятор — писать
+/// такие структуры руками на стороне Rust было бы прямым риском порчи памяти.
+///
+/// Сам рантайм линковкой не подключается: `libmfx.lib` на машинах без
+/// Intel-графики нет, и процесс просто не запустился бы. Шим резолвит символы
+/// через LoadLibrary/GetProcAddress, а отсутствие библиотеки — штатный отказ.
+fn compile_onevpl_shim() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let headers = PathBuf::from("vendor/onevpl");
+    if !headers.join("mfxvideo.h").exists() {
+        // Заголовков нет — молча пропускаем, весь oneVPL-путь просто не
+        // собирается, а вызывающий код откатывается на существующий каскад.
+        return;
+    }
+    println!("cargo:rerun-if-changed=src/onevpl_shim.cpp");
+    println!("cargo:rerun-if-changed=vendor/onevpl");
+    println!("cargo:rustc-cfg=onevpl_ffi");
+
+    let mut build = cc::Build::new();
+    build
+        .cpp(true)
+        .file("src/onevpl_shim.cpp")
+        .include(&headers);
+    build.flag_if_supported("/std:c++17");
+    build.flag_if_supported("-std=c++17");
+    build.compile("everty_onevpl_shim");
 }
 
 fn compile_nvenc_windows_shim(sdk: &PathBuf) {

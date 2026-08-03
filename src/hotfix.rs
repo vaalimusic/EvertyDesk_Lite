@@ -89,7 +89,7 @@ struct DisplaySnapshot {
 #[derive(Serialize)]
 struct IncidentPayload {
     schema_version: u8,
-    incident_id: String,    // client-generated UUID (idempotency key)
+    incident_id: String, // client-generated UUID (idempotency key)
     device_id: String,
     app: IncidentApp,
     incident: IncidentInfo,
@@ -124,23 +124,37 @@ struct IncidentEnv {
 }
 
 #[derive(Serialize)]
-struct EnvOs { family: String, name: String }
+struct EnvOs {
+    family: String,
+    name: String,
+}
 
 #[derive(Serialize)]
-struct EnvGpu { vendor: String, driver_version: String }
+struct EnvGpu {
+    vendor: String,
+    driver_version: String,
+}
 
 #[derive(Serialize)]
-struct EnvHardware { gpu: EnvGpu }
+struct EnvHardware {
+    gpu: EnvGpu,
+}
 
 #[derive(Serialize)]
-struct EnvGraphics { renderer_backend: String }
+struct EnvGraphics {
+    renderer_backend: String,
+}
 
 #[derive(Serialize)]
-struct EnvNetwork { transport: String }
+struct EnvNetwork {
+    transport: String,
+}
 
 // Extra field for stack trace — sервер хранит в raw_payload.
 #[derive(Serialize)]
-struct EnvDetail { stack_trace: String }
+struct EnvDetail {
+    stack_trace: String,
+}
 
 // POST /api/v1/incidents → {"accepted":true,"server_incident_id":"..."}
 #[derive(Deserialize, Debug)]
@@ -187,7 +201,7 @@ struct PlanSummary {
 
 #[derive(Deserialize, Debug)]
 struct PlanSignature {
-    sig: String,     // base64 Ed25519 64-byte signature
+    sig: String, // base64 Ed25519 64-byte signature
     key_id: String,
 }
 
@@ -211,7 +225,11 @@ pub fn submit_crash_sync(
     app_config: &AppConfig,
 ) {
     if !config.enabled || config.api_key.is_empty() {
-        eprintln!("[hotfix] submit_crash_sync skipped: enabled={} key_empty={}", config.enabled, config.api_key.is_empty());
+        eprintln!(
+            "[hotfix] submit_crash_sync skipped: enabled={} key_empty={}",
+            config.enabled,
+            config.api_key.is_empty()
+        );
         return;
     }
     let fp = collect_fingerprint();
@@ -225,7 +243,10 @@ pub fn submit_crash_sync(
         stack_trace,
         &fp,
     );
-    let url = format!("{}/api/v1/incidents", app_config.server.api_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/api/v1/incidents",
+        app_config.server.api_url.trim_end_matches('/')
+    );
     eprintln!("[hotfix] submitting to {url}");
     // 5 секунд максимум — не блокируем процесс надолго при завершении.
     match ureq::post(&url)
@@ -386,12 +407,16 @@ pub fn tick(state: &Arc<Mutex<HotfixState>>, config: &mut AppConfig) -> Option<C
 
         if plan.ttl_seconds > 0 {
             let deadline = unix_now() + plan.ttl_seconds;
-            state.lock().unwrap().pending_rollbacks.push(PendingRollback {
-                deadline_unix: deadline,
-                plan_id: plan.plan_id,
-                rollback_actions: plan.rollback_actions,
-                original: snapshot,
-            });
+            state
+                .lock()
+                .unwrap()
+                .pending_rollbacks
+                .push(PendingRollback {
+                    deadline_unix: deadline,
+                    plan_id: plan.plan_id,
+                    rollback_actions: plan.rollback_actions,
+                    original: snapshot,
+                });
         }
     }
 
@@ -418,12 +443,16 @@ pub fn confirm_consent(state: &Arc<Mutex<HotfixState>>, config: &mut AppConfig) 
 
         if pc.ready.ttl_seconds > 0 {
             let deadline = unix_now() + pc.ready.ttl_seconds;
-            state.lock().unwrap().pending_rollbacks.push(PendingRollback {
-                deadline_unix: deadline,
-                plan_id: pc.ready.plan_id,
-                rollback_actions: pc.ready.rollback_actions,
-                original: snapshot,
-            });
+            state
+                .lock()
+                .unwrap()
+                .pending_rollbacks
+                .push(PendingRollback {
+                    deadline_unix: deadline,
+                    plan_id: pc.ready.plan_id,
+                    rollback_actions: pc.ready.rollback_actions,
+                    original: snapshot,
+                });
         }
     }
 }
@@ -491,8 +520,8 @@ fn run_report(
 
     // Загрузить план
     let plan_url = format!("{api_base}/api/v1/remediation-plans/{plan_id}");
-    let plan: PlanResponse = get_json_auth(&plan_url, &config.api_key)
-        .map_err(|e| format!("get plan: {e}"))?;
+    let plan: PlanResponse =
+        get_json_auth(&plan_url, &config.api_key).map_err(|e| format!("get plan: {e}"))?;
 
     // Если решение no_action — ничего не делаем
     if plan.decision == "no_action" || plan.decision == "advice_only" {
@@ -501,21 +530,27 @@ fn run_report(
 
     // Верифицируем подпись
     if !config.signing_public_key.is_empty() {
-        verify_plan_signature(&plan.payload, &plan.signature.sig, &config.signing_public_key)
-            .map_err(|e| format!("signature verify: {e}"))?;
+        verify_plan_signature(
+            &plan.payload,
+            &plan.signature.sig,
+            &config.signing_public_key,
+        )
+        .map_err(|e| format!("signature verify: {e}"))?;
     }
 
     // Отправляем decision=accepted
     let decision_url = format!("{api_base}/api/v1/remediation-plans/{plan_id}/decision");
-    let _ = post_json_auth::<_, Value>(&decision_url, &config.api_key, &json!({
-        "device_id": device_id,
-        "decision": "accepted",
-        "incident_id": server_incident_id
-    }));
+    let _ = post_json_auth::<_, Value>(
+        &decision_url,
+        &config.api_key,
+        &json!({
+            "device_id": device_id,
+            "decision": "accepted",
+            "incident_id": server_incident_id
+        }),
+    );
 
-    let actions_human: Vec<String> = plan.actions.iter()
-        .map(|a| action_human_label(a))
-        .collect();
+    let actions_human: Vec<String> = plan.actions.iter().map(|a| action_human_label(a)).collect();
 
     let ready = ReadyPlan {
         plan_id: plan_id.clone(),
@@ -525,7 +560,9 @@ fn run_report(
     };
 
     if plan.requires_user_consent {
-        let summary = plan.summary.as_ref()
+        let summary = plan
+            .summary
+            .as_ref()
             .and_then(|s| s.text.clone())
             .unwrap_or_else(|| format!("Изменить настройки ({} действий)", ready.actions.len()));
 
@@ -547,15 +584,18 @@ fn run_report(
 // ── Ed25519 верификация ───────────────────────────────────────────────────────
 
 fn verify_plan_signature(payload: &str, sig_b64: &str, pubkey_b64: &str) -> Result<(), String> {
-    let sig_bytes = B64.decode(sig_b64)
+    let sig_bytes = B64
+        .decode(sig_b64)
         .map_err(|e| format!("sig decode: {e}"))?;
     if sig_bytes.len() != 64 {
         return Err(format!("sig length: expected 64, got {}", sig_bytes.len()));
     }
 
-    let pk_bytes = B64.decode(pubkey_b64)
+    let pk_bytes = B64
+        .decode(pubkey_b64)
         .map_err(|e| format!("pubkey decode: {e}"))?;
-    let pk: [u8; 32] = pk_bytes.try_into()
+    let pk: [u8; 32] = pk_bytes
+        .try_into()
         .map_err(|_| "pubkey must be 32 bytes".to_owned())?;
 
     // libsodium combined mode: signed_message = sig(64) || payload_bytes
@@ -565,8 +605,7 @@ fn verify_plan_signature(payload: &str, sig_b64: &str, pubkey_b64: &str) -> Resu
     combined.extend_from_slice(payload_bytes);
 
     let mut out = Vec::new();
-    crypto_sign_open(&mut out, &combined, &pk)
-        .map_err(|e| format!("signature invalid: {e:?}"))?;
+    crypto_sign_open(&mut out, &combined, &pk).map_err(|e| format!("signature invalid: {e:?}"))?;
 
     Ok(())
 }

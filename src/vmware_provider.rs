@@ -137,12 +137,20 @@ impl VirtualizationProvider for VMwareProvider {
                 Some("Connect vCenter to enable full probe"),
             )
         } else {
-            Capability::unsupported("WEBMKS_DISABLED_BY_CONFIG", "WebMKS disabled in provider config", None)
+            Capability::unsupported(
+                "WEBMKS_DISABLED_BY_CONFIG",
+                "WebMKS disabled in provider config",
+                None,
+            )
         };
         let rdp = if self.config.rdp_relay_enabled {
             Capability::unknown("NO_GUEST_IP_YET")
         } else {
-            Capability::unsupported("RDP_DISABLED_BY_CONFIG", "RDP relay disabled in provider config", None)
+            Capability::unsupported(
+                "RDP_DISABLED_BY_CONFIG",
+                "RDP relay disabled in provider config",
+                None,
+            )
         };
         Ok(VmCapabilityGraph {
             vm_id: vm_id.to_owned(),
@@ -168,7 +176,11 @@ impl VirtualizationProvider for VMwareProvider {
                 "VMware does not support SPICE",
                 None,
             ),
-            web_console: Capability::unsupported("WEB_CONSOLE_NOT_CONFIGURED", "Not configured", None),
+            web_console: Capability::unsupported(
+                "WEB_CONSOLE_NOT_CONFIGURED",
+                "Not configured",
+                None,
+            ),
             webmks_console: webmks,
             serial_console: Capability::unsupported(
                 "SERIAL_NOT_SUPPORTED_VMWARE",
@@ -182,7 +194,11 @@ impl VirtualizationProvider for VMwareProvider {
             ),
             hv_socket: Capability::experimental("HVSOCKET_EXPERIMENTAL_DISABLED"),
             clipboard: Capability::unknown("CLIPBOARD_DEPENDS_ON_SESSION"),
-            file_transfer: Capability::unsupported("FILE_TRANSFER_NOT_SUPPORTED", "Not implemented for VMware provider", None),
+            file_transfer: Capability::unsupported(
+                "FILE_TRANSFER_NOT_SUPPORTED",
+                "Not implemented for VMware provider",
+                None,
+            ),
             recording: Capability::degraded(
                 "RECORDING_METADATA_ONLY",
                 "Event metadata recording available. Video recording — Phase 2",
@@ -190,9 +206,7 @@ impl VirtualizationProvider for VMwareProvider {
             ),
             experimental: Capability::experimental("EXPERIMENTAL_DISABLED"),
             recommended_mode: SessionMode::WebMksConsole,
-            constraints: vec![
-                "VMware provider: inventory not yet connected".to_owned(),
-            ],
+            constraints: vec!["VMware provider: inventory not yet connected".to_owned()],
         })
     }
 
@@ -210,7 +224,9 @@ impl VirtualizationProvider for VMwareProvider {
     fn list_snapshots(&self, vm_id: &str) -> ProviderResult<Vec<SnapshotInfo>> {
         // TODO Phase 1.2: GET /api/vcenter/vm/{vm_id}/snapshots
         let _ = vm_id;
-        Err(ProviderError::NotSupported("VMware snapshots: Phase 1.2".to_owned()))
+        Err(ProviderError::NotSupported(
+            "VMware snapshots: Phase 1.2".to_owned(),
+        ))
     }
 
     fn manifest(&self) -> serde_json::Value {

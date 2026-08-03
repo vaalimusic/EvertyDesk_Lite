@@ -52,8 +52,9 @@
 //! reaches the decoder before less important regions, without changing what
 //! "decoded correctly" means. See `EvrtckEncoder::set_focus_pixel`.
 
-use std::fmt;
 use rayon::prelude::*;
+use std::fmt;
+use std::sync::OnceLock;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -63,9 +64,97 @@ pub const VERSION: u8 = 2;
 /// Pixels per tile edge. 32×32 = 1024 px, maps well onto L1 cache lines.
 pub const TILE_SIZE: usize = 32;
 
-/// Below this tile count, sequential encode beats rayon (spawn overhead ~0.3 ms).
-/// Roughly equivalent to a ~256×256 source frame (64 tiles of 32×32).
-const RAYON_THRESHOLD: usize = 64;
+// ── EVRT2CKMAX-TASK-02: sequential-vs-rayon is now a scheduled decision ───────
+//
+// This constant used to be the whole decision: "below N tiles, sequential
+// beats rayon (spawn overhead ~0.3ms)" — a number picked once and left in
+// source, exactly the thing evrt2/tasks/02_SILICON_MARGINAL_UTILITY_SCHEDULER.md
+// names as the problem. It's replaced by `use_rayon()` below, which asks a
+// `CapabilityRegistry` calibrated against *this machine's* actual measured
+// cost of both paths, run once per process on first use.
+static CAPABILITY_REGISTRY: OnceLock<crate::execution_capability::CapabilityRegistry> =
+    OnceLock::new();
+
+/// Calibration canvas: 32×16 = 512 tiles (1024×512px), enough range to
+/// bracket real dirty-tile counts (a typical 1080p frame at 15% dirty is
+/// ~500 tiles) without the calibration measurement itself taking long.
+const CALIBRATION_TILES_SMALL: usize = 8;
+const CALIBRATION_TILES_LARGE: usize = 512;
+const CALIBRATION_CANVAS_W: usize = 32 * TILE_SIZE; // 1024
+const CALIBRATION_CANVAS_H: usize = 16 * TILE_SIZE; // 512
+
+/// Phase 1+2 — get (calibrating on first call) the process-wide capability
+/// registry. `gpu_available` only takes effect on the very first call
+/// (`OnceLock` semantics); subsequent callers pass whatever they know and it
+/// is ignored once initialized. This mirrors the spec's "probe once per
+/// session" model — mid-session GPU appearance/loss is Phase 4 (`rebalance`,
+/// EVRT2CKMAX-TASK-02 Non-Goals), not in scope for this replacement.
+fn capability_registry(
+    gpu_available: bool,
+) -> &'static crate::execution_capability::CapabilityRegistry {
+    CAPABILITY_REGISTRY.get_or_init(|| {
+        let mut reg = crate::execution_capability::CapabilityRegistry::probe(gpu_available);
+
+        // Real, timed workload — not a synthetic microbenchmark: this calls
+        // the exact same encode_tile_buf() the live encode path uses, on a
+        // representative canvas, so the fitted cost model reflects this
+        // machine's real per-tile compression cost (zstd/ZRLE included) and
+        // real rayon dispatch overhead, not a guess.
+        let rgba = vec![0u8; CALIBRATION_CANVAS_W * CALIBRATION_CANVAS_H * 4];
+        let prev = vec![0xFFu8; CALIBRATION_CANVAS_W * CALIBRATION_CANVAS_H * 4]; // all-dirty
+        let tiles_x = tiles_in_dim(CALIBRATION_CANVAS_W);
+
+        let run_sequential = |n: usize| {
+            let started = std::time::Instant::now();
+            for idx in 0..n {
+                std::hint::black_box(encode_tile_buf(
+                    &rgba,
+                    &prev,
+                    CALIBRATION_CANVAS_W,
+                    CALIBRATION_CANVAS_H,
+                    idx % tiles_x,
+                    idx / tiles_x,
+                    false,
+                ));
+            }
+            started.elapsed()
+        };
+        let run_rayon = |n: usize| {
+            let started = std::time::Instant::now();
+            (0..n).into_par_iter().for_each(|idx| {
+                std::hint::black_box(encode_tile_buf(
+                    &rgba,
+                    &prev,
+                    CALIBRATION_CANVAS_W,
+                    CALIBRATION_CANVAS_H,
+                    idx % tiles_x,
+                    idx / tiles_x,
+                    false,
+                ));
+            });
+            started.elapsed()
+        };
+
+        reg.calibrate_entropy_coding(
+            CALIBRATION_TILES_SMALL,
+            CALIBRATION_TILES_LARGE,
+            run_sequential,
+            run_rayon,
+        );
+        reg
+    })
+}
+
+/// The actual replacement for `tile_count < RAYON_THRESHOLD`: true if the
+/// calibrated cost model says rayon is faster than sequential *for this many
+/// tiles, on this machine, right now*. Falls back to a conservative
+/// sequential choice (never wrong, just possibly slower) if called somehow
+/// before the registry could calibrate — see
+/// `CapabilityRegistry::entropy_coding_provider_for`.
+fn use_rayon(tile_count: usize) -> bool {
+    capability_registry(false).entropy_coding_provider_for(tile_count)
+        == crate::execution_capability::PROVIDER_CPU_RAYON
+}
 
 /// Minimum zero-run length to justify a ZRLE ZeroRun token (3-byte overhead).
 /// Runs of ≥4 zeros save ≥1 byte vs including them as literals.
@@ -83,7 +172,10 @@ pub enum EvrtckError {
     InvalidMagic,
     UnsupportedVersion(u8),
     TruncatedData,
-    DimensionMismatch { expected: (u32, u32), got: (u32, u32) },
+    DimensionMismatch {
+        expected: (u32, u32),
+        got: (u32, u32),
+    },
     InvalidTileMode(u8),
     InvalidDelta,
     /// v2: explicit `tile_idx` in the wire stream is >= tile_count for this
@@ -102,7 +194,9 @@ impl fmt::Display for EvrtckError {
             }
             Self::InvalidTileMode(m) => write!(f, "unknown tile mode 0x{m:02x}"),
             Self::InvalidDelta => write!(f, "malformed delta stream (ZRLE or zstd)"),
-            Self::InvalidTileIndex(i) => write!(f, "tile index {i} out of range for frame dimensions"),
+            Self::InvalidTileIndex(i) => {
+                write!(f, "tile index {i} out of range for frame dimensions")
+            }
         }
     }
 }
@@ -125,9 +219,26 @@ impl EvrtckPacket {
     /// Ratio of encoded size to raw RGBA size. Values near 0.0 mean mostly static frame.
     pub fn compression_ratio(&self) -> f32 {
         let raw = self.width as usize * self.height as usize * 4;
-        if raw == 0 { return 1.0; }
+        if raw == 0 {
+            return 1.0;
+        }
         self.data.len() as f32 / raw as f32
     }
+}
+
+/// EVRT2CKMAX-TASK-01 (ROADMAP.md Phase 1.2) — the exact byte range a given
+/// tile occupies inside `EvrtckPacket.data` (the `[tile_idx u16][data...]`
+/// entry, tile_idx prefix included so the whole entry is covered). Lets a
+/// caller build the Visible Region's `visible_region_byte_ranges` from the
+/// EXACT tiles the Attention Map selected, instead of approximating a byte
+/// prefix from an average tile cost (the tile that's actually top-priority
+/// isn't always the one nearest the encoder's own focus anchor, so a prefix
+/// guess and the true selection can diverge).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileOffset {
+    pub tile_idx: u16,
+    pub byte_start: usize,
+    pub byte_len: usize,
 }
 
 // ── Frame stats ──────────────────────────────────────────────────────────────
@@ -144,7 +255,9 @@ pub struct FrameStats {
 
 impl FrameStats {
     pub fn dirty_ratio(&self) -> f32 {
-        if self.total_tiles == 0 { return 0.0; }
+        if self.total_tiles == 0 {
+            return 0.0;
+        }
         self.dirty_tiles as f32 / self.total_tiles as f32
     }
 }
@@ -173,6 +286,20 @@ pub(crate) const FLAG_NOP: u8 = 0x02;
 pub trait EvrtckEncoderBackend: Send {
     /// Encode one BGRA frame. Returns an encoded packet and per-frame stats.
     fn encode_inner(&mut self, bgra: &[u8], frame_id: u32) -> (EvrtckPacket, FrameStats);
+    /// Same as `encode_inner`, plus the exact byte range of every dirty tile
+    /// in the output (EVRT2CKMAX-TASK-01, ROADMAP.md Phase 1.2) — lets a
+    /// caller build exact `visible_region_byte_ranges` instead of estimating
+    /// a byte prefix. Default: delegates to `encode_inner` and returns no
+    /// offsets, so backends that don't (yet) implement this still compile
+    /// and behave exactly as before — only `CpuEvrtckEncoder` overrides it.
+    fn encode_inner_with_offsets(
+        &mut self,
+        bgra: &[u8],
+        frame_id: u32,
+    ) -> (EvrtckPacket, FrameStats, Vec<TileOffset>) {
+        let (packet, stats) = self.encode_inner(bgra, frame_id);
+        (packet, stats, Vec::new())
+    }
     /// Signal that the next frame must be a full keyframe (resets prev to black).
     fn request_keyframe(&mut self);
     fn width(&self) -> usize;
@@ -187,6 +314,15 @@ pub trait EvrtckEncoderBackend: Send {
     /// exactly as before (raster order, since sort is a stable no-op when
     /// `focus` is `None`).
     fn set_focus(&mut self, _focus_tile: Option<(usize, usize)>) {}
+    /// EVRT2CKMAX-TASK-02: does this backend run on a GPU adapter? Used to
+    /// register a real, successfully-probed `RoiEncoding` provider in the
+    /// `execution_capability` registry — reusing the same probe that already
+    /// decides CPU-vs-GPU here (`new_backend`), instead of a second,
+    /// duplicate GPU init just for capability registration. Default: false
+    /// (every non-GPU backend, i.e. `CpuEvrtckEncoder`).
+    fn is_gpu(&self) -> bool {
+        false
+    }
 }
 
 // ── CPU backend — always available, no GPU required ───────────────────────────
@@ -211,12 +347,29 @@ impl CpuEvrtckEncoder {
     }
 }
 
-impl EvrtckEncoderBackend for CpuEvrtckEncoder {
-    fn encode_inner(&mut self, bgra: &[u8], frame_id: u32) -> (EvrtckPacket, FrameStats) {
+impl CpuEvrtckEncoder {
+    /// Shared body for `encode_inner`/`encode_inner_with_offsets` — the only
+    /// difference between the two is whether `encode_frame_with_offsets` is
+    /// asked to compute the (otherwise-free-to-skip) `Vec<TileOffset>`.
+    fn encode_inner_impl(
+        &mut self,
+        bgra: &[u8],
+        frame_id: u32,
+        want_offsets: bool,
+    ) -> (EvrtckPacket, FrameStats, Vec<TileOffset>) {
         debug_assert_eq!(bgra.len(), self.width * self.height * 4);
         let is_kf = self.pending_keyframe;
         self.pending_keyframe = false;
-        let (data, stats) = encode_frame(bgra, &self.prev, self.width, self.height, frame_id, is_kf, self.focus);
+        let (data, stats, offsets) = encode_frame_with_offsets(
+            bgra,
+            &self.prev,
+            self.width,
+            self.height,
+            frame_id,
+            is_kf,
+            self.focus,
+            want_offsets,
+        );
         // Skip memcpy on NOP frames (bgra == prev, copy would do nothing). Always
         // copy on keyframes so the next P-frame diffs against the correct baseline.
         if stats.dirty_tiles > 0 || is_kf {
@@ -233,7 +386,22 @@ impl EvrtckEncoderBackend for CpuEvrtckEncoder {
             height: self.height as u32,
             data,
         };
+        (pkt, stats, offsets)
+    }
+}
+
+impl EvrtckEncoderBackend for CpuEvrtckEncoder {
+    fn encode_inner(&mut self, bgra: &[u8], frame_id: u32) -> (EvrtckPacket, FrameStats) {
+        let (pkt, stats, _offsets) = self.encode_inner_impl(bgra, frame_id, false);
         (pkt, stats)
+    }
+
+    fn encode_inner_with_offsets(
+        &mut self,
+        bgra: &[u8],
+        frame_id: u32,
+    ) -> (EvrtckPacket, FrameStats, Vec<TileOffset>) {
+        self.encode_inner_impl(bgra, frame_id, true)
     }
 
     fn request_keyframe(&mut self) {
@@ -241,15 +409,23 @@ impl EvrtckEncoderBackend for CpuEvrtckEncoder {
         self.pending_keyframe = true;
     }
 
-    fn width(&self) -> usize { self.width }
-    fn height(&self) -> usize { self.height }
+    fn width(&self) -> usize {
+        self.width
+    }
+    fn height(&self) -> usize {
+        self.height
+    }
 
     fn dirty_ratio(&self, bgra: &[u8]) -> f32 {
-        if bgra == self.prev { return 0.0; }
+        if bgra == self.prev {
+            return 0.0;
+        }
         let tiles_x = tiles_in_dim(self.width);
         let tiles_y = tiles_in_dim(self.height);
         let total = tiles_x * tiles_y;
-        if total == 0 { return 0.0; }
+        if total == 0 {
+            return 0.0;
+        }
         let mut dirty = 0u32;
         for ty in 0..tiles_y {
             for tx in 0..tiles_x {
@@ -304,7 +480,13 @@ pub struct EvrtckEncoder {
 impl EvrtckEncoder {
     /// Create encoder, probing for the best available backend automatically.
     pub fn new(width: usize, height: usize) -> Self {
-        Self { inner: new_backend(width, height) }
+        let inner = new_backend(width, height);
+        // EVRT2CKMAX-TASK-02 M5: seed the capability registry's RoiEncoding
+        // provider from the SAME probe that just picked this backend — a
+        // real, successfully-initialized GPU backend, not a second guess.
+        // No-op on the 2nd+ encoder instance (OnceLock already initialized).
+        let _ = capability_registry(inner.is_gpu());
+        Self { inner }
     }
 
     pub fn encode_with_stats(&mut self, rgba: &[u8], frame_id: u32) -> (EvrtckPacket, FrameStats) {
@@ -313,6 +495,19 @@ impl EvrtckEncoder {
 
     pub fn encode(&mut self, rgba: &[u8], frame_id: u32) -> EvrtckPacket {
         self.inner.encode_inner(rgba, frame_id).0
+    }
+
+    /// EVRT2CKMAX-TASK-01 (ROADMAP.md Phase 1.2): same as `encode`, plus the
+    /// exact byte range of every dirty tile — lets a caller build exact
+    /// `visible_region_byte_ranges` from the Attention Map's actual tile
+    /// selection instead of estimating a byte prefix. Empty offsets on a
+    /// backend that hasn't implemented this yet (see trait default).
+    pub fn encode_with_offsets(
+        &mut self,
+        rgba: &[u8],
+        frame_id: u32,
+    ) -> (EvrtckPacket, FrameStats, Vec<TileOffset>) {
+        self.inner.encode_inner_with_offsets(rgba, frame_id)
     }
 
     /// Force-key: decoder will reset its frame buffer before applying this frame.
@@ -327,8 +522,12 @@ impl EvrtckEncoder {
         self.inner.dirty_ratio(rgba)
     }
 
-    pub fn width(&self) -> usize { self.inner.width() }
-    pub fn height(&self) -> usize { self.inner.height() }
+    pub fn width(&self) -> usize {
+        self.inner.width()
+    }
+    pub fn height(&self) -> usize {
+        self.inner.height()
+    }
 
     /// Set the Visible Region anchor in PIXEL coordinates (e.g. the last known
     /// cursor/aim position). Dirty tiles nearest this point are emitted first
@@ -359,7 +558,9 @@ pub struct EvrtckDecoder {
 }
 
 impl EvrtckDecoder {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Decode a packet into the internal frame buffer. Returns a slice of the
     /// reconstructed RGBA frame. The slice is valid until the next `decode` call.
@@ -371,8 +572,12 @@ impl EvrtckDecoder {
     /// Use this when the caller doesn't know the exact encoded dimensions.
     pub fn decode_wire(&mut self, data: &[u8]) -> Result<&[u8], EvrtckError> {
         // Wire header: magic(4) + ver(1) + flags(1) + frame_id(4) + w(4) + h(4) = 18 bytes minimum
-        if data.len() < 18 { return Err(EvrtckError::TruncatedData); }
-        if &data[0..4] != MAGIC { return Err(EvrtckError::InvalidMagic); }
+        if data.len() < 18 {
+            return Err(EvrtckError::TruncatedData);
+        }
+        if &data[0..4] != MAGIC {
+            return Err(EvrtckError::InvalidMagic);
+        }
         let w = u32::from_le_bytes(data[10..14].try_into().unwrap()) as usize;
         let h = u32::from_le_bytes(data[14..18].try_into().unwrap()) as usize;
         if self.width != w || self.height != h || self.frame.len() != w * h * 4 {
@@ -384,14 +589,237 @@ impl EvrtckDecoder {
         Ok(&self.frame)
     }
 
+    /// ROADMAP.md Phase 3.3 — same as `decode_wire`, but also returns the
+    /// actual tile apply order, and lets the caller supply a priority
+    /// function (e.g. from a decoded APF map) to steer that order. See
+    /// `decode_frame_prioritized`'s doc for what "order" does and doesn't
+    /// change — the reconstructed frame is identical either way.
+    pub fn decode_wire_prioritized(
+        &mut self,
+        data: &[u8],
+        tile_priority: Option<&dyn Fn(usize) -> f32>,
+    ) -> Result<(&[u8], Vec<usize>), EvrtckError> {
+        if data.len() < 18 {
+            return Err(EvrtckError::TruncatedData);
+        }
+        if &data[0..4] != MAGIC {
+            return Err(EvrtckError::InvalidMagic);
+        }
+        let w = u32::from_le_bytes(data[10..14].try_into().unwrap()) as usize;
+        let h = u32::from_le_bytes(data[14..18].try_into().unwrap()) as usize;
+        if self.width != w || self.height != h || self.frame.len() != w * h * 4 {
+            self.frame = vec![0u8; w * h * 4];
+            self.width = w;
+            self.height = h;
+        }
+        let apply_order = decode_frame_prioritized(data, &mut self.frame, w, h, tile_priority)?;
+        Ok((&self.frame, apply_order))
+    }
+
+    /// ROADMAP.md Phase 6.1/6.3 bug found during the Phase 6.4 investigation:
+    /// when an IS_SILICON (NVENC/H264) frame is decoded and shown to the
+    /// user, this decoder's OWN tracked framebuffer was never told about
+    /// it — the next EVRTCK P-frame's MODE_DELTA tiles are an XOR against
+    /// `self.frame`'s CURRENT bytes (see `decode_frame_prioritized`'s
+    /// `TilePixels::Delta` handling), and without this call `self.frame`
+    /// would still hold whatever the last EVRTCK frame painted, one or more
+    /// frames stale — XORing a delta computed on the host against the TRUE
+    /// previous frame, onto a client buffer that's actually further behind,
+    /// reconstructs garbage pixels for exactly the tiles that changed during
+    /// the silicon frame(s) in between. Confirmed against the same
+    /// wire-format fact `keyframe_1080p_compresses_better_than_raw` already
+    /// relies on: EVRTCK's own tile encode does the BGRA→RGBA channel swap
+    /// internally, so its decoded `frame` buffer and openh264's
+    /// `write_rgba8` output share the same RGBA byte layout — this is a
+    /// straight buffer copy, no channel conversion needed. `rgba.len()` must
+    /// equal `width * height * 4`; a mismatch means the caller decoded a
+    /// silicon frame at a different resolution than this decoder is tracking
+    /// (a genuine caller bug) and is treated as a no-op rather than a panic,
+    /// since a resolution change is about to force a keyframe anyway.
+    pub fn sync_from_rgba(&mut self, rgba: &[u8], width: usize, height: usize) {
+        if rgba.len() != width * height * 4 {
+            return;
+        }
+        if self.width != width || self.height != height || self.frame.len() != rgba.len() {
+            self.width = width;
+            self.height = height;
+            self.frame = rgba.to_vec();
+        } else {
+            self.frame.copy_from_slice(rgba);
+        }
+    }
+
+    /// ROADMAP.md Phase 6.4: applies a stream built by
+    /// `encode_tile_subset_absolute` on top of whatever is currently in
+    /// `self.frame` — e.g. right after `sync_from_rgba` synced in a
+    /// different codec's (NVENC's) lossy background for this same frame.
+    /// Every tile in `data` is ABSOLUTE (never MODE_DELTA — see that
+    /// function's doc comment for why), so each tile's rect is zeroed right
+    /// before it's applied: `TilePixels::Delta`'s apply step is an XOR, and
+    /// `0 XOR absolute_bytes == absolute_bytes` regardless of what was
+    /// there — this is what makes the overlay correct independent of the
+    /// background codec's content. `TilePixels::Solid` doesn't need the
+    /// zero (it's a direct overwrite either way) but gets it too, for one
+    /// uniform code path rather than a mode-conditional one.
+    ///
+    /// Requires `self`'s current dimensions to already match `width`/
+    /// `height` inside `data` (call `sync_from_rgba` or `decode_wire` first
+    /// to establish them) — this method never resizes `self.frame`, since
+    /// doing so would silently discard the background layer it's meant to
+    /// sit on top of.
+    ///
+    /// Returns the tile indices actually applied, in wire order — useful
+    /// for tests and telemetry, same shape as `decode_wire_prioritized`'s
+    /// `apply_order`.
+    pub fn apply_absolute_overlay(&mut self, data: &[u8]) -> Result<Vec<usize>, EvrtckError> {
+        let mut pos = 0usize;
+        macro_rules! need {
+            ($n:expr) => {
+                if pos + $n > data.len() {
+                    return Err(EvrtckError::TruncatedData);
+                }
+            };
+        }
+        macro_rules! read_bytes {
+            ($n:expr) => {{
+                need!($n);
+                let s = &data[pos..pos + $n];
+                pos += $n;
+                s
+            }};
+        }
+        macro_rules! read_u16 {
+            () => {
+                u16::from_le_bytes(read_bytes!(2).try_into().unwrap())
+            };
+        }
+        macro_rules! read_u32 {
+            () => {
+                u32::from_le_bytes(read_bytes!(4).try_into().unwrap())
+            };
+        }
+
+        if read_bytes!(4) != MAGIC {
+            return Err(EvrtckError::InvalidMagic);
+        }
+        let ver = read_bytes!(1)[0];
+        if ver != VERSION {
+            return Err(EvrtckError::UnsupportedVersion(ver));
+        }
+        let _flags = read_bytes!(1)[0]; // deliberately ignored — see encode_tile_subset_absolute's doc
+        let _frame_id = read_u32!();
+        let w = read_u32!() as usize;
+        let h = read_u32!() as usize;
+        if w != self.width || h != self.height {
+            return Err(EvrtckError::DimensionMismatch {
+                expected: (self.width as u32, self.height as u32),
+                got: (w as u32, h as u32),
+            });
+        }
+
+        let map_bytes = read_u16!() as usize;
+        let tile_map = read_bytes!(map_bytes);
+        let dirty_count: usize = tile_map.iter().map(|b| b.count_ones() as usize).sum();
+
+        let tiles_x = tiles_in_dim(w);
+        let tiles_y = tiles_in_dim(h);
+        let tile_count = tiles_x * tiles_y;
+
+        let mut applied = Vec::with_capacity(dirty_count);
+        for _ in 0..dirty_count {
+            let tile_idx = read_u16!();
+            let idx = tile_idx as usize;
+            if idx >= tile_count {
+                return Err(EvrtckError::InvalidTileIndex(tile_idx));
+            }
+            let tx = idx % tiles_x;
+            let ty = idx / tiles_x;
+            let x0 = tx * TILE_SIZE;
+            let y0 = ty * TILE_SIZE;
+            let x1 = (x0 + TILE_SIZE).min(w);
+            let y1 = (y0 + TILE_SIZE).min(h);
+
+            need!(1);
+            let mode = data[pos];
+            pos += 1;
+            let (enc_start, enc_end) = match mode {
+                MODE_SOLID => {
+                    need!(4);
+                    let range = (pos, pos + 4);
+                    pos += 4;
+                    range
+                }
+                MODE_DELTA | MODE_ZSTD => {
+                    let enc_len = read_u32!() as usize;
+                    need!(enc_len);
+                    let range = (pos, pos + enc_len);
+                    pos += enc_len;
+                    range
+                }
+                m => return Err(EvrtckError::InvalidTileMode(m)),
+            };
+            let pixels = decompress_tile(data, enc_start, enc_end, mode)?;
+
+            // Zero this tile's rect first — see doc comment for why. Then
+            // apply exactly like decode_frame_prioritized's Phase 3 does.
+            let tw4 = (x1 - x0) * 4;
+            for y in y0..y1 {
+                let rs = (y * w + x0) * 4;
+                self.frame[rs..rs + tw4].fill(0);
+            }
+            match pixels {
+                TilePixels::Solid(color) => {
+                    let mut row_buf = [0u8; TILE_SIZE * 4];
+                    for chunk in row_buf[..tw4].chunks_exact_mut(4) {
+                        chunk.copy_from_slice(&color);
+                    }
+                    let row_pat = &row_buf[..tw4];
+                    for y in y0..y1 {
+                        let rs = (y * w + x0) * 4;
+                        self.frame[rs..rs + tw4].copy_from_slice(row_pat);
+                    }
+                }
+                TilePixels::Delta(delta) => {
+                    let expected = tw4 * (y1 - y0);
+                    if delta.len() != expected {
+                        return Err(EvrtckError::InvalidDelta);
+                    }
+                    let mut di = 0;
+                    for y in y0..y1 {
+                        let rs = (y * w + x0) * 4;
+                        // frame was just zeroed above, so this XOR is a
+                        // plain copy — kept as XOR for one uniform code
+                        // path with the zero-fill step, not because the
+                        // buffer might be non-zero here.
+                        let frame_row = &mut self.frame[rs..rs + tw4];
+                        let delta_row = &delta[di..di + tw4];
+                        for (f, d) in frame_row.iter_mut().zip(delta_row) {
+                            *f ^= d;
+                        }
+                        di += tw4;
+                    }
+                }
+            }
+            applied.push(idx);
+        }
+
+        Ok(applied)
+    }
+
     /// Reset decoder state (e.g. after requesting a keyframe).
     pub fn reset(&mut self) {
         self.frame.fill(0);
     }
 
-    pub fn current_frame(&self) -> &[u8] { &self.frame }
-    pub fn width(&self) -> usize { self.width }
-    pub fn height(&self) -> usize { self.height }
+    pub fn current_frame(&self) -> &[u8] {
+        &self.frame
+    }
+    pub fn width(&self) -> usize {
+        self.width
+    }
+    pub fn height(&self) -> usize {
+        self.height
+    }
 }
 
 // ── Core: encode ─────────────────────────────────────────────────────────────
@@ -431,6 +859,34 @@ pub(crate) fn encode_frame(
     is_keyframe: bool,
     focus: Option<(usize, usize)>,
 ) -> (Vec<u8>, FrameStats) {
+    let (data, stats, _offsets) = encode_frame_with_offsets(
+        rgba,
+        prev,
+        width,
+        height,
+        frame_id,
+        is_keyframe,
+        focus,
+        false,
+    );
+    (data, stats)
+}
+
+/// Same encode path as `encode_frame`, optionally also returning the exact
+/// byte range of every dirty tile in the output (`want_offsets` — skipped
+/// when false, since computing it is free during assembly but the `Vec`
+/// allocation itself isn't, and every caller that doesn't need Task-01
+/// exact ranges shouldn't pay for it).
+pub(crate) fn encode_frame_with_offsets(
+    rgba: &[u8],
+    prev: &[u8],
+    width: usize,
+    height: usize,
+    frame_id: u32,
+    is_keyframe: bool,
+    focus: Option<(usize, usize)>,
+    want_offsets: bool,
+) -> (Vec<u8>, FrameStats, Vec<TileOffset>) {
     let tiles_x = tiles_in_dim(width);
     let tiles_y = tiles_in_dim(height);
     let tile_count = tiles_x * tiles_y;
@@ -439,11 +895,15 @@ pub(crate) fn encode_frame(
     // One memcmp of the whole buffer (~0.15 ms at 1080p) vs tile scan (~3.2 ms).
     // Fires whenever the screen is static — very common in typical desktop use.
     if !is_keyframe && rgba == prev {
-        return (nop_packet_data(frame_id, width, height), FrameStats {
-            total_tiles: tile_count as u32,
-            encoded_bytes: 20,
-            ..Default::default()
-        });
+        return (
+            nop_packet_data(frame_id, width, height),
+            FrameStats {
+                total_tiles: tile_count as u32,
+                encoded_bytes: 20,
+                ..Default::default()
+            },
+            Vec::new(),
+        );
     }
 
     // Encode strategy — result is a SPARSE list of dirty tiles only.
@@ -454,20 +914,40 @@ pub(crate) fn encode_frame(
     //
     // Keyframe: all tiles encoded in one rayon pass.
     // P-frame rayon: combined dirty-check + encode in a single filter_map pass.
-    // P-frame sequential: same but without rayon (< RAYON_THRESHOLD tiles).
+    // P-frame sequential: same but without rayon — decided by the calibrated
+    // EVRT2CKMAX-TASK-02 marginal-utility scheduler (use_rayon), not a fixed
+    // constant. tile_count is the right input here (not dirty count): this
+    // branch doesn't know the dirty count ahead of time, it checks-and-
+    // encodes in one pass, same as before this change.
     let mut dirty_tiles: Vec<(usize, Vec<u8>, u8)> = if is_keyframe {
         (0..tile_count)
             .into_par_iter()
             .map(|idx| {
-                let (data, mode) = encode_tile_buf(rgba, prev, width, height, idx % tiles_x, idx / tiles_x, true);
+                let (data, mode) = encode_tile_buf(
+                    rgba,
+                    prev,
+                    width,
+                    height,
+                    idx % tiles_x,
+                    idx / tiles_x,
+                    true,
+                );
                 (idx, data, mode)
             })
             .collect()
-    } else if tile_count < RAYON_THRESHOLD {
+    } else if !use_rayon(tile_count) {
         (0..tile_count)
             .filter_map(|idx| {
                 if tile_is_dirty(rgba, prev, width, height, idx % tiles_x, idx / tiles_x) {
-                    let (data, mode) = encode_tile_buf(rgba, prev, width, height, idx % tiles_x, idx / tiles_x, false);
+                    let (data, mode) = encode_tile_buf(
+                        rgba,
+                        prev,
+                        width,
+                        height,
+                        idx % tiles_x,
+                        idx / tiles_x,
+                        false,
+                    );
                     Some((idx, data, mode))
                 } else {
                     None
@@ -479,7 +959,15 @@ pub(crate) fn encode_frame(
             .into_par_iter()
             .filter_map(|idx| {
                 if tile_is_dirty(rgba, prev, width, height, idx % tiles_x, idx / tiles_x) {
-                    let (data, mode) = encode_tile_buf(rgba, prev, width, height, idx % tiles_x, idx / tiles_x, false);
+                    let (data, mode) = encode_tile_buf(
+                        rgba,
+                        prev,
+                        width,
+                        height,
+                        idx % tiles_x,
+                        idx / tiles_x,
+                        false,
+                    );
                     Some((idx, data, mode))
                 } else {
                     None
@@ -521,9 +1009,22 @@ pub(crate) fn encode_frame(
     out.extend_from_slice(&(height as u32).to_le_bytes());
     out.extend_from_slice(&(map_bytes as u16).to_le_bytes());
     out.extend_from_slice(&tile_map);
+    let mut offsets = if want_offsets {
+        Vec::with_capacity(dirty_tiles.len())
+    } else {
+        Vec::new()
+    };
     for (idx, data, _) in &dirty_tiles {
+        let entry_start = out.len();
         out.extend_from_slice(&(*idx as u16).to_le_bytes());
         out.extend_from_slice(data);
+        if want_offsets {
+            offsets.push(TileOffset {
+                tile_idx: *idx as u16,
+                byte_start: entry_start,
+                byte_len: out.len() - entry_start,
+            });
+        }
     }
 
     let stats = FrameStats {
@@ -533,7 +1034,84 @@ pub(crate) fn encode_frame(
         delta_tiles: delta_count,
         encoded_bytes: out.len() as u32,
     };
-    (out, stats)
+    (out, stats, offsets)
+}
+
+/// ROADMAP.md Phase 6.4 (cross-codec splicing): encodes ONLY the given
+/// tiles, each forced into ABSOLUTE (self-contained, prev-independent)
+/// encoding via `encode_tile_buf(..., is_keyframe=true)` — never MODE_DELTA.
+/// This is the piece that makes splicing a silicon (NVENC) background with
+/// an EVRTCK overlay for the same frame actually decode correctly: the
+/// overlay's job is to sit on top of whatever a DIFFERENT codec's lossy
+/// reconstruction just put in the client's buffer for those exact tiles,
+/// and a MODE_DELTA tile (XOR against `frame`'s CURRENT bytes) would XOR
+/// against that unrelated lossy content instead of the true previous frame
+/// it was actually computed against — corrupting exactly the pixels this
+/// overlay exists to make precise. Forcing absolute encoding (and, on
+/// decode, zeroing each tile's rect before applying — see
+/// `EvrtckDecoder::apply_absolute_overlay`) sidesteps the problem entirely:
+/// `0 XOR absolute_data == absolute_data` regardless of what was there
+/// before.
+///
+/// Wire format: identical 20-byte header + dirty-map + tile-record shape as
+/// `encode_frame_with_offsets` (so `apply_absolute_overlay` can reuse the
+/// same low-level tile scan/decompress code), except `flags` is always 0
+/// (NOT `FLAG_KEYFRAME` — this stream is never meant to be decoded via the
+/// ordinary `decode_frame`/`decode_wire` path, which would zero the WHOLE
+/// framebuffer on that flag; only `apply_absolute_overlay` should ever
+/// consume this stream's bytes).
+///
+/// `tile_indices` may contain duplicates or be unordered — deduped and
+/// sorted ascending before encoding, so the wire stream (and its tile_map)
+/// is deterministic regardless of the caller's own ordering (e.g. an
+/// Attention Map's tile selection, which isn't itself sorted).
+pub fn encode_tile_subset_absolute(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    frame_id: u32,
+    tile_indices: &[u16],
+) -> Vec<u8> {
+    let tiles_x = tiles_in_dim(width);
+    let tiles_y = tiles_in_dim(height);
+    let tile_count = tiles_x * tiles_y;
+
+    let mut indices: Vec<u16> = tile_indices
+        .iter()
+        .copied()
+        .filter(|&i| (i as usize) < tile_count)
+        .collect();
+    indices.sort_unstable();
+    indices.dedup();
+
+    let map_bytes = (tile_count + 7) / 8;
+    let mut tile_map = vec![0u8; map_bytes];
+    for &idx in &indices {
+        tile_map[idx as usize / 8] |= 1 << (idx as usize % 8);
+    }
+
+    let mut out = Vec::with_capacity(20 + map_bytes + indices.len() * 40);
+    out.extend_from_slice(MAGIC);
+    out.push(VERSION);
+    out.push(0); // flags: deliberately NOT FLAG_KEYFRAME — see doc comment
+    out.extend_from_slice(&frame_id.to_le_bytes());
+    out.extend_from_slice(&(width as u32).to_le_bytes());
+    out.extend_from_slice(&(height as u32).to_le_bytes());
+    out.extend_from_slice(&(map_bytes as u16).to_le_bytes());
+    out.extend_from_slice(&tile_map);
+
+    for &idx in &indices {
+        let tx = idx as usize % tiles_x;
+        let ty = idx as usize / tiles_x;
+        // `prev` is never read when `is_keyframe=true` (see encode_tile_buf:
+        // the solid-color fast path only reads `rgba`, and the keyframe
+        // branch gathers straight from `rgba` too) — an empty slice is safe.
+        let (data, _mode) = encode_tile_buf(rgba, &[], width, height, tx, ty, true);
+        out.extend_from_slice(&idx.to_le_bytes());
+        out.extend_from_slice(&data);
+    }
+
+    out
 }
 
 #[cfg_attr(not(feature = "gpu-accel"), allow(dead_code))]
@@ -569,16 +1147,36 @@ pub(crate) fn encode_pframe_from_dirty_indices(
     // dirty_indices order doesn't need to be raster anymore (v2 tiles are
     // self-describing via explicit tile_idx) — this comment kept accurate:
     // input order here is whatever the GPU dirty-detect pass produced.
-    let dirty_tiles: Vec<(usize, Vec<u8>, u8)> = if dirty_indices.len() < RAYON_THRESHOLD {
-        dirty_indices.iter().map(|&idx| {
-            let (data, mode) = encode_tile_buf(rgba, prev, width, height, idx % tiles_x, idx / tiles_x, false);
-            (idx, data, mode)
-        }).collect()
+    // EVRT2CKMAX-TASK-02: calibrated scheduler decision, exact dirty count.
+    let dirty_tiles: Vec<(usize, Vec<u8>, u8)> = if !use_rayon(dirty_indices.len()) {
+        dirty_indices
+            .iter()
+            .map(|&idx| {
+                let (data, mode) = encode_tile_buf(
+                    rgba,
+                    prev,
+                    width,
+                    height,
+                    idx % tiles_x,
+                    idx / tiles_x,
+                    false,
+                );
+                (idx, data, mode)
+            })
+            .collect()
     } else {
         dirty_indices
             .into_par_iter()
             .map(|idx| {
-                let (data, mode) = encode_tile_buf(rgba, prev, width, height, idx % tiles_x, idx / tiles_x, false);
+                let (data, mode) = encode_tile_buf(
+                    rgba,
+                    prev,
+                    width,
+                    height,
+                    idx % tiles_x,
+                    idx / tiles_x,
+                    false,
+                );
                 (idx, data, mode)
             })
             .collect()
@@ -718,7 +1316,7 @@ fn encode_tile_buf(
                 let o = row + x * 4;
                 tile.push(rgba[o + 2]); // R
                 tile.push(rgba[o + 1]); // G
-                tile.push(rgba[o]);     // B
+                tile.push(rgba[o]); // B
                 tile.push(rgba[o + 3]); // A
             }
         }
@@ -738,7 +1336,7 @@ fn encode_tile_buf(
                 let o = row + x * 4;
                 delta.push(rgba[o + 2] ^ prev[o + 2]); // R
                 delta.push(rgba[o + 1] ^ prev[o + 1]); // G
-                delta.push(rgba[o]     ^ prev[o]);      // B
+                delta.push(rgba[o] ^ prev[o]); // B
                 delta.push(rgba[o + 3] ^ prev[o + 3]); // A
             }
         }
@@ -770,7 +1368,39 @@ enum TilePixels {
     Delta(Vec<u8>),
 }
 
-fn decode_frame(data: &[u8], frame: &mut Vec<u8>, width: usize, height: usize) -> Result<(), EvrtckError> {
+fn decode_frame(
+    data: &[u8],
+    frame: &mut Vec<u8>,
+    width: usize,
+    height: usize,
+) -> Result<(), EvrtckError> {
+    decode_frame_prioritized(data, frame, width, height, None).map(|_apply_order| ())
+}
+
+/// ROADMAP.md Phase 3.3: same decode as `decode_frame`, except Phase 3
+/// (apply decoded tiles to the framebuffer) processes tiles in DESCENDING
+/// `tile_priority` order instead of raw byte-stream order, when a priority
+/// function is supplied. `tile_priority(tile_idx)` should return higher
+/// values for tiles that matter more (e.g. from a client's decoded APF
+/// map); a tile with no entry in the caller's priority source should map
+/// to a sensible default (0.0) rather than the function being partial.
+///
+/// The final framebuffer content is identical either way — tiles are
+/// non-overlapping, so paint order never changes the end result — the only
+/// thing this changes is which tiles are correct EARLIEST, observable via
+/// the returned apply order (a caller/test can check that high-`P_i` tile
+/// indices appear before low-`P_i` ones). `tile_priority: None` — which is
+/// what `decode_frame` above always passes — makes this function behave
+/// byte-for-byte like the original: `dirty` is never re-sorted, so
+/// EVRT1's live production decode path (via `decode_frame`/`EvrtckDecoder`)
+/// is completely unaffected by this function existing.
+fn decode_frame_prioritized(
+    data: &[u8],
+    frame: &mut Vec<u8>,
+    width: usize,
+    height: usize,
+    tile_priority: Option<&dyn Fn(usize) -> f32>,
+) -> Result<Vec<usize>, EvrtckError> {
     let mut pos = 0usize;
 
     macro_rules! need {
@@ -789,15 +1419,23 @@ fn decode_frame(data: &[u8], frame: &mut Vec<u8>, width: usize, height: usize) -
         }};
     }
     macro_rules! read_u16 {
-        () => { u16::from_le_bytes(read_bytes!(2).try_into().unwrap()) };
+        () => {
+            u16::from_le_bytes(read_bytes!(2).try_into().unwrap())
+        };
     }
     macro_rules! read_u32 {
-        () => { u32::from_le_bytes(read_bytes!(4).try_into().unwrap()) };
+        () => {
+            u32::from_le_bytes(read_bytes!(4).try_into().unwrap())
+        };
     }
 
-    if read_bytes!(4) != MAGIC { return Err(EvrtckError::InvalidMagic); }
+    if read_bytes!(4) != MAGIC {
+        return Err(EvrtckError::InvalidMagic);
+    }
     let ver = read_bytes!(1)[0];
-    if ver != VERSION { return Err(EvrtckError::UnsupportedVersion(ver)); }
+    if ver != VERSION {
+        return Err(EvrtckError::UnsupportedVersion(ver));
+    }
     let flags = read_bytes!(1)[0];
     let _frame_id = read_u32!();
     // Keyframe: encoder reset its prev to black → decoder must also reset.
@@ -814,7 +1452,7 @@ fn decode_frame(data: &[u8], frame: &mut Vec<u8>, width: usize, height: usize) -
     }
     // NOP frame: screen unchanged, prev frame buffer is still correct.
     if flags & FLAG_NOP != 0 {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let map_bytes = read_u16!() as usize;
@@ -834,8 +1472,12 @@ fn decode_frame(data: &[u8], frame: &mut Vec<u8>, width: usize, height: usize) -
     // dirty tile without decompressing. O(dirty_count) sequential, no per-tile
     // allocation. Entries may arrive in ANY order (priority order, not raster) —
     // each is self-describing via its explicit tile_idx.
-    // Fields: (x0, y0, x1, y1, mode, enc_start, enc_end)
-    let mut dirty: Vec<(usize, usize, usize, usize, u8, usize, usize)> = Vec::with_capacity(dirty_count);
+    // Fields: (tile_idx, x0, y0, x1, y1, mode, enc_start, enc_end). `tile_idx`
+    // is only needed for the priority sort below (ROADMAP.md Phase 3.3) —
+    // Phase 1/2 never used it beyond deriving x0/y0/x1/y1, unchanged from
+    // before this field was added.
+    let mut dirty: Vec<(usize, usize, usize, usize, usize, u8, usize, usize)> =
+        Vec::with_capacity(dirty_count);
 
     for _ in 0..dirty_count {
         let tile_idx = read_u16!();
@@ -847,7 +1489,8 @@ fn decode_frame(data: &[u8], frame: &mut Vec<u8>, width: usize, height: usize) -
         let ty = idx / tiles_x;
 
         need!(1);
-        let mode = data[pos]; pos += 1;
+        let mode = data[pos];
+        pos += 1;
 
         let x0 = tx * TILE_SIZE;
         let y0 = ty * TILE_SIZE;
@@ -857,13 +1500,13 @@ fn decode_frame(data: &[u8], frame: &mut Vec<u8>, width: usize, height: usize) -
         match mode {
             MODE_SOLID => {
                 need!(4);
-                dirty.push((x0, y0, x1, y1, mode, pos, pos + 4));
+                dirty.push((idx, x0, y0, x1, y1, mode, pos, pos + 4));
                 pos += 4;
             }
             MODE_DELTA | MODE_ZSTD => {
                 let enc_len = read_u32!() as usize;
                 need!(enc_len);
-                dirty.push((x0, y0, x1, y1, mode, pos, pos + enc_len));
+                dirty.push((idx, x0, y0, x1, y1, mode, pos, pos + enc_len));
                 pos += enc_len;
             }
             m => return Err(EvrtckError::InvalidTileMode(m)),
@@ -872,19 +1515,62 @@ fn decode_frame(data: &[u8], frame: &mut Vec<u8>, width: usize, height: usize) -
 
     // Phase 2: decompress dirty tiles — in parallel when there are enough to amortise
     // rayon spawn cost. Each tile is independent; order is preserved by collect().
-    let decoded: Vec<Result<TilePixels, EvrtckError>> = if dirty.len() < RAYON_THRESHOLD {
-        dirty.iter().map(|&(_, _, _, _, mode, enc_start, enc_end)| {
-            decompress_tile(data, enc_start, enc_end, mode)
-        }).collect()
+    //
+    // NOTE: decode (decompress_tile) is a different workload than encode
+    // (encode_tile_buf) — cheaper per-tile, no compression search — so the
+    // EntropyCoding registry calibrated for encode above does not apply
+    // here without its own calibration pass. Out of scope for
+    // EVRT2CKMAX-TASK-02's first pass (see task doc Non-Goals: "start with
+    // the capabilities that already have partial probing code... expand
+    // later"); kept as the same fixed heuristic it always was.
+    const DECODE_RAYON_THRESHOLD: usize = 64;
+    let decoded: Vec<Result<TilePixels, EvrtckError>> = if dirty.len() < DECODE_RAYON_THRESHOLD {
+        dirty
+            .iter()
+            .map(|&(_, _, _, _, _, mode, enc_start, enc_end)| {
+                decompress_tile(data, enc_start, enc_end, mode)
+            })
+            .collect()
     } else {
-        dirty.par_iter().map(|&(_, _, _, _, mode, enc_start, enc_end)| {
-            decompress_tile(data, enc_start, enc_end, mode)
-        }).collect()
+        dirty
+            .par_iter()
+            .map(|&(_, _, _, _, _, mode, enc_start, enc_end)| {
+                decompress_tile(data, enc_start, enc_end, mode)
+            })
+            .collect()
     };
+
+    // ROADMAP.md Phase 3.3: pair each tile with its decoded pixels, then —
+    // only if the caller supplied a priority function — stable-sort by
+    // DESCENDING priority before Phase 3 paints them. Stable sort keeps the
+    // original (byte-stream) relative order for equal-priority tiles, so
+    // this is deterministic. With `tile_priority: None` this whole block is
+    // skipped and `paint_order` stays exactly the byte-stream order —
+    // `decode_frame`'s production callers see zero behavior change.
+    let mut paint_order: Vec<(
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        Result<TilePixels, EvrtckError>,
+    )> = dirty
+        .into_iter()
+        .zip(decoded)
+        .map(|((idx, x0, y0, x1, y1, _, _, _), pixels)| (idx, x0, y0, x1, y1, pixels))
+        .collect();
+    if let Some(priority) = tile_priority {
+        paint_order.sort_by(|a, b| {
+            priority(b.0)
+                .partial_cmp(&priority(a.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    let apply_order: Vec<usize> = paint_order.iter().map(|entry| entry.0).collect();
 
     // Phase 3: apply decoded pixels to the frame buffer sequentially (tiles are
     // non-overlapping, but safe Rust can't express disjoint mutable borrows here).
-    for (&(x0, y0, x1, y1, _, _, _), pixels_result) in dirty.iter().zip(decoded.into_iter()) {
+    for (_, x0, y0, x1, y1, pixels_result) in paint_order {
         let tw4 = (x1 - x0) * 4;
         match pixels_result? {
             TilePixels::Solid(color) => {
@@ -920,25 +1606,24 @@ fn decode_frame(data: &[u8], frame: &mut Vec<u8>, width: usize, height: usize) -
         }
     }
 
-    Ok(())
+    Ok(apply_order)
 }
 
-fn decompress_tile(data: &[u8], enc_start: usize, enc_end: usize, mode: u8)
-    -> Result<TilePixels, EvrtckError>
-{
+fn decompress_tile(
+    data: &[u8],
+    enc_start: usize,
+    enc_end: usize,
+    mode: u8,
+) -> Result<TilePixels, EvrtckError> {
     match mode {
         MODE_SOLID => {
             let d = &data[enc_start..enc_end];
             Ok(TilePixels::Solid([d[0], d[1], d[2], d[3]]))
         }
-        MODE_DELTA => {
-            zrle_decode(&data[enc_start..enc_end]).map(TilePixels::Delta)
-        }
-        MODE_ZSTD => {
-            zstd::decode_all(&data[enc_start..enc_end])
-                .map_err(|_| EvrtckError::InvalidDelta)
-                .map(TilePixels::Delta)
-        }
+        MODE_DELTA => zrle_decode(&data[enc_start..enc_end]).map(TilePixels::Delta),
+        MODE_ZSTD => zstd::decode_all(&data[enc_start..enc_end])
+            .map_err(|_| EvrtckError::InvalidDelta)
+            .map(TilePixels::Delta),
         _ => unreachable!(), // validated in phase 1
     }
 }
@@ -962,11 +1647,15 @@ fn zrle_encode(src: &[u8]) -> Vec<u8> {
         let z_start = i;
         // Fast zero scan: consume u64 words while all 8 bytes are zero.
         while i + 8 <= src.len() {
-            if u64::from_ne_bytes(src[i..i + 8].try_into().unwrap()) != 0 { break; }
+            if u64::from_ne_bytes(src[i..i + 8].try_into().unwrap()) != 0 {
+                break;
+            }
             i += 8;
         }
         // Mop up remaining zero bytes.
-        while i < src.len() && src[i] == 0 { i += 1; }
+        while i < src.len() && src[i] == 0 {
+            i += 1;
+        }
         let zeros = i - z_start;
 
         if zeros >= ZRLE_MIN_RUN || (zeros > 0 && i == src.len()) {
@@ -983,7 +1672,9 @@ fn zrle_encode(src: &[u8]) -> Vec<u8> {
         i = z_start;
         let lit_start = i;
         loop {
-            if i >= src.len() { break; }
+            if i >= src.len() {
+                break;
+            }
             if src[i] == 0 {
                 // Fast check: is this zero run long enough to break?
                 let mut z = 0usize;
@@ -992,8 +1683,12 @@ fn zrle_encode(src: &[u8]) -> Vec<u8> {
                 {
                     z += 8;
                 }
-                while i + z < src.len() && src[i + z] == 0 { z += 1; }
-                if z >= ZRLE_MIN_RUN { break; }
+                while i + z < src.len() && src[i + z] == 0 {
+                    z += 1;
+                }
+                if z >= ZRLE_MIN_RUN {
+                    break;
+                }
             }
             i += 1;
         }
@@ -1021,16 +1716,22 @@ fn zrle_decode(src: &[u8]) -> Result<Vec<u8>, EvrtckError> {
         i += 1;
         match tag {
             0x00 => {
-                if i + 2 > src.len() { return Err(EvrtckError::InvalidDelta); }
+                if i + 2 > src.len() {
+                    return Err(EvrtckError::InvalidDelta);
+                }
                 let count = u16::from_le_bytes([src[i], src[i + 1]]) as usize;
                 i += 2;
                 out.resize(out.len() + count, 0);
             }
             0x01 => {
-                if i + 2 > src.len() { return Err(EvrtckError::InvalidDelta); }
+                if i + 2 > src.len() {
+                    return Err(EvrtckError::InvalidDelta);
+                }
                 let len = u16::from_le_bytes([src[i], src[i + 1]]) as usize;
                 i += 2;
-                if i + len > src.len() { return Err(EvrtckError::InvalidDelta); }
+                if i + len > src.len() {
+                    return Err(EvrtckError::InvalidDelta);
+                }
                 out.extend_from_slice(&src[i..i + len]);
                 i += len;
             }
@@ -1069,10 +1770,95 @@ mod tests {
             for x in 0..w {
                 let off = (y * w + x) * 4;
                 let v = if (x + y) % 2 == 0 { 255 } else { 0 };
-                f[off] = v; f[off+1] = v; f[off+2] = v; f[off+3] = 255;
+                f[off] = v;
+                f[off + 1] = v;
+                f[off + 2] = v;
+                f[off + 3] = 255;
             }
         }
         f
+    }
+
+    // ── TASK-01 exact tile offsets (ROADMAP.md Phase 1.2) ──────────────────────
+
+    #[test]
+    fn tile_offsets_point_at_the_correct_tile_idx_prefix() {
+        // 64×64 = 2×2 tiles at TILE_SIZE=32. Keyframe: every tile is dirty.
+        let mut enc = EvrtckEncoder::new(64, 64);
+        let (packet, stats, offsets) = enc.encode_with_offsets(&checkerboard(64, 64), 0);
+        assert_eq!(
+            offsets.len(),
+            stats.dirty_tiles as usize,
+            "one offset per dirty tile"
+        );
+        assert_eq!(offsets.len(), 4, "2x2 tile grid, keyframe → all 4 dirty");
+
+        for off in &offsets {
+            // Every tile entry is `[tile_idx u16 LE][data...]` — the offset's
+            // byte_start must land exactly on that prefix, not mid-tile.
+            let idx_bytes = &packet.data[off.byte_start..off.byte_start + 2];
+            let idx = u16::from_le_bytes([idx_bytes[0], idx_bytes[1]]);
+            assert_eq!(
+                idx, off.tile_idx,
+                "byte_start must point at this tile's own [tile_idx] prefix"
+            );
+            assert!(
+                off.byte_start + off.byte_len <= packet.data.len(),
+                "byte range must stay inside the packet"
+            );
+        }
+    }
+
+    #[test]
+    fn tile_offsets_do_not_overlap_and_cover_every_dirty_tile_once() {
+        // 128×128 = 4×4 tiles — dirty only the top-left quadrant (4 tiles),
+        // so this also exercises the P-frame sparse path, not just keyframe.
+        let mut enc = EvrtckEncoder::new(128, 128);
+        let _ = enc.encode(&black(128, 128), 0); // seed keyframe baseline
+        let mut frame = black(128, 128);
+        for y in 0..64 {
+            for x in 0..64 {
+                let i = (y * 128 + x) * 4;
+                frame[i] = 255;
+            }
+        }
+        let (packet, stats, offsets) = enc.encode_with_offsets(&frame, 1);
+        assert_eq!(offsets.len(), stats.dirty_tiles as usize);
+
+        let mut sorted = offsets.clone();
+        sorted.sort_by_key(|o| o.byte_start);
+        for pair in sorted.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            assert!(
+                a.byte_start + a.byte_len <= b.byte_start,
+                "tile byte ranges must not overlap: {a:?} vs {b:?}"
+            );
+        }
+        // Every tile_idx returned must be unique — no tile double-counted.
+        let mut idxs: Vec<u16> = offsets.iter().map(|o| o.tile_idx).collect();
+        idxs.sort_unstable();
+        idxs.dedup();
+        assert_eq!(
+            idxs.len(),
+            offsets.len(),
+            "no duplicate tile_idx across offsets"
+        );
+        let _ = packet; // packet content already exercised above
+    }
+
+    #[test]
+    fn encode_with_offsets_matches_encode_bit_for_bit() {
+        // The offsets facade must not change what actually gets sent —
+        // only add metadata alongside the identical wire bytes.
+        let frame = checkerboard(64, 64);
+        let mut enc_a = EvrtckEncoder::new(64, 64);
+        let mut enc_b = EvrtckEncoder::new(64, 64);
+        let plain = enc_a.encode(&frame, 0);
+        let (with_offsets, _stats, _offsets) = enc_b.encode_with_offsets(&frame, 0);
+        assert_eq!(
+            plain.data, with_offsets.data,
+            "encode() and encode_with_offsets() must produce identical wire bytes"
+        );
     }
 
     // ── zrle ─────────────────────────────────────────────────────────────────
@@ -1086,12 +1872,18 @@ mod tests {
         let enc = zrle_encode(&data);
         let dec = zrle_decode(&enc).unwrap();
         assert_eq!(dec, data);
-        assert!(enc.len() < 40, "sparse delta should compress well: {} bytes", enc.len());
+        assert!(
+            enc.len() < 40,
+            "sparse delta should compress well: {} bytes",
+            enc.len()
+        );
     }
 
     #[test]
     fn zrle_roundtrip_random_like() {
-        let data: Vec<u8> = (0u16..1000).map(|i| (i.wrapping_mul(6271) & 0xFF) as u8).collect();
+        let data: Vec<u8> = (0u16..1000)
+            .map(|i| (i.wrapping_mul(6271) & 0xFF) as u8)
+            .collect();
         let enc = zrle_encode(&data);
         let dec = zrle_decode(&enc).unwrap();
         assert_eq!(dec, data);
@@ -1154,7 +1946,7 @@ mod tests {
         let mut dec = EvrtckDecoder::new();
 
         let f1 = solid_frame(w, h, [10, 20, 30, 255]);
-        let f2 = checkerboard(w, h);      // grayscale — BGRA==RGBA for this one
+        let f2 = checkerboard(w, h); // grayscale — BGRA==RGBA for this one
         let f3 = solid_frame(w, h, [0, 0, 0, 0]);
 
         for (i, frame) in [&f1, &f2, &f3].iter().enumerate() {
@@ -1171,7 +1963,7 @@ mod tests {
         let mut enc = EvrtckEncoder::new(w, h);
         enc.encode(&frame, 1); // first frame — full encode
         let pkt2 = enc.encode(&frame, 2); // identical — should be tiny
-        // header(20) + map_bytes_field(2) + tile_map(255) = 277 bytes maximum
+                                          // header(20) + map_bytes_field(2) + tile_map(255) = 277 bytes maximum
         assert!(
             pkt2.data.len() <= 280,
             "static 1080p frame should be ≤280 bytes, got {}",
@@ -1223,8 +2015,10 @@ mod tests {
         let mut frame = solid_frame(w, h, [240, 240, 240, 255]);
         let mut enc = EvrtckEncoder::new(w, h);
         enc.encode(&frame, 1); // establish prev
-        // Change ~1% of pixels in one region
-        for i in 0..100 { frame[i * 4] = 0; }
+                               // Change ~1% of pixels in one region
+        for i in 0..100 {
+            frame[i * 4] = 0;
+        }
         let pkt = enc.encode(&frame, 2);
         assert!(
             pkt.compression_ratio() < 0.1,
@@ -1241,7 +2035,11 @@ mod tests {
         let (w, h) = (1920, 1080);
         let frame: Vec<u8> = (0..w * h)
             .flat_map(|i| {
-                if i % 2 == 0 { [200u8, 100, 50, 255] } else { [30u8, 180, 240, 255] }
+                if i % 2 == 0 {
+                    [200u8, 100, 50, 255]
+                } else {
+                    [30u8, 180, 240, 255]
+                }
             })
             .collect();
         let mut enc = EvrtckEncoder::new(w, h);
@@ -1259,7 +2057,12 @@ mod tests {
 
     #[test]
     fn error_on_bad_magic() {
-        let pkt = EvrtckPacket { frame_id: 0, width: 32, height: 32, data: b"BAAD\x01\x00\x00\x00\x00\x00\x20\x00\x00\x00\x20\x00\x00\x00\x02\x00".to_vec() };
+        let pkt = EvrtckPacket {
+            frame_id: 0,
+            width: 32,
+            height: 32,
+            data: b"BAAD\x01\x00\x00\x00\x00\x00\x20\x00\x00\x00\x20\x00\x00\x00\x02\x00".to_vec(),
+        };
         let mut dec = EvrtckDecoder::new();
         assert_eq!(dec.decode(&pkt), Err(EvrtckError::InvalidMagic));
     }
@@ -1275,6 +2078,241 @@ mod tests {
         assert_eq!(dec.decode(&pkt), Err(EvrtckError::TruncatedData));
     }
 
+    // ── ROADMAP.md Phase 6.4 investigation: silicon-frame/EVRTCK framebuffer
+    // desync bug found while designing cross-codec splicing ────────────────
+
+    /// Without `sync_from_rgba`, a client that displayed one frame via a
+    /// DIFFERENT codec (e.g. IS_SILICON/NVENC — simulated here by simply not
+    /// feeding that frame to `dec` at all, exactly like the pre-fix client
+    /// loop) ends up applying the next EVRTCK MODE_DELTA P-frame against a
+    /// stale framebuffer, producing corrupted pixels — this is the bug this
+    /// segment's fix addresses, reproduced here as a negative control so a
+    /// future regression can't silently reintroduce it.
+    #[test]
+    fn decoding_a_delta_frame_against_a_desynced_buffer_corrupts_pixels() {
+        let (w, h) = (64, 64);
+        let mut enc = EvrtckEncoder::new(w, h);
+        let mut dec = EvrtckDecoder::new();
+
+        let frame0 = checkerboard(w, h);
+        let pkt0 = enc.encode(&frame0, 0);
+        dec.decode(&pkt0).unwrap();
+        assert_eq!(dec.current_frame(), bgra_to_rgba(&frame0).as_slice());
+
+        // Host encodes frame1 too (both providers always run), but this
+        // frame is never sent to the client on the wire — NVENC "won" the
+        // race this frame in the real system. The encoder's OWN internal
+        // prev still advances to frame1's true content.
+        let mut frame1 = frame0.clone();
+        for i in 0..64 {
+            frame1[i * 4] = 200;
+        } // change one tile's blue channel (BGRA byte 0)
+        let _pkt1_never_sent = enc.encode(&frame1, 1);
+        // dec is NOT told about frame1 at all — the pre-fix behavior.
+
+        let mut frame2 = frame1.clone();
+        for i in 0..64 {
+            frame2[i * 4 + 1] = 77;
+        } // change the SAME tile further
+        let pkt2 = enc.encode(&frame2, 2); // real MODE_DELTA against frame1, sent for real
+        dec.decode(&pkt2).unwrap();
+
+        // dec.frame is still frame0-shaped for that tile; XORing frame2's
+        // delta-from-frame1 onto frame0 does NOT reconstruct frame2.
+        assert_ne!(
+            dec.current_frame(),
+            bgra_to_rgba(&frame2).as_slice(),
+            "expected corruption from the desynced buffer — if this now passes, the bug is gone even without sync_from_rgba"
+        );
+    }
+
+    /// The fix: calling `sync_from_rgba` with the real pixels shown by the
+    /// other codec keeps the decoder's tracked buffer truthful, so the next
+    /// real MODE_DELTA P-frame decodes correctly — no corruption, no dropped
+    /// frame, no keyframe request needed.
+    #[test]
+    fn sync_from_rgba_keeps_the_next_delta_frame_correct() {
+        let (w, h) = (64, 64);
+        let mut enc = EvrtckEncoder::new(w, h);
+        let mut dec = EvrtckDecoder::new();
+
+        let frame0 = checkerboard(w, h);
+        let pkt0 = enc.encode(&frame0, 0);
+        dec.decode(&pkt0).unwrap();
+
+        let mut frame1 = frame0.clone();
+        for i in 0..64 {
+            frame1[i * 4] = 200;
+        }
+        let _pkt1_never_sent = enc.encode(&frame1, 1);
+        // The client DID decode frame1 via the other codec (NVENC/H264) and
+        // displayed it — tell this decoder about the real pixels shown.
+        dec.sync_from_rgba(&bgra_to_rgba(&frame1), w, h);
+        assert_eq!(dec.current_frame(), bgra_to_rgba(&frame1).as_slice());
+
+        let mut frame2 = frame1.clone();
+        for i in 0..64 {
+            frame2[i * 4 + 1] = 77;
+        }
+        let pkt2 = enc.encode(&frame2, 2);
+        dec.decode(&pkt2).unwrap();
+
+        assert_eq!(
+            dec.current_frame(),
+            bgra_to_rgba(&frame2).as_slice(),
+            "sync_from_rgba should have kept the decoder's buffer truthful enough for the next delta to reconstruct frame2 exactly"
+        );
+    }
+
+    /// `sync_from_rgba` is a no-op (doesn't panic, doesn't corrupt existing
+    /// state) when handed a buffer of the wrong length for the given
+    /// dimensions — a genuine caller bug, not something to silently truncate
+    /// or pad around.
+    #[test]
+    fn sync_from_rgba_ignores_a_mismatched_buffer_length() {
+        let (w, h) = (16, 16);
+        let mut dec = EvrtckDecoder::new();
+        let mut enc = EvrtckEncoder::new(w, h);
+        let frame0 = solid_frame(w, h, [10, 20, 30, 255]);
+        dec.decode(&enc.encode(&frame0, 0)).unwrap();
+        let before = dec.current_frame().to_vec();
+
+        dec.sync_from_rgba(&[0u8; 4], w, h); // way too short for 16x16
+        assert_eq!(dec.current_frame(), before.as_slice());
+    }
+
+    // ── ROADMAP.md Phase 6.4: cross-codec splicing overlay ──────────────────
+
+    #[test]
+    fn absolute_overlay_roundtrips_the_selected_tiles_exactly() {
+        let (w, h) = (128, 96);
+        let frame = checkerboard(w, h);
+        let mut dec = EvrtckDecoder::new();
+        // Establish dimensions with a black base (stands in for a
+        // background layer from a different codec).
+        dec.sync_from_rgba(&black(w, h), w, h);
+
+        let tiles_x = w.div_ceil(TILE_SIZE);
+        let selected: Vec<u16> = vec![0, 3, tiles_x as u16 + 1]; // scattered tiles
+        let overlay = encode_tile_subset_absolute(&frame, w, h, 1, &selected);
+        let applied = dec.apply_absolute_overlay(&overlay).unwrap();
+
+        let mut expected_sorted = selected.clone();
+        expected_sorted.sort_unstable();
+        let mut applied_sorted: Vec<u16> = applied.iter().map(|&i| i as u16).collect();
+        applied_sorted.sort_unstable();
+        assert_eq!(applied_sorted, expected_sorted);
+
+        // Every selected tile's pixels must exactly match the true frame
+        // (checkerboard, converted to the decoder's RGBA layout); untouched
+        // tiles must remain black (the background layer, unmodified).
+        let expected_rgba = bgra_to_rgba(&frame);
+        for &idx in &selected {
+            let tx = idx as usize % tiles_x;
+            let ty = idx as usize / tiles_x;
+            let x0 = tx * TILE_SIZE;
+            let y0 = ty * TILE_SIZE;
+            let x1 = (x0 + TILE_SIZE).min(w);
+            let y1 = (y0 + TILE_SIZE).min(h);
+            for y in y0..y1 {
+                let rs = (y * w + x0) * 4;
+                let tw4 = (x1 - x0) * 4;
+                assert_eq!(
+                    dec.current_frame()[rs..rs + tw4],
+                    expected_rgba[rs..rs + tw4],
+                    "tile {idx} row {y} should exactly match the true frame"
+                );
+            }
+        }
+        // A tile NOT in the selection (e.g. the last one) should still be
+        // black — the overlay must not have touched it.
+        let untouched_idx = (tiles_x * h.div_ceil(TILE_SIZE)) - 1;
+        if !selected.contains(&(untouched_idx as u16)) {
+            let tx = untouched_idx % tiles_x;
+            let ty = untouched_idx / tiles_x;
+            let x0 = tx * TILE_SIZE;
+            let y0 = (ty * TILE_SIZE).min(h - 1);
+            let rs = (y0 * w + x0) * 4;
+            assert_eq!(dec.current_frame()[rs..rs + 4], [0, 0, 0, 0]);
+        }
+    }
+
+    /// The whole point of this overlay design: applying it on top of a
+    /// background that is COMPLETELY DIFFERENT from what a normal
+    /// MODE_DELTA P-frame would have assumed as `prev` must still
+    /// reconstruct the true tile content exactly — proving the "zero the
+    /// rect, then apply" trick actually neutralizes the desync problem
+    /// `sync_from_rgba` was built to guard against, for the specific tiles
+    /// the overlay covers.
+    #[test]
+    fn absolute_overlay_is_correct_even_over_a_wildly_different_background() {
+        let (w, h) = (64, 64);
+        let true_frame = checkerboard(w, h);
+        let mut dec = EvrtckDecoder::new();
+
+        // A background that shares NOTHING with true_frame — e.g. a
+        // completely different lossy NVENC reconstruction.
+        let unrelated_background = solid_frame(w, h, [200, 5, 90, 255]);
+        dec.sync_from_rgba(&bgra_to_rgba(&unrelated_background), w, h);
+
+        let overlay = encode_tile_subset_absolute(&true_frame, w, h, 1, &[0]);
+        dec.apply_absolute_overlay(&overlay).unwrap();
+
+        let expected_rgba = bgra_to_rgba(&true_frame);
+        let tw4 = TILE_SIZE * 4;
+        for y in 0..TILE_SIZE {
+            let rs = y * w * 4;
+            assert_eq!(
+                dec.current_frame()[rs..rs + tw4],
+                expected_rgba[rs..rs + tw4]
+            );
+        }
+    }
+
+    #[test]
+    fn absolute_overlay_rejects_dimension_mismatch() {
+        let mut dec = EvrtckDecoder::new();
+        dec.sync_from_rgba(&black(32, 32), 32, 32);
+        let overlay = encode_tile_subset_absolute(&checkerboard(64, 64), 64, 64, 1, &[0]);
+        assert_eq!(
+            dec.apply_absolute_overlay(&overlay),
+            Err(EvrtckError::DimensionMismatch {
+                expected: (32, 32),
+                got: (64, 64)
+            })
+        );
+    }
+
+    #[test]
+    fn encode_tile_subset_absolute_dedupes_and_ignores_out_of_range_indices() {
+        let (w, h) = (64, 64); // 2x2 tiles
+        let frame = checkerboard(w, h);
+        let mut dec = EvrtckDecoder::new();
+        dec.sync_from_rgba(&black(w, h), w, h);
+
+        // Duplicate 0 three times, include an out-of-range index (99).
+        let overlay = encode_tile_subset_absolute(&frame, w, h, 1, &[0, 0, 0, 99]);
+        let applied = dec.apply_absolute_overlay(&overlay).unwrap();
+        assert_eq!(
+            applied,
+            vec![0],
+            "duplicates collapse to one entry, out-of-range indices are dropped"
+        );
+    }
+
+    #[test]
+    fn empty_tile_selection_produces_a_no_op_overlay() {
+        let (w, h) = (32, 32);
+        let mut dec = EvrtckDecoder::new();
+        dec.sync_from_rgba(&solid_frame(w, h, [1, 2, 3, 255]), w, h);
+        let before = dec.current_frame().to_vec();
+
+        let overlay = encode_tile_subset_absolute(&checkerboard(w, h), w, h, 1, &[]);
+        let applied = dec.apply_absolute_overlay(&overlay).unwrap();
+        assert!(applied.is_empty());
+        assert_eq!(dec.current_frame(), before.as_slice());
+    }
+
     #[test]
     fn nop_frame_for_identical_pframe() {
         let (w, h) = (64, 64);
@@ -1284,18 +2322,31 @@ mod tests {
 
         // Keyframe — establishes prev on both sides.
         let kf = enc.encode(&frame, 1);
-        assert!(kf.data[5] & FLAG_KEYFRAME != 0, "first frame must be keyframe");
+        assert!(
+            kf.data[5] & FLAG_KEYFRAME != 0,
+            "first frame must be keyframe"
+        );
         let pixels_after_kf = dec.decode(&kf).unwrap().to_vec();
 
         // Second encode with the SAME frame → must produce a NOP packet.
         let nop = enc.encode(&frame, 2);
-        assert!(nop.data[5] & FLAG_NOP != 0, "identical P-frame must set FLAG_NOP");
-        assert!(nop.data.len() <= 20, "NOP packet must be tiny (got {} bytes)", nop.data.len());
+        assert!(
+            nop.data[5] & FLAG_NOP != 0,
+            "identical P-frame must set FLAG_NOP"
+        );
+        assert!(
+            nop.data.len() <= 20,
+            "NOP packet must be tiny (got {} bytes)",
+            nop.data.len()
+        );
 
         // Decoder must return the same pixels as after the keyframe.
         let pixels_after_nop = dec.decode(&nop).unwrap();
-        assert_eq!(pixels_after_nop, pixels_after_kf.as_slice(),
-            "NOP decode must preserve frame buffer");
+        assert_eq!(
+            pixels_after_nop,
+            pixels_after_kf.as_slice(),
+            "NOP decode must preserve frame buffer"
+        );
 
         // After a change the NOP must NOT fire.
         let frame2 = solid_frame(w, h, [1, 2, 3, 255]);
@@ -1343,7 +2394,8 @@ mod tests {
         let pkt = enc.encode(&frame, 2);
 
         assert_eq!(
-            first_wire_tile_idx(&pkt.data), 15,
+            first_wire_tile_idx(&pkt.data),
+            15,
             "nearest-to-focus dirty tile must be emitted first, not raster-first"
         );
 
@@ -1368,7 +2420,8 @@ mod tests {
         let pkt = enc.encode(&frame, 2);
 
         assert_eq!(
-            first_wire_tile_idx(&pkt.data), 0,
+            first_wire_tile_idx(&pkt.data),
+            0,
             "without a focus point, tiles must stay in ascending raster order"
         );
     }
@@ -1398,7 +2451,10 @@ mod tests {
         enc_b.set_focus_pixel(1, 1);
         let pkt2 = enc_b.encode(&frame_b, 2);
 
-        assert_eq!(first_wire_tile_idx(&pkt1.data), first_wire_tile_idx(&pkt2.data));
+        assert_eq!(
+            first_wire_tile_idx(&pkt1.data),
+            first_wire_tile_idx(&pkt2.data)
+        );
         // And it must be the raster-earlier of the tied pair (tile 1, not tile 4).
         assert_eq!(first_wire_tile_idx(&pkt1.data), 1);
     }
@@ -1416,9 +2472,8 @@ mod tests {
         }
 
         // Focus tile (2,2) = raster idx 10 — nearest among the dirty set is itself.
-        let (data, stats) = encode_pframe_from_dirty_indices(
-            &frame, &prev, w, h, 1, dirty_idxs, Some((2, 2)),
-        );
+        let (data, stats) =
+            encode_pframe_from_dirty_indices(&frame, &prev, w, h, 1, dirty_idxs, Some((2, 2)));
         assert_eq!(stats.dirty_tiles, 4);
         assert_eq!(first_wire_tile_idx(&data), 10);
 
@@ -1444,5 +2499,70 @@ mod tests {
 
         let mut dec = EvrtckDecoder::new();
         assert_eq!(dec.decode(&pkt), Err(EvrtckError::InvalidTileIndex(999)));
+    }
+
+    // ── ROADMAP.md Phase 3.3: priority-driven apply order ──────────────────
+
+    #[test]
+    fn decode_frame_with_no_priority_applies_in_byte_stream_order() {
+        // Regression guard for `decode_frame`'s production callers
+        // (EVRT1's live decode path via `EvrtckDecoder`): the apply order
+        // with `tile_priority: None` must be exactly the order tiles
+        // appear in the wire stream — unchanged from before this function
+        // existed. 4x4 grid = 4 tiles at TILE_SIZE=32, all dirty on a
+        // keyframe, so the wire order is whatever the encoder emitted.
+        let (w, h) = (64, 64);
+        let mut enc = EvrtckEncoder::new(w, h);
+        let pkt = enc.encode(&checkerboard(w, h), 0);
+        let mut frame = black(w, h);
+        let apply_order = decode_frame_prioritized(&pkt.data, &mut frame, w, h, None).unwrap();
+        assert_eq!(apply_order.len(), 4, "all 4 tiles dirty on a keyframe");
+        // Byte-stream order for a keyframe with no focus set is raster order.
+        assert_eq!(apply_order, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn decode_frame_prioritized_paints_the_highest_priority_tile_first() {
+        // 4x4 native tiles (2x2 grid, TILE_SIZE=32 → 64x64px), all dirty.
+        // Byte-stream (raster) order is [0,1,2,3] — priority says tile 3
+        // (bottom-right) matters most, so it must be FIRST in apply order,
+        // not last, once a priority function is supplied.
+        let (w, h) = (64, 64);
+        let mut enc = EvrtckEncoder::new(w, h);
+        let pkt = enc.encode(&checkerboard(w, h), 0);
+        let mut frame = black(w, h);
+        let priority = |idx: usize| if idx == 3 { 1.0 } else { 0.0 };
+        let apply_order =
+            decode_frame_prioritized(&pkt.data, &mut frame, w, h, Some(&priority)).unwrap();
+        assert_eq!(
+            apply_order.first(),
+            Some(&3),
+            "the one high-priority tile must be painted first"
+        );
+        // The final framebuffer must be identical regardless of paint order
+        // (tiles are non-overlapping) — reordering must never change the
+        // actual picture, only when each part of it became correct.
+        let mut frame_unordered = black(w, h);
+        decode_frame_prioritized(&pkt.data, &mut frame_unordered, w, h, None).unwrap();
+        assert_eq!(
+            frame, frame_unordered,
+            "paint order must not change the final reconstructed frame"
+        );
+    }
+
+    #[test]
+    fn decode_frame_prioritized_is_a_stable_sort_for_equal_priorities() {
+        // All tiles equal priority → must fall back to byte-stream order,
+        // exactly like `tile_priority: None` — a real APF grid coarser
+        // than the tile grid can legitimately assign the same priority to
+        // several tiles, and that must not scramble their relative order.
+        let (w, h) = (64, 64);
+        let mut enc = EvrtckEncoder::new(w, h);
+        let pkt = enc.encode(&checkerboard(w, h), 0);
+        let mut frame = black(w, h);
+        let flat_priority = |_idx: usize| 0.5f32;
+        let apply_order =
+            decode_frame_prioritized(&pkt.data, &mut frame, w, h, Some(&flat_priority)).unwrap();
+        assert_eq!(apply_order, vec![0, 1, 2, 3]);
     }
 }

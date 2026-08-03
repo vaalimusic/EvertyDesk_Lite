@@ -161,8 +161,12 @@ impl EvertyDeskApp {
                         .size(12.0)
                         .color(crate::theme::palette().text_weak),
                 );
-                let clear_selected = self.contact_tag_filter == *"" || self.contact_tag_filter.is_empty();
-                if ui.selectable_label(clear_selected, tr(lang, "Все", "All")).clicked() {
+                let clear_selected =
+                    self.contact_tag_filter == *"" || self.contact_tag_filter.is_empty();
+                if ui
+                    .selectable_label(clear_selected, tr(lang, "Все", "All"))
+                    .clicked()
+                {
                     self.contact_tag_filter.clear();
                 }
                 for tag in &all_tags {
@@ -191,7 +195,10 @@ impl EvertyDeskApp {
             .filter_map(|(idx, contact)| {
                 let haystack = format!(
                     "{} {} {} {} {}",
-                    contact.name, contact.remote_id, contact.note, contact.os,
+                    contact.name,
+                    contact.remote_id,
+                    contact.note,
+                    contact.os,
                     contact.tags.join(" ")
                 )
                 .to_lowercase();
@@ -799,13 +806,9 @@ impl EvertyDeskApp {
         // Preserve local-only fields (tags) that the server doesn't know about.
         let mut merged = contacts;
         for entry in &mut merged {
-            if let Some(existing) = self
-                .config
-                .ui
-                .contacts
-                .iter()
-                .find(|c| normalize_remote_id(&c.remote_id) == normalize_remote_id(&entry.remote_id))
-            {
+            if let Some(existing) = self.config.ui.contacts.iter().find(|c| {
+                normalize_remote_id(&c.remote_id) == normalize_remote_id(&entry.remote_id)
+            }) {
                 entry.tags = existing.tags.clone();
             }
         }
@@ -871,10 +874,7 @@ impl EvertyDeskApp {
 fn compact_panel_frame() -> egui::Frame {
     egui::Frame::NONE
         .fill(crate::theme::palette().surface)
-        .stroke(egui::Stroke::new(
-            1.0,
-            crate::theme::palette().border,
-        ))
+        .stroke(egui::Stroke::new(1.0, crate::theme::palette().border))
         .corner_radius(egui::CornerRadius::same(8))
         .inner_margin(egui::Margin::symmetric(12, 10))
 }
@@ -994,7 +994,9 @@ fn draw_contact_tile(
             });
         }
 
-        ui.add_space((inner_height - 98.0 - if contact.tags.is_empty() { 0.0 } else { 18.0 }).max(0.0));
+        ui.add_space(
+            (inner_height - 98.0 - if contact.tags.is_empty() { 0.0 } else { 18.0 }).max(0.0),
+        );
         ui.horizontal(|ui| {
             status_dot(
                 ui,

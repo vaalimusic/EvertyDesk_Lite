@@ -53,8 +53,13 @@ In 47 mode: buffer_depth = max(2ms, jitter_p95 × 1.2) — more aggressive.
 
 FEC is a native SD-UDP feature. Parameters:
 - **N**: data packets in a group
-- **K**: repair packets (XOR parity of N data packets)
-- Recovery: any N packets from (N+K) → full group recovered
+- **K**: repair packets (XOR parity, disjoint coverage classes `i mod K`)
+- Recovery: at most one lost packet per coverage class (up to K per
+  group when losses land in different classes). Not "any N of N+K" —
+  that is Reed–Solomon territory, deliberately out of scope.
+- Every protected unit carries a `[u16 BE true_len]` prefix so
+  recovered packets know their real length — see
+  [EVRT2_PACKET.md](../spec/EVRT2_PACKET.md) § FEC (normative).
 
 Default configuration by mode:
 | Mode | N | K | Redundancy | When to use FEC |
@@ -87,7 +92,29 @@ Host reacts:
 - `silicon_ok = false` → switch to lower-complexity encoding
 - `decoded_fps < target × 0.8` → reduce resolution or FPS cap
 
-### 5. Path Probing (Multi-Candidate)
+### 5. Liveness (Keepalive Discipline)
+
+A receive-only EVRT2 client generates no natural upstream traffic
+after HELLO — and every silent link dies. Two rules, both discovered
+as real session-drop bugs during live testing (2026-07):
+
+```
+UDP media path:
+  Client sends FEEDBACK at least every 3s, even when it has nothing
+  to report. Host tears the session down after 15s of client silence
+  (IDLE_TIMEOUT) — without the keepalive, a healthy receive-only
+  client is indistinguishable from a dead one and gets disconnected
+  mid-stream.
+
+TCP relay / signaling channel:
+  When no media flows over a TCP relay stream (e.g. an EVRT2-only
+  session where video runs on the separate UDP socket), BOTH ends
+  emit an empty keepalive frame at least once per second. Relays and
+  NAT middleboxes silently drop TCP connections after ~30s of
+  bidirectional silence.
+```
+
+### 6. Path Probing (Multi-Candidate)
 
 SD-UDP tries multiple host endpoints simultaneously on connection:
 - All LAN IP candidates

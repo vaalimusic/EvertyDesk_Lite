@@ -54,7 +54,11 @@ impl EvertyDeskApp {
                                 |ui| {
                                     if draft.ui.ui_scale == 0.0 {
                                         // Show platform default
-                                        let default_scale = if cfg!(target_os = "macos") { 1.08_f32 } else { 1.0_f32 };
+                                        let default_scale = if cfg!(target_os = "macos") {
+                                            1.08_f32
+                                        } else {
+                                            1.0_f32
+                                        };
                                         draft.ui.ui_scale = default_scale;
                                     }
                                     let label = format!("{:.0}%", draft.ui.ui_scale * 100.0);
@@ -76,7 +80,13 @@ impl EvertyDeskApp {
 
                     ui.add_space(8.0);
 
-                    security_section(ui, selected_lang, draft, &mut self.show_password, &mut self.whitelist_new_id);
+                    security_section(
+                        ui,
+                        selected_lang,
+                        draft,
+                        &mut self.show_password,
+                        &mut self.whitelist_new_id,
+                    );
 
                     ui.add_space(8.0);
 
@@ -86,16 +96,24 @@ impl EvertyDeskApp {
                 });
 
                 // Detect unsaved changes.
-                let has_changes = self.settings_draft.as_ref().map(|d| {
-                    serde_json::to_string(d).ok() != serde_json::to_string(&self.config).ok()
-                }).unwrap_or(false);
+                let has_changes = self
+                    .settings_draft
+                    .as_ref()
+                    .map(|d| {
+                        serde_json::to_string(d).ok() != serde_json::to_string(&self.config).ok()
+                    })
+                    .unwrap_or(false);
 
                 ui.separator();
                 if has_changes {
                     ui.label(
-                        egui::RichText::new(tr(selected_lang, "⚠ Есть несохранённые изменения", "⚠ You have unsaved changes"))
-                            .size(12.0)
-                            .color(egui::Color32::from_rgb(0xFF, 0xB7, 0x47)),
+                        egui::RichText::new(tr(
+                            selected_lang,
+                            "⚠ Есть несохранённые изменения",
+                            "⚠ You have unsaved changes",
+                        ))
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(0xFF, 0xB7, 0x47)),
                     );
                 }
                 ui.horizontal(|ui| {
@@ -239,167 +257,210 @@ impl EvertyDeskApp {
         egui::ScrollArea::vertical()
             .max_height(scroll_h)
             .show(ui, |ui| {
-            // ── General ──────────────────────────────────────────────────────
-            settings_section(ui, tr(selected_lang, "Общие", "General"), |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(tr(selected_lang, "Язык интерфейса", "Interface language"));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if language_button(ui, "EN", selected_lang == UiLang::En).clicked() {
-                            selected_lang = UiLang::En;
-                        }
-                        if language_button(ui, "RU", selected_lang == UiLang::Ru).clicked() {
-                            selected_lang = UiLang::Ru;
-                        }
-                    });
-                });
-                ui.add_space(6.0);
-                // Переключатель темы оформления — с мгновенным предпросмотром.
-                ui.horizontal(|ui| {
-                    ui.label(tr(selected_lang, "Тема оформления", "Theme"));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        use crate::theme::ThemeMode;
-                        let dark_label = tr(selected_lang, "🌙 Тёмная", "🌙 Dark");
-                        let light_label = tr(selected_lang, "☀ Светлая", "☀ Light");
-                        let auto_label = tr(selected_lang, "⚙ Авто", "⚙ Auto");
-                        if language_button(ui, light_label, draft.ui.theme_mode == ThemeMode::Light).clicked() {
-                            draft.ui.theme_mode = ThemeMode::Light;
-                            crate::theme::apply(ui.ctx(), ThemeMode::Light);
-                        }
-                        if language_button(ui, dark_label, draft.ui.theme_mode == ThemeMode::Dark).clicked() {
-                            draft.ui.theme_mode = ThemeMode::Dark;
-                            crate::theme::apply(ui.ctx(), ThemeMode::Dark);
-                        }
-                        if language_button(ui, auto_label, draft.ui.theme_mode == ThemeMode::System).clicked() {
-                            draft.ui.theme_mode = ThemeMode::System;
-                            crate::theme::apply(ui.ctx(), ThemeMode::System);
-                        }
-                    });
-                });
-                ui.add_space(6.0);
-                ui.checkbox(
-                    &mut draft.ui.show_connection_details,
-                    tr(
-                        selected_lang,
-                        "Показывать детали подключения на главной",
-                        "Show connection details on main page",
-                    ),
-                );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    use crate::settings::CoordinateMode;
-                    ui.label(tr(selected_lang, "Режим координат мыши", "Mouse coordinate mode"));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        for (mode, label_ru, label_en) in [
-                            (CoordinateMode::Auto, "Авто", "Auto"),
-                            (CoordinateMode::Absolute, "Абсолютный", "Absolute"),
-                            (CoordinateMode::Local, "Локальный", "Local"),
-                        ] {
-                            let label = match selected_lang {
-                                crate::UiLang::Ru => label_ru,
-                                crate::UiLang::En => label_en,
-                            };
-                            if language_button(ui, label, draft.ui.coordinate_mode == mode).clicked() {
-                                draft.ui.coordinate_mode = mode;
+                // ── General ──────────────────────────────────────────────────────
+                settings_section(ui, tr(selected_lang, "Общие", "General"), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(tr(selected_lang, "Язык интерфейса", "Interface language"));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if language_button(ui, "EN", selected_lang == UiLang::En).clicked() {
+                                selected_lang = UiLang::En;
                             }
-                        }
+                            if language_button(ui, "RU", selected_lang == UiLang::Ru).clicked() {
+                                selected_lang = UiLang::Ru;
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+                    // Переключатель темы оформления — с мгновенным предпросмотром.
+                    ui.horizontal(|ui| {
+                        ui.label(tr(selected_lang, "Тема оформления", "Theme"));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            use crate::theme::ThemeMode;
+                            let dark_label = tr(selected_lang, "🌙 Тёмная", "🌙 Dark");
+                            let light_label = tr(selected_lang, "☀ Светлая", "☀ Light");
+                            let auto_label = tr(selected_lang, "⚙ Авто", "⚙ Auto");
+                            if language_button(
+                                ui,
+                                light_label,
+                                draft.ui.theme_mode == ThemeMode::Light,
+                            )
+                            .clicked()
+                            {
+                                draft.ui.theme_mode = ThemeMode::Light;
+                                crate::theme::apply(ui.ctx(), ThemeMode::Light);
+                            }
+                            if language_button(
+                                ui,
+                                dark_label,
+                                draft.ui.theme_mode == ThemeMode::Dark,
+                            )
+                            .clicked()
+                            {
+                                draft.ui.theme_mode = ThemeMode::Dark;
+                                crate::theme::apply(ui.ctx(), ThemeMode::Dark);
+                            }
+                            if language_button(
+                                ui,
+                                auto_label,
+                                draft.ui.theme_mode == ThemeMode::System,
+                            )
+                            .clicked()
+                            {
+                                draft.ui.theme_mode = ThemeMode::System;
+                                crate::theme::apply(ui.ctx(), ThemeMode::System);
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+                    ui.checkbox(
+                        &mut draft.ui.show_connection_details,
+                        tr(
+                            selected_lang,
+                            "Показывать детали подключения на главной",
+                            "Show connection details on main page",
+                        ),
+                    );
+                    ui.add_space(6.0);
+                    ui.checkbox(
+                        &mut draft.ui.show_tech_info,
+                        tr(
+                            selected_lang,
+                            "Показывать техническую информацию (fps, битрейт, кодек)",
+                            "Show technical info (fps, bitrate, codec)",
+                        ),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        use crate::settings::CoordinateMode;
+                        ui.label(tr(
+                            selected_lang,
+                            "Режим координат мыши",
+                            "Mouse coordinate mode",
+                        ));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            for (mode, label_ru, label_en) in [
+                                (CoordinateMode::Auto, "Авто", "Auto"),
+                                (CoordinateMode::Absolute, "Абсолютный", "Absolute"),
+                                (CoordinateMode::Local, "Локальный", "Local"),
+                            ] {
+                                let label = match selected_lang {
+                                    crate::UiLang::Ru => label_ru,
+                                    crate::UiLang::En => label_en,
+                                };
+                                if language_button(ui, label, draft.ui.coordinate_mode == mode)
+                                    .clicked()
+                                {
+                                    draft.ui.coordinate_mode = mode;
+                                }
+                            }
+                        });
                     });
                 });
-            });
 
-            ui.add_space(8.0);
+                ui.add_space(8.0);
 
-            // ── Security (with password) ─────────────────────────────────────
-            security_section(ui, selected_lang, draft, &mut self.show_password, &mut self.whitelist_new_id);
-
-            ui.add_space(8.0);
-
-            // ── Video ─────────────────────────────────────────────────────────
-            settings_section(ui, tr(selected_lang, "Видео", "Video"), |ui| {
-                video_settings_body(ui, selected_lang, draft);
-            });
-
-            ui.add_space(8.0);
-
-            // ── Network (collapsed by default) ───────────────────────────────
-            network_section(ui, selected_lang, draft, &mut self.settings_custom_server);
-
-            ui.add_space(8.0);
-
-            llm_settings_section(ui, selected_lang, draft);
-
-            ui.add_space(8.0);
-
-            hotfix_settings_section(ui, selected_lang, draft);
-
-            ui.add_space(8.0);
-
-            // ── Windows service ──────────────────────────────────────────────
-            settings_section(ui, tr(selected_lang, "Служба", "Service"), |ui| {
-                ui.label(
-                    egui::RichText::new(tr(
-                        selected_lang,
-                        "Фоновый режим: тот же исполняемый файл с аргументом --host.",
-                        "Background mode: same executable with the --host argument.",
-                    ))
-                    .size(12.0)
-                    .color(crate::theme::palette().text_weak),
+                // ── Security (with password) ─────────────────────────────────────
+                security_section(
+                    ui,
+                    selected_lang,
+                    draft,
+                    &mut self.show_password,
+                    &mut self.whitelist_new_id,
                 );
-                ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .button(tr(selected_lang, "Установить службу", "Install service"))
-                        .clicked()
-                    {
-                        self.service_status = Some(match install_host_service() {
-                            Ok(msg) => msg,
-                            Err(err) => err,
-                        });
-                    }
-                    if ui.button(tr(selected_lang, "Запустить", "Start")).clicked() {
-                        self.service_status = Some(match start_installed_service() {
-                            Ok(msg) => msg,
-                            Err(err) => err,
-                        });
-                    }
-                    if ui.button(tr(selected_lang, "Остановить", "Stop")).clicked() {
-                        self.service_status = Some(match stop_installed_service() {
-                            Ok(msg) => msg,
-                            Err(err) => err,
-                        });
-                    }
-                    if ui
-                        .button(tr(selected_lang, "Удалить службу", "Uninstall service"))
-                        .clicked()
-                    {
-                        self.service_status = Some(match uninstall_host_service() {
-                            Ok(msg) => msg,
-                            Err(err) => err,
-                        });
+
+                ui.add_space(8.0);
+
+                // ── Video ─────────────────────────────────────────────────────────
+                settings_section(ui, tr(selected_lang, "Видео", "Video"), |ui| {
+                    video_settings_body(ui, selected_lang, draft);
+                });
+
+                ui.add_space(8.0);
+
+                // ── Network (collapsed by default) ───────────────────────────────
+                network_section(ui, selected_lang, draft, &mut self.settings_custom_server);
+
+                ui.add_space(8.0);
+
+                llm_settings_section(ui, selected_lang, draft);
+
+                ui.add_space(8.0);
+
+                hotfix_settings_section(ui, selected_lang, draft);
+
+                ui.add_space(8.0);
+
+                // ── Windows service ──────────────────────────────────────────────
+                settings_section(ui, tr(selected_lang, "Служба", "Service"), |ui| {
+                    ui.label(
+                        egui::RichText::new(tr(
+                            selected_lang,
+                            "Фоновый режим: тот же исполняемый файл с аргументом --host.",
+                            "Background mode: same executable with the --host argument.",
+                        ))
+                        .size(12.0)
+                        .color(crate::theme::palette().text_weak),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .button(tr(selected_lang, "Установить службу", "Install service"))
+                            .clicked()
+                        {
+                            self.service_status = Some(match install_host_service() {
+                                Ok(msg) => msg,
+                                Err(err) => err,
+                            });
+                        }
+                        if ui.button(tr(selected_lang, "Запустить", "Start")).clicked() {
+                            self.service_status = Some(match start_installed_service() {
+                                Ok(msg) => msg,
+                                Err(err) => err,
+                            });
+                        }
+                        if ui.button(tr(selected_lang, "Остановить", "Stop")).clicked() {
+                            self.service_status = Some(match stop_installed_service() {
+                                Ok(msg) => msg,
+                                Err(err) => err,
+                            });
+                        }
+                        if ui
+                            .button(tr(selected_lang, "Удалить службу", "Uninstall service"))
+                            .clicked()
+                        {
+                            self.service_status = Some(match uninstall_host_service() {
+                                Ok(msg) => msg,
+                                Err(err) => err,
+                            });
+                        }
+                    });
+                    if let Some(status) = &self.service_status {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new(status)
+                                .size(12.0)
+                                .color(crate::theme::palette().text_weak),
+                        );
                     }
                 });
-                if let Some(status) = &self.service_status {
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(status)
-                            .size(12.0)
-                            .color(crate::theme::palette().text_weak),
-                    );
-                }
-            });
 
-            ui.add_space(8.0);
-            settings_section(ui, tr(selected_lang, "О программе", "About"), |ui| {
-                ui.label(
-                    egui::RichText::new(format!("{APP_NAME} v{APP_VERSION}"))
-                        .color(crate::theme::palette().text),
+                ui.add_space(8.0);
+                settings_section(
+                    ui,
+                    tr(selected_lang, "О программе", "About"),
+                    |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{APP_NAME} v{APP_VERSION}"))
+                                .color(crate::theme::palette().text),
+                        );
+                        ui.label(format!(
+                            "{}: {}",
+                            tr(selected_lang, "Конфиг", "Config"),
+                            settings_mod::config_path().display()
+                        ));
+                    },
                 );
-                ui.label(format!(
-                    "{}: {}",
-                    tr(selected_lang, "Конфиг", "Config"),
-                    settings_mod::config_path().display()
-                ));
             });
-        });
 
         self.ui_lang = selected_lang;
         ui.add_space(10.0);
@@ -474,64 +535,67 @@ fn security_section(
     show_password: &mut bool,
     whitelist_new_id: &mut String,
 ) {
-    settings_section(ui, tr(selected_lang, "Безопасность", "Security"), |ui| {
-        // ── Password row ─────────────────────────────────────────────────────
-        {
-            let label = tr(selected_lang, "Пароль доступа", "Access password");
-            let hint = tr(
-                selected_lang,
-                "Не задан — нужно подтверждение",
-                "Not set — approval required",
-            );
-            let eye_icon = if *show_password { "🙈" } else { "👁" };
-
-            ui.horizontal(|ui| {
-                ui.set_min_height(36.0);
-                ui.set_width(ui.available_width());
-                ui.add_sized(
-                    egui::vec2(150.0, 24.0),
-                    egui::Label::new(
-                        egui::RichText::new(label)
-                            .size(13.0)
-                            .color(crate::theme::palette().text_weak),
-                    )
-                    .truncate(),
+    settings_section(
+        ui,
+        tr(selected_lang, "Безопасность", "Security"),
+        |ui| {
+            // ── Password row ─────────────────────────────────────────────────────
+            {
+                let label = tr(selected_lang, "Пароль доступа", "Access password");
+                let hint = tr(
+                    selected_lang,
+                    "Не задан — нужно подтверждение",
+                    "Not set — approval required",
                 );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button("↻")
-                        .on_hover_text(tr(
-                            selected_lang,
-                            "Сгенерировать новый пароль",
-                            "Generate new password",
-                        ))
-                        .clicked()
-                    {
-                        draft.local_password = crate::settings::generate_numeric_token(6);
-                    }
-                    if ui
-                        .small_button(eye_icon)
-                        .on_hover_text(tr(
-                            selected_lang,
-                            "Показать / скрыть пароль",
-                            "Show / hide password",
-                        ))
-                        .clicked()
-                    {
-                        *show_password = !*show_password;
-                    }
-                    let width = ui.available_width().min(300.0);
+                let eye_icon = if *show_password { "🙈" } else { "👁" };
+
+                ui.horizontal(|ui| {
+                    ui.set_min_height(36.0);
+                    ui.set_width(ui.available_width());
                     ui.add_sized(
-                        egui::vec2(width, 34.0),
-                        egui::TextEdit::singleline(&mut draft.local_password)
-                            .hint_text(hint)
-                            .password(!*show_password)
-                            .font(egui::TextStyle::Monospace),
+                        egui::vec2(150.0, 24.0),
+                        egui::Label::new(
+                            egui::RichText::new(label)
+                                .size(13.0)
+                                .color(crate::theme::palette().text_weak),
+                        )
+                        .truncate(),
                     );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button("↻")
+                            .on_hover_text(tr(
+                                selected_lang,
+                                "Сгенерировать новый пароль",
+                                "Generate new password",
+                            ))
+                            .clicked()
+                        {
+                            draft.local_password = crate::settings::generate_numeric_token(6);
+                        }
+                        if ui
+                            .small_button(eye_icon)
+                            .on_hover_text(tr(
+                                selected_lang,
+                                "Показать / скрыть пароль",
+                                "Show / hide password",
+                            ))
+                            .clicked()
+                        {
+                            *show_password = !*show_password;
+                        }
+                        let width = ui.available_width().min(300.0);
+                        ui.add_sized(
+                            egui::vec2(width, 34.0),
+                            egui::TextEdit::singleline(&mut draft.local_password)
+                                .hint_text(hint)
+                                .password(!*show_password)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                    });
                 });
-            });
-            ui.add_space(2.0);
-            ui.label(
+                ui.add_space(2.0);
+                ui.label(
                 egui::RichText::new(tr(
                     selected_lang,
                     "Клиент вводит этот пароль — подключается без диалога подтверждения. Нажмите Сохранить.",
@@ -540,110 +604,117 @@ fn security_section(
                 .size(11.0)
                 .color(crate::theme::palette().text_muted),
             );
-            ui.add_space(6.0);
-        }
-
-        ui.checkbox(
-            &mut draft.security.require_confirmation,
-            tr(
-                selected_lang,
-                "Подтверждать каждое входящее подключение",
-                "Confirm every incoming connection",
-            ),
-        );
-        ui.add_space(2.0);
-        ui.checkbox(
-            &mut draft.security.allow_keyboard_mouse,
-            tr(
-                selected_lang,
-                "Разрешить управление клавиатурой и мышью",
-                "Allow keyboard and mouse control",
-            ),
-        );
-        ui.add_space(2.0);
-        ui.checkbox(
-            &mut draft.security.allow_clipboard,
-            tr(
-                selected_lang,
-                "Разрешить доступ к буферу обмена",
-                "Allow clipboard access",
-            ),
-        );
-
-        ui.add_space(10.0);
-        ui.separator();
-        ui.add_space(6.0);
-
-        // ── Whitelist ────────────────────────────────────────────────────────
-        ui.label(
-            egui::RichText::new(tr(
-                selected_lang,
-                "Белый список (авто-подключение без диалога)",
-                "Whitelist (auto-approve without dialog)",
-            ))
-            .size(13.0)
-            .strong()
-            .color(crate::theme::palette().text),
-        );
-        ui.add_space(2.0);
-        ui.label(
-            egui::RichText::new(tr(
-                selected_lang,
-                "ID из этого списка подключаются без подтверждения",
-                "IDs in this list connect without approval prompt",
-            ))
-            .size(11.0)
-            .color(crate::theme::palette().text_muted),
-        );
-        ui.add_space(6.0);
-
-        // Existing entries
-        let mut remove_idx: Option<usize> = None;
-        for (i, wid) in draft.security.whitelist.iter().enumerate() {
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(wid)
-                        .monospace()
-                        .size(13.0)
-                        .color(crate::theme::palette().text),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button("✕")
-                        .on_hover_text(tr(selected_lang, "Удалить", "Remove"))
-                        .clicked()
-                    {
-                        remove_idx = Some(i);
-                    }
-                });
-            });
-        }
-        if let Some(idx) = remove_idx {
-            draft.security.whitelist.remove(idx);
-        }
-
-        // Add new entry
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(whitelist_new_id)
-                    .hint_text(tr(selected_lang, "Добавить ID…", "Add ID…"))
-                    .desired_width(180.0)
-                    .font(egui::TextStyle::Monospace),
-            );
-            let can_add = !whitelist_new_id.trim().is_empty()
-                && !draft
-                    .security
-                    .whitelist
-                    .contains(&whitelist_new_id.trim().to_owned());
-            if ui
-                .add_enabled(can_add, egui::Button::new(tr(selected_lang, "Добавить", "Add")))
-                .clicked()
-            {
-                draft.security.whitelist.push(whitelist_new_id.trim().to_owned());
-                whitelist_new_id.clear();
+                ui.add_space(6.0);
             }
-        });
-    });
+
+            ui.checkbox(
+                &mut draft.security.require_confirmation,
+                tr(
+                    selected_lang,
+                    "Подтверждать каждое входящее подключение",
+                    "Confirm every incoming connection",
+                ),
+            );
+            ui.add_space(2.0);
+            ui.checkbox(
+                &mut draft.security.allow_keyboard_mouse,
+                tr(
+                    selected_lang,
+                    "Разрешить управление клавиатурой и мышью",
+                    "Allow keyboard and mouse control",
+                ),
+            );
+            ui.add_space(2.0);
+            ui.checkbox(
+                &mut draft.security.allow_clipboard,
+                tr(
+                    selected_lang,
+                    "Разрешить доступ к буферу обмена",
+                    "Allow clipboard access",
+                ),
+            );
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(6.0);
+
+            // ── Whitelist ────────────────────────────────────────────────────────
+            ui.label(
+                egui::RichText::new(tr(
+                    selected_lang,
+                    "Белый список (авто-подключение без диалога)",
+                    "Whitelist (auto-approve without dialog)",
+                ))
+                .size(13.0)
+                .strong()
+                .color(crate::theme::palette().text),
+            );
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(tr(
+                    selected_lang,
+                    "ID из этого списка подключаются без подтверждения",
+                    "IDs in this list connect without approval prompt",
+                ))
+                .size(11.0)
+                .color(crate::theme::palette().text_muted),
+            );
+            ui.add_space(6.0);
+
+            // Existing entries
+            let mut remove_idx: Option<usize> = None;
+            for (i, wid) in draft.security.whitelist.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(wid)
+                            .monospace()
+                            .size(13.0)
+                            .color(crate::theme::palette().text),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button(egui_phosphor::regular::TRASH)
+                            .on_hover_text(tr(selected_lang, "Удалить", "Remove"))
+                            .clicked()
+                        {
+                            remove_idx = Some(i);
+                        }
+                    });
+                });
+            }
+            if let Some(idx) = remove_idx {
+                draft.security.whitelist.remove(idx);
+            }
+
+            // Add new entry
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(whitelist_new_id)
+                        .hint_text(tr(selected_lang, "Добавить ID…", "Add ID…"))
+                        .desired_width(180.0)
+                        .font(egui::TextStyle::Monospace),
+                );
+                let can_add = !whitelist_new_id.trim().is_empty()
+                    && !draft
+                        .security
+                        .whitelist
+                        .contains(&whitelist_new_id.trim().to_owned());
+                if ui
+                    .add_enabled(
+                        can_add,
+                        egui::Button::new(tr(selected_lang, "Добавить", "Add")),
+                    )
+                    .clicked()
+                {
+                    draft
+                        .security
+                        .whitelist
+                        .push(whitelist_new_id.trim().to_owned());
+                    whitelist_new_id.clear();
+                }
+            });
+        },
+    );
 }
 
 // ── Network section: hidden by default, expandable ───────────────────────────
@@ -787,21 +858,43 @@ fn network_section(
 // ── Video settings body (shared) ─────────────────────────────────────────────
 
 fn video_settings_body(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut AppConfig) {
+    use egui_phosphor::regular as ph;
     // Quick presets row
     ui.horizontal(|ui| {
         ui.label(tr(selected_lang, "Пресет", "Preset"));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button(tr(selected_lang, "🎮 Игры", "🎮 Game")).clicked() {
+            if ui
+                .button(format!(
+                    "{}  {}",
+                    ph::GAME_CONTROLLER,
+                    tr(selected_lang, "Игры", "Game")
+                ))
+                .clicked()
+            {
                 draft.display.streaming_mode = crate::settings::StreamingMode::Game;
                 draft.display.target_fps = 60;
                 draft.display.adaptive_quality = false;
             }
-            if ui.button(tr(selected_lang, "⚖️ Баланс", "⚖️ Balanced")).clicked() {
+            if ui
+                .button(format!(
+                    "{}  {}",
+                    ph::SCALES,
+                    tr(selected_lang, "Баланс", "Balanced")
+                ))
+                .clicked()
+            {
                 draft.display.streaming_mode = crate::settings::StreamingMode::Interactive;
                 draft.display.target_fps = 30;
                 draft.display.adaptive_quality = true;
             }
-            if ui.button(tr(selected_lang, "🎯 Поддержка", "🎯 Support")).clicked() {
+            if ui
+                .button(format!(
+                    "{}  {}",
+                    ph::LIFEBUOY,
+                    tr(selected_lang, "Поддержка", "Support")
+                ))
+                .clicked()
+            {
                 draft.display.streaming_mode = crate::settings::StreamingMode::Support;
                 draft.display.target_fps = 15;
                 draft.display.adaptive_quality = true;
@@ -819,21 +912,10 @@ fn video_settings_body(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut App
     );
     ui.add_space(8.0);
 
-    // Row: Transport / Codec
-    ui.horizontal(|ui| {
-        ui.label(tr(selected_lang, "Транспорт", "Transport"));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            for codec in codec_preference_order() {
-                ui.selectable_value(&mut draft.display.codec, codec, codec.label());
-            }
-        });
-    });
-    ui.label(
-        egui::RichText::new(codec_status_text(draft.display.codec))
-            .size(11.0)
-            .color(crate::theme::palette().text_muted),
-    );
-    ui.add_space(4.0);
+    // Выбор кодека/транспорта убран из UI: он согласуется автоматически между
+    // хостом и клиентом по реальным аппаратным возможностям обеих сторон
+    // (EVRT UDP при прямом соединении, иначе H264/H265 по TCP relay). Ручной
+    // выбор только путал пользователя. Поле draft.display.codec остаётся Auto.
 
     // Row: Encoder
     ui.horizontal(|ui| {
@@ -1120,7 +1202,10 @@ fn settings_secret_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
     ui.add_space(4.0);
 }
 
-fn codec_preference_order() -> [CodecPreference; 6] {
+/// Used by the per-connection codec picker in the main connect panel
+/// (`EvertyDeskApp::remote_connect_ui` in main.rs) for the EVRT1 pipeline —
+/// EVRT2 negotiates its own codec independently, this list doesn't apply there.
+pub(crate) fn codec_preference_order() -> [CodecPreference; 6] {
     [
         CodecPreference::Evrtck,
         CodecPreference::Auto,
@@ -1131,10 +1216,11 @@ fn codec_preference_order() -> [CodecPreference; 6] {
     ]
 }
 
-fn codec_status_text(codec: CodecPreference) -> String {
+pub(crate) fn codec_status_text(codec: CodecPreference) -> String {
     match codec {
         CodecPreference::Evrtck => {
-            "EVRTCK: UDP-транспорт, lossless XOR-diff. Лучший выбор для LAN и прямых подключений.".to_owned()
+            "EVRTCK: UDP-транспорт, lossless XOR-diff. Лучший выбор для LAN и прямых подключений."
+                .to_owned()
         }
         CodecPreference::Auto => {
             "Авто: EVRT если доступен, иначе TCP/H264. Кодек выбирается автоматически.".to_owned()
@@ -1149,7 +1235,8 @@ fn codec_status_text(codec: CodecPreference) -> String {
             "H265: TCP relay, без EVRT. Лучше H264 по качеству при том же битрейте.".to_owned()
         }
         CodecPreference::Vp9 => {
-            "VP9: TCP relay, без EVRT. Открытый кодек, хорошее качество на низком битрейте.".to_owned()
+            "VP9: TCP relay, без EVRT. Открытый кодек, хорошее качество на низком битрейте."
+                .to_owned()
         }
         CodecPreference::Av1 if !crate::video::av1_available() => {
             "AV1: TCP relay — decoder недоступен в этой сборке, будет fallback на H264.".to_owned()
@@ -1197,6 +1284,7 @@ fn default_config_from(config: &AppConfig) -> AppConfig {
         hotfix: config.hotfix.clone(),
         local_id: config.local_id.clone(),
         local_password: config.local_password.clone(),
+        permanent_password: config.permanent_password.clone(),
         ui: config.ui.clone(),
         udp_bind_port: 0,
         evrt_udp_port: 0,
@@ -1209,7 +1297,11 @@ fn default_config_from(config: &AppConfig) -> AppConfig {
 fn hotfix_settings_section(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut AppConfig) {
     settings_section(
         ui,
-        tr(selected_lang, "AI Hotfix (авто-исправления)", "AI Hotfix (auto-fixes)"),
+        tr(
+            selected_lang,
+            "AI Hotfix (авто-исправления)",
+            "AI Hotfix (auto-fixes)",
+        ),
         |ui| {
             ui.label(
                 egui::RichText::new(tr(
@@ -1256,34 +1348,50 @@ fn hotfix_settings_section(ui: &mut egui::Ui, selected_lang: UiLang, draft: &mut
                 ui.add_space(4.0);
 
                 // Проверка ключа — показываем статус
-                let key_status: (String, egui::Color32) = if draft.hotfix.signing_public_key.trim().is_empty() {
-                    (
-                        tr(selected_lang, "Ключ подписи не задан — подпись не проверяется", "Signing key not set — signatures won't be verified").to_owned(),
-                        crate::theme::palette().warning,
-                    )
-                } else {
-                    match base64::engine::general_purpose::STANDARD
-                        .decode(draft.hotfix.signing_public_key.trim())
-                    {
-                        Ok(b) if b.len() == 32 => (
-                            tr(selected_lang, "Ключ корректен (32 байта Ed25519)", "Key valid (32-byte Ed25519)").to_owned(),
-                            crate::theme::palette().success,
-                        ),
-                        Ok(b) => (
-                            format!(
-                                "{} ({} {})",
-                                tr(selected_lang, "Неверная длина:", "Wrong length:"),
-                                b.len(),
-                                tr(selected_lang, "байт, ожидается 32", "bytes, expected 32")
+                let key_status: (String, egui::Color32) =
+                    if draft.hotfix.signing_public_key.trim().is_empty() {
+                        (
+                            tr(
+                                selected_lang,
+                                "Ключ подписи не задан — подпись не проверяется",
+                                "Signing key not set — signatures won't be verified",
+                            )
+                            .to_owned(),
+                            crate::theme::palette().warning,
+                        )
+                    } else {
+                        match base64::engine::general_purpose::STANDARD
+                            .decode(draft.hotfix.signing_public_key.trim())
+                        {
+                            Ok(b) if b.len() == 32 => (
+                                tr(
+                                    selected_lang,
+                                    "Ключ корректен (32 байта Ed25519)",
+                                    "Key valid (32-byte Ed25519)",
+                                )
+                                .to_owned(),
+                                crate::theme::palette().success,
                             ),
-                            crate::theme::palette().danger,
-                        ),
-                        Err(_) => (
-                            tr(selected_lang, "Ошибка декодирования Base64", "Base64 decode error").to_owned(),
-                            crate::theme::palette().danger,
-                        ),
-                    }
-                };
+                            Ok(b) => (
+                                format!(
+                                    "{} ({} {})",
+                                    tr(selected_lang, "Неверная длина:", "Wrong length:"),
+                                    b.len(),
+                                    tr(selected_lang, "байт, ожидается 32", "bytes, expected 32")
+                                ),
+                                crate::theme::palette().danger,
+                            ),
+                            Err(_) => (
+                                tr(
+                                    selected_lang,
+                                    "Ошибка декодирования Base64",
+                                    "Base64 decode error",
+                                )
+                                .to_owned(),
+                                crate::theme::palette().danger,
+                            ),
+                        }
+                    };
 
                 ui.horizontal(|ui| {
                     status_dot(ui, key_status.1);

@@ -715,8 +715,7 @@ mod macos {
                 self.session = ptr::null_mut();
             }
 
-            let format =
-                create_format_description(self.codec, &self.vps, &self.sps, &self.pps)?;
+            let format = create_format_description(self.codec, &self.vps, &self.sps, &self.pps)?;
             let decoder_spec = create_hardware_decoder_specification();
             let (attrs, attrs_value) = create_bgra_pixel_buffer_attributes();
             let callback = VTDecompressionOutputCallbackRecord {
@@ -874,7 +873,11 @@ mod macos {
         if status != 0 || format.is_null() {
             return Err(format!(
                 "CMVideoFormatDescriptionCreateFrom{}ParameterSets status={status}",
-                if codec == NvencCodec::H265 { "HEVC" } else { "H264" }
+                if codec == NvencCodec::H265 {
+                    "HEVC"
+                } else {
+                    "H264"
+                }
             ));
         }
         Ok(format)
@@ -1244,7 +1247,14 @@ mod macos {
         let mut header_len = 4i32;
         let mut first_ptr = ptr::null();
         let mut first_len = 0usize;
-        let status = getter(format, 0, &mut first_ptr, &mut first_len, &mut count, &mut header_len);
+        let status = getter(
+            format,
+            0,
+            &mut first_ptr,
+            &mut first_len,
+            &mut count,
+            &mut header_len,
+        );
         if status != 0 || count == 0 {
             return (Vec::new(), 4);
         }

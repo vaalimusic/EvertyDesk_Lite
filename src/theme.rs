@@ -250,7 +250,11 @@ pub fn apply_palette(ctx: &egui::Context, p: &Palette) {
     v.widgets.inactive.corner_radius = radius;
 
     // hovered
-    v.widgets.hovered.bg_fill = mix(p.surface_raised, p.accent, if p.mode.is_dark() { 0.10 } else { 0.06 });
+    v.widgets.hovered.bg_fill = mix(
+        p.surface_raised,
+        p.accent,
+        if p.mode.is_dark() { 0.10 } else { 0.06 },
+    );
     v.widgets.hovered.weak_bg_fill = p.surface_raised;
     v.widgets.hovered.bg_stroke = Stroke::new(1.0, p.border_strong);
     v.widgets.hovered.fg_stroke = Stroke::new(1.0, p.text);
@@ -258,7 +262,11 @@ pub fn apply_palette(ctx: &egui::Context, p: &Palette) {
     v.widgets.hovered.expansion = 1.0;
 
     // active — нажато
-    v.widgets.active.bg_fill = mix(p.surface_raised, p.accent, if p.mode.is_dark() { 0.18 } else { 0.12 });
+    v.widgets.active.bg_fill = mix(
+        p.surface_raised,
+        p.accent,
+        if p.mode.is_dark() { 0.18 } else { 0.12 },
+    );
     v.widgets.active.weak_bg_fill = p.surface_raised;
     v.widgets.active.bg_stroke = Stroke::new(1.0, p.accent);
     v.widgets.active.fg_stroke = Stroke::new(1.0, p.text);
@@ -299,11 +307,7 @@ fn shadow_color(p: &Palette, alpha: f32) -> Color32 {
 pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
     let lerp = |x: u8, y: u8| -> u8 { (x as f32 + (y as f32 - x as f32) * t).round() as u8 };
-    Color32::from_rgb(
-        lerp(a.r(), b.r()),
-        lerp(a.g(), b.g()),
-        lerp(a.b(), b.b()),
-    )
+    Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
 }
 
 /// Полупрозрачный оттенок акцента — для бейджей/подложек.
@@ -362,32 +366,47 @@ use egui::RichText;
 
 /// Заголовок раздела (H1, strong, основной текст).
 pub fn h1(text: impl Into<String>) -> RichText {
-    RichText::new(text.into()).size(font::H1).strong().color(palette().text)
+    RichText::new(text.into())
+        .size(font::H1)
+        .strong()
+        .color(palette().text)
 }
 
 /// Заголовок карты (H2, strong).
 pub fn h2(text: impl Into<String>) -> RichText {
-    RichText::new(text.into()).size(font::H2).strong().color(palette().text)
+    RichText::new(text.into())
+        .size(font::H2)
+        .strong()
+        .color(palette().text)
 }
 
 /// Подзаголовок / сильный лейбл (H3, strong).
 pub fn h3(text: impl Into<String>) -> RichText {
-    RichText::new(text.into()).size(font::H3).strong().color(palette().text)
+    RichText::new(text.into())
+        .size(font::H3)
+        .strong()
+        .color(palette().text)
 }
 
 /// Основной текст.
 pub fn body(text: impl Into<String>) -> RichText {
-    RichText::new(text.into()).size(font::BODY).color(palette().text)
+    RichText::new(text.into())
+        .size(font::BODY)
+        .color(palette().text)
 }
 
 /// Вторичный / приглушённый текст.
 pub fn weak(text: impl Into<String>) -> RichText {
-    RichText::new(text.into()).size(font::SMALL).color(palette().text_weak)
+    RichText::new(text.into())
+        .size(font::SMALL)
+        .color(palette().text_weak)
 }
 
 /// Подпись / метка поля (CAPTION, muted).
 pub fn caption(text: impl Into<String>) -> RichText {
-    RichText::new(text.into()).size(font::CAPTION).color(palette().text_muted)
+    RichText::new(text.into())
+        .size(font::CAPTION)
+        .color(palette().text_muted)
 }
 
 // ── Компонент-хелперы ────────────────────────────────────────────────────────

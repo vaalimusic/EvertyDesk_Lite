@@ -88,7 +88,10 @@ fn main() {
         dirty_one_pixel_in_tile(&mut frame2, w, idx, tiles_x, 200);
     }
     let focus_tile = (1usize, 3usize); // tile 25's own grid position
-    enc2.set_focus_pixel((focus_tile.0 * TILE + 1) as u32, (focus_tile.1 * TILE + 1) as u32);
+    enc2.set_focus_pixel(
+        (focus_tile.0 * TILE + 1) as u32,
+        (focus_tile.1 * TILE + 1) as u32,
+    );
     let pkt_focus = enc2.encode(&frame2, 2);
     let order_focus = wire_tile_order(&pkt_focus.data);
     println!("WITH focus at tile {focus_tile:?} (= tile 25's position):");
@@ -101,7 +104,10 @@ fn main() {
 
     // ── Prove it still decodes correctly despite the reordering ────────────
     let decoded = dec2.decode(&pkt_focus).unwrap();
-    let expected: Vec<u8> = frame2.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0], p[3]]).collect();
+    let expected: Vec<u8> = frame2
+        .chunks_exact(4)
+        .flat_map(|p| [p[2], p[1], p[0], p[3]])
+        .collect();
     let correct = decoded == expected.as_slice();
     println!(
         "Round-trip correctness with priority-ordered wire stream: {}",
@@ -113,5 +119,8 @@ fn main() {
         pkt_focus.data.len()
     );
 
-    assert!(correct, "demo invariant violated — this should never happen");
+    assert!(
+        correct,
+        "demo invariant violated — this should never happen"
+    );
 }

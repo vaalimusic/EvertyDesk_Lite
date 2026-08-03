@@ -21,8 +21,8 @@
 #![cfg(windows)]
 
 use std::{
-    fs::{File, OpenOptions},
     fmt,
+    fs::{File, OpenOptions},
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
     path::PathBuf,
@@ -33,12 +33,13 @@ use std::{
 
 use native_tls::TlsConnector;
 
-use ironrdp_blocking::{Framed, connect_begin, mark_as_upgraded, single_sequence_step};
+use ironrdp_blocking::{connect_begin, mark_as_upgraded, single_sequence_step, Framed};
 use ironrdp_connector::{
     BitmapConfig, ClientConnector, ClientConnectorState, Config, ConnectionResult, Credentials,
     DesktopSize,
 };
 use ironrdp_core::WriteBuf;
+use ironrdp_graphics::{image_processing::PixelFormat, pointer::DecodedPointer};
 use ironrdp_pdu::{
     gcc::KeyboardType,
     input::{
@@ -48,13 +49,12 @@ use ironrdp_pdu::{
     pcb::{PcbVersion, PreconnectionBlob},
     rdp::capability_sets::MajorPlatformType,
 };
-use ironrdp_session::{ActiveStage, ActiveStageOutput, image::DecodedImage};
-use ironrdp_graphics::{image_processing::PixelFormat, pointer::DecodedPointer};
+use ironrdp_session::{image::DecodedImage, ActiveStage, ActiveStageOutput};
 
 // Reuse the generic, transport-agnostic RDP plumbing from the VirtualBox path.
 use crate::vbox_rdp::{
-    Poll, VrdeCmd, char_to_rdp_scancode, composite_cursor, is_ignorable_pdu_error,
-    is_transient_read_error, sanitize_desktop_size, send_fastpath_input,
+    char_to_rdp_scancode, composite_cursor, is_ignorable_pdu_error, is_transient_read_error,
+    sanitize_desktop_size, send_fastpath_input, Poll, VrdeCmd,
 };
 
 /// Hyper-V VM-connection broker port on the host.
@@ -80,10 +80,17 @@ pub struct RdpSession {
 
 impl RdpSession {
     /// Open an Enhanced Session connection to `vm_guid` (Msvm_ComputerSystem.Name).
-    pub fn connect(vm_guid: &str, creds: RdpCredentials, desktop_size: (u16, u16)) -> Result<Self, String> {
+    pub fn connect(
+        vm_guid: &str,
+        creds: RdpCredentials,
+        desktop_size: (u16, u16),
+    ) -> Result<Self, String> {
         // Normalize to a bare lowercase GUID (no braces) for the preconnection
         // blob — that's the form vmconnect/FreeRDP send.
-        let vm_guid = vm_guid.trim().trim_matches(|c| c == '{' || c == '}').to_lowercase();
+        let vm_guid = vm_guid
+            .trim()
+            .trim_matches(|c| c == '{' || c == '}')
+            .to_lowercase();
         if vm_guid.split('-').count() != 5 {
             return Err(format!("invalid VM GUID: {vm_guid}"));
         }
@@ -110,7 +117,11 @@ impl RdpSession {
             })
             .map_err(|e| format!("spawn HV-RDP thread: {e}"))?;
 
-        Ok(RdpSession { cmd_tx, frame_rx, status_rx })
+        Ok(RdpSession {
+            cmd_tx,
+            frame_rx,
+            status_rx,
+        })
     }
 
     pub fn send(&self, cmd: VrdeCmd) {
@@ -134,12 +145,19 @@ fn hv_log_path() -> Option<PathBuf> {
 }
 
 fn open_hv_log() -> Option<File> {
-    OpenOptions::new().create(true).append(true).open(hv_log_path()?).ok()
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(hv_log_path()?)
+        .ok()
 }
 
 fn hv_log(file: &mut Option<File>, args: fmt::Arguments<'_>) {
     if let Some(f) = file.as_mut() {
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or_default();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or_default();
         let _ = writeln!(f, "[{ts}] {args}");
         let _ = f.flush();
     }
@@ -161,7 +179,10 @@ fn hv_rdp_thread(
     status_tx: mpsc::SyncSender<String>,
 ) {
     let mut log_file = open_hv_log();
-    hv_log(&mut log_file, format_args!("--- HV-RDP session start vm={vm_guid} ---"));
+    hv_log(
+        &mut log_file,
+        format_args!("--- HV-RDP session start vm={vm_guid} ---"),
+    );
 
     macro_rules! status {
         ($($t:tt)*) => {{
@@ -175,7 +196,9 @@ fn hv_rdp_thread(
     }
 
     // ── TCP to the host VM-connection broker ─────────────────────────────────
-    let addr: SocketAddr = format!("127.0.0.1:{HYPERV_VMCONNECT_PORT}").parse().unwrap();
+    let addr: SocketAddr = format!("127.0.0.1:{HYPERV_VMCONNECT_PORT}")
+        .parse()
+        .unwrap();
     status!("HV-RDP: подключение к брокеру 127.0.0.1:{HYPERV_VMCONNECT_PORT}…");
     let mut tcp = match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
         Ok(s) => s,
@@ -203,12 +226,18 @@ fn hv_rdp_thread(
         status!("HV-RDP: send preconnection blob: {e}");
         return;
     }
-    diag!("HV-RDP: preconnection blob отправлен ({} байт, VmId={vm_guid})", pcb_bytes.len());
+    diag!(
+        "HV-RDP: preconnection blob отправлен ({} байт, VmId={vm_guid})",
+        pcb_bytes.len()
+    );
 
     let (desktop_width, desktop_height) = sanitize_desktop_size(desktop_size.0, desktop_size.1);
 
     let config = Config {
-        desktop_size: DesktopSize { width: desktop_width, height: desktop_height },
+        desktop_size: DesktopSize {
+            width: desktop_width,
+            height: desktop_height,
+        },
         desktop_scale_factor: 0,
         enable_tls: true,
         // Start without CredSSP/NLA; the X.224 negotiation log shows whether the
@@ -218,7 +247,11 @@ fn hv_rdp_thread(
             username: creds.username.clone(),
             password: creds.password.clone(),
         },
-        domain: if creds.domain.is_empty() { None } else { Some(creds.domain.clone()) },
+        domain: if creds.domain.is_empty() {
+            None
+        } else {
+            Some(creds.domain.clone())
+        },
         client_build: 0x0A28_0000,
         client_name: "EvertyDesk".to_owned(),
         keyboard_type: KeyboardType::IbmEnhanced,
@@ -249,7 +282,9 @@ fn hv_rdp_thread(
         multitransport_flags: None,
     };
 
-    let client_addr: SocketAddr = tcp.local_addr().unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap());
+    let client_addr: SocketAddr = tcp
+        .local_addr()
+        .unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap());
     let mut connector = ClientConnector::new(config, client_addr);
     let mut framed = Framed::new(tcp);
 
@@ -399,7 +434,9 @@ fn run_active_session<S: Read + Write>(
                         Ok(update) => had_update |= update,
                         Err(e) => diag!("HV-RDP input mouse move error: {e}"),
                     }
-                    if cursor_shape.is_some() { had_update = true; }
+                    if cursor_shape.is_some() {
+                        had_update = true;
+                    }
                 }
                 Ok(VrdeCmd::MouseButton { button, down }) => {
                     let btn = match button {
@@ -473,7 +510,8 @@ fn run_active_session<S: Read + Write>(
                             if shift {
                                 events.push(fast_key_event(0x2A, false, true));
                             }
-                            match send_fastpath_input(&mut active, &mut image, &mut framed, &events) {
+                            match send_fastpath_input(&mut active, &mut image, &mut framed, &events)
+                            {
                                 Ok(update) => had_update |= update,
                                 Err(e) => diag!("HV-RDP input text scancode error: {e}"),
                             }

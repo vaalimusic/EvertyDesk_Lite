@@ -1437,6 +1437,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer 0.10.4",
  "crypto-common 0.1.7",
+ "subtle",
 ]
 
 [[package]]
@@ -1889,6 +1890,7 @@ dependencies = [
  "egui-phosphor",
  "embed-resource",
  "font8x8",
+ "hmac 0.12.1",
  "image",
  "ironrdp-blocking",
  "ironrdp-connector",
@@ -1905,6 +1907,7 @@ dependencies = [
  "openh264",
  "pollster 0.3.0",
  "prost",
+ "raw-window-handle",
  "rayon",
  "serde",
  "serde_json",
@@ -2497,7 +2500,16 @@ version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
 dependencies = [
- "hmac",
+ "hmac 0.13.0",
+]
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest 0.10.7",
 ]
 
 [[package]]
@@ -3949,7 +3961,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f24f3eb2f4471b1730d59e4b730b747939960a8c7eb0c33c5a9076f2d3dddea"
 dependencies = [
  "digest 0.11.3",
- "hmac",
+ "hmac 0.13.0",
 ]
 
 [[package]]
@@ -4048,7 +4060,7 @@ dependencies = [
  "ff",
  "group",
  "hex",
- "hmac",
+ "hmac 0.13.0",
  "http",
  "inout 0.2.2",
  "md-5 0.11.0",
@@ -4135,7 +4147,7 @@ dependencies = [
  "cipher 0.5.2",
  "crypto-bigint",
  "des",
- "hmac",
+ "hmac 0.13.0",
  "inout 0.2.2",
  "oid",
  "pbkdf2",
@@ -4673,7 +4685,7 @@ version = "0.5.0-rc.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23a3127ee32baec36af75b4107082d9bd823501ec14a4e016be4b6b37faa74ae"
 dependencies = [
- "hmac",
+ "hmac 0.13.0",
  "subtle",
 ]
 
@@ -5364,7 +5376,7 @@ dependencies = [
  "futures",
  "getrandom 0.3.4",
  "group",
- "hmac",
+ "hmac 0.13.0",
  "md-5 0.11.0",
  "md4",
  "num-derive",

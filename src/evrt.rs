@@ -142,7 +142,11 @@ pub fn parse(buf: &[u8], len: usize) -> Option<EvrtPacket> {
     })
 }
 
-pub fn parse_authenticated(buf: &[u8], len: usize, session_token: Option<&str>) -> Option<EvrtPacket> {
+pub fn parse_authenticated(
+    buf: &[u8],
+    len: usize,
+    session_token: Option<&str>,
+) -> Option<EvrtPacket> {
     let Some(token) = session_token.filter(|token| valid_session_token(token)) else {
         return parse(buf, len);
     };
@@ -304,7 +308,13 @@ pub fn packetize_video_with_fec(
 
     // FEC только при ≥2 пакетах.
     let fec = if chunks.len() >= 2 {
-        build_fec_packets(frame_id, presentation_time_us, flags, &chunks, session_token)
+        build_fec_packets(
+            frame_id,
+            presentation_time_us,
+            flags,
+            &chunks,
+            session_token,
+        )
     } else {
         Vec::new()
     };
@@ -359,10 +369,10 @@ impl RoiRect {
         }
         Some(Self {
             frame_id: u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
-            x:        u32::from_be_bytes([b[4], b[5], b[6], b[7]]),
-            y:        u32::from_be_bytes([b[8], b[9], b[10], b[11]]),
-            w:        u32::from_be_bytes([b[12], b[13], b[14], b[15]]),
-            h:        u32::from_be_bytes([b[16], b[17], b[18], b[19]]),
+            x: u32::from_be_bytes([b[4], b[5], b[6], b[7]]),
+            y: u32::from_be_bytes([b[8], b[9], b[10], b[11]]),
+            w: u32::from_be_bytes([b[12], b[13], b[14], b[15]]),
+            h: u32::from_be_bytes([b[16], b[17], b[18], b[19]]),
         })
     }
 
@@ -513,7 +523,15 @@ fn packetize(
     presentation_time_us: u64,
     payload: &[u8],
 ) -> Vec<Vec<u8>> {
-    packetize_with_limit(packet_type, flags, frame_id, presentation_time_us, payload, MAX_PAYLOAD_SIZE, None)
+    packetize_with_limit(
+        packet_type,
+        flags,
+        frame_id,
+        presentation_time_us,
+        payload,
+        MAX_PAYLOAD_SIZE,
+        None,
+    )
 }
 
 fn packetize_authenticated(
@@ -927,19 +945,26 @@ impl ReceiverFeedback {
             return None;
         }
         Some(Self {
-            pressure:         Pressure::from_u8(b[0]),
-            backlog_frames:   u32::from_be_bytes([b[1],  b[2],  b[3],  b[4]]),
-            queue_drops:      u64::from_be_bytes([b[5],  b[6],  b[7],  b[8],
-                                                  b[9],  b[10], b[11], b[12]]),
-            decode_fps:       u32::from_be_bytes([b[13], b[14], b[15], b[16]]),
+            pressure: Pressure::from_u8(b[0]),
+            backlog_frames: u32::from_be_bytes([b[1], b[2], b[3], b[4]]),
+            queue_drops: u64::from_be_bytes([b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12]]),
+            decode_fps: u32::from_be_bytes([b[13], b[14], b[15], b[16]]),
             assembly_delay_ms: i32::from_be_bytes([b[17], b[18], b[19], b[20]]),
-            arrival_delta_ms:  i32::from_be_bytes([b[21], b[22], b[23], b[24]]),
-            decode_delta_ms:   i32::from_be_bytes([b[25], b[26], b[27], b[28]]),
-            present_delta_ms:  i32::from_be_bytes([b[29], b[30], b[31], b[32]]),
+            arrival_delta_ms: i32::from_be_bytes([b[21], b[22], b[23], b[24]]),
+            decode_delta_ms: i32::from_be_bytes([b[25], b[26], b[27], b[28]]),
+            present_delta_ms: i32::from_be_bytes([b[29], b[30], b[31], b[32]]),
             pulse_estimate_ms: i32::from_be_bytes([b[33], b[34], b[35], b[36]]),
             input_estimate_ms: i32::from_be_bytes([b[37], b[38], b[39], b[40]]),
-            max_width:  if b.len() >= 45 { u32::from_be_bytes([b[41], b[42], b[43], b[44]]) } else { 0 },
-            max_height: if b.len() >= 49 { u32::from_be_bytes([b[45], b[46], b[47], b[48]]) } else { 0 },
+            max_width: if b.len() >= 45 {
+                u32::from_be_bytes([b[41], b[42], b[43], b[44]])
+            } else {
+                0
+            },
+            max_height: if b.len() >= 49 {
+                u32::from_be_bytes([b[45], b[46], b[47], b[48]])
+            } else {
+                0
+            },
         })
     }
 }
@@ -1286,7 +1311,16 @@ mod tests {
     #[test]
     fn authenticated_packet_roundtrip_strips_tag() {
         let token = "0123456789abcdef0123456789abcdef";
-        let pkt = build_packet_authenticated(TYPE_VIDEO_FRAME, FLAG_KEY_FRAME, 7, 0, 1, 42, b"abc", Some(token));
+        let pkt = build_packet_authenticated(
+            TYPE_VIDEO_FRAME,
+            FLAG_KEY_FRAME,
+            7,
+            0,
+            1,
+            42,
+            b"abc",
+            Some(token),
+        );
         assert_eq!(pkt.len(), HEADER_SIZE + 3 + AUTH_TAG_SIZE);
         let parsed = parse_authenticated(&pkt, pkt.len(), Some(token)).unwrap();
         assert_eq!(parsed.packet_type, TYPE_VIDEO_FRAME);
@@ -1298,10 +1332,14 @@ mod tests {
     #[test]
     fn authenticated_packet_rejects_tamper() {
         let token = "0123456789abcdef0123456789abcdef";
-        let mut pkt = build_packet_authenticated(TYPE_VIDEO_FRAME, 0, 7, 0, 1, 42, b"abc", Some(token));
+        let mut pkt =
+            build_packet_authenticated(TYPE_VIDEO_FRAME, 0, 7, 0, 1, 42, b"abc", Some(token));
         pkt[HEADER_SIZE] ^= 0x01;
         assert!(parse_authenticated(&pkt, pkt.len(), Some(token)).is_none());
-        assert!(parse_authenticated(&pkt, pkt.len(), Some("ffffffffffffffffffffffffffffffff")).is_none());
+        assert!(
+            parse_authenticated(&pkt, pkt.len(), Some("ffffffffffffffffffffffffffffffff"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -1381,7 +1419,10 @@ mod tests {
         let token = "0123456789abcdef0123456789abcdef";
         let pkt = build_request_key_frame_authenticated(Some(token));
         // HMAC проверяется здесь — неправильный токен вернёт None.
-        assert!(parse_authenticated(&pkt, pkt.len(), Some("ffffffffffffffffffffffffffffffff")).is_none());
+        assert!(
+            parse_authenticated(&pkt, pkt.len(), Some("ffffffffffffffffffffffffffffffff"))
+                .is_none()
+        );
         let parsed = parse_authenticated(&pkt, pkt.len(), Some(token)).unwrap();
         assert_eq!(parsed.packet_type, TYPE_CONTROL);
         assert_eq!(control_session_token(&parsed.payload), None); // binary

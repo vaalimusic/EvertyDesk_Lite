@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Конфигурация службы доступности EvertyInputService.
+    canPerformGestures=true — разрешает dispatchGesture (тапы/свайпы/скролл),
+    чем служба физически инжектит ввод от подключённого клиента.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:description="@string/accessibility_desc"
+    android:accessibilityEventTypes="typeAllMask"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:notificationTimeout="100"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="false"
+    android:accessibilityFlags="flagDefault" />

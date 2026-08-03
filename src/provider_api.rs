@@ -95,7 +95,10 @@ impl PowerState {
         matches!(self, Self::Running)
     }
     pub fn is_operational(&self) -> bool {
-        matches!(self, Self::Running | Self::Paused | Self::Suspended | Self::Saved)
+        matches!(
+            self,
+            Self::Running | Self::Paused | Self::Suspended | Self::Saved
+        )
     }
     /// Badge colour for the dashboard (R, G, B).
     pub fn badge_rgb(&self) -> (u8, u8, u8) {
@@ -243,7 +246,11 @@ pub enum ProviderError {
     /// Authentication / authorisation failure.
     AuthFailed(String),
     /// Provider-native error (pass-through with provider context).
-    NativeError { provider: String, code: String, message: String },
+    NativeError {
+        provider: String,
+        code: String,
+        message: String,
+    },
     /// Timeout waiting for provider response.
     Timeout(String),
     /// Any other error.
@@ -257,8 +264,11 @@ impl std::fmt::Display for ProviderError {
             Self::VmNotFound(s) => write!(f, "VM not found: {s}"),
             Self::NotSupported(s) => write!(f, "Not supported: {s}"),
             Self::AuthFailed(s) => write!(f, "Auth failed: {s}"),
-            Self::NativeError { provider, code, message } =>
-                write!(f, "[{provider}] {code}: {message}"),
+            Self::NativeError {
+                provider,
+                code,
+                message,
+            } => write!(f, "[{provider}] {code}: {message}"),
             Self::Timeout(s) => write!(f, "Timeout: {s}"),
             Self::Other(s) => write!(f, "Error: {s}"),
         }
@@ -310,11 +320,11 @@ pub trait VirtualizationProvider: Send + Sync {
 
     // ── Preview ───────────────────────────────────────────────────────────────
     /// Returns a BGRA preview frame for the VM, if available.
-    fn get_preview_frame(&self, vm_id: &str, width: u32, height: u32)
-        -> ProviderResult<Vec<u8>>
-    {
+    fn get_preview_frame(&self, vm_id: &str, width: u32, height: u32) -> ProviderResult<Vec<u8>> {
         let _ = (vm_id, width, height);
-        Err(ProviderError::NotSupported("preview not implemented".to_owned()))
+        Err(ProviderError::NotSupported(
+            "preview not implemented".to_owned(),
+        ))
     }
 
     // ── Provider manifest ─────────────────────────────────────────────────────
@@ -367,7 +377,9 @@ impl ProviderRegistry {
     }
 
     pub fn all(&self) -> Vec<Arc<dyn VirtualizationProvider>> {
-        self.providers.read().ok()
+        self.providers
+            .read()
+            .ok()
             .map(|m| m.values().cloned().collect())
             .unwrap_or_default()
     }
@@ -468,23 +480,21 @@ impl FakeProvider {
             os_version: Some("Proxmox VE 8.2".to_owned()),
             provider_metadata: serde_json::json!({ "pve_version": "8.2.2" }),
         };
-        let vms = vec![
-            VmInfo {
-                vm_id: "fake-pve-vm-100".to_owned(),
-                provider_native_id: "100".to_owned(),
-                name: "fake-debian-01".to_owned(),
-                provider_type: ProviderType::Proxmox,
-                host_id: "fake-pve-node-001".to_owned(),
-                cluster: Some("Fake-PVE-Cluster".to_owned()),
-                power_state: PowerState::Running,
-                guest_ips: vec!["10.10.10.100".to_owned()],
-                tools_status: ToolsStatus::NotApplicable,
-                tags: vec!["fake".to_owned()],
-                provider_metadata: serde_json::json!({
-                    "proxmox": { "vmid": 100, "type": "qemu", "node": "pve-fake-01" }
-                }),
-            },
-        ];
+        let vms = vec![VmInfo {
+            vm_id: "fake-pve-vm-100".to_owned(),
+            provider_native_id: "100".to_owned(),
+            name: "fake-debian-01".to_owned(),
+            provider_type: ProviderType::Proxmox,
+            host_id: "fake-pve-node-001".to_owned(),
+            cluster: Some("Fake-PVE-Cluster".to_owned()),
+            power_state: PowerState::Running,
+            guest_ips: vec!["10.10.10.100".to_owned()],
+            tools_status: ToolsStatus::NotApplicable,
+            tags: vec!["fake".to_owned()],
+            provider_metadata: serde_json::json!({
+                "proxmox": { "vmid": 100, "type": "qemu", "node": "pve-fake-01" }
+            }),
+        }];
         Self {
             id: provider_id.to_owned(),
             provider_type: ProviderType::Proxmox,
@@ -505,13 +515,18 @@ impl VirtualizationProvider for FakeProvider {
         Ok(self.hosts.clone())
     }
     fn list_vms(&self, host_id: &str) -> ProviderResult<Vec<VmInfo>> {
-        Ok(self.vms.iter()
+        Ok(self
+            .vms
+            .iter()
             .filter(|v| v.host_id == host_id)
             .cloned()
             .collect())
     }
     fn get_vm(&self, vm_id: &str) -> ProviderResult<VmInfo> {
-        self.vms.iter().find(|v| v.vm_id == vm_id).cloned()
+        self.vms
+            .iter()
+            .find(|v| v.vm_id == vm_id)
+            .cloned()
             .ok_or_else(|| ProviderError::VmNotFound(vm_id.to_owned()))
     }
     fn get_capabilities(&self, vm_id: &str) -> ProviderResult<VmCapabilityGraph> {
@@ -527,7 +542,10 @@ impl VirtualizationProvider for FakeProvider {
             Capability::unsupported("VM_OFFLINE", "VM is not running", None)
         };
         let rdp = if vm.primary_ip().is_some() && is_running {
-            Capability::available("RDP_GUEST_IP_KNOWN", "Guest IP detected — RDP Relay possible")
+            Capability::available(
+                "RDP_GUEST_IP_KNOWN",
+                "Guest IP detected — RDP Relay possible",
+            )
         } else {
             Capability::unknown("NO_GUEST_IP")
         };
@@ -555,24 +573,54 @@ impl VirtualizationProvider for FakeProvider {
                 None,
             ),
             hv_socket: Capability::experimental("HVSOCKET_EXPERIMENTAL_DISABLED"),
-            vnc_console: if matches!(vm.provider_type, ProviderType::Proxmox | ProviderType::Libvirt)
-                && is_running
+            vnc_console: if matches!(
+                vm.provider_type,
+                ProviderType::Proxmox | ProviderType::Libvirt
+            ) && is_running
             {
                 Capability::available("VNC_AVAILABLE", "VNC console available via provider")
             } else {
-                Capability::unsupported("VNC_NOT_SUPPORTED", "VNC not available for this provider", None)
+                Capability::unsupported(
+                    "VNC_NOT_SUPPORTED",
+                    "VNC not available for this provider",
+                    None,
+                )
             },
-            spice_console: Capability::unsupported("SPICE_NOT_SUPPORTED", "SPICE not configured", None),
-            web_console: Capability::unsupported("WEB_CONSOLE_NOT_SUPPORTED", "Web console not configured", None),
+            spice_console: Capability::unsupported(
+                "SPICE_NOT_SUPPORTED",
+                "SPICE not configured",
+                None,
+            ),
+            web_console: Capability::unsupported(
+                "WEB_CONSOLE_NOT_SUPPORTED",
+                "Web console not configured",
+                None,
+            ),
             webmks_console: if matches!(vm.provider_type, ProviderType::VMware) && is_running {
                 Capability::available("WEBMKS_AVAILABLE", "WebMKS ticket available via vSphere")
             } else {
                 Capability::unsupported("WEBMKS_NOT_SUPPORTED", "WebMKS is VMware only", None)
             },
-            serial_console: Capability::unsupported("SERIAL_NOT_SUPPORTED", "Serial console not configured", None),
-            clipboard: Capability::unsupported("CLIPBOARD_DEPENDS_ON_SESSION", "Clipboard depends on session mode", None),
-            file_transfer: Capability::unsupported("FILE_TRANSFER_NOT_SUPPORTED", "File transfer not implemented", None),
-            recording: Capability::unsupported("RECORDING_NOT_CONFIGURED", "Session recording not configured", None),
+            serial_console: Capability::unsupported(
+                "SERIAL_NOT_SUPPORTED",
+                "Serial console not configured",
+                None,
+            ),
+            clipboard: Capability::unsupported(
+                "CLIPBOARD_DEPENDS_ON_SESSION",
+                "Clipboard depends on session mode",
+                None,
+            ),
+            file_transfer: Capability::unsupported(
+                "FILE_TRANSFER_NOT_SUPPORTED",
+                "File transfer not implemented",
+                None,
+            ),
+            recording: Capability::unsupported(
+                "RECORDING_NOT_CONFIGURED",
+                "Session recording not configured",
+                None,
+            ),
             experimental: Capability::experimental("EXPERIMENTAL_DISABLED"),
             recommended_mode,
             constraints: vec!["Fake provider — synthetic data only".to_owned()],
@@ -634,21 +682,25 @@ pub fn choose_backend(graph: &VmCapabilityGraph) -> BackendDecision {
 
     let mut scored: Vec<BackendScore> = candidates
         .into_iter()
-        .filter_map(|(mode, cap, base)| {
-            match cap.state {
-                Unsupported | BlockedByPolicy => None,
-                _ => {
-                    let mut s = base;
-                    if cap.state == Degraded { s -= 20; }
-                    if cap.state == Unknown { s -= 10; }
-                    if cap.state == Experimental { s -= 50; }
-                    Some(BackendScore {
-                        mode,
-                        available: cap.state.is_available(),
-                        score: s,
-                        reason: cap.human_reason.clone(),
-                    })
+        .filter_map(|(mode, cap, base)| match cap.state {
+            Unsupported | BlockedByPolicy => None,
+            _ => {
+                let mut s = base;
+                if cap.state == Degraded {
+                    s -= 20;
                 }
+                if cap.state == Unknown {
+                    s -= 10;
+                }
+                if cap.state == Experimental {
+                    s -= 50;
+                }
+                Some(BackendScore {
+                    mode,
+                    available: cap.state.is_available(),
+                    score: s,
+                    reason: cap.human_reason.clone(),
+                })
             }
         })
         .collect();

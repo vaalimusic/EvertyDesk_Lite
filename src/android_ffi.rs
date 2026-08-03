@@ -18,7 +18,7 @@ use std::thread;
 
 use jni::objects::{GlobalRef, JByteArray, JClass, JString};
 use jni::sys::{jboolean, jbyteArray, jint, jintArray, jlong};
-use jni::{JavaVM, JNIEnv};
+use jni::{JNIEnv, JavaVM};
 
 // ─── JavaVM и класс декодера — сохраняем при загрузке .so ─────────────────────
 
@@ -29,6 +29,8 @@ static ANDROID_JVM: OnceLock<JavaVM> = OnceLock::new();
 // минуя системный загрузчик (который не знает о классах APK).
 static DECODER_CLASS_REF: OnceLock<GlobalRef> = OnceLock::new();
 static PERF_STATS_CLASS_REF: OnceLock<GlobalRef> = OnceLock::new();
+// Класс службы доступности — для Android-хост режима (инжект ввода из Rust).
+static INPUT_SERVICE_CLASS_REF: OnceLock<GlobalRef> = OnceLock::new();
 
 /// Вызывается JVM при `System.loadLibrary("evertydesk_core")`.
 /// Сохраняем JavaVM и GlobalRef на VideoDecoder/PerfStats для фоновых потоков.
@@ -50,6 +52,11 @@ pub extern "system" fn JNI_OnLoad(
                     let _ = PERF_STATS_CLASS_REF.set(global);
                 }
             }
+            if let Ok(cls) = env.find_class("ru/everty/desklite/EvertyInputService") {
+                if let Ok(global) = env.new_global_ref(cls) {
+                    let _ = INPUT_SERVICE_CLASS_REF.set(global);
+                }
+            }
         }
         let _ = ANDROID_JVM.set(jvm);
     }
@@ -69,6 +76,11 @@ pub fn decoder_class_ref() -> Option<&'static GlobalRef> {
 /// GlobalRef на класс PerfStats — безопасен для использования в любом потоке.
 pub fn perf_stats_class_ref() -> Option<&'static GlobalRef> {
     PERF_STATS_CLASS_REF.get()
+}
+
+/// GlobalRef на класс EvertyInputService — для Android-хост инжекта из любого потока.
+pub fn input_service_class_ref() -> Option<&'static GlobalRef> {
+    INPUT_SERVICE_CLASS_REF.get()
 }
 
 use crate::settings::{AppConfig, CodecPreference, ServerConfig};
@@ -109,6 +121,19 @@ struct AndroidSession {
     /// Текстовый статус (прогресс/ошибка) для UI.
     status: Arc<Mutex<String>>,
     connected: Arc<AtomicBool>,
+    /// Экспериментальная кнопка «EVRT2»: отдельный слот кадра — сознательно
+    /// НЕ делит `latest` с живым видео, иначе картинка мигала бы между
+    /// EVRT1 и EVRT2. См. SessionEvent::Evrt2ExperimentFrame.
+    evrt2_latest: Arc<Mutex<LatestFrame>>,
+    /// ROADMAP.md Phase 3 live-test gap, found while verifying APF on a
+    /// real device: `SessionEvent::Info` (every EVRT2 experimental status —
+    /// "подключено", frame counts, MODE_SWITCH, APF confirmations, decode
+    /// errors) was falling into `collect_events`'s catch-all and going
+    /// nowhere visible on Android. Separate slot from `status` (which is
+    /// the main connection's own status text) for the same reason
+    /// `evrt2_latest` is separate from `latest` — mixing them would make
+    /// one clobber the other on screen.
+    evrt2_status: Arc<Mutex<String>>,
 }
 
 // ─── helper: лог ───────────────────────────────────────────────────────────────
@@ -172,14 +197,157 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeStartTouchpad(
     )
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Android HOST режим (тачпад): устройство принимает подключения и инжектит
+// ввод через службу доступности. Видео не захватывается — оператор смотрит на
+// сам экран (например ТВ), телефон работает слепым трекпадом.
+// ═══════════════════════════════════════════════════════════════════════════
+
+static HOST_SERVICE: Mutex<Option<crate::host::HostService>> = Mutex::new(None);
+static HOST_DRAIN_STARTED: AtomicBool = AtomicBool::new(false);
+static HOST_LAST_STATUS: OnceLock<Mutex<String>> = OnceLock::new();
+
+fn host_status_slot() -> &'static Mutex<String> {
+    HOST_LAST_STATUS.get_or_init(|| Mutex::new("Ожидание запуска…".to_owned()))
+}
+
+/// Фоновый поток: сливает события хоста в лог/статус, чтобы канал не рос.
+fn ensure_host_drain_thread() {
+    if HOST_DRAIN_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    thread::spawn(|| loop {
+        {
+            if let Ok(guard) = HOST_SERVICE.lock() {
+                if let Some(svc) = guard.as_ref() {
+                    while let Some(ev) = svc.try_recv() {
+                        if let crate::host::HostEvent::Log(ref s) = ev {
+                            if let Ok(mut st) = host_status_slot().lock() {
+                                *st = s.clone();
+                            }
+                        }
+                        jni_log(&format!("[host] {ev:?}"));
+                    }
+                }
+            }
+        }
+        thread::sleep(std::time::Duration::from_millis(300));
+    });
+}
+
+/// Запустить Android-хост (тачпад-режим). Возвращает true при старте.
+///
+/// Kotlin: `external fun nativeStartTouchpadHost(localId, password, idServer,
+///          relayServer, publicKey, screenW, screenH): Boolean`
+#[no_mangle]
+pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeStartTouchpadHost(
+    mut env: JNIEnv,
+    _class: JClass,
+    local_id: JString,
+    password: JString,
+    id_server: JString,
+    relay_server: JString,
+    public_key: JString,
+    screen_w: jint,
+    screen_h: jint,
+) -> jboolean {
+    init_android_logger();
+
+    let get = |env: &mut JNIEnv, s: JString| -> String {
+        env.get_string(&s).map(|v| v.into()).unwrap_or_default()
+    };
+    let local_id = get(&mut env, local_id);
+    let password = get(&mut env, password);
+    let id_server = get(&mut env, id_server);
+    let relay_server = get(&mut env, relay_server);
+    let public_key = get(&mut env, public_key);
+
+    if local_id.is_empty() {
+        jni_log("nativeStartTouchpadHost: пустой local_id");
+        return 0;
+    }
+
+    crate::capture::set_android_screen(screen_w.max(1) as u32, screen_h.max(1) as u32);
+
+    if !crate::android_input::is_ready() {
+        jni_log("nativeStartTouchpadHost: EvertyInputService не найдена (служба доступности выключена?)");
+    }
+
+    let (sign_pk, sign_sk) = crate::crypto::gen_sign_keypair();
+    let config = AppConfig {
+        server: ServerConfig {
+            api_url: "https://desk.everty.ru".to_owned(),
+            id_server,
+            relay_server,
+            public_key,
+        },
+        local_id,
+        local_password: password,
+        permanent_password: String::new(),
+        security: Default::default(),
+        display: Default::default(),
+        llm: Default::default(),
+        ui: Default::default(),
+        hotfix: Default::default(),
+        udp_bind_port: 0,
+        evrt_udp_port: 0,
+        host_pk: Vec::new(),
+        host_sign_pk: sign_pk,
+        host_sign_sk: sign_sk,
+    };
+
+    let service = crate::host::HostService::start(config);
+    if let Ok(mut guard) = HOST_SERVICE.lock() {
+        if let Some(old) = guard.take() {
+            old.stop();
+        }
+        *guard = Some(service);
+    }
+    ensure_host_drain_thread();
+    jni_log("Android-хост (тачпад) запущен ✓");
+    1
+}
+
+/// Остановить Android-хост.
+/// Kotlin: `external fun nativeStopHost()`
+#[no_mangle]
+pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeStopHost(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    if let Ok(mut guard) = HOST_SERVICE.lock() {
+        if let Some(svc) = guard.take() {
+            svc.stop();
+            jni_log("Android-хост остановлен");
+        }
+    }
+}
+
+/// Текущий статус хоста (последняя строка лога) для UI.
+/// Kotlin: `external fun nativeHostStatus(): String`
+#[no_mangle]
+pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeHostStatus<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jni::sys::jstring {
+    let status = host_status_slot()
+        .lock()
+        .map(|s| s.clone())
+        .unwrap_or_default();
+    match env.new_string(status) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 fn parse_codec_preference(s: &str) -> CodecPreference {
     match s.trim().to_ascii_uppercase().as_str() {
         "H264" => CodecPreference::H264,
         "H265" => CodecPreference::H265,
-        "AV1"  => CodecPreference::Av1,
-        "VP9"  => CodecPreference::Vp9,
+        "AV1" => CodecPreference::Av1,
+        "VP9" => CodecPreference::Vp9,
         "AUTO" => CodecPreference::Auto,
-        _      => CodecPreference::Evrtck,
+        _ => CodecPreference::Evrtck,
     }
 }
 
@@ -242,18 +410,25 @@ fn start_android_session(
         "codec={:?} device_decode_caps: h265={h265_ok} av1={av1_ok}",
         display.codec
     ));
+    let evrt2_only = codec_str.trim().eq_ignore_ascii_case("EVRT2ONLY");
     let request = ConnectionRequest {
         remote_id,
         password,
+        client_id: "evertydesk-android".to_owned(),
+        client_name: "EvertyDesk Android".to_owned(),
         server,
         display,
-        control_only,
+        control_only: control_only || evrt2_only,
+        audio_enabled: Arc::new(AtomicBool::new(true)),
+        evrt2_only,
     };
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>();
     let (ev_tx, ev_rx) = mpsc::channel::<SessionEvent>();
 
     let latest = Arc::new(Mutex::new(LatestFrame::default()));
+    let evrt2_latest = Arc::new(Mutex::new(LatestFrame::default()));
+    let evrt2_status = Arc::new(Mutex::new(String::new()));
     let status = Arc::new(Mutex::new("Подключение…".to_owned()));
     let connected = Arc::new(AtomicBool::new(false));
     let remote_bounds = Arc::new(Mutex::new(RemoteBounds::default()));
@@ -270,12 +445,23 @@ fn start_android_session(
     // Поток сбора событий → latest frame / status
     {
         let latest = latest.clone();
+        let evrt2_latest = evrt2_latest.clone();
+        let evrt2_status = evrt2_status.clone();
         let status = status.clone();
         let connected = connected.clone();
         let remote_bounds = remote_bounds.clone();
         let stop = stop.clone();
         thread::spawn(move || {
-            collect_events(ev_rx, latest, status, connected, remote_bounds, stop);
+            collect_events(
+                ev_rx,
+                latest,
+                evrt2_latest,
+                evrt2_status,
+                status,
+                connected,
+                remote_bounds,
+                stop,
+            );
         });
     }
 
@@ -286,6 +472,8 @@ fn start_android_session(
         stop,
         status,
         connected,
+        evrt2_latest,
+        evrt2_status,
     });
     Box::into_raw(session) as jlong
 }
@@ -293,12 +481,15 @@ fn start_android_session(
 fn collect_events(
     ev_rx: Receiver<SessionEvent>,
     latest: Arc<Mutex<LatestFrame>>,
+    evrt2_latest: Arc<Mutex<LatestFrame>>,
+    evrt2_status: Arc<Mutex<String>>,
     status: Arc<Mutex<String>>,
     connected: Arc<AtomicBool>,
     remote_bounds: Arc<Mutex<RemoteBounds>>,
     stop: Arc<AtomicBool>,
 ) {
     let mut seq = 0u64;
+    let mut evrt2_seq = 0u64;
     let mut has_display_bounds = false;
     while !stop.load(Ordering::Relaxed) {
         match ev_rx.recv_timeout(std::time::Duration::from_millis(250)) {
@@ -324,6 +515,19 @@ fn collect_events(
                     f.height = height as u32;
                     f.rgba = rgba;
                     f.seq = seq;
+                }
+            }
+            Ok(SessionEvent::Evrt2ExperimentFrame {
+                width,
+                height,
+                rgba,
+            }) => {
+                evrt2_seq += 1;
+                if let Ok(mut f) = evrt2_latest.lock() {
+                    f.width = width as u32;
+                    f.height = height as u32;
+                    f.rgba = rgba;
+                    f.seq = evrt2_seq;
                 }
             }
             Ok(SessionEvent::Connected(info)) => {
@@ -359,6 +563,18 @@ fn collect_events(
                 }
                 break;
             }
+            Ok(SessionEvent::Info(msg)) => {
+                // "EVRT2" prefix filters out unrelated Info traffic (shell
+                // output, generic peer-message logs) so this slot only ever
+                // shows the experimental stream's own status, matching the
+                // filtering already implicit in evrt2_latest's separation
+                // from the live-video `latest` slot.
+                if msg.starts_with("EVRT2") {
+                    if let Ok(mut s) = evrt2_status.lock() {
+                        *s = msg;
+                    }
+                }
+            }
             Ok(_) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(_) => break,
@@ -389,13 +605,19 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativePollFrame(
     // Снимаем снапшот кадра под коротким локом, сразу освобождаем мьютекс.
     // Это не блокирует collect_events пока идёт конвертация + JNI копия.
     let (w, h, rgba) = {
-        let Ok(f) = session.latest.lock() else { return 0; };
-        if f.seq == 0 || f.rgba.is_empty() { return 0; }
+        let Ok(f) = session.latest.lock() else {
+            return 0;
+        };
+        if f.seq == 0 || f.rgba.is_empty() {
+            return 0;
+        }
         (f.width as usize, f.height as usize, f.rgba.clone())
     };
 
     let px_count = w * h;
-    if px_count == 0 { return 0; }
+    if px_count == 0 {
+        return 0;
+    }
 
     let arr = unsafe { jni::objects::JIntArray::from_raw(out) };
 
@@ -403,7 +625,10 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativePollFrame(
     // разрешение изменилось между nativeFrameSize() и nativePollFrame().
     let arr_len = match env.get_array_length(&arr) {
         Ok(l) => l as usize,
-        Err(_) => { let _ = env.exception_clear(); return 0; }
+        Err(_) => {
+            let _ = env.exception_clear();
+            return 0;
+        }
     };
     if arr_len < px_count {
         // Kotlin переаллоцирует на следующем тике по новому frameSize().
@@ -445,6 +670,82 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeFrameSize(
         return 0;
     }
     ((f.width as i64) << 32) | (f.height as i64)
+}
+
+/// Экспериментальная кнопка «EVRT2»: размер последнего кадра из отдельного
+/// EVRT2-потока (не пересекается с nativeFrameSize/nativePollFrame — см.
+/// AndroidSession::evrt2_latest). (width<<32 | height), или 0.
+/// Kotlin: `external fun nativeEvrt2FrameSize(handle: Long): Long`
+#[no_mangle]
+pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeEvrt2FrameSize(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jlong {
+    let Some(session) = session_ref(handle) else {
+        return 0;
+    };
+    let Ok(f) = session.evrt2_latest.lock() else {
+        return 0;
+    };
+    if f.seq == 0 {
+        return 0;
+    }
+    ((f.width as i64) << 32) | (f.height as i64)
+}
+
+/// Экспериментальная кнопка «EVRT2»: скопировать последний EVRT2-кадр в
+/// `out` (IntArray ARGB), аналогично nativePollFrame но из отдельного слота.
+/// Kotlin: `external fun nativePollEvrt2Frame(handle: Long, out: IntArray): Long`
+#[no_mangle]
+pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativePollEvrt2Frame(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    out: jintArray,
+) -> jlong {
+    let session = match session_ref(handle) {
+        Some(s) => s,
+        None => return 0,
+    };
+    let (w, h, rgba) = {
+        let Ok(f) = session.evrt2_latest.lock() else {
+            return 0;
+        };
+        if f.seq == 0 || f.rgba.is_empty() {
+            return 0;
+        }
+        (f.width as usize, f.height as usize, f.rgba.clone())
+    };
+    let px_count = w * h;
+    if px_count == 0 {
+        return 0;
+    }
+
+    let arr = unsafe { jni::objects::JIntArray::from_raw(out) };
+    let arr_len = match env.get_array_length(&arr) {
+        Ok(l) => l as usize,
+        Err(_) => {
+            let _ = env.exception_clear();
+            return 0;
+        }
+    };
+    if arr_len < px_count {
+        return 0;
+    }
+    let mut argb = vec![0i32; px_count];
+    for (i, chunk) in rgba.chunks_exact(4).take(px_count).enumerate() {
+        let r = chunk[0] as i32;
+        let g = chunk[1] as i32;
+        let b = chunk[2] as i32;
+        let a = chunk[3] as i32;
+        argb[i] = (a << 24) | (r << 16) | (g << 8) | b;
+    }
+    if env.set_int_array_region(&arr, 0, &argb).is_err() {
+        let _ = env.exception_clear();
+        return 0;
+    }
+    ((w as i64) << 32) | (h as i64)
 }
 
 #[no_mangle]
@@ -524,6 +825,41 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeRightClick(
     let _ = session.cmd_tx.send(SessionCommand::MouseRightUp { x, y });
 }
 
+/// Установить системную громкость хоста (0..100 %).
+/// Kotlin: `external fun nativeSetHostVolume(handle: Long, volume: Int)`
+#[no_mangle]
+pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeSetHostVolume(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    volume: jint,
+) {
+    let Some(session) = session_ref(handle) else {
+        return;
+    };
+    let vol = volume.clamp(0, 100) as u32;
+    let _ = session
+        .cmd_tx
+        .send(crate::transport::SessionCommand::SetHostVolume(vol));
+}
+
+/// Экспериментальная кнопка «EVRT2» на игровом экране — просит хост поднять
+/// отдельный EVRT2 UDP-сокет параллельно живой сессии.
+/// Kotlin: `external fun nativeStartEvrt2Experiment(handle: Long)`
+#[no_mangle]
+pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeStartEvrt2Experiment(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) {
+    let Some(session) = session_ref(handle) else {
+        return;
+    };
+    let _ = session
+        .cmd_tx
+        .send(crate::transport::SessionCommand::StartEvrt2Experiment);
+}
+
 /// Ввод текста (Unicode-строка). Kotlin: `external fun nativeKeyText(handle: Long, text: String)`
 #[no_mangle]
 pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeKeyText(
@@ -563,6 +899,33 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeKeyControl(
             .cmd_tx
             .send(crate::transport::SessionCommand::KeyControl(key));
     }
+}
+
+/// Навигация браузера жестом (3 пальца): Alt+← (назад) или Alt+→ (вперёд).
+/// forward=false → назад, true → вперёд.
+/// Kotlin: `external fun nativeNavigate(handle: Long, forward: Boolean)`
+#[no_mangle]
+pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeNavigate(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    forward: jboolean,
+) {
+    let Some(session) = session_ref(handle) else {
+        return;
+    };
+    use crate::rustdesk_proto::ControlKey;
+    let key = if forward != 0 {
+        ControlKey::RightArrow
+    } else {
+        ControlKey::LeftArrow
+    };
+    let _ = session
+        .cmd_tx
+        .send(crate::transport::SessionCommand::KeyControlWithModifiers {
+            key,
+            modifiers: vec![ControlKey::Alt],
+        });
 }
 
 /// Ctrl+символ. Kotlin: `external fun nativeKeyCtrl(handle: Long, ch: String)`
@@ -619,6 +982,23 @@ pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeStatus<'local>
     let text = session_ref(handle)
         .and_then(|s| s.status.lock().ok().map(|g| g.clone()))
         .unwrap_or_else(|| "—".to_owned());
+    match env.new_string(text) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Последний статус EVRT2-эксперимента (пусто, если ничего ещё не пришло).
+/// Kotlin: `external fun nativeEvrt2Status(handle: Long): String`
+#[no_mangle]
+pub extern "system" fn Java_ru_everty_desklite_NativeClient_nativeEvrt2Status<'local>(
+    env: JNIEnv<'local>,
+    _class: JClass,
+    handle: jlong,
+) -> jni::sys::jstring {
+    let text = session_ref(handle)
+        .and_then(|s| s.evrt2_status.lock().ok().map(|g| g.clone()))
+        .unwrap_or_default();
     match env.new_string(text) {
         Ok(s) => s.into_raw(),
         Err(_) => std::ptr::null_mut(),

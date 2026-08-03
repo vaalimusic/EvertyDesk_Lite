@@ -51,6 +51,24 @@ pub fn set_max_resolution(w: u32, h: u32) {
     CLIENT_MAX_RES.store(((w as u64) << 32) | (h as u64), Ordering::Relaxed);
 }
 
+/// Read back whatever `set_max_resolution` last stored — `(0, 0)` if never
+/// called. Live-found (chasing EVRT2's fps gap vs this file's own EVRT1
+/// pipeline): `MainActivity.kt` already calls `setMaxResolution` with the
+/// real device screen size (`dm.widthPixels`/`heightPixels`) before any
+/// connection, EVRT1 or EVRT2 — but the EVRT2 experiment's own client HELLO
+/// (`evrt2_experiment.rs`) never read it back, sending a hardcoded
+/// `(1920, 1080)` instead of the phone's actual, usually much smaller,
+/// real width. Exposed here so that HELLO can reuse the SAME value EVRT1
+/// already has, instead of duplicating the JNI plumbing for a second
+/// client-side resolution hint.
+pub fn max_resolution() -> (u32, u32) {
+    let packed = CLIENT_MAX_RES.load(Ordering::Relaxed);
+    (
+        ((packed >> 32) & 0xFFFF_FFFF) as u32,
+        (packed & 0xFFFF_FFFF) as u32,
+    )
+}
+
 // ─── константы ────────────────────────────────────────────────────────────────
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
@@ -59,6 +77,29 @@ const FEEDBACK_INTERVAL_ULL: Duration = Duration::from_millis(70);
 const FEEDBACK_INTERVAL_NORM: Duration = Duration::from_millis(150);
 const PUNCH_REPEATS: usize = 3;
 const PUNCH_GAP: Duration = Duration::from_millis(30);
+
+// ─── Android EVRT liveness flag ────────────────────────────────────────────────
+// Android's direct-to-Surface decode path (decode_h264/h265/av1_frame below)
+// renders via MediaCodec and returns `None` — no `SessionEvent::Frame` is ever
+// sent for those frames. `transport::run_session`'s "have we seen live video"
+// watchdog only learns about frames from `SessionEvent::Frame`, so on Android
+// it never saw EVRT deliver anything and kept resending SetClientCodec every
+// 3s for the whole session — forcing a full host-side IDR each time even
+// during smooth 60fps playback. This flag closes that gap.
+static ANDROID_EVRT_FRAME_SEEN: AtomicBool = AtomicBool::new(false);
+
+/// Has the Android direct-to-Surface path decoded at least one EVRT frame in
+/// the current session? Sticky — stays true once set; call
+/// `reset_android_evrt_frame_seen` at the start of a new session.
+pub fn android_evrt_frame_seen() -> bool {
+    ANDROID_EVRT_FRAME_SEEN.load(Ordering::Relaxed)
+}
+
+/// Reset at the start of each `run_session` so a previous session's frames
+/// don't mask a genuine "no video yet" state in a new one.
+pub fn reset_android_evrt_frame_seen() {
+    ANDROID_EVRT_FRAME_SEEN.store(false, Ordering::Relaxed);
+}
 
 // ─── публичный интерфейс ──────────────────────────────────────────────────────
 
@@ -75,6 +116,8 @@ pub struct EvrtClientParams {
     /// Ultra-low-latency режим (feedback каждые 70мс вместо 150мс).
     pub ultra_low_latency: bool,
     pub session_token: Option<String>,
+    /// Per-viewer playback state; changing it must not affect other sessions.
+    pub audio_enabled: Arc<AtomicBool>,
 }
 
 /// Результат попытки EVRT-подключения.
@@ -96,6 +139,7 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
         stop,
         ultra_low_latency,
         session_token,
+        audio_enabled,
     } = params;
 
     evrt_log(&events, format!("EVRT client: punching to {host_addr}"));
@@ -130,9 +174,7 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
     while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
         match socket.recv_from(&mut buf) {
             Ok((len, src)) if src == host_addr => {
-                if let Some(pkt) =
-                    evrt::parse_authenticated(&buf, len, session_token.as_deref())
-                {
+                if let Some(pkt) = evrt::parse_authenticated(&buf, len, session_token.as_deref()) {
                     if pkt.packet_type == evrt::TYPE_SESSION_CONFIG {
                         if let Some(cfg) = SessionConfig::from_json(&pkt.payload) {
                             evrt_log(
@@ -248,6 +290,7 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
         let mut reassembler = ChannelReassembler::new();
         let mut audio_re = crate::evrt_audio::AudioReassembler::new();
         let mut audio_player = crate::evrt_audio::AudioPlayer::new();
+        let mut audio_was_enabled = true;
         let mut buf = vec![0u8; evrt::MAX_PACKET_SIZE + 64];
         let mut last_pkt_at = Instant::now();
         let mut last_loss_keyframe_request = Instant::now() - Duration::from_secs(1);
@@ -256,7 +299,14 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
             .ok();
 
         while !recv_stop.load(Ordering::Relaxed) {
-            audio_player.tick();
+            let audio_is_enabled = audio_enabled.load(Ordering::Acquire);
+            if audio_was_enabled && !audio_is_enabled {
+                audio_player.clear_buffer();
+            }
+            audio_was_enabled = audio_is_enabled;
+            if audio_is_enabled {
+                audio_player.tick();
+            }
             match recv_socket.recv_from(&mut buf) {
                 Ok((len, src)) if src == host_addr => {
                     let now_us = evrt::now_us();
@@ -319,7 +369,10 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
                                     );
                                     // On Android Surface path MediaCodec handles incomplete frames
                                     // gracefully (brief artifact vs multi-second freeze on WiFi loss).
-                                    #[cfg(not(all(target_os = "android", feature = "android-client")))]
+                                    #[cfg(not(all(
+                                        target_os = "android",
+                                        feature = "android-client"
+                                    )))]
                                     recv_queue.wait_for_keyframe();
                                     last_loss_keyframe_request = Instant::now();
                                 }
@@ -356,8 +409,14 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
                                 }
                             }
                             evrt::TYPE_AUDIO_FRAME => {
-                                if let Some(pcm) = audio_re.on_packet(&pkt) {
-                                    audio_player.play(&pcm);
+                                if audio_is_enabled {
+                                    if let Some(pcm) = audio_re.on_packet(&pkt) {
+                                        audio_player.play(&pcm);
+                                    }
+                                } else {
+                                    // Continue feeding the reassembler so a later unmute starts
+                                    // from a complete frame without retaining muted PCM.
+                                    let _ = audio_re.on_packet(&pkt);
                                 }
                             }
                             // ── ROI — логируем для диагностики ───────────────
@@ -373,7 +432,9 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
                 }
                 Ok(_) => {} // чужой пакет
                 Err(ref e) if is_timeout(e) => {
-                    audio_player.tick();
+                    if audio_is_enabled {
+                        audio_player.tick();
+                    }
                     if last_pkt_at.elapsed() > IDLE_TIMEOUT {
                         evrt_log(&recv_events, "EVRT: idle timeout".into());
                         recv_stop.store(true, Ordering::Relaxed);
@@ -455,8 +516,14 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
         }
 
         // Вычислить pressure
-        let pressure = compute_pressure(arr_delta, dec_delta, queued, new_drops, cinema,
-            cfg!(all(target_os = "android", feature = "android-client")));
+        let pressure = compute_pressure(
+            arr_delta,
+            dec_delta,
+            queued,
+            new_drops,
+            cinema,
+            cfg!(all(target_os = "android", feature = "android-client")),
+        );
 
         // Адаптивный jitter
         let jitter_ms = jitter.update(pressure, arr_delta, queued, new_drops, cinema);
@@ -474,7 +541,7 @@ pub fn run_evrt_client(params: EvrtClientParams) -> EvrtConnectResult {
             present_delta_ms: -1,
             pulse_estimate_ms: -1,
             input_estimate_ms: -1,
-            max_width:  (packed_res >> 32) as u32,
+            max_width: (packed_res >> 32) as u32,
             max_height: (packed_res & 0xFFFF_FFFF) as u32,
         };
 
@@ -569,14 +636,20 @@ fn evrt_decode_loop(
     // AV1 через Windows Media Foundation.
     let mut av1_mf: Option<crate::mf_video::MfVideoDecoder> = None;
 
-    evrt_log(&events, format!("evrt_decode_loop: codec={codec} {width}x{height}"));
+    evrt_log(
+        &events,
+        format!("evrt_decode_loop: codec={codec} {width}x{height}"),
+    );
     let mut diag_frames = 0u32;
 
     loop {
         // Обновить кодек если хост объявил смену
         while let Ok(new_codec) = codec_change_rx.try_recv() {
             if new_codec != codec {
-                evrt_log(&events, format!("EVRT decode: codec {} → {}", codec, new_codec));
+                evrt_log(
+                    &events,
+                    format!("EVRT decode: codec {} → {}", codec, new_codec),
+                );
                 codec = new_codec;
             }
         }
@@ -603,11 +676,14 @@ fn evrt_decode_loop(
                 };
                 let flags = bytes.get(5).copied().unwrap_or(0);
                 if diag_frames < 5 {
-                    evrt_log(&events, format!(
+                    evrt_log(
+                        &events,
+                        format!(
                         "EVRTCK frame#{diag_frames}: len={} magic={:?} flags={flags} w={ew} h={eh}",
                         bytes.len(),
                         bytes.get(0..4).map(|b| b.to_vec()).unwrap_or_default(),
-                    ));
+                    ),
+                    );
                     diag_frames += 1;
                 }
                 // FLAG_NOP (0x02): screen unchanged — skip render, decoder state needs no update.
@@ -617,8 +693,13 @@ fn evrt_decode_loop(
                     match evrtck_dec.decode_wire(&bytes) {
                         Ok(rgba) => Some((rgba.to_vec(), ew, eh)),
                         Err(e) => {
-                            evrt_log(&events, format!("EVRTCK decode error: {e} magic={:?}",
-                                bytes.get(0..4).map(|b| b.to_vec()).unwrap_or_default()));
+                            evrt_log(
+                                &events,
+                                format!(
+                                    "EVRTCK decode error: {e} magic={:?}",
+                                    bytes.get(0..4).map(|b| b.to_vec()).unwrap_or_default()
+                                ),
+                            );
                             None
                         }
                     }
@@ -697,6 +778,7 @@ fn decode_h264_frame(
     #[cfg(all(target_os = "android", feature = "android-client"))]
     {
         crate::android_video::decode_frame_to_surface("H264", bytes, is_key, _width, _height);
+        ANDROID_EVRT_FRAME_SEEN.store(true, Ordering::Relaxed);
         return None;
     }
 
@@ -758,6 +840,7 @@ fn decode_h265_frame(
     #[cfg(all(target_os = "android", feature = "android-client"))]
     {
         crate::android_video::decode_frame_to_surface("H265", bytes, is_key, width, height);
+        ANDROID_EVRT_FRAME_SEEN.store(true, Ordering::Relaxed);
         return None;
     }
 
@@ -831,6 +914,7 @@ fn decode_av1_frame(
     #[cfg(all(target_os = "android", feature = "android-client"))]
     {
         crate::android_video::decode_frame_to_surface("AV1", bytes, is_key, width, height);
+        ANDROID_EVRT_FRAME_SEEN.store(true, Ordering::Relaxed);
         return None;
     }
 
@@ -838,7 +922,10 @@ fn decode_av1_frame(
     let _ = is_key;
 
     if !crate::mf_video::mf_video_decode_status().av1 {
-        evrt_log(events, "AV1: MF decoder not available on this system".into());
+        evrt_log(
+            events,
+            "AV1: MF decoder not available on this system".into(),
+        );
         return None;
     }
 
@@ -918,6 +1005,7 @@ pub fn try_evrt_before_relay(
     events: &Sender<SessionEvent>,
     stop: Arc<AtomicBool>,
     ultra_low_lat: bool,
+    audio_enabled: Arc<AtomicBool>,
 ) -> bool {
     let params = EvrtClientParams {
         socket: local_udp.clone(),
@@ -926,6 +1014,7 @@ pub fn try_evrt_before_relay(
         stop,
         ultra_low_latency: ultra_low_lat,
         session_token,
+        audio_enabled,
     };
 
     match run_evrt_client(params) {
@@ -956,6 +1045,7 @@ pub fn try_evrt_candidates(
     events: &Sender<SessionEvent>,
     ultra_low_lat: bool,
     stop: Arc<AtomicBool>,
+    audio_enabled: Arc<AtomicBool>,
 ) -> bool {
     for (i, addr) in candidates.iter().enumerate() {
         if stop.load(Ordering::Relaxed) {
@@ -984,6 +1074,7 @@ pub fn try_evrt_candidates(
             stop: stop.clone(),
             ultra_low_latency: ultra_low_lat,
             session_token: session_token.clone(),
+            audio_enabled: Arc::clone(&audio_enabled),
         }) {
             EvrtConnectResult::Ok => {
                 // Сессия завершилась нормально (была установлена)

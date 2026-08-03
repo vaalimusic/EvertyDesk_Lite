@@ -2,7 +2,29 @@
 
 **Task ID:** EVRT2CKMAX-TASK-02  
 **Author:** Arthur Valiev  
-**Status:** Specification → pending implementation  
+**Status:** Implemented and live-verified (2026-07) — `src/execution_capability.rs`
+(registry, calibration, marginal-utility `schedule()`); the
+`RAYON_THRESHOLD` constant in `evrtck.rs` is replaced by a calibrated
+`use_rayon(n)` decision, and `evrtck_wgpu.rs` registers as a real
+RoiEncoding provider. `rebalance()` from ReceiverFeedback2 (Phase 4) is
+implemented (ROADMAP Phase 6.2) and was live-debugged 2026-07-27: a real
+bug caused NVENC to stay demoted permanently after a single transient
+client decode error, because the 30s `DEMOTION_COOLDOWN` clock kept
+getting reset by repeated STALE `silicon_ok=false` reports (the client
+never got a chance to re-verify health once demotion stopped further
+NVENC frames from being sent). Fixed by edge-triggering the
+`rebalance()` call — only a fresh healthy→unhealthy transition demotes,
+not a repeat of the same stale status. Live-confirmed: demotion now
+genuinely expires after ~30s instead of never recovering. Separately
+found (same investigation, still open): under sustained real
+full-motion content, EVRTCK's own CPU cost (50-150ms+/frame at
+2560×1440) — not NVENC, not the network — is what actually caps
+`schedule()`'s useful throughput, since EVRTCK's output is the real sent
+packet whenever NVENC isn't chosen and the loop must wait for it
+synchronously every frame; see `ROADMAP.md` Phase 6.3 for the live fps
+data. This is an architectural throughput limit of the CPU EVRTCK
+implementation, not a scheduler bug — optimizing it is a separate,
+larger project, not started.  
 **Depends on:** [`EVRT2CKMAX.md`](../codec/EVRT2CKMAX.md) — Valiev Law of
 Computational Opportunity, Execution Capability (object 5), the
 marginal utility test

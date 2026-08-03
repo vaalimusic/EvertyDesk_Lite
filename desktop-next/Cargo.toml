@@ -1,0 +1,52 @@
+[package]
+name = "evertydesk-desktop-next"
+version = "0.1.0"
+edition = "2021"
+publish = false
+build = "build.rs"
+
+[features]
+default = []
+viewer-core = ["dep:evertydesk-core"]
+
+[dependencies]
+arboard = "3.6"
+async-channel = "2"
+evertydesk-core = { package = "evertydesk-lite", path = "..", optional = true, default-features = false, features = [
+    "evrt-wasapi",
+    "live-h264",
+    "live-vp9-mf",
+] }
+font8x8 = "0.3"
+iced = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "tokio", "svg"] }
+icondata = { version = "0.7", default-features = false, features = ["lucide"] }
+pixels = "0.17"
+png = "0.18"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+winit = "0.30"
+zeroize = { version = "1", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.24.2"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_UI_Shell"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6.3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6.3", features = ["sync-secret-service"] }
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "2"
+
+[[bin]]
+name = "evertydesk-launcher"
+path = "src/bin/launcher.rs"
+required-features = ["viewer-core"]
+
+[[bin]]
+name = "evertydesk-viewer"
+path = "src/bin/viewer.rs"
+required-features = ["viewer-core"]

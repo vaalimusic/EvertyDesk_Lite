@@ -9,6 +9,7 @@ import android.graphics.Paint
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.util.Log
 import android.view.GestureDetector
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
@@ -214,7 +215,10 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
     }
 
     private fun rebuildMatrix() {
-        if (frameW <= 0 || frameH <= 0 || width <= 0 || height <= 0) return
+        if (frameW <= 0 || frameH <= 0 || width <= 0 || height <= 0) {
+            Log.i("EvdGameScreen", "rebuildMatrix EARLY RETURN frameW=$frameW frameH=$frameH viewW=$width viewH=$height")
+            return
+        }
         baseFit = min(width.toFloat() / frameW, height.toFloat() / frameH)
             .coerceAtLeast(MIN_SCALE)
         val totalScale = baseFit * userZoom
@@ -225,6 +229,7 @@ class RemoteView(context: Context, private val client: NativeClient) : View(cont
         matrix.setScale(totalScale, totalScale)
         matrix.postTranslate(tx, ty)
         matrix.invert(matrixInv)
+        Log.i("EvdGameScreen", "rebuildMatrix frameW=$frameW frameH=$frameH viewW=$width viewH=$height baseFit=$baseFit tx=$tx ty=$ty drawW=$drawW drawH=$drawH")
         onVideoRectChanged?.invoke(VideoRect(tx.toInt(), ty.toInt(), drawW.toInt(), drawH.toInt()))
     }
 

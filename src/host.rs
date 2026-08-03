@@ -15,20 +15,91 @@ use std::{
     net::{TcpStream, UdpSocket},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
         Arc, Mutex, OnceLock,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 static APPROVALS: OnceLock<Mutex<std::collections::HashMap<String, bool>>> = OnceLock::new();
 static RECENT_RELAY_EVENTS: OnceLock<Mutex<std::collections::HashMap<String, Instant>>> =
     OnceLock::new();
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+static ACTIVE_SESSION: OnceLock<Mutex<Option<(u64, String)>>> = OnceLock::new();
+
+#[derive(Clone)]
+struct RemoteIdentity {
+    peer_id: String,
+    peer_name: String,
+    platform: String,
+    version: String,
+}
+
+impl RemoteIdentity {
+    fn unknown() -> Self {
+        Self {
+            peer_id: "Неизвестное устройство".to_owned(),
+            peer_name: String::new(),
+            platform: String::new(),
+            version: String::new(),
+        }
+    }
+}
+
+fn clean_identity_field(value: &str, limit: usize) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(limit)
+        .collect()
+}
+
+fn remote_identity_from_login(login: &crate::rustdesk_proto::LoginRequest) -> RemoteIdentity {
+    let raw_id = clean_identity_field(&login.my_id, 128);
+    let raw_name = clean_identity_field(&login.my_name, 128);
+    let peer_id = if !raw_id.is_empty()
+        && !raw_id.eq_ignore_ascii_case("evertydesk-lite")
+        && !raw_id.eq_ignore_ascii_case("rustdesk")
+    {
+        raw_id
+    } else if !raw_name.is_empty()
+        && !raw_name.eq_ignore_ascii_case("evertydesk lite")
+        && !raw_name.eq_ignore_ascii_case("rustdesk")
+    {
+        raw_name.clone()
+    } else {
+        "Неизвестное устройство".to_owned()
+    };
+    RemoteIdentity {
+        peer_id,
+        peer_name: raw_name,
+        platform: clean_identity_field(&login.my_platform, 64),
+        version: clean_identity_field(&login.version, 32),
+    }
+}
+
+fn safe_session_end_reason(reason: &str) -> String {
+    let cleaned = clean_identity_field(reason, 160);
+    let lowered = cleaned.to_lowercase();
+    if cleaned.is_empty() {
+        "Сессия завершена".to_owned()
+    } else if lowered.contains("rejected") {
+        "Подключение отклонено".to_owned()
+    } else if lowered.contains("approval timed out") {
+        "Истекло время подтверждения".to_owned()
+    } else if lowered.contains("wrong-password") || lowered.contains("wrong password") {
+        "Ошибка аутентификации".to_owned()
+    } else {
+        cleaned
+    }
+}
 
 /// When true, incoming mouse/keyboard events from the remote client are discarded.
 static BLOCK_REMOTE_INPUT: AtomicBool = AtomicBool::new(false);
+static ALLOW_REMOTE_CLIPBOARD: AtomicBool = AtomicBool::new(true);
 
 pub fn set_remote_input_blocked(blocked: bool) {
     BLOCK_REMOTE_INPUT.store(blocked, Ordering::Relaxed);
@@ -36,6 +107,75 @@ pub fn set_remote_input_blocked(blocked: bool) {
 
 pub fn is_remote_input_blocked() -> bool {
     BLOCK_REMOTE_INPUT.load(Ordering::Relaxed)
+}
+
+pub fn set_remote_clipboard_allowed(allowed: bool) {
+    ALLOW_REMOTE_CLIPBOARD.store(allowed, Ordering::Relaxed);
+}
+
+pub fn is_remote_clipboard_allowed() -> bool {
+    ALLOW_REMOTE_CLIPBOARD.load(Ordering::Relaxed)
+}
+
+fn active_session() -> &'static Mutex<Option<(u64, String)>> {
+    ACTIVE_SESSION.get_or_init(|| Mutex::new(None))
+}
+
+fn set_active_session(session_id: u64, peer_id: String) {
+    if let Ok(mut active) = active_session().lock() {
+        *active = Some((session_id, peer_id));
+    }
+}
+
+fn clear_active_session(session_id: u64) -> bool {
+    if let Ok(mut active) = active_session().lock() {
+        if active
+            .as_ref()
+            .is_some_and(|(active_id, _)| *active_id == session_id)
+        {
+            *active = None;
+            return true;
+        }
+    }
+    false
+}
+
+fn apply_session_permissions(
+    session_id: u64,
+    peer_id: &str,
+    input_blocked: bool,
+    clipboard_allowed: bool,
+) -> bool {
+    let matches_active = active_session()
+        .lock()
+        .ok()
+        .and_then(|active| active.clone())
+        .is_some_and(|(active_id, active_peer)| active_id == session_id && active_peer == peer_id);
+    if !matches_active {
+        return false;
+    }
+    set_remote_input_blocked(input_blocked);
+    set_remote_clipboard_allowed(clipboard_allowed);
+    true
+}
+
+/// UI-driven kill switch. When the host user presses "Отключить" on the active
+/// session panel, the UI sets this to `true`; the relay input loop checks it
+/// each iteration and tears the session down cleanly (same path as a normal
+/// disconnect). Reset to `false` when a new session starts so a stale request
+/// can't kill a fresh connection.
+static KICK_ACTIVE_SESSION: AtomicBool = AtomicBool::new(false);
+
+pub fn request_kick_active_session() {
+    KICK_ACTIVE_SESSION.store(true, Ordering::Relaxed);
+}
+
+fn take_kick_request() -> bool {
+    KICK_ACTIVE_SESSION.swap(false, Ordering::Relaxed)
+}
+
+fn clear_kick_request() {
+    KICK_ACTIVE_SESSION.store(false, Ordering::Relaxed);
 }
 
 fn approvals() -> &'static Mutex<std::collections::HashMap<String, bool>> {
@@ -93,7 +233,7 @@ const BEST_QUALITY_MILLI: u32 = 1_800;
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /// Observable state of the host service.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum HostState {
     Idle,
     Connecting,
@@ -134,7 +274,11 @@ impl HostState {
 pub type EguiColor = (u8, u8, u8);
 
 /// Events sent from the host background thread to the UI.
-#[derive(Debug, Clone)]
+///
+/// Also the wire format for the Phase 1 `--host-agent` IPC link (see
+/// `host_agent.rs`): serialized as one JSON object per line over a loopback
+/// TCP socket when the host runs in its own process instead of a GUI thread.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum HostEvent {
     StateChanged(HostState),
     Registered {
@@ -150,38 +294,132 @@ pub enum HostEvent {
     },
     ApprovalRequested {
         peer_id: String,
+        #[serde(default)]
+        peer_name: String,
+        #[serde(default)]
+        platform: String,
+        #[serde(default)]
+        version: String,
     },
     SessionStarted {
         peer_id: String,
+        #[serde(default)]
+        session_id: u64,
+        #[serde(default)]
+        peer_name: String,
+        #[serde(default)]
+        platform: String,
+        #[serde(default)]
+        version: String,
     },
     SessionEnded {
         peer_id: String,
         reason: String,
+        #[serde(default)]
+        session_id: u64,
     },
     VideoTelemetry {
         summary: String,
         fallback_reason: Option<String>,
     },
+    SessionPermissionsChanged {
+        peer_id: String,
+        session_id: u64,
+        input_blocked: bool,
+        clipboard_allowed: bool,
+    },
     Log(String),
 }
 
 /// Commands sent from the UI to the host thread.
-#[derive(Debug)]
+///
+/// Also the wire format for the Phase 1 `--host-agent` IPC link — see
+/// `HostEvent`'s doc comment.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub enum HostCommand {
     Stop,
     Reconfigure(AppConfig),
+    /// Routed to the agent process's own `approvals()` map — in agent mode
+    /// `HostService::approve_incoming` can no longer write that map directly
+    /// because it lives in a different process's address space.
+    ApproveIncoming {
+        peer_id: String,
+        accept: bool,
+    },
+    /// Take-control toggle, see HostService::set_input_blocked. Same
+    /// cross-process reasoning as ApproveIncoming: BLOCK_REMOTE_INPUT lives
+    /// wherever the actual relay session thread runs, which in agent mode
+    /// is not this process.
+    SetInputBlocked(bool),
+    /// Allow or reject clipboard messages for the active incoming session.
+    /// This is process-global for the same reason as `SetInputBlocked`.
+    SetClipboardAllowed(bool),
+    /// Atomically changes permissions only when `peer_id` is still the
+    /// currently active incoming session and reports the applied state.
+    SetSessionPermissions {
+        peer_id: String,
+        session_id: u64,
+        input_blocked: bool,
+        clipboard_allowed: bool,
+    },
+    /// Disconnect client, see HostService::kick_active_session.
+    KickActiveSession,
 }
 
 // ── Service handle ────────────────────────────────────────────────────────────
 
+/// What's on the other end of `event_rx`/`command_tx`.
+///
+/// `InProcess` is the original, always-available behavior: `run_host_loop`
+/// on a thread in this same process, signaled directly through a shared
+/// `AtomicBool`. `Agent` is Phase 1 (`TZ_HOST_SERVICE.md`) — the same loop
+/// running in a separate `--host-agent` process, bridged over a loopback
+/// socket by `host_agent.rs`. `HostService`'s public methods hide which one
+/// is active from every other call site in the app.
+enum Backend {
+    InProcess(Arc<AtomicBool>),
+    Agent(std::net::TcpStream),
+}
+
 pub struct HostService {
     pub event_rx: Receiver<HostEvent>,
     command_tx: Sender<HostCommand>,
-    stop: Arc<AtomicBool>,
+    backend: Backend,
 }
 
 impl HostService {
+    /// Starts hosting, using the out-of-process agent (`host_agent::enabled`)
+    /// when opted in and reachable, falling back to the in-process path on
+    /// any failure — Phase 1 must never be a hard dependency for hosting to
+    /// work at all. Prefer this over `start_in_process` at every normal call
+    /// site; the agent process itself is the one exception (see
+    /// `host_agent::run_host_agent`, which must not try to spawn another
+    /// agent recursively).
     pub fn start(config: AppConfig) -> Self {
+        // Android has no separate-process host model (the whole app is one
+        // .so loaded into a Kotlin host process) — Phase 1 is desktop-only.
+        #[cfg(not(target_os = "android"))]
+        {
+            if crate::host_agent::enabled() {
+                if let Some(svc) = crate::host_agent::connect_or_spawn(config.clone()) {
+                    return svc;
+                }
+            }
+        }
+        let svc = Self::start_in_process(config);
+        // Phase 2 (approval_prompt.rs) needs a way to reach whichever
+        // process is actually hosting, regardless of whether Phase 1 is
+        // enabled — this is the in-process half of that; `run_host_agent`
+        // (Phase 1's own process) sets up its own richer version of the same
+        // thing itself, so this must not run there (hence calling
+        // `start_in_process` directly above, not through here).
+        #[cfg(not(target_os = "android"))]
+        crate::host_agent::spawn_command_listener(svc.command_sender());
+        svc
+    }
+
+    /// The original behavior: `run_host_loop` on a thread in this process.
+    pub fn start_in_process(config: AppConfig) -> Self {
         let (event_tx, event_rx) = mpsc::channel::<HostEvent>();
         let (command_tx, command_rx) = mpsc::channel::<HostCommand>();
         let stop = Arc::new(AtomicBool::new(false));
@@ -190,13 +428,59 @@ impl HostService {
         Self {
             event_rx,
             command_tx,
-            stop,
+            backend: Backend::InProcess(stop),
         }
     }
 
+    /// Wraps an already-connected agent link (see `host_agent::connect_or_spawn`)
+    /// in the same `HostService` shape every other call site already uses.
+    /// `socket` is kept only so `detach()` can shut it down cleanly.
+    pub(crate) fn from_agent_link(
+        event_rx: Receiver<HostEvent>,
+        command_tx: Sender<HostCommand>,
+        socket: std::net::TcpStream,
+    ) -> Self {
+        Self {
+            event_rx,
+            command_tx,
+            backend: Backend::Agent(socket),
+        }
+    }
+
+    pub fn command_sender(&self) -> Sender<HostCommand> {
+        self.command_tx.clone()
+    }
+
+    /// Actually stops hosting: for `Agent`, this ends the agent process too
+    /// (see `host_agent::run_host_agent`'s handling of `HostCommand::Stop`).
     pub fn stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
+        if let Backend::InProcess(stop) = &self.backend {
+            stop.store(true, Ordering::Relaxed);
+        }
         let _ = self.command_tx.send(HostCommand::Stop);
+    }
+
+    /// Leaves hosting running and just drops this process's link to it.
+    ///
+    /// For `Agent`, the agent process keeps hosting after this returns — the
+    /// whole point of Phase 1 is that closing/minimizing the GUI must not
+    /// kill the stream (`TZ_HOST_SERVICE.md` §1). For `InProcess` there is no
+    /// separate process to leave running (the host thread dies with this one
+    /// regardless), so this is equivalent to `stop()`.
+    pub fn detach(&self) {
+        match &self.backend {
+            Backend::Agent(socket) => {
+                let _ = socket.shutdown(std::net::Shutdown::Both);
+            }
+            Backend::InProcess(stop) => {
+                stop.store(true, Ordering::Relaxed);
+                let _ = self.command_tx.send(HostCommand::Stop);
+            }
+        }
+    }
+
+    pub fn is_agent_backed(&self) -> bool {
+        matches!(self.backend, Backend::Agent(_))
     }
 
     pub fn reconfigure(&self, config: AppConfig) {
@@ -204,8 +488,50 @@ impl HostService {
     }
 
     pub fn approve_incoming(&self, peer_id: &str, accept: bool) {
-        if let Ok(mut approvals) = approvals().lock() {
-            approvals.insert(peer_id.to_owned(), accept);
+        match &self.backend {
+            // Agent mode: `approvals()` in *this* process is a different map
+            // than the one `handle_relay_session` checks in the agent
+            // process — must cross the IPC link instead.
+            Backend::Agent(_) => {
+                let _ = self.command_tx.send(HostCommand::ApproveIncoming {
+                    peer_id: peer_id.to_owned(),
+                    accept,
+                });
+            }
+            Backend::InProcess(_) => {
+                if let Ok(mut approvals) = approvals().lock() {
+                    approvals.insert(peer_id.to_owned(), accept);
+                }
+            }
+        }
+    }
+
+    /// "Take control" toggle — blocks (or un-blocks) the remote client's own
+    /// mouse/keyboard while a session is active. `BLOCK_REMOTE_INPUT` is a
+    /// process-local static, so in agent mode this must cross the IPC link
+    /// like `approve_incoming` does, not call `set_remote_input_blocked`
+    /// directly (that would only touch this — irrelevant — process's copy).
+    pub fn set_input_blocked(&self, blocked: bool) {
+        match &self.backend {
+            Backend::Agent(_) => {
+                let _ = self.command_tx.send(HostCommand::SetInputBlocked(blocked));
+            }
+            Backend::InProcess(_) => {
+                set_remote_input_blocked(blocked);
+            }
+        }
+    }
+
+    /// "Disconnect client" — ends the active session, same cross-process
+    /// reasoning as `set_input_blocked`.
+    pub fn kick_active_session(&self) {
+        match &self.backend {
+            Backend::Agent(_) => {
+                let _ = self.command_tx.send(HostCommand::KickActiveSession);
+            }
+            Backend::InProcess(_) => {
+                request_kick_active_session();
+            }
         }
     }
 
@@ -356,9 +682,37 @@ fn run_host_loop(
     // Логируем доступные кодеки — видно в GUI при первом запуске.
     #[cfg(all(feature = "live-vp9-mf", target_os = "windows"))]
     {
-        let enc = crate::mf_encode::mf_encoder_status().label();
+        let enc_status = crate::mf_encode::mf_encoder_status();
+        let enc = enc_status.label();
         let dec = crate::mf_video::mf_video_decode_status().label();
         host_log(&events, format!("Кодеки: {enc} | {dec}"));
+
+        // Аппаратный H264 есть, а HEVC нет вообще — это почти всегда НЕ про
+        // железо. Любой GPU, который выдаёт H264(hw) через Quick Sync/NVENC/AMF,
+        // умеет и HEVC в кремнии; но Microsoft вынесла HEVC из Windows в
+        // отдельный пакет Store, и без него Media Foundation не показывает ни
+        // одного HEVC MFT. Пишем подсказку явно — иначе «нет H265» выглядит как
+        // приговор железу и уводит диагностику не туда (живо словили на
+        // Intel UHD 610: H264(hw) есть, HEVC нет ни в encode, ни в decode).
+        if enc_status.has_hardware_h264() && !enc_status.has_hardware_h265() {
+            host_log(
+                &events,
+                "ℹ️ Аппаратный H265 не найден через Media Foundation, хотя аппаратный H264 \
+                 работает. Это почти всегда не про железо, а про то, что Microsoft вынесла \
+                 HEVC из Windows в отдельный пакет Store. Ставить его мы не требуем — \
+                 см. строку D3D12 ниже: этот путь идёт напрямую в драйвер и пакета не требует."
+                    .to_owned(),
+            );
+        }
+
+        // D3D12 Video Encode — путь мимо Media Foundation. Логируем ВСЕГДА, в
+        // том числе отрицательный результат: именно эта строка отвечает на
+        // вопрос, можно ли на данной машине кодировать HEVC без пакета Store.
+        host_log(&events, crate::d3d12_encode::d3d12_encode_status().label());
+        // Второй путь мимо Media Foundation — рантайм Intel, приезжающий с
+        // драйвером. Отвечает на вопрос, какое поколение API стоит на машине
+        // (legacy MSDK 1.x или oneVPL 2.x) — от этого зависит реализация.
+        host_log(&events, crate::onevpl::onevpl_status().label());
     }
 
     // On macOS, host mode needs Screen Recording + Accessibility permission.
@@ -368,7 +722,10 @@ fn run_host_loop(
     {
         let (ok, hints) = macos_cgevent::preflight_permissions();
         if ok {
-            host_log(&events, "macOS: Screen Recording + Accessibility доступ есть ✓".to_owned());
+            host_log(
+                &events,
+                "macOS: Screen Recording + Accessibility доступ есть ✓".to_owned(),
+            );
         } else {
             for hint in hints {
                 host_log(&events, hint);
@@ -416,6 +773,40 @@ fn run_host_loop(
                                 config = cfg;
                                 break;
                             }
+                            HostCommand::ApproveIncoming { peer_id, accept } => {
+                                if let Ok(mut approvals) = approvals().lock() {
+                                    approvals.insert(peer_id, accept);
+                                }
+                            }
+                            HostCommand::SetInputBlocked(blocked) => {
+                                set_remote_input_blocked(blocked);
+                            }
+                            HostCommand::SetClipboardAllowed(allowed) => {
+                                set_remote_clipboard_allowed(allowed);
+                            }
+                            HostCommand::SetSessionPermissions {
+                                peer_id,
+                                session_id,
+                                input_blocked,
+                                clipboard_allowed,
+                            } => {
+                                if apply_session_permissions(
+                                    session_id,
+                                    &peer_id,
+                                    input_blocked,
+                                    clipboard_allowed,
+                                ) {
+                                    let _ = events.send(HostEvent::SessionPermissionsChanged {
+                                        peer_id,
+                                        session_id,
+                                        input_blocked,
+                                        clipboard_allowed,
+                                    });
+                                }
+                            }
+                            HostCommand::KickActiveSession => {
+                                request_kick_active_session();
+                            }
                         }
                     }
                     if Instant::now() >= deadline {
@@ -439,19 +830,26 @@ fn registration_loop(
     commands: &Receiver<HostCommand>,
     stop: &Arc<AtomicBool>,
 ) -> LoopResult {
-    // ── Self-test: UDP loopback (proves recv_from works on this machine) ─────
-    udp_loopback_test(events);
+    // Диагностические self-тесты нужны только для отладки десктоп-хоста и
+    // добавляют ~10с задержки (таймауты 3с). На Android их пропускаем, чтобы
+    // хост регистрировался на hbbs немедленно — иначе клиент, подключающийся
+    // сразу, получает "id does not exist" пока хост ещё не дошёл до RegisterPk.
+    #[cfg(not(target_os = "android"))]
+    {
+        // ── Self-test: UDP loopback (proves recv_from works on this machine) ─
+        udp_loopback_test(events);
 
-    // ── Self-test: external UDP (proves inbound UDP from internet works) ──────
-    udp_internet_test(events);
+        // ── Self-test: external UDP (proves inbound UDP from internet works) ─
+        udp_internet_test(events);
 
-    // ── TCP probe: see what the server actually does on port 21116 ────────────
-    tcp_probe(
-        &config.server.id_server,
-        RENDEZVOUS_PORT,
-        &config.local_id,
-        events,
-    );
+        // ── TCP probe: see what the server actually does on port 21116 ───────
+        tcp_probe(
+            &config.server.id_server,
+            RENDEZVOUS_PORT,
+            &config.local_id,
+            events,
+        );
+    }
 
     // ── DNS resolution ────────────────────────────────────────────────────────
     {
@@ -628,6 +1026,40 @@ fn registration_loop(
             match cmd {
                 HostCommand::Stop => return LoopResult::Stop,
                 HostCommand::Reconfigure(cfg) => return LoopResult::Reconfigure(cfg),
+                HostCommand::ApproveIncoming { peer_id, accept } => {
+                    if let Ok(mut approvals) = approvals().lock() {
+                        approvals.insert(peer_id, accept);
+                    }
+                }
+                HostCommand::SetInputBlocked(blocked) => {
+                    set_remote_input_blocked(blocked);
+                }
+                HostCommand::SetClipboardAllowed(allowed) => {
+                    set_remote_clipboard_allowed(allowed);
+                }
+                HostCommand::SetSessionPermissions {
+                    peer_id,
+                    session_id,
+                    input_blocked,
+                    clipboard_allowed,
+                } => {
+                    if apply_session_permissions(
+                        session_id,
+                        &peer_id,
+                        input_blocked,
+                        clipboard_allowed,
+                    ) {
+                        let _ = events.send(HostEvent::SessionPermissionsChanged {
+                            peer_id,
+                            session_id,
+                            input_blocked,
+                            clipboard_allowed,
+                        });
+                    }
+                }
+                HostCommand::KickActiveSession => {
+                    request_kick_active_session();
+                }
             }
         }
 
@@ -655,7 +1087,11 @@ fn registration_loop(
                 events,
                 format!(
                     "Heartbeat: {} → {server_addr} (#{send_count})",
-                    if pk_confirmed { "RegisterPeer" } else { "RegisterPk+RegisterPeer" }
+                    if pk_confirmed {
+                        "RegisterPeer"
+                    } else {
+                        "RegisterPk+RegisterPeer"
+                    }
                 ),
             );
             last_hb = Instant::now();
@@ -698,7 +1134,10 @@ fn registration_loop(
                                 4 => "INVALID_ID_FORMAT / NOT_DEPLOYED",
                                 _ => "unknown",
                             };
-                            host_log(events, format!("RegisterPkResponse  result={} ({})", r.result, meaning));
+                            host_log(
+                                events,
+                                format!("RegisterPkResponse  result={} ({})", r.result, meaning),
+                            );
                             if r.result == 0 {
                                 pk_confirmed = true;
                                 host_log(
@@ -986,17 +1425,41 @@ fn handle_relay_session(
     uuid: String,
     stop: Arc<AtomicBool>,
 ) {
-    match relay_session_inner(&config, &events, &peer_id, &relay_server, &uuid, &stop) {
-        Ok(()) => {
+    let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed).max(1);
+    let identity = Arc::new(Mutex::new(RemoteIdentity::unknown()));
+    let end_reason = match relay_session_inner(
+        &config,
+        &events,
+        &peer_id,
+        session_id,
+        Arc::clone(&identity),
+        &relay_server,
+        &uuid,
+        &stop,
+    ) {
+        Ok(reason) => {
             host_log(&events, format!("Session with {peer_id} ended normally."));
+            reason
         }
         Err(e) => {
             host_log(&events, format!("Session with {peer_id} error: {e}"));
+            safe_session_end_reason(&e)
         }
+    };
+    // A runtime input lock belongs only to the session that requested it.
+    // Never let it leak into the next incoming connection.
+    if clear_active_session(session_id) {
+        set_remote_input_blocked(false);
     }
+    let resolved_peer_id = identity
+        .lock()
+        .ok()
+        .map(|identity| identity.peer_id.clone())
+        .unwrap_or(peer_id);
     let _ = events.send(HostEvent::SessionEnded {
-        peer_id: peer_id.clone(),
-        reason: String::new(),
+        peer_id: resolved_peer_id,
+        reason: end_reason,
+        session_id,
     });
     let _ = events.send(HostEvent::StateChanged(HostState::Ready));
 }
@@ -1011,8 +1474,8 @@ fn windows_session_info() -> String {
 
     #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
     {
-        use windows::Win32::System::Threading::GetCurrentProcessId;
         use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+        use windows::Win32::System::Threading::GetCurrentProcessId;
         let mut session_id: u32 = 0;
         let our_pid = unsafe { GetCurrentProcessId() };
         let ok = unsafe { ProcessIdToSessionId(our_pid, &mut session_id) }.as_bool();
@@ -1026,16 +1489,272 @@ fn windows_session_info() -> String {
     format!("SESSIONNAME={session_name} USER={username}")
 }
 
+/// Android тачпад-хост: цикл приёма ввода без видео. Клиент (телефон) шлёт
+/// Mouse/KeyEvent, мы инжектим их в службу доступности (EvertyInputService).
+#[cfg(target_os = "android")]
+fn android_touchpad_session(
+    relay: &mut TcpStream,
+    cipher: &mut Option<StreamCipher>,
+    events: &Sender<HostEvent>,
+    peer_id: &str,
+    host_stop: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    host_log(
+        events,
+        format!("Android тачпад-хост: сессия с {peer_id} (ввод-только, без видео) ✓"),
+    );
+    // Короткий таймаут чтения — чтобы регулярно проверять host_stop и слать keepalive.
+    relay
+        .set_read_timeout(Some(Duration::from_millis(1000)))
+        .ok();
+    let mut idle_ticks: u32 = 0;
+    loop {
+        if host_stop.load(Ordering::Relaxed) {
+            host_log(
+                events,
+                format!("Android тачпад-хост: остановка сессии {peer_id}"),
+            );
+            return Ok(());
+        }
+        match recv_peer_enc(relay, cipher) {
+            Ok(Some(msg)) => {
+                idle_ticks = 0;
+                match msg.union {
+                    Some(peer_message::Union::MouseEvent(ev)) => inject_mouse(ev),
+                    Some(peer_message::Union::KeyEvent(ev)) => inject_key(ev),
+                    Some(peer_message::Union::TestDelay(d)) => {
+                        let mut d = d;
+                        d.from_client = false;
+                        let reply = PeerMessage {
+                            union: Some(peer_message::Union::TestDelay(d)),
+                        };
+                        let _ = send_peer_enc(relay, cipher, &reply);
+                    }
+                    _ => {}
+                }
+            }
+            Ok(None) => {
+                // keepalive от клиента — отвечаем пустым фреймом.
+                relay
+                    .write_all(&encode_frame_len(0)?)
+                    .map_err(|e| e.to_string())?;
+            }
+            Err(e) => {
+                if is_android_timeout(&e) {
+                    idle_ticks += 1;
+                    let _ = relay.write_all(&encode_frame_len(0)?);
+                    if idle_ticks > 180 {
+                        return Err("Android тачпад-хост: таймаут простоя (~3 мин)".to_owned());
+                    }
+                    continue;
+                }
+                return Err(format!("Android тачпад-хост: relay read: {e}"));
+            }
+        }
+    }
+}
+
+/// EVRT2-only test session (host.rs's counterpart of `android_touchpad_session`
+/// above): the client requested `evrt2_only` in its LoginRequest, so we skip
+/// spawning `video_pipeline::run` entirely — no capture, no NVENC/encoder
+/// loop — and go straight into the experimental EVRT2 capture→encode→UDP
+/// loop instead. This is what makes the two never compete for the same
+/// desktop-capture source or CPU/GPU encode time; see evrt2_experiment.rs's
+/// doc comment for why that mattered when both used to run side by side.
+fn run_evrt2_only_session(
+    relay: &mut TcpStream,
+    cipher: &mut Option<StreamCipher>,
+    events: &Sender<HostEvent>,
+    peer_id: &str,
+    host_stop: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    host_log(
+        events,
+        format!("EVRT2-only сессия с {peer_id}: живой EVRT1-пайплайн пропущен целиком ✓"),
+    );
+    clear_kick_request();
+
+    // ROADMAP.md Phase 5.3 — RELAY_WRAP: the host side of the relay
+    // candidate. `relay_inbound_tx` feeds bytes this thread unwraps from
+    // incoming `Misc::Evrt2RelayWrap` into the race; `relay_outbound_rx`
+    // (returned below) is what the writer thread further down drains and
+    // wraps back out.
+    let (relay_inbound_tx, relay_inbound_rx) = mpsc::channel::<Vec<u8>>();
+    let (port, public_addr, auth_key, evrt2_stop, relay_outbound_rx) =
+        crate::evrt2_experiment::start_host_experiment_with_relay_race(
+            events.clone(),
+            relay_inbound_rx,
+        )
+        .map_err(|e| format!("EVRT2-only: failed to bind UDP socket: {e}"))?;
+    // ROADMAP.md Phase 5.1: WAN candidate appended after the LAN/VPN ones —
+    // same "mini-ICE" list shape the EVRT1 UDP socket already announces.
+    let mut endpoints = crate::netif::candidate_endpoints(port);
+    if let Some(addr) = public_addr {
+        endpoints = if endpoints.is_empty() {
+            addr.to_string()
+        } else {
+            format!("{endpoints},{addr}")
+        };
+    }
+    // Debug-only test hook (ROADMAP.md Phase 5.3 live verification): with
+    // EVRTDESK_EVRT2_FORCE_RELAY=1, don't advertise any UDP candidates at
+    // all — the client then has nothing to race except the relay leg,
+    // exercising the real RELAY_WRAP path end-to-end over an actual
+    // connection instead of only in the loopback unit tests. Not meant to
+    // stay set for a normal session; the UDP socket itself still binds
+    // normally (this only trims what's ANNOUNCED), so the host-side race
+    // still races both — it just can't be won by UDP.
+    let force_relay_only = std::env::var("EVRTDESK_EVRT2_FORCE_RELAY")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    if force_relay_only {
+        host_log(events, "EVRT2-only: EVRTDESK_EVRT2_FORCE_RELAY=1 — UDP-кандидаты не объявляются (тест RELAY_WRAP)".to_owned());
+        endpoints.clear();
+    }
+    host_log(
+        events,
+        format!("EVRT2-only: сокет поднят на порту {port}, кандидаты: [{endpoints}] (+ relay-кандидат, Phase 5.3)"),
+    );
+    // ROADMAP.md Phase 4.2: the AuthTag session key travels the same TCP
+    // relay channel EVRT1's own `evrt_session_token` already uses — see
+    // `evrt2_crypto`'s module doc for the honest caveat on what that does
+    // and doesn't defend against. Sent BEFORE the cipher is split below —
+    // this is the last message on this thread that still uses the combined
+    // `StreamCipher`.
+    let endpoints_with_key = format!(
+        "{endpoints},evrt2key={}",
+        crate::evrt2_crypto::key_to_hex(&auth_key)
+    );
+    let _ = send_peer_enc(
+        relay,
+        cipher,
+        &vm_misc_message(misc::Union::Evrt2ExperimentEndpoints(endpoints_with_key)),
+    );
+
+    // ROADMAP.md Phase 5.3: split the cipher (same into_halves()/try_clone()
+    // pattern the live EVRT1 pipeline already uses for its own input-loop/
+    // TCP-sender split) so a dedicated writer thread can forward relay-wrap
+    // bytes AND keepalives independently of this thread's read loop, without
+    // two threads ever calling `write_all` on the same socket concurrently.
+    let (send_cipher, mut recv_cipher) = match cipher.take() {
+        Some(c) => {
+            let (s, r) = c.into_halves();
+            (Some(s), Some(r))
+        }
+        None => (None, None),
+    };
+    let write_stream = relay
+        .try_clone()
+        .map_err(|e| format!("EVRT2-only: try_clone relay stream: {e}"))?;
+
+    let writer_stop = evrt2_stop.clone();
+    let writer_thread = thread::Builder::new()
+        .name("evrt2-relay-writer".into())
+        .spawn(move || {
+            let mut stream = write_stream;
+            let mut cipher = send_cipher;
+            while !writer_stop.load(Ordering::Relaxed) {
+                match relay_outbound_rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(raw) => {
+                        let msg = vm_misc_message(misc::Union::Evrt2RelayWrap(raw));
+                        if send_peer_sc(&mut stream, &mut cipher, &msg).is_err() {
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        // Same keepalive rule as before (SDUDP.md § relay
+                        // keepalive doc: ≥1/s or middleboxes drop the TCP
+                        // connection after ~30s idle) — now owned solely by
+                        // this thread so it never races the reader's socket
+                        // clone or the relay-wrap bytes above.
+                        if let Ok(frame) = encode_frame_len(0) {
+                            if stream.write_all(&frame).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        })
+        .expect("spawn evrt2-relay-writer");
+
+    relay
+        .set_read_timeout(Some(Duration::from_millis(1000)))
+        .ok();
+    let result = loop {
+        if host_stop.load(Ordering::Relaxed) {
+            break Ok(());
+        }
+        if take_kick_request() {
+            host_log(
+                events,
+                format!("EVRT2-only сессия {peer_id} остановлена хостом"),
+            );
+            break Ok(());
+        }
+        match recv_peer_rc(relay, &mut recv_cipher) {
+            Ok(Some(msg)) => {
+                // ROADMAP.md Phase 5.3: the only control traffic this
+                // session cares about — everything else (mouse/keyboard) is
+                // still ignored, pure video test, no input path.
+                match &msg.union {
+                    Some(peer_message::Union::Misc(m)) => match &m.union {
+                        Some(misc::Union::Evrt2RelayWrap(bytes)) => {
+                            let send_ok = relay_inbound_tx.send(bytes.clone()).is_ok();
+                            host_log(events, format!(
+                                "EVRT2-only: received Evrt2RelayWrap {} bytes, forwarded_ok={send_ok}",
+                                bytes.len()
+                            ));
+                        }
+                        other => {
+                            host_log(
+                                events,
+                                format!(
+                                    "EVRT2-only: received Misc, but not Evrt2RelayWrap: {other:?}"
+                                ),
+                            );
+                        }
+                    },
+                    other => {
+                        host_log(
+                            events,
+                            format!("EVRT2-only: received PeerMessage, not Misc: {other:?}"),
+                        );
+                    }
+                }
+            }
+            Ok(None) => {} // peer's own empty keepalive frame — nothing to do
+            Err(ref e) if is_timeout(e) => {} // no data right now; the writer thread keeps the connection alive on its own cadence
+            Err(e) => break Err(format!("EVRT2-only: relay read: {e}")),
+        }
+    };
+    evrt2_stop.store(true, Ordering::Relaxed);
+    let _ = writer_thread.join();
+    result
+}
+
+#[cfg(target_os = "android")]
+fn is_android_timeout(err: &str) -> bool {
+    err.contains("timed out")
+        || err.contains("would block")
+        || err.contains("WouldBlock")
+        || err.contains("os error 11")
+        || err.contains("os error 35")
+}
+
 fn relay_session_inner(
     config: &AppConfig,
     events: &Sender<HostEvent>,
     peer_id: &str,
+    session_id: u64,
+    session_identity: Arc<Mutex<RemoteIdentity>>,
     relay_server: &str,
     uuid: &str,
     host_stop: &Arc<AtomicBool>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     if host_stop.load(Ordering::Relaxed) {
-        return Ok(());
+        return Ok("Приём подключений остановлен".to_owned());
     }
     host_log(events, format!("Session debug: {}", windows_session_info()));
     // ── 1. Connect to relay ───────────────────────────────────────────────────
@@ -1149,7 +1868,10 @@ fn relay_session_inner(
         })),
     };
     send_peer_enc(&mut relay, &mut cipher, &hash_msg)?;
-    host_log(events, format!("Hash challenge sent to {peer_id} — awaiting LoginRequest…"));
+    host_log(
+        events,
+        format!("Hash challenge sent to {peer_id} — awaiting LoginRequest…"),
+    );
 
     // Wait for a LoginRequest with a valid password. On empty/wrong password
     // we send the RustDesk-standard error ("Empty Password" / "Wrong Password")
@@ -1176,20 +1898,31 @@ fn relay_session_inner(
         };
         match msg.union {
             Some(peer_message::Union::LoginRequest(lr)) => {
+                let identity = remote_identity_from_login(&lr);
+                let request_peer_id = identity.peer_id.clone();
+                if let Ok(mut current) = session_identity.lock() {
+                    *current = identity.clone();
+                }
+                if request_peer_id != peer_id {
+                    approvals().lock().unwrap().remove(&request_peer_id);
+                }
                 if lr.password.is_empty() {
                     if config.security.require_confirmation || lr.password.is_empty() {
                         host_log(
                             events,
-                            format!("Approval requested for {peer_id} (empty password)"),
+                            format!("Approval requested for {request_peer_id} (empty password)"),
                         );
                         let _ = events.send(HostEvent::ApprovalRequested {
-                            peer_id: peer_id.to_owned(),
+                            peer_id: request_peer_id.clone(),
+                            peer_name: identity.peer_name.clone(),
+                            platform: identity.platform.clone(),
+                            version: identity.version.clone(),
                         });
-                        match wait_for_approval(peer_id, Duration::from_secs(45)) {
+                        match wait_for_approval(&request_peer_id, Duration::from_secs(45)) {
                             Some(true) => {
                                 host_log(
                                     events,
-                                    format!("Approved incoming connection from {peer_id}"),
+                                    format!("Approved incoming connection from {request_peer_id}"),
                                 );
                                 break lr;
                             }
@@ -1210,11 +1943,14 @@ fn relay_session_inner(
                         send_login_error(&mut relay, &mut cipher, "Empty Password")?;
                         pw_attempts += 1;
                     }
-                } else if verify_password(&lr.password, &config.local_password, &salt, &challenge) {
+                } else if verify_access_password(&lr.password, &config, &salt, &challenge) {
                     // ★ Верный пароль = автоматический доступ, без подтверждения.
                     //   ID+пароль достаточно. Подтверждение остаётся только для
                     //   подключений с ПУСТЫМ паролем (unattended режим выше).
-                    host_log(events, format!("Password OK ✓ — авто-доступ для {peer_id}"));
+                    host_log(
+                        events,
+                        format!("Password OK ✓ — авто-доступ для {request_peer_id}"),
+                    );
                     break lr;
                 } else {
                     host_log(events, "Wrong password → asking to retry".to_owned());
@@ -1250,6 +1986,12 @@ fn relay_session_inner(
             }
         }
     };
+    let identity = session_identity
+        .lock()
+        .ok()
+        .map(|identity| identity.clone())
+        .unwrap_or_else(RemoteIdentity::unknown);
+    let peer_id = identity.peer_id.as_str();
 
     // ── 4. Send LoginResponse + display info ─────────────────────────────────
     let hostname = hostname();
@@ -1313,6 +2055,22 @@ fn relay_session_inner(
     };
     send_peer_enc(&mut relay, &mut cipher, &login_ok)?;
 
+    // ── EVRT2-only тест: клиент попросил не поднимать живой EVRT1-пайплайн ───
+    if login.evrt2_only {
+        return run_evrt2_only_session(&mut relay, &mut cipher, events, peer_id, host_stop)
+            .map(|()| "EVRT2-сессия завершена".to_owned());
+    }
+
+    // ── Android-хост: тачпад-режим (ввод-только, без видео) ──────────────────
+    // Пользователь смотрит прямо на экран Android/ТВ, телефон — слепой трекпад.
+    // Захвата/энкодера на Android нет; принимаем Mouse/KeyEvent и инжектим их в
+    // службу доступности. Видео-пайплайн ниже не запускаем.
+    #[cfg(target_os = "android")]
+    {
+        return android_touchpad_session(&mut relay, &mut cipher, events, peer_id, host_stop)
+            .map(|()| "Сеанс управления завершён".to_owned());
+    }
+
     // ── 4а. EVRT: открываем выделенный UDP сокет и сообщаем порт клиенту ─────
     //
     // Отдельный сокет — не hbbs-порт. Это решает проблему конкуренции:
@@ -1325,11 +2083,34 @@ fn relay_session_inner(
     let mut evrt_announce: Option<(String, u16)> = None;
     let mut evrt_token: Option<String> = None;
 
-    if let Some((ref _sock, evrt_port)) = evrt_socket {
+    if let Some((ref sock, evrt_port)) = evrt_socket {
         let token = new_evrt_session_token();
         // ★ Перечисляем ВСЕ локальные IP (LAN + VPN) как кандидаты — mini-ICE.
         //   Это решает мультихоминг: через VPN клиент достучится по VPN-IP хоста.
-        let endpoints = crate::netif::candidate_endpoints(evrt_port);
+        let mut endpoints = crate::netif::candidate_endpoints(evrt_port);
+
+        // ★ STUN: публичный адрес как последний кандидат — решает "клиент не в
+        //   LAN хоста" (мобильный интернет, другая сеть). ОБЯЗАТЕЛЬНО через тот
+        //   же сокет, что откроет EVRT-сессию — NAT-маппинг per-socket, другой
+        //   сокет узнает бесполезный порт. Best-effort: symmetric NAT или
+        //   недоступность STUN-серверов оставляет endpoints как раньше (только
+        //   LAN/VPN), клиент падает на TCP relay — как и было до этого фикса,
+        //   никакой регрессии на неудаче.
+        match crate::netif::discover_public_endpoint(sock) {
+            Some(public_addr) => {
+                host_log(events, format!("EVRT: STUN обнаружил публичный адрес {public_addr}"));
+                endpoints = if endpoints.is_empty() {
+                    public_addr.to_string()
+                } else {
+                    format!("{endpoints},{public_addr}")
+                };
+            }
+            None => host_log(
+                events,
+                "EVRT: STUN не смог определить публичный адрес (WAN-подключения вне LAN будут падать на TCP relay)".to_owned(),
+            ),
+        }
+
         let endpoints_with_token = append_evrt_session_token(&endpoints, &token);
         evrt_token = Some(token);
         evrt_announce = Some((endpoints_with_token.clone(), evrt_port));
@@ -1352,7 +2133,11 @@ fn relay_session_inner(
     }
 
     // EVRT game mode: allow up to 60fps regardless of host's configured limit (default 30).
-    let fps_limit = if evrt_socket.is_some() { MAX_TARGET_FPS } else { config.display.target_fps };
+    let fps_limit = if evrt_socket.is_some() {
+        MAX_TARGET_FPS
+    } else {
+        config.display.target_fps
+    };
     let target_fps = negotiated_target_fps(&login, fps_limit);
     let quality_milli = negotiated_quality_milli(&login);
     let client_video = client_video_support(&login);
@@ -1364,8 +2149,17 @@ fn relay_session_inner(
             quality_milli / 10,
         ),
     );
+    // Defensive reset in case a previous session ended abnormally before its
+    // launcher could send the matching unblock command.
+    set_remote_input_blocked(false);
+    set_remote_clipboard_allowed(config.security.allow_clipboard);
+    set_active_session(session_id, peer_id.to_owned());
     let _ = events.send(HostEvent::SessionStarted {
         peer_id: peer_id.to_owned(),
+        session_id,
+        peer_name: identity.peer_name.clone(),
+        platform: identity.platform.clone(),
+        version: identity.version.clone(),
     });
 
     // ── Единый пайплайн: один захват → один энкодер → TCP + UDP ──────────────
@@ -1429,7 +2223,25 @@ fn relay_session_inner(
     let mut shell: Option<ShellRuntime> = None;
     let (_peer_out_tx, _peer_out_rx) = mpsc::channel::<PeerMessage>();
 
+    // Fresh session — drop any stale "kick" request from a previous connection.
+    clear_kick_request();
+
+    let mut end_reason = None;
     while !stop.load(Ordering::Relaxed) && !host_stop.load(Ordering::Relaxed) {
+        // UI pressed "Отключить" — tear the session down like a normal disconnect.
+        if take_kick_request() {
+            host_log(events, format!("Session with {peer_id} terminated by host"));
+            end_reason = Some("Отключено владельцем устройства".to_owned());
+            break;
+        }
+        // Every loop iteration, not just on MouseEvent: the read timeout
+        // below forces at least one iteration per second regardless of
+        // whether the remote client is actually moving its mouse right now,
+        // so the elevation hint fires reliably as soon as an elevated
+        // window (e.g. Task Manager) takes the foreground — not only after
+        // someone happens to send a mouse event while it's focused.
+        #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
+        elevation_hint::check(events);
         match recv_peer_rc(&mut relay, &mut recv_cipher) {
             Ok(Some(msg)) => handle_client_input_pipeline(
                 msg,
@@ -1439,13 +2251,28 @@ fn relay_session_inner(
                 &mut shell,
                 &shared_target_fps,
                 &shared_quality_milli,
-                config.security.allow_clipboard,
+                is_remote_clipboard_allowed(),
             ),
             Ok(None) => {}
             Err(ref e) if is_timeout(e) => {}
-            Err(_) => break,
+            Err(error) => {
+                end_reason = Some(format!(
+                    "Соединение потеряно: {}",
+                    safe_session_end_reason(&error.to_string())
+                ));
+                break;
+            }
         }
     }
+    let end_reason = end_reason.unwrap_or_else(|| {
+        if host_stop.load(Ordering::Relaxed) {
+            "Приём подключений остановлен".to_owned()
+        } else if stop.load(Ordering::Relaxed) {
+            "Видеоконвейер завершён".to_owned()
+        } else {
+            "Клиент отключился".to_owned()
+        }
+    });
 
     // Сигнал остановки
     let _ = cmd_tx.send(crate::video_pipeline::PipelineCmd::Stop);
@@ -1490,7 +2317,7 @@ fn relay_session_inner(
         format!("Relay session cleanup complete for {peer_id}"),
     );
 
-    Ok(())
+    Ok(end_reason)
 }
 
 fn negotiated_target_fps(login: &crate::rustdesk_proto::LoginRequest, configured_fps: u32) -> u32 {
@@ -1954,7 +2781,9 @@ fn negotiate_backend_codec(
         .filter(|(codec, hardware)| *hardware || *codec == crate::nvenc::NvencCodec::H264)
         // 3. explicit choice narrows to that codec, keeping H264 as the net
         .filter(|(codec, _)| {
-            explicit.map_or(true, |want| *codec == want || *codec == crate::nvenc::NvencCodec::H264)
+            explicit.map_or(true, |want| {
+                *codec == want || *codec == crate::nvenc::NvencCodec::H264
+            })
         })
         .max_by_key(|(codec, hardware)| {
             let mut score = codec_quality_rank(*codec) * 1_000;
@@ -1972,6 +2801,34 @@ fn negotiate_backend_codec(
         .map(|(codec, _)| codec)
 }
 
+/// Какой кодек РЕАЛЬНО будет кодировать этот хост для данного клиента.
+///
+/// Повторяет порядок каскада `MultiEncoder::encode` (NVENC → Media Foundation →
+/// VideoToolbox), поэтому даёт тот же ответ, что и сам энкодер, но БЕЗ создания
+/// энкодера — нужно до старта захвата, чтобы объявить клиенту правду в первом же
+/// `SessionConfig`.
+///
+/// `None` означает, что аппаратного бэкенда нет вовсе и каскад упадёт на
+/// программный OpenH264, то есть на проводе будет H264.
+///
+/// Зачем это отдельной функцией: `SessionConfig.codec` определяет, КАКОЙ декодер
+/// откроет клиент ещё до первого кадра. Объявить H265 и прислать H264 — не
+/// «неточность», а гарантированный жёсткий крах клиентского процесса: системный
+/// `HEVCDECODER_STORE.dll` падает с 0xC0000005, получив чужой битстрим (задача
+/// #39, воспроизведено дважды). Механизм `TYPE_CODEC_CONFIG` такое расхождение
+/// потом исправляет, но он едет по ДРУГОМУ каналу, чем кадры, и успевает не
+/// всегда.
+pub fn negotiated_session_codec(
+    encoder_preference: EncoderPreference,
+    codec_preference: CodecPreference,
+    client: ClientVideoSupport,
+) -> Option<crate::nvenc::NvencCodec> {
+    choose_nvenc_codec(encoder_preference, codec_preference, client)
+        .or_else(|| choose_onevpl_codec(encoder_preference, codec_preference, client))
+        .or_else(|| choose_mf_encoder_codec(encoder_preference, codec_preference, client))
+        .or_else(|| choose_videotoolbox_codec(encoder_preference, codec_preference, client))
+}
+
 fn choose_nvenc_codec(
     encoder_preference: EncoderPreference,
     codec_preference: CodecPreference,
@@ -1979,6 +2836,21 @@ fn choose_nvenc_codec(
 ) -> Option<crate::nvenc::NvencCodec> {
     // Every NVENC-reported codec is hardware-accelerated.
     let available: Vec<_> = crate::nvenc::nvenc_encoder_codecs()
+        .into_iter()
+        .map(|codec| (codec, true))
+        .collect();
+    negotiate_backend_codec(&available, encoder_preference, codec_preference, client)
+}
+
+/// Intel oneVPL / Media SDK. Всё, что он сообщает, аппаратное по определению:
+/// сессия открывается с `MFX_IMPL_HARDWARE_ANY`, программную мы намеренно не
+/// запрашиваем — она была бы медленнее уже имеющегося OpenH264.
+fn choose_onevpl_codec(
+    encoder_preference: EncoderPreference,
+    codec_preference: CodecPreference,
+    client: ClientVideoSupport,
+) -> Option<crate::nvenc::NvencCodec> {
+    let available: Vec<_> = crate::onevpl::onevpl_encoder_codecs()
         .into_iter()
         .map(|codec| (codec, true))
         .collect();
@@ -2310,6 +3182,44 @@ fn bgra_to_yuv420_into(out: &mut YuvFrame, w: usize, h: usize, bgra: &[u8]) {
 }
 
 #[cfg(test)]
+mod remote_identity_tests {
+    use super::*;
+
+    #[test]
+    fn login_identity_prefers_real_client_id_and_sanitizes_metadata() {
+        let login = crate::rustdesk_proto::LoginRequest {
+            my_id: " 987 654 321 ".to_owned(),
+            my_name: "Office PC\n".to_owned(),
+            my_platform: "windows".to_owned(),
+            version: "1.4.6".to_owned(),
+            ..Default::default()
+        };
+        let identity = remote_identity_from_login(&login);
+        assert_eq!(identity.peer_id, "987 654 321");
+        assert_eq!(identity.peer_name, "Office PC");
+        assert_eq!(identity.platform, "windows");
+        assert_eq!(identity.version, "1.4.6");
+    }
+
+    #[test]
+    fn legacy_generic_identity_has_a_readable_fallback() {
+        let login = crate::rustdesk_proto::LoginRequest {
+            my_id: "evertydesk-lite".to_owned(),
+            my_name: "EvertyDesk Lite".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(
+            remote_identity_from_login(&login).peer_id,
+            "Неизвестное устройство"
+        );
+        assert_eq!(
+            safe_session_end_reason("Incoming connection rejected"),
+            "Подключение отклонено"
+        );
+    }
+}
+
+#[cfg(test)]
 mod codec_negotiation_tests {
     use super::*;
     use crate::nvenc::NvencCodec;
@@ -2601,6 +3511,8 @@ fn handle_client_input_pipeline(
                 x: ev.x.max(0) as u32,
                 y: ev.y.max(0) as u32,
             });
+            #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
+            elevation_hint::check(events);
             inject_mouse(ev);
         }
         Some(peer_message::Union::KeyEvent(ev)) => {
@@ -2612,6 +3524,42 @@ fn handle_client_input_pipeline(
             }
             host_log(events, format!("Host input: {}", key_event_summary(&ev)));
             inject_key(ev);
+        }
+        Some(peer_message::Union::Misc(Misc {
+            union: Some(misc::Union::Evrt2ExperimentRequest(_)),
+        })) => {
+            // Экспериментальная кнопка «EVRT2» в режиме игры — полностью
+            // отдельный UDP-сокет + свой цикл захвата/кодирования EVRTCK,
+            // не трогает video_pipeline.rs/encode_loop. См. evrt2_experiment.rs.
+            match crate::evrt2_experiment::start_host_experiment(events.clone()) {
+                Ok((port, public_addr, auth_key, _stop)) => {
+                    // ROADMAP.md Phase 5.1: LAN/VPN candidates plus a WAN
+                    // one if STUN succeeded on this socket — same "mini-ICE"
+                    // shape EVRT1's own UDP announce already uses.
+                    let mut endpoints = crate::netif::candidate_endpoints(port);
+                    if let Some(addr) = public_addr {
+                        endpoints = if endpoints.is_empty() {
+                            addr.to_string()
+                        } else {
+                            format!("{endpoints},{addr}")
+                        };
+                    }
+                    host_log(events, format!("EVRT2 (experimental): сокет поднят на порту {port}, кандидаты: [{endpoints}]"));
+                    let endpoints_with_key = format!(
+                        "{endpoints},evrt2key={}",
+                        crate::evrt2_crypto::key_to_hex(&auth_key)
+                    );
+                    let _ = peer_msg_tx.send(vm_misc_message(
+                        misc::Union::Evrt2ExperimentEndpoints(endpoints_with_key),
+                    ));
+                }
+                Err(e) => {
+                    host_log(
+                        events,
+                        format!("EVRT2 (experimental): не удалось поднять сокет: {e}"),
+                    );
+                }
+            }
         }
         Some(peer_message::Union::Misc(Misc {
             union: Some(misc::Union::VmListRequest(_)),
@@ -2664,7 +3612,10 @@ fn handle_client_input_pipeline(
         Some(peer_message::Union::Misc(Misc {
             union: Some(misc::Union::VmCapabilityRequest(vm_id)),
         })) => {
-            host_log(events, format!("Host VM: capability graph запрошен для {vm_id}"));
+            host_log(
+                events,
+                format!("Host VM: capability graph запрошен для {vm_id}"),
+            );
             let graph_json = crate::vm_bridge::get_capability_graph(&vm_id);
             let _ = peer_msg_tx.send(vm_misc_message(misc::Union::VmCapabilityGraph(graph_json)));
         }
@@ -2682,6 +3633,16 @@ fn handle_client_input_pipeline(
         })) => {
             host_log(events, format!("Host VM: rescue input: {json}"));
             crate::vm_bridge::rescue_input(&json);
+        }
+        // ── Управление громкостью хоста ─────────────────────────────────────────
+        Some(peer_message::Union::Misc(Misc {
+            union: Some(misc::Union::SetHostVolume(vol)),
+        })) => {
+            let vol = vol.min(100);
+            match set_system_volume(vol) {
+                Ok(()) => host_log(events, format!("Громкость хоста → {vol}%")),
+                Err(e) => host_log(events, format!("Не удалось изменить громкость: {e}")),
+            }
         }
         Some(peer_message::Union::Misc(Misc {
             union: Some(misc::Union::Option(option)),
@@ -2982,8 +3943,8 @@ fn release_stuck_input() {
     use std::mem::size_of;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
-        KEYEVENTF_KEYUP, MOUSE_EVENT_FLAGS, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEUP,
-        MOUSEEVENTF_RIGHTUP, MOUSEINPUT, VIRTUAL_KEY,
+        KEYEVENTF_KEYUP, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTUP, MOUSEINPUT,
+        MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
     };
     unsafe {
         // VK_LBUTTON=1, VK_RBUTTON=2, VK_MBUTTON=4
@@ -2993,9 +3954,15 @@ fn release_stuck_input() {
         let mdown = (GetAsyncKeyState(0x04) as u16) & 0x8000 != 0;
 
         let mut flags = MOUSE_EVENT_FLAGS(0);
-        if ldown { flags |= MOUSEEVENTF_LEFTUP; }
-        if rdown { flags |= MOUSEEVENTF_RIGHTUP; }
-        if mdown { flags |= MOUSEEVENTF_MIDDLEUP; }
+        if ldown {
+            flags |= MOUSEEVENTF_LEFTUP;
+        }
+        if rdown {
+            flags |= MOUSEEVENTF_RIGHTUP;
+        }
+        if mdown {
+            flags |= MOUSEEVENTF_MIDDLEUP;
+        }
 
         if flags.0 != 0 {
             let mi = MOUSEINPUT {
@@ -3045,6 +4012,138 @@ fn release_stuck_input() {}
 #[cfg(target_os = "macos")]
 fn release_stuck_input() {
     macos_cgevent::release_stuck_input();
+}
+
+// ── Elevation-needed detection (TZ_HOST_SERVICE.md complication #2) ───────
+//
+// Windows silently drops any input a lower-integrity process injects into a
+// higher-integrity window (UIPI) — SendInput still returns success, so there
+// is no error to catch after the fact. The only reliable signal is to check
+// *before* injecting: compare our own process's integrity level against the
+// foreground window's owning process. This can't fix the block (that needs
+// the agent itself to run elevated — see `winservice.rs`'s linked-token
+// trick, which only applies when running as the Windows service), but it
+// lets us tell the person at the keyboard why control just stopped working
+// instead of leaving it a silent mystery.
+#[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
+mod elevation_hint {
+    use super::*;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
+    use windows::Win32::Security::{
+        GetTokenInformation, TokenIntegrityLevel, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    };
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+
+    static LAST_CHECK_MS: AtomicU64 = AtomicU64::new(0);
+    static WAS_NEEDED: AtomicBool = AtomicBool::new(false);
+
+    unsafe fn integrity_level_of(token: HANDLE) -> Option<u32> {
+        let mut needed = 0u32;
+        // First call with a null buffer to learn the required size.
+        let _ = GetTokenInformation(token, TokenIntegrityLevel, None, 0, &mut needed);
+        if needed == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; needed as usize];
+        if !GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            Some(buf.as_mut_ptr() as *mut _),
+            needed,
+            &mut needed,
+        )
+        .as_bool()
+        {
+            return None;
+        }
+        let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+        let sid = label.Label.Sid;
+        let count = *windows::Win32::Security::GetSidSubAuthorityCount(sid);
+        if count == 0 {
+            return None;
+        }
+        // The integrity level RID is always the SID's last sub-authority —
+        // e.g. S-1-16-4096 (Low), -8192 (Medium), -12288 (High), -16384
+        // (System).
+        let rid_ptr = windows::Win32::Security::GetSidSubAuthority(sid, (count - 1) as u32);
+        Some(*rid_ptr)
+    }
+
+    unsafe fn integrity_level_of_process(process: HANDLE) -> Option<u32> {
+        let mut token = HANDLE::default();
+        if !OpenProcessToken(process, TOKEN_QUERY, &mut token).as_bool() {
+            return None;
+        }
+        let level = integrity_level_of(token);
+        let _ = CloseHandle(token);
+        level
+    }
+
+    fn foreground_needs_elevation() -> bool {
+        unsafe {
+            let ours = match integrity_level_of_process(GetCurrentProcess()) {
+                Some(l) => l,
+                None => return false,
+            };
+
+            let hwnd: HWND = GetForegroundWindow();
+            if hwnd.0 == 0 {
+                return false;
+            }
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if pid == 0 {
+                return false;
+            }
+            let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+                return false;
+            };
+            let theirs = integrity_level_of_process(process);
+            let _ = CloseHandle(process);
+            match theirs {
+                Some(theirs) => theirs > ours,
+                None => false,
+            }
+        }
+    }
+
+    /// Checks at most once every 3 seconds (cheap atomic load otherwise —
+    /// safe to call from a hot input path) and logs only on a state
+    /// transition, not on every check, so this can never spam the log.
+    pub fn check(events: &Sender<HostEvent>) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last = LAST_CHECK_MS.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) < 3000 {
+            return;
+        }
+        LAST_CHECK_MS.store(now_ms, Ordering::Relaxed);
+
+        let needed = foreground_needs_elevation();
+        let was = WAS_NEEDED.swap(needed, Ordering::Relaxed);
+        if needed && !was {
+            host_log(
+                events,
+                "⚠ В фокусе на хосте окно с повышенными правами (например, Диспетчер задач \
+                 или UAC-запрос) — ввод от клиента туда не дойдёт: так работает защита Windows \
+                 (UIPI), это не баг соединения. Для полного доступа установите службу (кнопка \
+                 в главном окне) — она умеет получать повышенный токен для этого; либо запустите \
+                 сам хост от имени администратора."
+                    .to_owned(),
+            );
+        } else if !needed && was {
+            host_log(
+                events,
+                "Окно с повышенными правами больше не в фокусе — ввод снова работает как обычно."
+                    .to_owned(),
+            );
+        }
+    }
 }
 
 #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
@@ -3185,10 +4284,19 @@ fn release_stuck_input() {
     linux_xtest::release_stuck_input();
 }
 
+// Android-хост: маршрутизируем мышь в службу доступности через JNI.
+#[cfg(all(target_os = "android", feature = "android-client"))]
+fn inject_mouse(ev: crate::rustdesk_proto::MouseEvent) {
+    let kind = ev.mask & 0x7; // 0=move 1=down 2=up 3=wheel
+    let button = ev.mask >> 3; // 1=left 2=right 4=wheel
+    crate::android_input::on_mouse(kind, button, ev.x, ev.y);
+}
+
 #[cfg(all(
     not(target_os = "linux"),
     not(target_os = "macos"),
-    not(all(target_os = "windows", feature = "live-vp9-mf"))
+    not(all(target_os = "windows", feature = "live-vp9-mf")),
+    not(all(target_os = "android", feature = "android-client")),
 ))]
 fn inject_mouse(_ev: crate::rustdesk_proto::MouseEvent) {}
 
@@ -3215,6 +4323,19 @@ fn inject_key(ev: crate::rustdesk_proto::KeyEvent) {
         match &ev.union {
             // ── Control / named keys → virtual-key code ──────────────────────
             Some(crate::rustdesk_proto::key_event::Union::ControlKey(ck)) => {
+                if *ck == crate::rustdesk_proto::ControlKey::CtrlAltDel as i32 {
+                    // Preserve the semantic protocol command as a real chord.
+                    // Windows may still reserve the secure-attention screen
+                    // unless the installed service has the required policy,
+                    // but this must never degrade to a bare Delete key.
+                    send_key_vk(0x11, false);
+                    send_key_vk(0x12, false);
+                    send_key_vk(0x2E, false);
+                    send_key_vk(0x2E, true);
+                    send_key_vk(0x12, true);
+                    send_key_vk(0x11, true);
+                    return;
+                }
                 let vk = control_key_to_vk(*ck);
                 if vk == 0 {
                     return;
@@ -3223,9 +4344,24 @@ fn inject_key(ev: crate::rustdesk_proto::KeyEvent) {
                     windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS::default();
                 let key_up = !ev.down && !ev.press;
                 if ev.press {
-                    // press = down then up
+                    // press = (зажать модификаторы) → down → up → (отпустить
+                    // модификаторы). Без этого Alt+←/→ (навигация 3 пальцами)
+                    // и любые другие ControlKey+модификатор не работали — модификатор
+                    // просто игнорировался и на хост шла голая клавиша.
+                    let mod_vks: Vec<u16> = ev
+                        .modifiers
+                        .iter()
+                        .map(|m| control_key_to_vk(*m))
+                        .filter(|v| *v != 0)
+                        .collect();
+                    for mv in &mod_vks {
+                        send_key_vk(*mv, false);
+                    }
                     send_key_vk(vk, false);
                     send_key_vk(vk, true);
+                    for mv in mod_vks.iter().rev() {
+                        send_key_vk(*mv, true);
+                    }
                     return;
                 }
                 if key_up {
@@ -3327,10 +4463,27 @@ fn inject_key(ev: crate::rustdesk_proto::KeyEvent) {
     linux_xtest::inject_key(ev);
 }
 
+// Android-хост: управляющие клавиши → глобальные действия доступности через JNI.
+#[cfg(all(target_os = "android", feature = "android-client"))]
+fn inject_key(ev: crate::rustdesk_proto::KeyEvent) {
+    if let Some(crate::rustdesk_proto::key_event::Union::ControlKey(code)) = ev.union {
+        // Реагируем только на нажатие (press), чтобы не дублировать на down+up.
+        if !ev.press && !ev.down {
+            return;
+        }
+        let alt = ev
+            .modifiers
+            .iter()
+            .any(|m| *m == crate::rustdesk_proto::ControlKey::Alt as i32);
+        crate::android_input::on_key(code, alt);
+    }
+}
+
 #[cfg(all(
     not(target_os = "linux"),
     not(target_os = "macos"),
-    not(all(target_os = "windows", feature = "live-vp9-mf"))
+    not(all(target_os = "windows", feature = "live-vp9-mf")),
+    not(all(target_os = "android", feature = "android-client")),
 ))]
 fn inject_key(_ev: crate::rustdesk_proto::KeyEvent) {}
 
@@ -4157,9 +5310,8 @@ mod macos_cgevent {
     }
 
     fn post_mouse(mouse_type: u32, point: CGPoint, button: u32) {
-        let ev = unsafe {
-            CGEventCreateMouseEvent(std::ptr::null_mut(), mouse_type, point, button)
-        };
+        let ev =
+            unsafe { CGEventCreateMouseEvent(std::ptr::null_mut(), mouse_type, point, button) };
         post(ev);
     }
 
@@ -4188,15 +5340,27 @@ mod macos_cgevent {
                 let down = evt_type == EVT_DOWN;
                 let (mtype, cg_btn) = match button {
                     MB_LEFT => (
-                        if down { K_LEFT_MOUSE_DOWN } else { K_LEFT_MOUSE_UP },
+                        if down {
+                            K_LEFT_MOUSE_DOWN
+                        } else {
+                            K_LEFT_MOUSE_UP
+                        },
                         BTN_LEFT,
                     ),
                     MB_RIGHT => (
-                        if down { K_RIGHT_MOUSE_DOWN } else { K_RIGHT_MOUSE_UP },
+                        if down {
+                            K_RIGHT_MOUSE_DOWN
+                        } else {
+                            K_RIGHT_MOUSE_UP
+                        },
                         BTN_RIGHT,
                     ),
                     MB_MIDDLE => (
-                        if down { K_OTHER_MOUSE_DOWN } else { K_OTHER_MOUSE_UP },
+                        if down {
+                            K_OTHER_MOUSE_DOWN
+                        } else {
+                            K_OTHER_MOUSE_UP
+                        },
                         BTN_CENTER,
                     ),
                     _ => return,
@@ -4468,6 +5632,17 @@ fn verify_password(received: &[u8], our_password: &str, salt: &str, challenge: &
     let expected = h2.finalize();
 
     received == expected.as_slice()
+}
+
+fn verify_access_password(
+    received: &[u8],
+    config: &AppConfig,
+    salt: &str,
+    challenge: &str,
+) -> bool {
+    verify_password(received, &config.local_password, salt, challenge)
+        || (!config.permanent_password.trim().is_empty()
+            && verify_password(received, &config.permanent_password, salt, challenge))
 }
 
 // ── Utility ───────────────────────────────────────────────────────────────────
@@ -4831,19 +6006,28 @@ fn handle_vm_power_op(json: &str) -> String {
         let vm_id = val.get("vm_id").and_then(|v| v.as_str()).unwrap_or("");
         let vm_path = val.get("vm_path").and_then(|v| v.as_str()).unwrap_or("");
         let action_str = val.get("action").and_then(|v| v.as_str()).unwrap_or("");
-        let provider = if vm_id.starts_with("hyperv:") { "hyperv" }
-                       else if vm_id.starts_with("vbox:") { "vbox" }
-                       else { "hyperv" };
+        let provider = if vm_id.starts_with("hyperv:") {
+            "hyperv"
+        } else if vm_id.starts_with("vbox:") {
+            "vbox"
+        } else {
+            "hyperv"
+        };
         let real_id = vm_id.splitn(2, ':').nth(1).unwrap_or(vm_id);
         match provider {
             "hyperv" => {
                 if let Some(action) = crate::hyperv::VmPowerAction::from_str(action_str) {
-                    let path = if !vm_path.is_empty() { vm_path.to_owned() }
-                               else { format!("Msvm_ComputerSystem.CreationClassName=\"Msvm_ComputerSystem\",Name=\"{real_id}\"") };
+                    let path = if !vm_path.is_empty() {
+                        vm_path.to_owned()
+                    } else {
+                        format!("Msvm_ComputerSystem.CreationClassName=\"Msvm_ComputerSystem\",Name=\"{real_id}\"")
+                    };
                     crate::hyperv::request_power_action(&path, action);
-                    format!(r#"{{"vm_id":{vm_id_json},"action":{action_json},"ok":true,"error":""}}"#,
+                    format!(
+                        r#"{{"vm_id":{vm_id_json},"action":{action_json},"ok":true,"error":""}}"#,
                         vm_id_json = serde_json::Value::String(vm_id.to_owned()),
-                        action_json = serde_json::Value::String(action_str.to_owned()))
+                        action_json = serde_json::Value::String(action_str.to_owned())
+                    )
                 } else {
                     format!(r#"{{"ok":false,"error":"unknown action: {action_str}"}}"#)
                 }
@@ -4851,23 +6035,35 @@ fn handle_vm_power_op(json: &str) -> String {
             "vbox" => {
                 // VBoxManage controlvm <uuid> <acpipowerbutton|poweroff|pause|resume|savestate>
                 let vbox_action = match action_str {
-                    "start"    => "startvm",
-                    "stop"     => "poweroff",
+                    "start" => "startvm",
+                    "stop" => "poweroff",
                     "shutdown" => "acpipowerbutton",
-                    "pause"    => "pause",
-                    "resume"   => "resume",
-                    "save"     => "savestate",
-                    other      => return format!(r#"{{"ok":false,"error":"unknown vbox action: {other}"}}"#),
+                    "pause" => "pause",
+                    "resume" => "resume",
+                    "save" => "savestate",
+                    other => {
+                        return format!(r#"{{"ok":false,"error":"unknown vbox action: {other}"}}"#)
+                    }
                 };
                 let ok = if action_str == "start" {
-                    std::process::Command::new("VBoxManage").args(["startvm", real_id]).status().map(|s| s.success()).unwrap_or(false)
+                    std::process::Command::new("VBoxManage")
+                        .args(["startvm", real_id])
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false)
                 } else {
-                    std::process::Command::new("VBoxManage").args(["controlvm", real_id, vbox_action]).status().map(|s| s.success()).unwrap_or(false)
+                    std::process::Command::new("VBoxManage")
+                        .args(["controlvm", real_id, vbox_action])
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false)
                 };
-                format!(r#"{{"vm_id":{vm_id_json},"action":{action_json},"ok":{ok},"error":""}}"#,
+                format!(
+                    r#"{{"vm_id":{vm_id_json},"action":{action_json},"ok":{ok},"error":""}}"#,
                     vm_id_json = serde_json::Value::String(vm_id.to_owned()),
                     action_json = serde_json::Value::String(action_str.to_owned()),
-                    ok = ok)
+                    ok = ok
+                )
             }
             _ => r#"{"ok":false,"error":"unknown provider"}"#.to_owned(),
         }
@@ -4926,6 +6122,26 @@ fn repeat_evrt_announcement(
 fn send_peer_enc(
     stream: &mut TcpStream,
     cipher: &mut Option<StreamCipher>,
+    msg: &PeerMessage,
+) -> Result<(), String> {
+    let mut bytes = encode_peer_message(msg);
+    if let Some(c) = cipher.as_mut() {
+        bytes = c.encrypt(&bytes);
+    }
+    send_framed(stream, &bytes)
+}
+
+/// Send-only-cipher-half counterpart of `send_peer_enc` — for a dedicated
+/// writer thread that owns a `TcpStream::try_clone()` of the relay stream
+/// (`recv_peer_rc` above is the matching receive-only-half reader, already
+/// used by the live pipeline's own input-loop/TCP-sender split). ROADMAP.md
+/// Phase 5.3 uses this so `run_evrt2_only_session`'s relay-wrap writer
+/// thread never has to touch the read-side cipher state or the read-side
+/// socket clone — the two threads share nothing, so there's no lock and no
+/// risk of interleaving two `write_all` calls on the same underlying fd.
+fn send_peer_sc(
+    stream: &mut TcpStream,
+    cipher: &mut Option<crate::crypto::SendCipher>,
     msg: &PeerMessage,
 ) -> Result<(), String> {
     let mut bytes = encode_peer_message(msg);
@@ -4998,7 +6214,16 @@ fn host_log(events: &Sender<HostEvent>, msg: String) {
 }
 
 fn is_timeout(e: &str) -> bool {
-    e.contains("timed out") || e.contains("WouldBlock") || e.contains("os error 10060")
+    // "os error 997" is ERROR_IO_PENDING — a Windows quirk where recv() on a
+    // socket using SO_RCVTIMEO occasionally fails with 997 instead of the
+    // normal WSAETIMEDOUT (10060), especially under CPU load. It means "no
+    // data yet", not a broken connection. Live-found: it was killing whole
+    // EVRT2 sessions ~seconds after the screen went static (host busy
+    // encoding at full tilt → relay poll hit 997 → treated as fatal).
+    e.contains("timed out")
+        || e.contains("WouldBlock")
+        || e.contains("os error 10060")
+        || e.contains("os error 997")
 }
 
 fn random_u64() -> u64 {
@@ -5085,16 +6310,22 @@ pub struct MultiEncoder {
     desired_mf: Option<crate::nvenc::NvencCodec>,
     desired_vt: Option<crate::nvenc::NvencCodec>,
     desired_nv: Option<crate::nvenc::NvencCodec>,
+    /// Intel oneVPL/Media SDK — путь напрямую в драйвер, минуя Media
+    /// Foundation. Единственный способ получить HEVC на машинах без пакета
+    /// «HEVC Video Extensions» из Store.
+    desired_vpl: Option<crate::nvenc::NvencCodec>,
 
     // Состояния энкодеров (lazy-init)
     mf: Option<crate::mf_encode::MfVideoEncoder>,
     vt: Option<crate::videotoolbox::VideoToolboxEncoder>,
     nv: Option<crate::nvenc::NvencEncoder>,
+    vpl: Option<crate::onevpl::OneVplEncoder>,
 
     // Disabled-флаги: после ошибки бэкенд выключается
     mf_disabled: bool,
     vt_disabled: bool,
     nv_disabled: bool,
+    vpl_disabled: bool,
 
     // OpenH264 software fallback
     #[cfg(feature = "live-h264")]
@@ -5117,6 +6348,7 @@ impl MultiEncoder {
         client: ClientVideoSupport,
     ) -> Self {
         let desired_nv = choose_nvenc_codec(encoder_pref, codec_pref, client);
+        let desired_vpl = choose_onevpl_codec(encoder_pref, codec_pref, client);
         let desired_mf = choose_mf_encoder_codec(encoder_pref, codec_pref, client);
         let desired_vt = choose_videotoolbox_codec(encoder_pref, codec_pref, client);
 
@@ -5127,12 +6359,15 @@ impl MultiEncoder {
             desired_mf,
             desired_vt,
             desired_nv,
+            desired_vpl,
             mf: None,
             vt: None,
             nv: None,
+            vpl: None,
             mf_disabled: false,
             vt_disabled: false,
             nv_disabled: false,
+            vpl_disabled: false,
             #[cfg(feature = "live-h264")]
             sw,
             #[cfg(feature = "live-h264")]
@@ -5145,6 +6380,34 @@ impl MultiEncoder {
     /// Реальный бэкенд который выдал последний кадр (MF/VideoToolbox/NVENC/OpenH264/PNG).
     pub fn active_backend(&self) -> &'static str {
         self.active_backend
+    }
+
+    /// Есть ли вообще аппаратный бэкенд, пригодный для этого клиента.
+    ///
+    /// Игровой режим осмыслен только когда он true: иначе каскад свалится в
+    /// OpenH264/PNG, и «игровой режим» окажется медленнее обычного EVRTCK —
+    /// про такое лучше честно сказать, чем тихо отдать софтверную картинку.
+    pub fn has_hardware_backend(&self) -> bool {
+        self.desired_nv.is_some()
+            || self.desired_vpl.is_some()
+            || self.desired_mf.is_some()
+            || self.desired_vt.is_some()
+    }
+
+    /// Есть ли аппаратный бэкенд, который ЕЩЁ НЕ отключён ошибкой.
+    ///
+    /// В отличие от `active_backend()`, который говорит лишь про последний
+    /// конкретный кадр и может прыгать туда-сюда (аппаратный MFT асинхронный:
+    /// вернул `Ok(None)` — и каскад провалился в OpenH264 на этом кадре), это
+    /// стабильное свойство сессии. Меняется только когда бэкенд по-настоящему
+    /// выключился после ошибки. Именно на такой признак должны опираться
+    /// решения вроде «включить софтверный профиль», иначе они дребезжат на
+    /// каждом кадре.
+    pub fn has_active_hardware_backend(&self) -> bool {
+        (self.desired_nv.is_some() && !self.nv_disabled)
+            || (self.desired_vpl.is_some() && !self.vpl_disabled)
+            || (self.desired_mf.is_some() && !self.mf_disabled)
+            || (self.desired_vt.is_some() && !self.vt_disabled)
     }
 
     /// Причина отключения MF (если был выбран, но упал). Для диагностики.
@@ -5160,6 +6423,9 @@ impl MultiEncoder {
         if let Some(nv) = self.nv.take() {
             std::mem::forget(nv);
         }
+        if let Some(vpl) = self.vpl.take() {
+            std::mem::forget(vpl);
+        }
         if let Some(mf) = self.mf.take() {
             std::mem::forget(mf);
         }
@@ -5174,6 +6440,9 @@ impl MultiEncoder {
         let mut parts = Vec::new();
         if let Some(c) = self.desired_nv {
             parts.push(format!("NVENC/{}", c.label()));
+        }
+        if let Some(c) = self.desired_vpl {
+            parts.push(format!("oneVPL/{}", c.label()));
         }
         if let Some(c) = self.desired_mf {
             parts.push(format!("MF/{}", c.label()));
@@ -5222,7 +6491,10 @@ impl MultiEncoder {
                         codec: codec_label(codec),
                     });
                 }
-                Ok(None) => {}
+                // Как и у oneVPL ниже: «пакета пока нет» не даёт права спускаться
+                // к бэкенду с другим кодеком — это отправило бы клиенту чужой
+                // битстрим под видом текущего кодека сессии.
+                Ok(None) => return None,
                 Err(err) => {
                     eprintln!("[host-video] NVENC disabled after error: {err}");
                     self.nv_disabled = true;
@@ -5230,7 +6502,65 @@ impl MultiEncoder {
             }
         }
 
-        // 2. Media Foundation (Windows)
+        // 2. Intel oneVPL / Media SDK — ДО Media Foundation.
+        //
+        // Порядок не косметический: на Intel без пакета «HEVC Video
+        // Extensions» из Store у Media Foundation вообще нет HEVC (живо
+        // подтверждено на UHD 610: MFTEnumEx не находит ни одного HEVC-MFT,
+        // хотя H264(hw) находит). oneVPL идёт напрямую в драйвер и HEVC там
+        // есть. Пропусти мы его вперёд MF — получили бы H264 на железе,
+        // которое умеет H265.
+        if let Some(codec) = self.desired_vpl.filter(|_| !self.vpl_disabled) {
+            let needs_new = self
+                .vpl
+                .as_ref()
+                .map(|enc| {
+                    !enc.matches(codec, width, height, fps) || enc.current_bitrate() != bitrate
+                })
+                .unwrap_or(true);
+            if needs_new {
+                match crate::onevpl::OneVplEncoder::new(codec, width, height, fps, bitrate) {
+                    Ok(enc) => self.vpl = Some(enc),
+                    Err(err) => {
+                        eprintln!("[host-video] oneVPL disabled after init error: {err}");
+                        self.vpl_disabled = true;
+                        self.vpl = None;
+                    }
+                }
+            }
+            if let Some(enc) = self.vpl.as_mut() {
+                match enc.encode_bgra(bgra, force_key) {
+                    Ok(Some(pkt)) => {
+                        self.active_backend = "oneVPL";
+                        return Some(EncodedOutput {
+                            bytes: pkt.bytes,
+                            key: pkt.key,
+                            sps_pps: None,
+                            codec: codec_label(codec),
+                        });
+                    }
+                    Ok(None) => {
+                        // «Пакета пока нет» — НЕ повод спускаться ниже по
+                        // каскаду. Следующий бэкенд (Media Foundation) кодирует
+                        // в ДРУГОЙ кодек, и подмешать его кадр в сессию,
+                        // объявленную как H265, значит отправить клиенту H264
+                        // под видом HEVC. Системный декодер Windows на таком
+                        // не возвращает ошибку — он роняет процесс клиента
+                        // (0xC0000005 в HEVCDECODER_STORE.dll, живо поймано
+                        // отладчиком). Пропускаем кадр целиком: следующий
+                        // придёт через ~16мс, это несопоставимо дешевле.
+                        return None;
+                    }
+                    Err(err) => {
+                        eprintln!("[host-video] oneVPL disabled after error: {err}");
+                        self.vpl_disabled = true;
+                        self.vpl = None;
+                    }
+                }
+            }
+        }
+
+        // 3. Media Foundation (Windows)
         if let Some(codec) = self.desired_mf.filter(|_| !self.mf_disabled) {
             match encode_mf_frame(
                 &mut self.mf,
@@ -5256,7 +6586,10 @@ impl MultiEncoder {
                         codec: codec_label(codec),
                     });
                 }
-                Ok(None) => {}
+                // Тот же принцип, что у NVENC/oneVPL выше: ниже по каскаду
+                // стоит OpenH264, и он всегда H264. Для сессии на H265 это
+                // чужой кодек.
+                Ok(None) => return None,
                 Err(e) => {
                     eprintln!("[host-video] MediaFoundation disabled after error: {e}");
                     self.mf_disabled = true;
@@ -5286,7 +6619,7 @@ impl MultiEncoder {
                         codec: codec_label(codec),
                     });
                 }
-                Ok(None) => {}
+                Ok(None) => return None,
                 Err(err) => {
                     eprintln!("[host-video] VideoToolbox disabled after error: {err}");
                     self.vt_disabled = true;
@@ -5374,6 +6707,46 @@ pub fn encode_png_fallback(bgra: &[u8], w: u32, h: u32) -> Vec<u8> {
     img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
         .ok();
     out
+}
+
+// ─── Управление системной громкостью хоста ─────────────────────────────────────
+
+/// Установить громкость мастер-устройства воспроизведения хоста (0..100 %).
+/// Windows Core Audio (IAudioEndpointVolume). На других платформах — no-op с ошибкой.
+fn set_system_volume(percent: u32) -> Result<(), String> {
+    #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
+    {
+        use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
+        use windows::Win32::Media::Audio::{
+            eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator,
+        };
+        use windows::Win32::System::Com::{
+            CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
+        };
+
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let enumerator: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                    .map_err(|e| format!("MMDeviceEnumerator: {e}"))?;
+            let device = enumerator
+                .GetDefaultAudioEndpoint(eRender, eConsole)
+                .map_err(|e| format!("GetDefaultAudioEndpoint: {e}"))?;
+            let endpoint: IAudioEndpointVolume = device
+                .Activate(CLSCTX_ALL, None)
+                .map_err(|e| format!("Activate IAudioEndpointVolume: {e}"))?;
+            let scalar = (percent.min(100) as f32) / 100.0;
+            endpoint
+                .SetMasterVolumeLevelScalar(scalar, std::ptr::null())
+                .map_err(|e| format!("SetMasterVolumeLevelScalar: {e}"))?;
+        }
+        Ok(())
+    }
+    #[cfg(not(all(target_os = "windows", feature = "live-vp9-mf")))]
+    {
+        let _ = percent;
+        Err("volume control is only available on the Windows host build".to_owned())
+    }
 }
 
 // ─── EVRT socket helper ───────────────────────────────────────────────────────

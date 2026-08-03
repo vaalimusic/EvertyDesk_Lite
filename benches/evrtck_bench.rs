@@ -68,10 +68,10 @@ fn dirty_frame(base: &[u8], w: usize, h: usize, dirty_fraction: f32) -> Vec<u8> 
         for y in y0..y1 {
             for x in x0..x1 {
                 let off = (y * w + x) * 4;
-                frame[off]     = 255 - base[off];     // invert B
+                frame[off] = 255 - base[off]; // invert B
                 frame[off + 1] = 255 - base[off + 1]; // invert G
                 frame[off + 2] = 255 - base[off + 2]; // invert R
-                // A unchanged
+                                                      // A unchanged
             }
         }
     }
@@ -82,9 +82,9 @@ fn dirty_frame(base: &[u8], w: usize, h: usize, dirty_fraction: f32) -> Vec<u8> 
 
 fn bench_keyframes(c: &mut Criterion) {
     let resolutions = [
-        ("720p",  1280usize,  720usize),
-        ("1080p", 1920,       1080),
-        ("4k",    3840,       2160),
+        ("720p", 1280usize, 720usize),
+        ("1080p", 1920, 1080),
+        ("4k", 3840, 2160),
     ];
 
     let mut group = c.benchmark_group("keyframe");
@@ -92,12 +92,16 @@ fn bench_keyframes(c: &mut Criterion) {
         let frame = gradient_frame(*w, *h);
         let raw_bytes = (w * h * 4) as u64;
         group.throughput(Throughput::Bytes(raw_bytes));
-        group.bench_with_input(BenchmarkId::from_parameter(name), &(*w, *h, &frame), |b, (w, h, frame)| {
-            b.iter(|| {
-                let mut enc = EvrtckEncoder::new(*w, *h);
-                black_box(enc.encode(black_box(frame), 1))
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(name),
+            &(*w, *h, &frame),
+            |b, (w, h, frame)| {
+                b.iter(|| {
+                    let mut enc = EvrtckEncoder::new(*w, *h);
+                    black_box(enc.encode(black_box(frame), 1))
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -108,11 +112,11 @@ fn bench_pframes(c: &mut Criterion) {
     let raw_bytes = (w * h * 4) as u64;
 
     let scenarios: &[(&str, f32)] = &[
-        ("static_0pct",  0.00),
-        ("sparse_5pct",  0.05),
+        ("static_0pct", 0.00),
+        ("sparse_5pct", 0.05),
         ("typing_15pct", 0.15),
         ("scroll_50pct", 0.50),
-        ("video_90pct",  0.90),
+        ("video_90pct", 0.90),
     ];
 
     let mut group = c.benchmark_group("pframe_1080p");
@@ -162,7 +166,7 @@ fn bench_nop_static_frame(c: &mut Criterion) {
 
 fn bench_dirty_ratio_scan(c: &mut Criterion) {
     let (w, h) = (1920usize, 1080usize);
-    let base  = solid_frame(w, h, [30, 30, 30, 255]);
+    let base = solid_frame(w, h, [30, 30, 30, 255]);
     let frame = dirty_frame(&base, w, h, 0.15);
 
     let mut group = c.benchmark_group("dirty_ratio_scan");
@@ -181,7 +185,7 @@ fn bench_dirty_ratio_scan(c: &mut Criterion) {
 
 fn bench_roundtrip(c: &mut Criterion) {
     let (w, h) = (1920usize, 1080usize);
-    let base  = solid_frame(w, h, [30, 30, 30, 255]);
+    let base = solid_frame(w, h, [30, 30, 30, 255]);
     let frame = dirty_frame(&base, w, h, 0.15);
 
     let mut group = c.benchmark_group("roundtrip");
@@ -216,8 +220,8 @@ fn bench_pframe_sizes(c: &mut Criterion) {
     let base = solid_frame(w, h, [30, 30, 30, 255]);
 
     let scenarios: &[(&str, f32)] = &[
-        ("0pct",  0.00),
-        ("5pct",  0.05),
+        ("0pct", 0.00),
+        ("5pct", 0.05),
         ("15pct", 0.15),
         ("50pct", 0.50),
         ("90pct", 0.90),
@@ -233,7 +237,11 @@ fn bench_pframe_sizes(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(pkt.data.len() as u64));
         group.bench_with_input(BenchmarkId::from_parameter(name), &frame, |b, frame| {
             b.iter_batched(
-                || { let mut e = EvrtckEncoder::new(w, h); e.encode(&base, 1); e },
+                || {
+                    let mut e = EvrtckEncoder::new(w, h);
+                    e.encode(&base, 1);
+                    e
+                },
                 |mut enc| black_box(enc.encode(black_box(frame), 2)),
                 criterion::BatchSize::SmallInput,
             );

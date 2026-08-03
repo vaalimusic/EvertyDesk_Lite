@@ -18,9 +18,7 @@ use std::{
 use prost::Message as _;
 
 use crate::{
-    rustdesk_proto::{
-        rendezvous_message, PeerDiscovery, RendezvousMessage,
-    },
+    rustdesk_proto::{rendezvous_message, PeerDiscovery, RendezvousMessage},
     settings::AppConfig,
 };
 
@@ -37,12 +35,18 @@ fn run(config: Arc<std::sync::Mutex<AppConfig>>, stop: Arc<AtomicBool>) {
     let socket = match UdpSocket::bind(format!("0.0.0.0:{LAN_DISCOVERY_PORT}")) {
         Ok(s) => s,
         Err(e) => {
-            log(format!("LAN discovery: bind port {LAN_DISCOVERY_PORT} failed: {e}"));
+            log(format!(
+                "LAN discovery: bind port {LAN_DISCOVERY_PORT} failed: {e}"
+            ));
             return;
         }
     };
-    socket.set_read_timeout(Some(Duration::from_millis(500))).ok();
-    log(format!("LAN discovery: listening on UDP {LAN_DISCOVERY_PORT}"));
+    socket
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .ok();
+    log(format!(
+        "LAN discovery: listening on UDP {LAN_DISCOVERY_PORT}"
+    ));
 
     let mut buf = vec![0u8; 2048];
     loop {
@@ -104,7 +108,10 @@ fn handle_ping(
     if let Err(e) = socket.send_to(&bytes, src) {
         log(format!("LAN discovery: pong send failed: {e}"));
     } else {
-        log(format!("LAN discovery: pong → {src} (ping from {})", ping.id));
+        log(format!(
+            "LAN discovery: pong → {src} (ping from {})",
+            ping.id
+        ));
     }
 }
 

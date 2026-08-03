@@ -497,9 +497,15 @@ pub fn run_diagnose(remote_id: &str, password: &str, secs: u64, out_dir: &str) -
     let request = ConnectionRequest {
         remote_id: remote_id.to_owned(),
         password: password.to_owned(),
+        client_id: config.local_id.clone(),
+        client_name: std::env::var("COMPUTERNAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .unwrap_or_else(|_| "EvertyDesk Diagnostics".to_owned()),
         server: config.server.clone(),
         display: config.display.clone(),
         control_only: false,
+        audio_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        evrt2_only: false,
     };
 
     eprintln!("╔══════════════════════════════════════════════════════════╗");

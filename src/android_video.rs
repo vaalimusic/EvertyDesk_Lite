@@ -83,8 +83,12 @@ pub fn decode_frame_to_surface(
 /// Возвращает (h265_supported, av1_supported). При недоступности JNI —
 /// (false, false) — тот же консервативный дефолт, что был раньше.
 pub fn query_android_decode_caps() -> (bool, bool) {
-    let Some(jvm) = crate::android_ffi::android_jvm() else { return (false, false); };
-    let Some(cls_ref) = crate::android_ffi::decoder_class_ref() else { return (false, false); };
+    let Some(jvm) = crate::android_ffi::android_jvm() else {
+        return (false, false);
+    };
+    let Some(cls_ref) = crate::android_ffi::decoder_class_ref() else {
+        return (false, false);
+    };
     let mut env = match jvm.attach_current_thread() {
         Ok(e) => e,
         Err(_) => return (false, false),
@@ -93,14 +97,24 @@ pub fn query_android_decode_caps() -> (bool, bool) {
 
     let h265_ok = match env.new_string("video/hevc") {
         Ok(jmime) => env
-            .call_static_method(&cls, "isDecodeSupported", "(Ljava/lang/String;)Z", &[JValue::Object(&jmime)])
+            .call_static_method(
+                &cls,
+                "isDecodeSupported",
+                "(Ljava/lang/String;)Z",
+                &[JValue::Object(&jmime)],
+            )
             .and_then(|v| v.z())
             .unwrap_or(false),
         Err(_) => false,
     };
     let av1_ok = match env.new_string("video/av01") {
         Ok(jmime) => env
-            .call_static_method(&cls, "isDecodeSupported", "(Ljava/lang/String;)Z", &[JValue::Object(&jmime)])
+            .call_static_method(
+                &cls,
+                "isDecodeSupported",
+                "(Ljava/lang/String;)Z",
+                &[JValue::Object(&jmime)],
+            )
             .and_then(|v| v.z())
             .unwrap_or(false),
         Err(_) => false,
@@ -112,12 +126,18 @@ pub fn query_android_decode_caps() -> (bool, bool) {
 /// Два отдельных вызова надёжнее, чем читать LongArray через unsafe JPrimitiveArray cast.
 /// Возвращает (total_decoded_frames, avg_decode_ms). При ошибке — кешированные значения.
 pub fn get_android_decode_stats() -> (u64, i32) {
-    let cached = || (
-        CACHED_DECODED_FRAMES.load(Ordering::Relaxed),
-        CACHED_DECODE_MS.load(Ordering::Relaxed) as i32,
-    );
-    let Some(jvm) = crate::android_ffi::android_jvm() else { return cached(); };
-    let Some(cls_ref) = crate::android_ffi::perf_stats_class_ref() else { return cached(); };
+    let cached = || {
+        (
+            CACHED_DECODED_FRAMES.load(Ordering::Relaxed),
+            CACHED_DECODE_MS.load(Ordering::Relaxed) as i32,
+        )
+    };
+    let Some(jvm) = crate::android_ffi::android_jvm() else {
+        return cached();
+    };
+    let Some(cls_ref) = crate::android_ffi::perf_stats_class_ref() else {
+        return cached();
+    };
     let mut env = match jvm.attach_current_thread() {
         Ok(e) => e,
         Err(_) => return cached(),

@@ -633,7 +633,12 @@ impl ChannelReassembler {
         }
 
         // Попробовать восстановить недостающие пакеты через FEC, если есть.
-        if !self.frames.get(&pkt.frame_id).map(|a| a.is_complete()).unwrap_or(false) {
+        if !self
+            .frames
+            .get(&pkt.frame_id)
+            .map(|a| a.is_complete())
+            .unwrap_or(false)
+        {
             self.try_fec_recover(pkt.frame_id);
         }
 
@@ -729,13 +734,20 @@ impl ChannelReassembler {
     /// Завершить кадр, если он полностью собран. Общая точка для on_packet и
     /// on_fec_packet.
     fn finalize_frame(&mut self, frame_id: u32) -> Option<(Vec<u8>, bool, i32, u64)> {
-        if !self.frames.get(&frame_id).map(|a| a.is_complete()).unwrap_or(false) {
+        if !self
+            .frames
+            .get(&frame_id)
+            .map(|a| a.is_complete())
+            .unwrap_or(false)
+        {
             return None;
         }
         let assembly = self.frames.remove(&frame_id).unwrap();
         self.buffered_bytes = self
             .buffered_bytes
             .saturating_sub(assembly.buffered_bytes());
+        // Запоминаем ДО перезаписи — нужен для проверки непрерывности ниже.
+        let previous_completed_id = self.latest_completed_id;
         self.latest_completed_id = Some(assembly.frame_id);
         self.pending_fec.remove(&frame_id); // FEC для этого кадра больше не нужен
         let delay_ms = assembly.assembly_delay_ms();
@@ -756,6 +768,32 @@ impl ChannelReassembler {
         if self.waiting_after_loss {
             self.mark_frame_dropped(frame_id);
             return None;
+        }
+
+        // Разрыв в нумерации кадров = наша база больше не та, против которой
+        // хост считал дельту. Для EVRTCK это фатально и НЕ самовосстанавливается:
+        // кадр — XOR-дельта против предыдущего, так что применить его поверх
+        // чужой базы значит намертво испортить картинку до следующего IDR
+        // (визуально — призрачные смещённые копии окон и блоки шума).
+        //
+        // Раньше такой разрыв мог пройти совершенно незамеченным. Детектор
+        // потерь в `on_packet` опирается на `drop_older_than`, который считает
+        // только кадры, У КОТОРЫХ ХОТЬ ЧТО-ТО СОБРАЛОСЬ и потом вышло за окно
+        // переупорядочивания. Если же ВСЕ пакеты кадра потеряны разом (обычное
+        // дело при перетаскивании окна: кадр огромный, пакетов сотни, потери
+        // идут пачкой), записи в `self.frames` не появляется вовсе — считать
+        // нечего, `waiting_after_loss` не взводится, и следующая дельта тихо
+        // ложится на устаревшую базу.
+        //
+        // Ключевые кадры проверку не проходят намеренно: они самодостаточны и
+        // как раз и являются лекарством (см. ветку `if key` выше, которая
+        // сбрасывает `waiting_after_loss`).
+        if let Some(completed) = previous_completed_id {
+            if frame_id.wrapping_sub(completed) != 1 {
+                self.waiting_after_loss = true;
+                self.mark_frame_dropped(frame_id);
+                return None;
+            }
         }
 
         Some((bytes, false, delay_ms, pts))
@@ -998,12 +1036,10 @@ impl AdaptiveRelief {
         // Also require backlog > 0: if the queue is empty and decode_fps < target_fps,
         // the HOST is not sending enough frames (e.g. static_skip suppressing output) —
         // not a decoder bottleneck. Don't reduce bitrate for the host's own frame-skip.
-        let decode_behind =
-            fb.backlog_frames > 0
+        let decode_behind = fb.backlog_frames > 0
             && fb.decode_fps >= 10
             && fb.decode_fps <= (target_fps.saturating_sub(3)).max(28);
-        let decode_collapsed =
-            fb.backlog_frames > 0
+        let decode_collapsed = fb.backlog_frames > 0
             && fb.decode_fps >= 10
             && fb.decode_fps <= (target_fps.saturating_sub(8)).max(24);
         let present_elevated = fb.present_delta_ms >= 20;
@@ -1033,7 +1069,7 @@ impl AdaptiveRelief {
         }
 
         let threshold = if self.step == 0 {
-            4  // require sustained pressure (≥2 High reports) before first step
+            4 // require sustained pressure (≥2 High reports) before first step
         } else if severe {
             4
         } else {
@@ -1177,6 +1213,63 @@ mod tests {
         assert!(key);
         assert_eq!(bytes, vec![0xAB, 0xCD]);
         assert_eq!(ch.dropped_frames(), 0);
+    }
+
+    /// Пропуск в нумерации кадров обязан быть замечен, даже когда потерянный
+    /// кадр не оставил после себя НИЧЕГО. Именно этот случай (все пакеты кадра
+    /// потеряны разом) раньше проходил мимо детектора потерь: он считал только
+    /// частично собранные кадры, вышедшие за окно переупорядочивания. Для
+    /// EVRTCK последствия фатальны — следующая XOR-дельта легла бы на
+    /// устаревшую базу и намертво испортила картинку до следующего IDR.
+    #[test]
+    fn reassembler_detects_a_completely_lost_frame_and_waits_for_keyframe() {
+        let mut ch = ChannelReassembler::new();
+
+        // Кадр 1 — ключевой, задаёт базу.
+        let raw = crate::evrt::packetize_video_frame(1, 1000, true, &[0x01]);
+        let parsed = crate::evrt::parse(&raw[0], raw[0].len()).unwrap();
+        assert!(
+            ch.on_packet(&parsed).is_some(),
+            "keyframe must be delivered"
+        );
+
+        // Кадр 2 теряется ЦЕЛИКОМ — ни одного его пакета не приходит.
+
+        // Кадр 3 приходит полностью, но применять его нельзя: его дельта
+        // посчитана против кадра 2, которого у нас нет.
+        let raw = crate::evrt::packetize_video_frame(3, 3000, false, &[0x03]);
+        let parsed = crate::evrt::parse(&raw[0], raw[0].len()).unwrap();
+        assert!(
+            ch.on_packet(&parsed).is_none(),
+            "frame after a gap must NOT be delivered — its XOR base is stale"
+        );
+        assert_eq!(ch.dropped_frames(), 1, "the gap must be counted as a loss");
+
+        // Кадр 4 тоже не спасёт — до ключевого кадра доверять нечему.
+        let raw = crate::evrt::packetize_video_frame(4, 4000, false, &[0x04]);
+        let parsed = crate::evrt::parse(&raw[0], raw[0].len()).unwrap();
+        assert!(
+            ch.on_packet(&parsed).is_none(),
+            "still waiting for a keyframe"
+        );
+
+        // Ключевой кадр самодостаточен — он и восстанавливает поток.
+        let raw = crate::evrt::packetize_video_frame(5, 5000, true, &[0x05]);
+        let parsed = crate::evrt::parse(&raw[0], raw[0].len()).unwrap();
+        let recovered = ch.on_packet(&parsed);
+        assert!(
+            recovered.is_some(),
+            "keyframe must resynchronise the stream"
+        );
+        assert!(recovered.unwrap().1, "and be reported as a keyframe");
+
+        // После восстановления непрерывные кадры снова проходят.
+        let raw = crate::evrt::packetize_video_frame(6, 6000, false, &[0x06]);
+        let parsed = crate::evrt::parse(&raw[0], raw[0].len()).unwrap();
+        assert!(
+            ch.on_packet(&parsed).is_some(),
+            "a contiguous delta after recovery must be delivered again"
+        );
     }
 
     #[test]
@@ -1324,8 +1417,7 @@ mod tests {
     #[test]
     fn reassembler_rejects_payload_over_buffer_budget() {
         let mut ch = ChannelReassembler::new();
-        ch.frames
-            .insert(1, FrameAssembly::new(1, 1, false, 1000));
+        ch.frames.insert(1, FrameAssembly::new(1, 1, false, 1000));
 
         assert!(!ch.reserve_buffer(REASSEMBLY_MAX_BUFFERED_BYTES + 1, 1, false));
         assert_eq!(ch.dropped_frames(), 1);
@@ -1401,7 +1493,10 @@ mod tests {
         let result = re.on_fec_packet(&fec);
         assert!(result.is_some(), "FEC должен был восстановить кадр");
         let (bytes, _key, _ms, got_pts) = result.unwrap();
-        assert_eq!(bytes, payload, "восстановленный кадр должен совпадать с оригиналом");
+        assert_eq!(
+            bytes, payload,
+            "восстановленный кадр должен совпадать с оригиналом"
+        );
         assert_eq!(got_pts, pts);
         assert_eq!(re.fec_recovered(), 1);
     }

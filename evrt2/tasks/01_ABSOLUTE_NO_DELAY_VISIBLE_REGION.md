@@ -2,7 +2,21 @@
 
 **Task ID:** EVRT2CKMAX-TASK-01  
 **Author:** Arthur Valiev  
-**Status:** Specification → pending implementation  
+**Status:** Implemented and live-verified (2026-07) — `src/evrt2_scheduler.rs`,
+`src/evrt2_attention.rs`, `src/evrt2_jitter.rs`, wired into the live
+EVRT2 stream in `src/evrt2_experiment.rs`. VISIBLE_REGION now uses exact
+per-tile byte offsets (`encode_with_offsets`), not an averaged estimate.
+DEGRADE_SIGNAL is a real wire packet (`PacketType::DegradeSignal`), with
+a visual PC-side indicator (ROADMAP Phase 1.3) — live-confirmed 2026-07-27
+with a real host→client `Task01 breach` firing on the wire
+(`visible region age 44.75ms > ceiling 12ms`). Known live-tested
+limitation: `region.tiles` (the mechanism this whole task depends on)
+needs either real cursor/`MouseEvent` input or motion+surprise strong
+enough to cross the mode's `P_visible_threshold` — the EVRT2-only test
+harness (no cursor) empirically maxes out around P_i≈0.637 in R2 mode
+against an 0.80 threshold, so live confirmation there required a debug
+focus-hook, not organic gameplay. See `ROADMAP.md` Phase 1.3/6.4 for the
+full investigation.  
 **Depends on:** [`EVRT2CKMAX.md`](../codec/EVRT2CKMAX.md) — Perceptual Age Field,
 Attention Map (object 1), Reconstruction Budget (object 3), Temporal APF
 

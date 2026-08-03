@@ -196,7 +196,12 @@ pub fn route_mouse(ev: &crate::rustdesk_proto::MouseEvent) -> bool {
             Err(_) => return false,
         };
         match &s.attached_id {
-            Some(id) => (id.clone(), s.provider.clone(), s.width.max(1), s.height.max(1)),
+            Some(id) => (
+                id.clone(),
+                s.provider.clone(),
+                s.width.max(1),
+                s.height.max(1),
+            ),
             None => return false,
         }
     };
@@ -305,7 +310,10 @@ fn attach_vbox(uuid: &str) -> Result<String, String> {
         .find(|v| v.id == uuid)
         .ok_or_else(|| format!("VirtualBox VM {uuid} не найдена"))?;
     if !vm.running {
-        return Err(format!("VM «{}» выключена — запустите её в VirtualBox", vm.name));
+        return Err(format!(
+            "VM «{}» выключена — запустите её в VirtualBox",
+            vm.name
+        ));
     }
     let gen = begin_attach("vbox", &vm.id, &vm.name)?;
     let name = vm.name.clone();
@@ -464,8 +472,7 @@ const EVT_WHEEL: i32 = 3;
 
 #[cfg(windows)]
 fn dispatch_mouse(vm_id: &str, ev: &crate::rustdesk_proto::MouseEvent, w: u32, h: u32) {
-    let cmd_tx = state().lock().ok()
-        .and_then(|s| s.hyperv_cmd_tx.clone());
+    let cmd_tx = state().lock().ok().and_then(|s| s.hyperv_cmd_tx.clone());
     let Some(tx) = cmd_tx else {
         note_input("мышь: сессия не готова");
         return;
@@ -495,17 +502,22 @@ fn dispatch_mouse(vm_id: &str, ev: &crate::rustdesk_proto::MouseEvent, w: u32, h
 #[cfg(windows)]
 fn dispatch_key(vm_id: &str, ev: &crate::rustdesk_proto::KeyEvent) {
     use crate::rustdesk_proto::key_event::Union;
-    let cmd_tx = state().lock().ok()
-        .and_then(|s| s.hyperv_cmd_tx.clone());
+    let cmd_tx = state().lock().ok().and_then(|s| s.hyperv_cmd_tx.clone());
     let Some(tx) = cmd_tx else {
         note_input("клава: сессия не готова");
         return;
     };
 
     // Send a key via the session channel — no WMI connect overhead
-    let send_press = |vk: u32| { let _ = tx.send(hyperv::HyperVCmd::PressKey(vk)); };
-    let send_release = |vk: u32| { let _ = tx.send(hyperv::HyperVCmd::ReleaseKey(vk)); };
-    let send_text = |t: String| { let _ = tx.send(hyperv::HyperVCmd::TypeText(t)); };
+    let send_press = |vk: u32| {
+        let _ = tx.send(hyperv::HyperVCmd::PressKey(vk));
+    };
+    let send_release = |vk: u32| {
+        let _ = tx.send(hyperv::HyperVCmd::ReleaseKey(vk));
+    };
+    let send_text = |t: String| {
+        let _ = tx.send(hyperv::HyperVCmd::TypeText(t));
+    };
 
     // Модификаторы (Shift/Ctrl/Alt) — жмём перед, отпускаем после.
     let mods: Vec<u32> = ev
@@ -532,10 +544,16 @@ fn dispatch_key(vm_id: &str, ev: &crate::rustdesk_proto::KeyEvent) {
                 Ok(())
             }
             Some(Union::Unicode(ch)) => {
-                if *ch == 0 { return Ok(()); }
-                let Some(c) = char::from_u32(*ch) else { return Ok(()); };
+                if *ch == 0 {
+                    return Ok(());
+                }
+                let Some(c) = char::from_u32(*ch) else {
+                    return Ok(());
+                };
                 // Печатаемый символ обрабатываем только на нажатии — атомарно.
-                if !(ev.press || ev.down) { return Ok(()); }
+                if !(ev.press || ev.down) {
+                    return Ok(());
+                }
 
                 // VK-код клавиши: ASCII-пунктуация/буквы, затем JCUKEN-кириллица.
                 let vk = ascii_scancode(c).or_else(|| cyrillic_to_vk(c));
@@ -543,7 +561,13 @@ fn dispatch_key(vm_id: &str, ev: &crate::rustdesk_proto::KeyEvent) {
                 // ДИАГНОСТИКА: показываем что реально пришло и что отправим.
                 note_input(&format!(
                     "U+{:04X} '{}' press={} down={} mods={:?} shift={} vk={:?}",
-                    *ch, c, ev.press, ev.down, mods, needs_shift(c), vk
+                    *ch,
+                    c,
+                    ev.press,
+                    ev.down,
+                    mods,
+                    needs_shift(c),
+                    vk
                 ));
 
                 match vk {
@@ -564,10 +588,14 @@ fn dispatch_key(vm_id: &str, ev: &crate::rustdesk_proto::KeyEvent) {
 
                         // Атомарно: [Ctrl/Alt][Shift] key↓ key↑ [Shift][Ctrl/Alt]
                         non_shift_mods.iter().for_each(|m| send_press(*m));
-                        if shift_needed { send_press(VK_SHIFT); }
+                        if shift_needed {
+                            send_press(VK_SHIFT);
+                        }
                         send_press(vk_code);
                         send_release(vk_code);
-                        if shift_needed { send_release(VK_SHIFT); }
+                        if shift_needed {
+                            send_release(VK_SHIFT);
+                        }
                         non_shift_mods.iter().rev().for_each(|m| send_release(*m));
                     }
                     None => {
@@ -664,11 +692,10 @@ fn needs_shift(c: char) -> bool {
     match c {
         'A'..='Z' => true,
         'a'..='z' => false,
-        '!' | '@' | '#' | '$' | '%' | '^' | '&' | '*' | '(' | ')'
-        | '_' | '+' | '{' | '}' | ':' | '"' | '~' | '<' | '>' | '?' | '|' => true,
+        '!' | '@' | '#' | '$' | '%' | '^' | '&' | '*' | '(' | ')' | '_' | '+' | '{' | '}' | ':'
+        | '"' | '~' | '<' | '>' | '?' | '|' => true,
         '0'..='9' => false,
-        '-' | '=' | '[' | ']' | ';' | '\'' | '`' | ',' | '.' | '/' | '\\'
-        | ' ' | '\t' => false,
+        '-' | '=' | '[' | ']' | ';' | '\'' | '`' | ',' | '.' | '/' | '\\' | ' ' | '\t' => false,
         // Кириллица и прочее: по регистру самого символа.
         _ => c.is_uppercase(),
     }
@@ -695,7 +722,7 @@ fn ascii_scancode(c: char) -> Option<u32> {
         'a'..='z' | 'A'..='Z' => c.to_ascii_uppercase() as u32,
         // Цифры (0x30–0x39).
         '0'..='9' => c as u32,
-        ' ' => 0x20, // VK_SPACE
+        ' ' => 0x20,  // VK_SPACE
         '\t' => 0x09, // VK_TAB
         // Shifted-цифры: клиент посылает Unicode символ + Shift в modifiers.
         // Возвращаем VK базовой цифровой клавиши, Shift уже есть в mods.
@@ -710,16 +737,16 @@ fn ascii_scancode(c: char) -> Option<u32> {
         '(' => 0x39, // Shift+9
         ')' => 0x30, // Shift+0
         // Пунктуация (base key без Shift / со Shift через modifiers).
-        '-' | '_'  => 0xBD, // VK_OEM_MINUS
-        '=' | '+'  => 0xBB, // VK_OEM_PLUS
-        '[' | '{'  => 0xDB, // VK_OEM_4
-        ']' | '}'  => 0xDD, // VK_OEM_6
-        ';' | ':'  => 0xBA, // VK_OEM_1
-        '\''| '"'  => 0xDE, // VK_OEM_7
-        '`' | '~'  => 0xC0, // VK_OEM_3
-        ',' | '<'  => 0xBC, // VK_OEM_COMMA
-        '.' | '>'  => 0xBE, // VK_OEM_PERIOD
-        '/' | '?'  => 0xBF, // VK_OEM_2
+        '-' | '_' => 0xBD,  // VK_OEM_MINUS
+        '=' | '+' => 0xBB,  // VK_OEM_PLUS
+        '[' | '{' => 0xDB,  // VK_OEM_4
+        ']' | '}' => 0xDD,  // VK_OEM_6
+        ';' | ':' => 0xBA,  // VK_OEM_1
+        '\'' | '"' => 0xDE, // VK_OEM_7
+        '`' | '~' => 0xC0,  // VK_OEM_3
+        ',' | '<' => 0xBC,  // VK_OEM_COMMA
+        '.' | '>' => 0xBE,  // VK_OEM_PERIOD
+        '/' | '?' => 0xBF,  // VK_OEM_2
         '\\' | '|' => 0xDC, // VK_OEM_5
         _ => return None,
     })
@@ -871,41 +898,68 @@ pub fn checkpoint_op(json: &str) -> String {
         match (provider, op) {
             ("hyperv", "list") => {
                 let checkpoints = crate::hyperv::list_checkpoints(real_id);
-                let items: Vec<String> = checkpoints.iter().map(|c| {
-                    format!(
-                        r#"{{"name":{},"path":{},"created_time":{},"type":{}}}"#,
-                        json_str(&c.name),
-                        json_str(&c.wmi_path),
-                        json_str(&c.created_time),
-                        json_str(&c.checkpoint_type),
-                    )
-                }).collect();
-                format!(r#"{{"vm_id":{},"op":"list","ok":true,"error":"","checkpoints":[{}]}}"#,
-                    json_str(vm_id), items.join(","))
+                let items: Vec<String> = checkpoints
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            r#"{{"name":{},"path":{},"created_time":{},"type":{}}}"#,
+                            json_str(&c.name),
+                            json_str(&c.wmi_path),
+                            json_str(&c.created_time),
+                            json_str(&c.checkpoint_type),
+                        )
+                    })
+                    .collect();
+                format!(
+                    r#"{{"vm_id":{},"op":"list","ok":true,"error":"","checkpoints":[{}]}}"#,
+                    json_str(vm_id),
+                    items.join(",")
+                )
             }
             ("hyperv", "create") => {
-                let effective_path = if !vm_path.is_empty() { vm_path.to_owned() }
-                    else { format!("Msvm_ComputerSystem.CreationClassName=\"Msvm_ComputerSystem\",Name=\"{real_id}\"") };
+                let effective_path = if !vm_path.is_empty() {
+                    vm_path.to_owned()
+                } else {
+                    format!("Msvm_ComputerSystem.CreationClassName=\"Msvm_ComputerSystem\",Name=\"{real_id}\"")
+                };
                 match crate::hyperv::create_checkpoint(&effective_path, None) {
-                    Ok(name) => format!(r#"{{"vm_id":{},"op":"create","ok":true,"error":"","name":{}}}"#,
-                        json_str(vm_id), json_str(&name)),
-                    Err(e) => format!(r#"{{"vm_id":{},"op":"create","ok":false,"error":{}}}"#,
-                        json_str(vm_id), json_str(&e)),
+                    Ok(name) => format!(
+                        r#"{{"vm_id":{},"op":"create","ok":true,"error":"","name":{}}}"#,
+                        json_str(vm_id),
+                        json_str(&name)
+                    ),
+                    Err(e) => format!(
+                        r#"{{"vm_id":{},"op":"create","ok":false,"error":{}}}"#,
+                        json_str(vm_id),
+                        json_str(&e)
+                    ),
                 }
             }
-            ("hyperv", "apply") => {
-                match crate::hyperv::apply_checkpoint(path) {
-                    Ok(()) => format!(r#"{{"vm_id":{},"op":"apply","ok":true,"error":""}}"#, json_str(vm_id)),
-                    Err(e) => format!(r#"{{"vm_id":{},"op":"apply","ok":false,"error":{}}}"#, json_str(vm_id), json_str(&e)),
-                }
+            ("hyperv", "apply") => match crate::hyperv::apply_checkpoint(path) {
+                Ok(()) => format!(
+                    r#"{{"vm_id":{},"op":"apply","ok":true,"error":""}}"#,
+                    json_str(vm_id)
+                ),
+                Err(e) => format!(
+                    r#"{{"vm_id":{},"op":"apply","ok":false,"error":{}}}"#,
+                    json_str(vm_id),
+                    json_str(&e)
+                ),
+            },
+            ("hyperv", "delete") => match crate::hyperv::delete_checkpoint(path) {
+                Ok(()) => format!(
+                    r#"{{"vm_id":{},"op":"delete","ok":true,"error":""}}"#,
+                    json_str(vm_id)
+                ),
+                Err(e) => format!(
+                    r#"{{"vm_id":{},"op":"delete","ok":false,"error":{}}}"#,
+                    json_str(vm_id),
+                    json_str(&e)
+                ),
+            },
+            _ => {
+                format!(r#"{{"ok":false,"error":"unsupported: {provider}/{op}","checkpoints":[]}}"#)
             }
-            ("hyperv", "delete") => {
-                match crate::hyperv::delete_checkpoint(path) {
-                    Ok(()) => format!(r#"{{"vm_id":{},"op":"delete","ok":true,"error":""}}"#, json_str(vm_id)),
-                    Err(e) => format!(r#"{{"vm_id":{},"op":"delete","ok":false,"error":{}}}"#, json_str(vm_id), json_str(&e)),
-                }
-            }
-            _ => format!(r#"{{"ok":false,"error":"unsupported: {provider}/{op}","checkpoints":[]}}"#),
         }
     }
     #[cfg(not(windows))]
@@ -919,7 +973,9 @@ pub fn checkpoint_op(json: &str) -> String {
 pub fn rescue_input(json: &str) {
     #[cfg(windows)]
     {
-        let Ok(val) = serde_json::from_str::<serde_json::Value>(json) else { return };
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(json) else {
+            return;
+        };
         let vm_id = val.get("vm_id").and_then(|v| v.as_str()).unwrap_or("");
         let input_type = val.get("input_type").and_then(|v| v.as_str()).unwrap_or("");
         let text = val.get("text").and_then(|v| v.as_str()).unwrap_or("");
@@ -930,10 +986,18 @@ pub fn rescue_input(json: &str) {
             }
             ("hyperv", "type_text") => {
                 let _ = crate::hyperv::type_text(real_id, text);
-                note_input(if text.is_empty() { "type_text: пустая строка" } else { "type_text: OK" });
+                note_input(if text.is_empty() {
+                    "type_text: пустая строка"
+                } else {
+                    "type_text: OK"
+                });
             }
             ("hyperv", "press_key") => {
-                if let Ok(vk) = text.trim_start_matches("0x").parse::<u32>().or_else(|_| u32::from_str_radix(text.trim_start_matches("0x"), 16)) {
+                if let Ok(vk) = text
+                    .trim_start_matches("0x")
+                    .parse::<u32>()
+                    .or_else(|_| u32::from_str_radix(text.trim_start_matches("0x"), 16))
+                {
                     let _ = crate::hyperv::press_key(real_id, vk);
                     std::thread::sleep(std::time::Duration::from_millis(30));
                     let _ = crate::hyperv::release_key(real_id, vk);
