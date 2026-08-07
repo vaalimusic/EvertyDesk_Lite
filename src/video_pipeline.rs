@@ -100,6 +100,8 @@ struct VideoServiceHandle {
     stop: Arc<AtomicBool>,
     idr_tx: Sender<()>,
     handle: thread::JoinHandle<()>,
+    client_video: ClientVideoSupport,
+    using_evrtck: bool,
 }
 
 // ─── Pipeline config ──────────────────────────────────────────────────────────
@@ -199,6 +201,9 @@ pub fn run(cfg: PipelineConfig) {
     // Обновляется командой PipelineCmd::CursorMoved из handle_client_input_pipeline
     // при каждом MouseEvent. Читается encode_loop перед EVRTCK-кодированием.
     let cursor_pos: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let evrtck_silicon_requested: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let evrtck_return_requested: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let evrtck_scheduler_silicon_active: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
     // ── Forwarder: peer_msg_rx (shell output) → TCP канал ────────────────────
     {
@@ -244,6 +249,9 @@ pub fn run(cfg: PipelineConfig) {
         &actual_encode_res,
         &want_evrtck,
         &cursor_pos,
+        &evrtck_silicon_requested,
+        &evrtck_return_requested,
+        &evrtck_scheduler_silicon_active,
     );
 
     // ── TCP Sender thread ─────────────────────────────────────────────────────
@@ -455,6 +463,9 @@ pub fn run(cfg: PipelineConfig) {
                             &actual_encode_res,
                             &want_evrtck,
                             &cursor_pos,
+                            &evrtck_silicon_requested,
+                            &evrtck_return_requested,
+                            &evrtck_scheduler_silicon_active,
                         );
                     }
                 }
@@ -509,6 +520,9 @@ pub fn run(cfg: PipelineConfig) {
                     &actual_encode_res,
                     &want_evrtck,
                     &cursor_pos,
+                    &evrtck_silicon_requested,
+                    &evrtck_return_requested,
+                    &evrtck_scheduler_silicon_active,
                 );
             }
 
@@ -621,6 +635,9 @@ pub fn run(cfg: PipelineConfig) {
                     &actual_encode_res,
                     &want_evrtck,
                     &cursor_pos,
+                    &evrtck_silicon_requested,
+                    &evrtck_return_requested,
+                    &evrtck_scheduler_silicon_active,
                 );
             }
             Ok(PipelineCmd::SetSubscribedDisplays(displays)) => {
@@ -642,6 +659,9 @@ pub fn run(cfg: PipelineConfig) {
                     &actual_encode_res,
                     &want_evrtck,
                     &cursor_pos,
+                    &evrtck_silicon_requested,
+                    &evrtck_return_requested,
+                    &evrtck_scheduler_silicon_active,
                 );
             }
             Ok(PipelineCmd::AddSubscribedDisplays(displays)) => {
@@ -665,6 +685,9 @@ pub fn run(cfg: PipelineConfig) {
                     &actual_encode_res,
                     &want_evrtck,
                     &cursor_pos,
+                    &evrtck_silicon_requested,
+                    &evrtck_return_requested,
+                    &evrtck_scheduler_silicon_active,
                 );
             }
             Ok(PipelineCmd::RemoveSubscribedDisplays(displays)) => {
@@ -693,6 +716,9 @@ pub fn run(cfg: PipelineConfig) {
                     &actual_encode_res,
                     &want_evrtck,
                     &cursor_pos,
+                    &evrtck_silicon_requested,
+                    &evrtck_return_requested,
+                    &evrtck_scheduler_silicon_active,
                 );
             }
             Ok(PipelineCmd::RefreshDisplay(display)) => {
@@ -793,11 +819,98 @@ pub fn run(cfg: PipelineConfig) {
                             &actual_encode_res,
                             &want_evrtck,
                             &cursor_pos,
+                            &evrtck_silicon_requested,
+                            &evrtck_return_requested,
+                            &evrtck_scheduler_silicon_active,
                         );
                     }
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if evrtck_silicon_requested.swap(false, Ordering::Relaxed)
+                    && want_evrtck.load(Ordering::Relaxed)
+                {
+                    let evrt_live = evrt_active.lock().map(|g| g.is_some()).unwrap_or(false);
+                    if let Some(prefer) = evrtck_silicon_prefer(client_video, evrt_live) {
+                        want_evrtck.store(false, Ordering::Relaxed);
+                        evrtck_scheduler_silicon_active.store(true, Ordering::Relaxed);
+                        client_video.prefer = prefer;
+                        let displays: Vec<i32> = subscribed_displays.iter().copied().collect();
+                        log(
+                            &events,
+                            format!(
+                                "EVRTCK scheduler: switching to silicon codec {:?} (evrt_live={})",
+                                prefer, evrt_live
+                            ),
+                        );
+                        set_subscribed_displays(
+                            displays,
+                            &mut video_services,
+                            &mut subscribed_displays,
+                            &tcp_tx,
+                            &evrt_tx,
+                            &stop,
+                            &target_fps,
+                            &quality_ms,
+                            &bitrate_scale_milli,
+                            &app_config,
+                            client_video,
+                            &events,
+                            &evrt_active,
+                            &client_max_res,
+                            &actual_encode_res,
+                            &want_evrtck,
+                            &cursor_pos,
+                            &evrtck_silicon_requested,
+                            &evrtck_return_requested,
+                            &evrtck_scheduler_silicon_active,
+                        );
+                        let _ = global_idr_tx.send(());
+                    } else {
+                        log(
+                            &events,
+                            "EVRTCK scheduler: silicon candidate ignored; no compatible client codec"
+                                .to_owned(),
+                        );
+                    }
+                }
+                if evrtck_return_requested.swap(false, Ordering::Relaxed)
+                    && evrtck_scheduler_silicon_active.load(Ordering::Relaxed)
+                {
+                    evrtck_scheduler_silicon_active.store(false, Ordering::Relaxed);
+                    want_evrtck.store(true, Ordering::Relaxed);
+                    client_video.prefer = PreferCodec::Auto;
+                    let displays: Vec<i32> = subscribed_displays.iter().copied().collect();
+                    log(
+                        &events,
+                        "EVRTCK scheduler: returning to EVRTCK after stable low-delta period"
+                            .to_owned(),
+                    );
+                    set_subscribed_displays(
+                        displays,
+                        &mut video_services,
+                        &mut subscribed_displays,
+                        &tcp_tx,
+                        &evrt_tx,
+                        &stop,
+                        &target_fps,
+                        &quality_ms,
+                        &bitrate_scale_milli,
+                        &app_config,
+                        client_video,
+                        &events,
+                        &evrt_active,
+                        &client_max_res,
+                        &actual_encode_res,
+                        &want_evrtck,
+                        &cursor_pos,
+                        &evrtck_silicon_requested,
+                        &evrtck_return_requested,
+                        &evrtck_scheduler_silicon_active,
+                    );
+                    let _ = global_idr_tx.send(());
+                }
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 stop.store(true, Ordering::Relaxed);
                 break;
@@ -841,6 +954,9 @@ fn set_subscribed_displays(
     actual_encode_res: &Arc<AtomicU64>,
     want_evrtck: &Arc<AtomicBool>,
     cursor_pos: &Arc<AtomicU64>,
+    evrtck_silicon_requested: &Arc<AtomicBool>,
+    evrtck_return_requested: &Arc<AtomicBool>,
+    evrtck_scheduler_silicon_active: &Arc<AtomicBool>,
 ) {
     // RustDesk-compatible service model: switching displays changes the
     // subscribed service set instead of mutating capture state inside a worker.
@@ -849,19 +965,40 @@ fn set_subscribed_displays(
         next.insert(0);
     }
 
-    let removed: Vec<i32> = subscribed.difference(&next).copied().collect();
+    let using_evrtck_now = want_evrtck.load(Ordering::Relaxed);
+    let restart: Vec<i32> = next
+        .intersection(subscribed)
+        .copied()
+        .filter(|display| {
+            services
+                .get(display)
+                .map(|service| {
+                    service.client_video != client_video || service.using_evrtck != using_evrtck_now
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    let removed: Vec<i32> = subscribed
+        .difference(&next)
+        .copied()
+        .chain(restart.iter().copied())
+        .collect();
     for display in removed {
         if let Some(service) = services.remove(&display) {
             service.stop.store(true, Ordering::Relaxed);
             let _ = service.handle.join();
             log(
                 events,
-                format!("VideoService display={} stopped", display + 1),
+                format!("VideoService display={} stopped/restarting", display + 1),
             );
         }
     }
 
-    let added: Vec<i32> = next.difference(subscribed).copied().collect();
+    let added: Vec<i32> = next
+        .iter()
+        .copied()
+        .filter(|display| !services.contains_key(display))
+        .collect();
     for display in added {
         // Android game mode: want_evrtck=false means the client requested H264/H265/AV1
         // (non-EVRTCK). Force StreamingMode::Game so static_skip is disabled — game
@@ -889,6 +1026,9 @@ fn set_subscribed_displays(
             actual_encode_res.clone(),
             want_evrtck.clone(),
             cursor_pos.clone(),
+            evrtck_silicon_requested.clone(),
+            evrtck_return_requested.clone(),
+            evrtck_scheduler_silicon_active.clone(),
         );
         services.insert(display, service);
     }
@@ -924,6 +1064,9 @@ fn start_video_service(
     actual_encode_res: Arc<AtomicU64>,
     want_evrtck: Arc<AtomicBool>,
     cursor_pos: Arc<AtomicU64>,
+    evrtck_silicon_requested: Arc<AtomicBool>,
+    evrtck_return_requested: Arc<AtomicBool>,
+    evrtck_scheduler_silicon_active: Arc<AtomicBool>,
 ) -> VideoServiceHandle {
     let service_stop = Arc::new(AtomicBool::new(false));
     let loop_stop = Arc::new(AtomicBool::new(false));
@@ -931,6 +1074,7 @@ fn start_video_service(
     let service_stop_for_thread = service_stop.clone();
     let loop_stop_for_thread = loop_stop.clone();
     let events_for_log = events.clone();
+    let using_evrtck_for_handle = want_evrtck.load(Ordering::Relaxed);
 
     let handle = thread::Builder::new()
         .name(format!("video-service-d{}", display + 1))
@@ -976,6 +1120,9 @@ fn start_video_service(
                 actual_encode_res,
                 want_evrtck,
                 cursor_pos,
+                evrtck_silicon_requested,
+                evrtck_return_requested,
+                evrtck_scheduler_silicon_active,
             );
 
             if let Some(watcher) = watcher {
@@ -988,6 +1135,8 @@ fn start_video_service(
         stop: service_stop,
         idr_tx,
         handle,
+        client_video,
+        using_evrtck: using_evrtck_for_handle,
     }
 }
 
@@ -1005,6 +1154,31 @@ fn send_ordered_switch_display(tcp_tx: &SyncSender<TcpItem>, stop: &Arc<AtomicBo
             Err(mpsc::TrySendError::Disconnected(_)) => break,
         }
     }
+}
+
+fn evrtck_silicon_prefer(client: ClientVideoSupport, evrt_live: bool) -> Option<PreferCodec> {
+    // Relay/TCP path is safest with H264. H265/AV1 over relay has platform
+    // decoder edge cases in this codebase, so only prefer them once EVRT UDP is
+    // live. H264 is also the broadest RustDesk-compatible fallback.
+    if client.h264 {
+        return Some(PreferCodec::H264);
+    }
+    if evrt_live && client.h265 {
+        return Some(PreferCodec::H265);
+    }
+    if evrt_live && client.av1 {
+        return Some(PreferCodec::Av1);
+    }
+    None
+}
+
+fn evrtck_return_candidate(
+    roi: crate::evrt::RoiRect,
+    width: u32,
+    height: u32,
+    want_idr: bool,
+) -> bool {
+    !want_idr && roi.dirty_area_milli(width, height) <= 80
 }
 
 fn switch_display_message(display: i32) -> Option<crate::rustdesk_proto::PeerMessage> {
@@ -1047,6 +1221,9 @@ fn encode_loop(
     actual_encode_res: Arc<AtomicU64>,
     want_evrtck: Arc<AtomicBool>,
     cursor_pos: Arc<AtomicU64>,
+    evrtck_silicon_requested: Arc<AtomicBool>,
+    evrtck_return_requested: Arc<AtomicBool>,
+    evrtck_scheduler_silicon_active: Arc<AtomicBool>,
 ) {
     use crate::evrtck::EvrtckEncoder;
     use crate::host::{h264_target_bitrate_bps_pub, EncodedOutput, MultiEncoder};
@@ -1113,7 +1290,12 @@ fn encode_loop(
     let mut last_tele_at = Instant::now();
     let mut backend_logged = false;
     let mut evrtck_logged = false;
+    let mut evrtck_silicon_candidate_logged_at: Option<Instant> = None;
+    let mut evrtck_silicon_candidate_frames: u32 = 0;
+    let mut evrtck_return_candidate_frames: u32 = 0;
     const TELE_INTERVAL: Duration = Duration::from_secs(10);
+    const EVRTCK_SILICON_SWITCH_STREAK: u32 = 8;
+    const EVRTCK_RETURN_STREAK: u32 = 90;
 
     // ★ Периодическая отправка телеметрии хоста КЛИЕНТУ (для --diagnose).
     //   Не один раз, а каждые 2с — надёжно доходит даже при дропах/статике.
@@ -1550,6 +1732,7 @@ fn encode_loop(
         // using_evrtck → EVRTCK lossless LAN кодек (всегда через EVRT UDP).
         // !using_evrtck → MultiEncoder (H264/H265/AV1): если evrt_on, кадры идут
         //   через EVRT UDP с выбранным кодеком; если нет — через TCP relay.
+        let mut evrtck_analysis_for_frame: Option<crate::evrtck::FrameAnalysis> = None;
         let encode_started = Instant::now();
         let Some(out) = (if using_evrtck {
             Some(EVRTCK_ENC.with(|cell| {
@@ -1580,6 +1763,8 @@ fn encode_loop(
                     let cy = (packed_cursor & 0xFFFF_FFFF) as u32;
                     enc.as_mut().unwrap().set_focus_pixel(cx, cy);
                 }
+                let analysis = enc.as_ref().unwrap().analyze_next_frame(bgra);
+                evrtck_analysis_for_frame = Some(analysis);
                 let pkt = enc.as_mut().unwrap().encode(bgra, frame_id);
                 if !evrtck_logged {
                     evrtck_logged = true;
@@ -1606,6 +1791,45 @@ fn encode_loop(
         let encode_dur = encode_started.elapsed();
         tele.mark_encode(encode_dur);
         let encode_ms = encode_dur.as_millis();
+        if evrtck_scheduler_silicon_active.load(Ordering::Relaxed) && !using_evrtck {
+            if evrtck_return_candidate(decision.roi, enc_w, enc_h, want_idr) {
+                evrtck_return_candidate_frames = evrtck_return_candidate_frames.saturating_add(1);
+                if evrtck_return_candidate_frames >= EVRTCK_RETURN_STREAK {
+                    evrtck_return_requested.store(true, Ordering::Relaxed);
+                }
+            } else {
+                evrtck_return_candidate_frames = 0;
+            }
+        } else {
+            evrtck_return_candidate_frames = 0;
+        }
+        if let Some(analysis) = evrtck_analysis_for_frame {
+            if analysis.prefer_silicon {
+                evrtck_silicon_candidate_frames = evrtck_silicon_candidate_frames.saturating_add(1);
+                if evrtck_silicon_candidate_frames >= EVRTCK_SILICON_SWITCH_STREAK {
+                    evrtck_silicon_requested.store(true, Ordering::Relaxed);
+                }
+                let should_log = evrtck_silicon_candidate_logged_at
+                    .map(|last| last.elapsed() >= Duration::from_secs(5))
+                    .unwrap_or(true);
+                if should_log {
+                    evrtck_silicon_candidate_logged_at = Some(Instant::now());
+                    log(
+                        &events,
+                        format!(
+                            "EVRTCK scheduler: silicon candidate dirty={:.0}% entropy={:.2} est_payload={}B actual_payload={}B streak={}",
+                            analysis.dirty_ratio * 100.0,
+                            analysis.entropy_score,
+                            analysis.estimated_payload_bytes,
+                            out.bytes.len(),
+                            evrtck_silicon_candidate_frames,
+                        ),
+                    );
+                }
+            } else {
+                evrtck_silicon_candidate_frames = 0;
+            }
+        }
 
         // ★ Периодически шлём телеметрию хоста клиенту (надёжнее одноразовой).
         //   БЛОКИРУЮЩИЙ send — try_send дропался когда канал забит видео-кадрами.
@@ -1656,9 +1880,21 @@ fn encode_loop(
             } else {
                 0
             };
+            let evrtck_analysis = evrtck_analysis_for_frame;
+            let evrtck_dirty_pct = evrtck_analysis
+                .map(|a| (a.dirty_ratio * 100.0).round() as u32)
+                .unwrap_or(0);
+            let evrtck_entropy_pct = evrtck_analysis
+                .map(|a| (a.entropy_score * 100.0).round() as u32)
+                .unwrap_or(0);
+            let evrtck_est_payload = evrtck_analysis
+                .map(|a| a.estimated_payload_bytes)
+                .unwrap_or(0);
+            let evrtck_silicon_candidate =
+                evrtck_analysis.map(|a| a.prefer_silicon).unwrap_or(false);
 
             let info = format!(
-                "backend={} encode_ms={} encode_avg_ms={} capture_avg_ms={} capture_max_ms={} slot_avg_ms={} change_avg_ms={} actual_fps={:.1} sent={} skipped={} interval_ms={} res={}x{} fps={} build={}",
+                "backend={} encode_ms={} encode_avg_ms={} capture_avg_ms={} capture_max_ms={} slot_avg_ms={} change_avg_ms={} actual_fps={:.1} sent={} skipped={} interval_ms={} res={}x{} fps={} evrtck_dirty_pct={} evrtck_entropy_pct={} evrtck_est_payload={} evrtck_silicon_candidate={} build={}",
                 encoder.active_backend(),
                 encode_ms,
                 encode_avg_ms,
@@ -1671,6 +1907,10 @@ fn encode_loop(
                 skipped_delta,
                 host_tele_elapsed.as_millis(),
                 enc_w, enc_h, fps,
+                evrtck_dirty_pct,
+                evrtck_entropy_pct,
+                evrtck_est_payload,
+                evrtck_silicon_candidate,
                 crate::host::binary_build_stamp(),
             );
             // Шлём клиенту
@@ -2654,6 +2894,79 @@ fn quantize_bitrate(bps: u32, min_bps: u32, max_bps: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evrtck_silicon_prefer_uses_h264_on_relay_when_available() {
+        let client = ClientVideoSupport {
+            h264: true,
+            h265: true,
+            av1: true,
+            prefer: PreferCodec::Auto,
+        };
+
+        assert_eq!(
+            evrtck_silicon_prefer(client, false),
+            Some(PreferCodec::H264)
+        );
+    }
+
+    #[test]
+    fn evrtck_silicon_prefer_allows_h265_when_evrt_is_live_and_h264_missing() {
+        let client = ClientVideoSupport {
+            h264: false,
+            h265: true,
+            av1: false,
+            prefer: PreferCodec::Auto,
+        };
+
+        assert_eq!(evrtck_silicon_prefer(client, true), Some(PreferCodec::H265));
+    }
+
+    #[test]
+    fn evrtck_silicon_prefer_does_not_switch_without_compatible_codec() {
+        let client = ClientVideoSupport {
+            h264: false,
+            h265: true,
+            av1: false,
+            prefer: PreferCodec::Auto,
+        };
+
+        assert_eq!(evrtck_silicon_prefer(client, false), None);
+    }
+
+    #[test]
+    fn evrtck_return_candidate_accepts_small_non_key_delta() {
+        let roi = crate::evrt::RoiRect {
+            frame_id: 1,
+            x: 0,
+            y: 0,
+            w: 160,
+            h: 90,
+        };
+
+        assert!(evrtck_return_candidate(roi, 1920, 1080, false));
+    }
+
+    #[test]
+    fn evrtck_return_candidate_rejects_fullscreen_or_keyframe() {
+        let fullscreen = crate::evrt::RoiRect {
+            frame_id: 1,
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        };
+        let small = crate::evrt::RoiRect {
+            frame_id: 1,
+            x: 0,
+            y: 0,
+            w: 160,
+            h: 90,
+        };
+
+        assert!(!evrtck_return_candidate(fullscreen, 1920, 1080, false));
+        assert!(!evrtck_return_candidate(small, 1920, 1080, true));
+    }
 
     #[test]
     fn roi_adaptation_keeps_fullscreen_at_base_bitrate() {

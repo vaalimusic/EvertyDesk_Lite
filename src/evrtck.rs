@@ -262,10 +262,34 @@ impl FrameStats {
     }
 }
 
+/// EVRTCK pre-encode frame analysis.
+///
+/// This is intentionally cheaper than a full encode: it scans dirty tiles and
+/// samples XOR bytes from changed tiles to estimate whether the frame is
+/// desktop/UI-like (EVRTCK sweet spot) or video/noise-like (hardware codec
+/// should take over after a controlled renegotiation).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameAnalysis {
+    pub total_tiles: u32,
+    pub dirty_tiles: u32,
+    /// `dirty_tiles / total_tiles`.
+    pub dirty_ratio: f32,
+    /// Approximate diversity of sampled XOR bytes in dirty tiles. Low values
+    /// mean repeated UI deltas; high values mean high-entropy/video-like data.
+    pub entropy_score: f32,
+    /// Rough wire-size estimate if this frame is encoded as EVRTCK P-frame.
+    pub estimated_payload_bytes: u32,
+    /// True when this frame is probably better handled by a hardware video
+    /// codec. The live pipeline must still switch only through negotiated codec
+    /// change; this flag is the policy signal, not a transport packet type.
+    pub prefer_silicon: bool,
+}
+
 // Wire flags byte (offset 5 in header).
 pub(crate) const FLAG_KEYFRAME: u8 = 0x01;
 // NOP frame: cur == prev, frame buffer unchanged. No tile map or payload.
 pub(crate) const FLAG_NOP: u8 = 0x02;
+const FRAME_HEADER_LEN: usize = 20;
 
 // ── Backend trait ─────────────────────────────────────────────────────────────
 
@@ -307,6 +331,19 @@ pub trait EvrtckEncoderBackend: Send {
     /// Fast dirty-tile pre-scan (no compression). GPU backends may override with
     /// a compute shader. Default: O(W×H) CPU compare.
     fn dirty_ratio(&self, bgra: &[u8]) -> f32;
+    /// Cheap pre-encode analysis used by the heterogeneous EVRTCK scheduler.
+    fn analyze_next_frame(&self, bgra: &[u8]) -> FrameAnalysis {
+        let dirty_ratio = self.dirty_ratio(bgra);
+        let total_tiles = tiles_in_dim(self.width()) * tiles_in_dim(self.height());
+        FrameAnalysis {
+            total_tiles: total_tiles as u32,
+            dirty_tiles: (dirty_ratio * total_tiles as f32).round() as u32,
+            dirty_ratio,
+            entropy_score: 0.0,
+            estimated_payload_bytes: FRAME_HEADER_LEN as u32,
+            prefer_silicon: false,
+        }
+    }
     /// Set (or clear, with `None`) the Visible Region anchor in TILE coordinates
     /// (not pixels). When set, dirty tiles are emitted nearest-to-focus first
     /// instead of raster order — see EVRT2CKMAX-TASK-01. Default: no-op, so
@@ -343,6 +380,108 @@ impl CpuEvrtckEncoder {
             height,
             pending_keyframe: true, // first frame is always a keyframe
             focus: None,
+        }
+    }
+
+    fn analyze_next_frame_impl(&self, bgra: &[u8]) -> FrameAnalysis {
+        let tiles_x = tiles_in_dim(self.width);
+        let tiles_y = tiles_in_dim(self.height);
+        let total_tiles = tiles_x * tiles_y;
+        if total_tiles == 0 || bgra.len() != self.prev.len() || bgra == self.prev {
+            return FrameAnalysis {
+                total_tiles: total_tiles as u32,
+                dirty_tiles: 0,
+                dirty_ratio: 0.0,
+                entropy_score: 0.0,
+                estimated_payload_bytes: FRAME_HEADER_LEN as u32,
+                prefer_silicon: false,
+            };
+        }
+
+        const MAX_SAMPLED_DIRTY_TILES: usize = 96;
+        const SAMPLE_STRIDE_BYTES: usize = 16;
+        let map_bytes = total_tiles.div_ceil(8);
+        let mut dirty_tiles = 0usize;
+        let mut sampled_dirty_tiles = 0usize;
+        let mut sampled_bytes = 0usize;
+        let mut changed_sampled_bytes = 0usize;
+        let mut histogram = [0u16; 256];
+        let mut unique = 0usize;
+
+        for ty in 0..tiles_y {
+            for tx in 0..tiles_x {
+                if !tile_is_dirty(bgra, &self.prev, self.width, self.height, tx, ty) {
+                    continue;
+                }
+                dirty_tiles += 1;
+
+                if sampled_dirty_tiles >= MAX_SAMPLED_DIRTY_TILES {
+                    continue;
+                }
+                sampled_dirty_tiles += 1;
+                let x0 = tx * TILE_SIZE;
+                let y0 = ty * TILE_SIZE;
+                let x1 = (x0 + TILE_SIZE).min(self.width);
+                let y1 = (y0 + TILE_SIZE).min(self.height);
+
+                for y in y0..y1 {
+                    let row_start = (y * self.width + x0) * 4;
+                    let row_end = (y * self.width + x1) * 4;
+                    let mut off = row_start;
+                    while off < row_end {
+                        // Sample B/G/R only. Alpha is normally constant and
+                        // would hide entropy in noisy/video content.
+                        for channel in 0..3 {
+                            let xor = bgra[off + channel] ^ self.prev[off + channel];
+                            sampled_bytes += 1;
+                            if xor != 0 {
+                                changed_sampled_bytes += 1;
+                            }
+                            let bin = &mut histogram[xor as usize];
+                            if *bin == 0 {
+                                unique += 1;
+                            }
+                            *bin = bin.saturating_add(1);
+                        }
+                        off += SAMPLE_STRIDE_BYTES;
+                    }
+                }
+            }
+        }
+
+        let dirty_ratio = dirty_tiles as f32 / total_tiles as f32;
+        let changed_density = if sampled_bytes == 0 {
+            0.0
+        } else {
+            changed_sampled_bytes as f32 / sampled_bytes as f32
+        };
+        let entropy_score = if sampled_bytes == 0 {
+            0.0
+        } else {
+            (unique as f32 / 192.0).clamp(0.0, 1.0)
+        };
+        let dirty_tile_pixels = (self.width * self.height) as f32 / total_tiles as f32;
+        let bytes_per_dirty_tile = if entropy_score >= 0.65 {
+            9.0 + dirty_tile_pixels * 3.0 * changed_density * 0.92
+        } else if entropy_score >= 0.25 {
+            18.0 + dirty_tile_pixels * 0.55
+        } else {
+            8.0 + dirty_tile_pixels * 0.015
+        };
+        let estimated_payload_bytes =
+            FRAME_HEADER_LEN + map_bytes + (dirty_tiles as f32 * bytes_per_dirty_tile) as usize;
+        let raw_bytes = self.width.saturating_mul(self.height).saturating_mul(4);
+        let prefer_silicon = dirty_tiles > 0
+            && entropy_score >= 0.62
+            && (dirty_ratio >= 0.12 || estimated_payload_bytes >= raw_bytes / 10);
+
+        FrameAnalysis {
+            total_tiles: total_tiles as u32,
+            dirty_tiles: dirty_tiles as u32,
+            dirty_ratio,
+            entropy_score,
+            estimated_payload_bytes: estimated_payload_bytes.min(u32::MAX as usize) as u32,
+            prefer_silicon,
         }
     }
 }
@@ -437,6 +576,10 @@ impl EvrtckEncoderBackend for CpuEvrtckEncoder {
         dirty as f32 / total as f32
     }
 
+    fn analyze_next_frame(&self, bgra: &[u8]) -> FrameAnalysis {
+        self.analyze_next_frame_impl(bgra)
+    }
+
     fn set_focus(&mut self, focus_tile: Option<(usize, usize)>) {
         self.focus = focus_tile;
     }
@@ -520,6 +663,10 @@ impl EvrtckEncoder {
     /// on CPU backend; compute shader on GPU backend.
     pub fn dirty_ratio(&self, rgba: &[u8]) -> f32 {
         self.inner.dirty_ratio(rgba)
+    }
+
+    pub fn analyze_next_frame(&self, rgba: &[u8]) -> FrameAnalysis {
+        self.inner.analyze_next_frame(rgba)
     }
 
     pub fn width(&self) -> usize {
@@ -1777,6 +1924,87 @@ mod tests {
             }
         }
         f
+    }
+
+    fn dirty_tiles_frame(
+        base: &[u8],
+        w: usize,
+        h: usize,
+        dirty_fraction: f32,
+        noisy: bool,
+    ) -> Vec<u8> {
+        let mut frame = base.to_vec();
+        let tiles_x = tiles_in_dim(w);
+        let tiles_y = tiles_in_dim(h);
+        let total_tiles = tiles_x * tiles_y;
+        let dirty_tiles = ((total_tiles as f32) * dirty_fraction).round() as usize;
+        let mut seed = 0x4556_5254_434b_u64;
+        for tile_idx in 0..dirty_tiles.min(total_tiles) {
+            let tx = tile_idx % tiles_x;
+            let ty = tile_idx / tiles_x;
+            let x0 = tx * TILE_SIZE;
+            let y0 = ty * TILE_SIZE;
+            let x1 = (x0 + TILE_SIZE).min(w);
+            let y1 = (y0 + TILE_SIZE).min(h);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let off = (y * w + x) * 4;
+                    if noisy {
+                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        frame[off] = seed as u8;
+                        frame[off + 1] = (seed >> 8) as u8;
+                        frame[off + 2] = (seed >> 16) as u8;
+                    } else {
+                        frame[off] = 255 - base[off];
+                        frame[off + 1] = 255 - base[off + 1];
+                        frame[off + 2] = 255 - base[off + 2];
+                    }
+                }
+            }
+        }
+        frame
+    }
+
+    #[test]
+    fn frame_analysis_keeps_low_entropy_desktop_delta_on_evrtck() {
+        let (w, h) = (320, 192);
+        let base = solid_frame(w, h, [30, 30, 30, 255]);
+        let frame = dirty_tiles_frame(&base, w, h, 0.50, false);
+        let mut enc = EvrtckEncoder::new(w, h);
+        enc.encode(&base, 1);
+
+        let analysis = enc.analyze_next_frame(&frame);
+
+        assert!(analysis.dirty_ratio > 0.45);
+        assert!(
+            analysis.entropy_score < 0.25,
+            "low-entropy UI delta must not look like video/noise: {analysis:?}"
+        );
+        assert!(
+            !analysis.prefer_silicon,
+            "EVRTCK must remain preferred for low-entropy desktop deltas: {analysis:?}"
+        );
+    }
+
+    #[test]
+    fn frame_analysis_marks_high_entropy_dirty_delta_for_silicon() {
+        let (w, h) = (320, 192);
+        let base = solid_frame(w, h, [30, 30, 30, 255]);
+        let frame = dirty_tiles_frame(&base, w, h, 0.50, true);
+        let mut enc = EvrtckEncoder::new(w, h);
+        enc.encode(&base, 1);
+
+        let analysis = enc.analyze_next_frame(&frame);
+
+        assert!(analysis.dirty_ratio > 0.45);
+        assert!(
+            analysis.entropy_score > 0.60,
+            "noisy delta should be classified as high entropy: {analysis:?}"
+        );
+        assert!(
+            analysis.prefer_silicon,
+            "high-entropy video-like delta should trigger silicon recommendation: {analysis:?}"
+        );
     }
 
     // ── TASK-01 exact tile offsets (ROADMAP.md Phase 1.2) ──────────────────────

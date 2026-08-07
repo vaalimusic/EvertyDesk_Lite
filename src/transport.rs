@@ -4331,7 +4331,9 @@ fn trim_video_backlog_to_keyframe(batch: &mut Vec<DecoderInput>) -> BacklogTrim 
         return BacklogTrim::default();
     }
     let before = batch.len();
-    let evrtck_only = batch.iter().all(|frame| matches!(frame, DecoderInput::Evrtck { .. }));
+    let evrtck_only = batch
+        .iter()
+        .all(|frame| matches!(frame, DecoderInput::Evrtck { .. }));
     if let Some(index) = batch.iter().rposition(DecoderInput::has_keyframe) {
         if index > 0 {
             batch.drain(..index);
@@ -5995,8 +5997,14 @@ mod tests {
         assert!(!decoder_latency_needs_recovery(120, 30));
         assert!(decoder_latency_needs_recovery(350, 30));
         assert!(decoder_latency_needs_recovery(80, 90));
-        assert_eq!(downgrade_one_quality(ImageQuality::Best), ImageQuality::Balanced);
-        assert_eq!(downgrade_one_quality(ImageQuality::Balanced), ImageQuality::Low);
+        assert_eq!(
+            downgrade_one_quality(ImageQuality::Best),
+            ImageQuality::Balanced
+        );
+        assert_eq!(
+            downgrade_one_quality(ImageQuality::Balanced),
+            ImageQuality::Low
+        );
         assert_eq!(downgrade_one_quality(ImageQuality::Low), ImageQuality::Low);
     }
 

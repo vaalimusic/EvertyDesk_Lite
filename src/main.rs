@@ -1284,6 +1284,7 @@ fn run_headless_host() {
                 } => {
                     eprintln!("[host] Session ended: {peer_id} {reason}")
                 }
+                host::HostEvent::SessionPermissionsChanged { .. } => {}
                 host::HostEvent::VideoTelemetry {
                     summary,
                     fallback_reason,
@@ -1611,6 +1612,7 @@ fn run_cli_connect() -> Option<i32> {
                     } => {
                         eprintln!("[host] Session ended: {peer_id} {reason}")
                     }
+                    host::HostEvent::SessionPermissionsChanged { .. } => {}
                     host::HostEvent::VideoTelemetry {
                         summary,
                         fallback_reason,
@@ -2972,6 +2974,7 @@ impl EvertyDeskApp {
                     ));
                 }
             }
+            SessionEvent::AudioFrame(_) => {}
             SessionEvent::Displays(displays) => {
                 let previous_selected_display = self.selected_display;
                 // Запоминаем нативное разрешение хоста для FSR апскейла.
@@ -9214,6 +9217,7 @@ impl EvertyDeskApp {
                     svc.set_input_blocked(false);
                 }
             }
+            HostEvent::SessionPermissionsChanged { .. } => {}
             HostEvent::VideoTelemetry {
                 summary,
                 fallback_reason,

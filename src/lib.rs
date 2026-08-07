@@ -68,6 +68,16 @@ pub mod vp9_mf;
 #[cfg(windows)]
 pub mod hyperv;
 
+// Phase 3/4 (TZ_HOST_SERVICE.md): OS service install/query — Windows service
+// (Session 0 + linked-token elevation) / systemd --user / launchd. Exposed
+// from the core library, not just main.rs's own binary, so other desktop
+// front-ends (e.g. desktop-next) can offer the same "install service" path
+// without reimplementing it.
+#[cfg(windows)]
+pub mod winservice;
+#[cfg(unix)]
+pub mod host_service_unix;
+
 #[cfg(feature = "live-vpx-system")]
 pub mod vpx_system;
 

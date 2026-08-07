@@ -15,7 +15,10 @@ pub struct OidcAuthStart {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OidcAuthQuery {
     Pending,
-    Authorized { access_token: String, account: String },
+    Authorized {
+        access_token: String,
+        account: String,
+    },
 }
 
 pub fn login(
