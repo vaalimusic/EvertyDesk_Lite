@@ -1,7 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use evertydesk_core::fsr;
 use evertydesk_core::rustdesk_proto::ControlKey;
-use evertydesk_core::settings::{AppConfig, CodecPreference, DisplayConfig, StreamingMode};
+use evertydesk_core::settings::{
+    AppConfig, CodecPreference, DisplayConfig, FsrQualitySetting, StreamingMode,
+};
 use evertydesk_core::transport::{
     ConnectionRequest, RemoteDisplay, SessionCommand, SessionEvent, TransportClient,
 };
@@ -589,6 +592,8 @@ struct SessionControl {
     audio_enabled: Arc<AtomicBool>,
     request_evrt2_experiment: bool,
     transport_profile_label: String,
+    fsr_quality: FsrQualitySetting,
+    fsr_sharpness: f32,
 }
 
 impl SessionControl {
@@ -625,6 +630,8 @@ impl SessionControl {
         let transport_profile_label =
             viewer_transport_profile_label(bootstrap.game_mode, bootstrap.game_codec);
         let allow_clipboard = config.security.allow_clipboard;
+        let fsr_quality = config.display.fsr_quality;
+        let fsr_sharpness = config.display.fsr_sharpness;
         let audio_enabled = Arc::new(AtomicBool::new(bootstrap.audio_enabled));
         let request = ConnectionRequest {
             remote_id: bootstrap.remote_id.trim().to_owned(),
@@ -662,6 +669,8 @@ impl SessionControl {
             audio_enabled,
             request_evrt2_experiment,
             transport_profile_label,
+            fsr_quality,
+            fsr_sharpness,
         })
     }
 
@@ -2106,6 +2115,12 @@ struct Viewer {
     frame_size: (u32, u32),
     base_frame: Vec<u8>,
     has_frame: bool,
+    // Client-side upscale (AMD FSR1 EASU+RCAS) applied when the host streams
+    // below its native resolution — see `apply_fsr_upscale`. `None` when
+    // fsr_quality == Off (the default), which keeps the passthrough path
+    // identical to before this field existed.
+    fsr: Option<fsr::FsrAdapter>,
+    fsr_native_size: Option<(u32, u32)>,
     session: SessionControl,
     cursor_position: Option<(i32, i32)>,
     toolbar_hover: Option<ToolbarAction>,
@@ -2150,6 +2165,12 @@ impl Viewer {
         let scaling = session.scaling;
         let quality = session.quality;
         let audio_enabled = session.audio_enabled.load(Ordering::Acquire);
+        let fsr = session.fsr_quality.to_fsr_quality().map(|quality| {
+            fsr::FsrAdapter::new(fsr::FsrConfig {
+                quality,
+                sharpness: session.fsr_sharpness,
+            })
+        });
         Self {
             remote_id,
             window: None,
@@ -2162,6 +2183,8 @@ impl Viewer {
             frame_size: (FRAME_WIDTH, FRAME_HEIGHT),
             base_frame: Vec::new(),
             has_frame: false,
+            fsr,
+            fsr_native_size: None,
             session,
             cursor_position: None,
             toolbar_hover: None,
@@ -2201,6 +2224,48 @@ impl Viewer {
         pixels.render()
     }
 
+    /// Client-side AMD FSR1 upscale (EASU + RCAS), applied when the host is
+    /// streaming below its own native resolution and the user has FSR
+    /// enabled (`AppConfig.display.fsr_quality`, off by default). Mutates
+    /// `frame` in place to the upscaled size — everything downstream
+    /// (resize_buffer, base_frame, toolbar compositing) then just sees a
+    /// bigger, sharper frame and doesn't need to know FSR ran.
+    ///
+    /// FSR's easu_bgra/rcas_bgra expect BGRA (they compute Rec.709 luma from
+    /// specific byte offsets for edge-adaptive sharpening), while this
+    /// viewer's whole pipeline is RGBA — hence the swap in and back out.
+    fn apply_fsr_upscale(&mut self, frame: &mut RemoteFrame) {
+        let Some(fsr) = self.fsr.as_mut() else {
+            return;
+        };
+        let (native_w, native_h) = self.fsr_native_size.unwrap_or((frame.width, frame.height));
+        if native_w == 0 || native_h == 0 {
+            return;
+        }
+
+        let mut bgra = vec![0u8; frame.rgba.len()];
+        for (src, dst) in frame.rgba.chunks_exact(4).zip(bgra.chunks_exact_mut(4)) {
+            dst[0] = src[2]; // B
+            dst[1] = src[1]; // G
+            dst[2] = src[0]; // R
+            dst[3] = src[3]; // A
+        }
+
+        let upscaled_bgra = fsr.process_bgra(&bgra, frame.width, frame.height, native_w, native_h);
+
+        let mut out_rgba = vec![0u8; upscaled_bgra.len()];
+        for (src, dst) in upscaled_bgra.chunks_exact(4).zip(out_rgba.chunks_exact_mut(4)) {
+            dst[0] = src[2]; // R
+            dst[1] = src[1]; // G
+            dst[2] = src[0]; // B
+            dst[3] = 255;
+        }
+
+        frame.rgba = out_rgba;
+        frame.width = native_w;
+        frame.height = native_h;
+    }
+
     fn present_latest_frame(&mut self) {
         self.frame_mailbox
             .wake_pending
@@ -2211,7 +2276,7 @@ impl Viewer {
             .lock()
             .ok()
             .and_then(|mut latest| latest.take());
-        let Some(frame) = frame else {
+        let Some(mut frame) = frame else {
             return;
         };
 
@@ -2240,6 +2305,8 @@ impl Viewer {
             self.connection_notice = None;
             self.notice_expires_at = None;
         }
+
+        self.apply_fsr_upscale(&mut frame);
 
         let session_seconds = self.session_seconds();
         let Some(pixels) = self.pixels.as_mut() else {
@@ -2923,6 +2990,7 @@ impl Viewer {
         self.session_connected.store(false, Ordering::Release);
         self.reconnect_count = self.reconnect_count.saturating_add(1);
         self.displays.clear();
+        self.fsr_native_size = None;
         self.cursors.clear();
         self.cursor_position = None;
         self.diagnostics = ViewerDiagnostics::default();
@@ -3208,6 +3276,13 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
             ViewerEvent::Displays(displays) => {
                 let previous_selection = self.selected_display;
                 self.displays = displays;
+                // FSR upscale target: the host's native resolution, so a
+                // lower-resolution capture stream still displays sharp.
+                if let Some(primary) = self.displays.first() {
+                    if primary.width > 0 && primary.height > 0 {
+                        self.fsr_native_size = Some((primary.width as u32, primary.height as u32));
+                    }
+                }
                 self.selected_display = resolved_display_index(&self.displays, previous_selection);
                 if let Some(display) = self.selected_display.and_then(|selected| {
                     self.displays

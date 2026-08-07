@@ -4,7 +4,8 @@ use evertydesk_core::host::{HostCommand, HostEvent, HostService, HostState};
 #[cfg(windows)]
 use evertydesk_core::hyperv;
 use evertydesk_core::settings::{
-    generate_numeric_token, AppConfig, ContactEntry, ServerConfig, StreamingMode,
+    generate_numeric_token, AppConfig, ContactEntry, FsrQualitySetting, ServerConfig,
+    StreamingMode,
 };
 use evertydesk_core::virtualbox;
 use evertydesk_core::vm_bridge;
@@ -702,6 +703,7 @@ enum Message {
     SetAllowClipboard(bool),
     SetViewerAudioDefault(bool),
     SetStreamingMode(StreamingMode),
+    SetFsrQuality(FsrQualitySetting),
     ToggleCompatibilitySettings,
     ServerApiUrlChanged(String),
     ServerIdChanged(String),
@@ -1328,6 +1330,10 @@ impl Launcher {
                     self.config.display.adaptive_quality = false;
                 }
                 self.save_runtime_settings("Режим трансляции сохранён");
+            }
+            Message::SetFsrQuality(quality) => {
+                self.config.display.fsr_quality = quality;
+                self.save_runtime_settings("Апскейл FSR сохранён");
             }
             Message::ToggleCompatibilitySettings => {
                 self.store.compatibility_settings_expanded =
@@ -4837,6 +4843,44 @@ impl Launcher {
                     }),
             );
         }
+        let fsr_quality_row = |options: [FsrQualitySetting; 3], current: &Self| {
+            let mut row = row![].spacing(8);
+            for fsr_quality in options {
+                let selected = current.config.display.fsr_quality == fsr_quality;
+                row = row.push(
+                    button(text(fsr_quality.label()).size(13))
+                        .on_press(Message::SetFsrQuality(fsr_quality))
+                        .padding([8, 14])
+                        .style(move |theme, status| {
+                            if selected {
+                                selected_segment(theme, status)
+                            } else {
+                                quiet_button(theme, status)
+                            }
+                        }),
+                );
+            }
+            row
+        };
+        let fsr_buttons = column![
+            fsr_quality_row(
+                [
+                    FsrQualitySetting::Off,
+                    FsrQualitySetting::Native,
+                    FsrQualitySetting::UltraQuality,
+                ],
+                self,
+            ),
+            fsr_quality_row(
+                [
+                    FsrQualitySetting::Quality,
+                    FsrQualitySetting::Balanced,
+                    FsrQualitySetting::Performance,
+                ],
+                self,
+            ),
+        ]
+        .spacing(8);
 
         let permanent_access = container(
             column![
@@ -4994,6 +5038,23 @@ impl Launcher {
                     text(streaming_mode_hint(self.config.display.streaming_mode))
                         .size(11)
                         .color(MUTED),
+                ]
+                .spacing(8),
+            )
+            .padding(14)
+            .width(Fill)
+            .style(subtle_panel),
+            container(
+                column![
+                    text("Апскейл изображения (FSR)").size(13),
+                    fsr_buttons,
+                    text(
+                        "Досрезчает картинку, если хост передаёт кадр ниже своего \
+                         нативного разрешения — полезно с «Поддержкой»/«Игрой» на \
+                         медленной сети. По умолчанию выключен."
+                    )
+                    .size(11)
+                    .color(MUTED),
                 ]
                 .spacing(8),
             )
