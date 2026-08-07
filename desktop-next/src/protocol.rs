@@ -287,6 +287,60 @@ fn default_true() -> bool {
     true
 }
 
+/// One-shot bootstrap for the RDP-to-VM console viewer, sent over its
+/// stdin the same way `ViewerBootstrap` is — credentials never touch argv
+/// or a process listing. A separate, much smaller binary from the normal
+/// EVRT/RustDesk viewer: this connects straight to the VM's RDP endpoint
+/// (Hyper-V's `vmconnect` broker), it never goes through EvertyDesk's own
+/// host/relay/transport at all.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RdpBootstrap {
+    pub target: RdpTarget,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default)]
+    pub domain: String,
+}
+
+// Manual `Debug` (not derived) — redacts `password`, same rationale as
+// `ViewerBootstrap`'s manual impl.
+impl std::fmt::Debug for RdpBootstrap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RdpBootstrap")
+            .field("target", &self.target)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("domain", &self.domain)
+            .finish()
+    }
+}
+
+impl Zeroize for RdpBootstrap {
+    fn zeroize(&mut self) {
+        self.username.zeroize();
+        self.password.zeroize();
+        self.domain.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for RdpBootstrap {}
+
+impl Drop for RdpBootstrap {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "provider", rename_all = "snake_case")]
+pub enum RdpTarget {
+    /// Hyper-V Enhanced Session, via the host's `vmconnect` broker
+    /// (127.0.0.1:2179) — `vm_guid` is `Msvm_ComputerSystem.Name`.
+    HyperV { vm_guid: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootstrapError {
     UnsupportedProtocol { received: u16, supported: u16 },

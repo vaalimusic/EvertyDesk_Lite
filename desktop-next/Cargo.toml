@@ -53,3 +53,8 @@ required-features = ["viewer-core"]
 name = "evertydesk-viewer"
 path = "src/bin/viewer.rs"
 required-features = ["viewer-core"]
+
+[[bin]]
+name = "evertydesk-rdp-viewer"
+path = "src/bin/rdp_viewer.rs"
+required-features = ["viewer-core"]

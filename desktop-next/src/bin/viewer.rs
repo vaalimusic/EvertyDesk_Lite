@@ -3554,6 +3554,7 @@ fn normalized_wheel_delta(delta: MouseScrollDelta) -> (i32, i32) {
     (normalize(x), normalize(y))
 }
 
+
 fn audio_frame_is_audible(enabled: &AtomicBool, pcm: &[u8]) -> bool {
     !pcm.is_empty() && pcm.len() <= MAX_AUDIO_FRAME_BYTES && enabled.load(Ordering::Acquire)
 }

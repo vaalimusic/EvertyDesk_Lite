@@ -68,6 +68,14 @@ pub mod vp9_mf;
 #[cfg(windows)]
 pub mod hyperv;
 
+// Прямой встроенный RDP-клиент к ВМ (VirtualBox VRDE / Hyper-V Enhanced
+// Session), поверх ironrdp-* — отдельный путь от evrt_client/transport,
+// не через host/relay. Exposed here (was main.rs-only `mod`) so desktop-next
+// can offer the same VM-console connection the egui client has.
+pub mod vbox_rdp;
+#[cfg(windows)]
+pub mod hyperv_rdp;
+
 // Phase 3/4 (TZ_HOST_SERVICE.md): OS service install/query — Windows service
 // (Session 0 + linked-token elevation) / systemd --user / launchd. Exposed
 // from the core library, not just main.rs's own binary, so other desktop

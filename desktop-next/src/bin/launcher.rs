@@ -16,8 +16,8 @@ use evertydesk_desktop_next::launcher_store::{
     RecentConnection, VmProviderPreference,
 };
 use evertydesk_desktop_next::protocol::{
-    ConnectionQuality, ViewerBootstrap, ViewerCommand, ViewerControl, ViewerGameCodec,
-    ViewerScaling, ViewerStatus,
+    ConnectionQuality, RdpBootstrap, RdpTarget, ViewerBootstrap, ViewerCommand, ViewerControl,
+    ViewerGameCodec, ViewerScaling, ViewerStatus,
 };
 use evertydesk_desktop_next::smart_agent::{
     self, AgentNotification, AgentOperator, HeartbeatRequest, SupportRequest,
@@ -723,6 +723,7 @@ enum Message {
     RefreshVmBridge,
     AttachVmBridge,
     AttachVmBridgeTarget(String),
+    ConnectVmRdp(String),
     DetachVmBridge,
     VmBridgeInventory(Result<Vec<VmInventoryEntry>, String>),
     VmBridgeResult(Result<String, String>),
@@ -1467,6 +1468,29 @@ impl Launcher {
                 self.vm_bridge_busy = true;
                 self.vm_bridge_status = format!("Подключаю VM {target}…");
                 return Task::perform(run_vm_attach(target), Message::VmBridgeResult);
+            }
+            Message::ConnectVmRdp(target) => {
+                let target = sanitize_vm_target_id(&target);
+                let Some(vm_guid) = target.strip_prefix("hyperv:").map(str::to_owned) else {
+                    self.vm_bridge_status =
+                        "RDP-консоль пока доступна только для Hyper-V".to_owned();
+                    return Task::none();
+                };
+                let bootstrap = RdpBootstrap {
+                    target: RdpTarget::HyperV { vm_guid: vm_guid.clone() },
+                    username: String::new(),
+                    password: String::new(),
+                    domain: String::new(),
+                };
+                match spawn_rdp_viewer(&bootstrap) {
+                    Ok(()) => {
+                        self.vm_bridge_status =
+                            format!("RDP-консоль открыта для {vm_guid}");
+                    }
+                    Err(error) => {
+                        self.vm_bridge_status = format!("Не удалось открыть RDP-консоль: {error}");
+                    }
+                }
             }
             Message::DetachVmBridge => {
                 self.vm_bridge_busy = true;
@@ -3777,6 +3801,20 @@ impl Launcher {
                 };
                 let power_controls =
                     vm_power_controls(&vm.id, self.vm_bridge_busy || !vm.connectable);
+                // RDP console (Hyper-V Enhanced Session only for now — VirtualBox
+                // VRDE needs port-discovery plumbing this doesn't have yet, see
+                // rdp_viewer.rs's module doc).
+                let rdp_button: Element<'_, Message> = if vm.connectable
+                    && vm_inventory_group_key(&vm.id) == "1_hyperv"
+                {
+                    button("RDP")
+                        .on_press(Message::ConnectVmRdp(vm.id.clone()))
+                        .padding([7, 10])
+                        .style(quiet_button)
+                        .into()
+                } else {
+                    Space::new().width(Length::Fixed(0.0)).into()
+                };
                 group_column = group_column.push(
                     container(
                         row![
@@ -3806,6 +3844,7 @@ impl Launcher {
                             .spacing(5)
                             .width(Fill),
                             power_controls,
+                            rdp_button,
                             select_button,
                             connect_button,
                         ]
@@ -7985,6 +8024,57 @@ async fn run_vm_detach() -> Result<String, String> {
 
 async fn run_vm_power_action(target: String, action: VmPowerAction) -> String {
     dispatch_vm_power_action(&target, action)
+}
+
+/// Opens an RDP console window for `bootstrap`, fire-and-forget — unlike
+/// `spawn_viewer` (evertydesk-viewer.exe), this doesn't keep a handle or a
+/// control channel open; the console window manages its own lifetime
+/// independently once launched, the same way `vmconnect.exe`/`mstsc`
+/// external launches work in the egui client.
+fn spawn_rdp_viewer(bootstrap: &RdpBootstrap) -> io::Result<()> {
+    let current = std::env::current_exe()?;
+    let directory = current.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "launcher executable has no parent directory",
+        )
+    })?;
+    let mut executable = directory.join("evertydesk-rdp-viewer");
+    executable.set_extension(std::env::consts::EXE_EXTENSION);
+
+    let encoded = zeroize::Zeroizing::new(
+        serde_json::to_vec(bootstrap).map_err(io::Error::other)?,
+    );
+
+    let mut child = std::process::Command::new(&executable)
+        .arg("--bootstrap-stdin")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("could not start {}: {error}", executable.display()),
+            )
+        })?;
+
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::BrokenPipe, "rdp-viewer stdin unavailable")
+    })?;
+    let write_result = stdin
+        .write_all(&encoded)
+        .and_then(|()| stdin.write_all(b"\n"))
+        .and_then(|()| stdin.flush());
+    drop(stdin);
+
+    if let Err(error) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+
+    Ok(())
 }
 
 fn parse_vm_inventory(raw: &str) -> Result<Vec<VmInventoryEntry>, String> {
