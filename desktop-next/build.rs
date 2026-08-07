@@ -1,9 +1,11 @@
 fn main() {
     validate_asset("assets/logo.ico", 6);
     validate_asset("assets/logo-32.rgba", 32 * 32 * 4);
+    validate_asset("assets/viewer-logo-32.rgba", 32 * 32 * 4);
 
     println!("cargo:rerun-if-changed=assets/logo.ico");
     println!("cargo:rerun-if-changed=assets/logo-32.rgba");
+    println!("cargo:rerun-if-changed=assets/viewer-logo-32.rgba");
     println!("cargo:rerun-if-changed=desktop-next.rc");
 
     #[cfg(windows)]

@@ -16,6 +16,7 @@ evertydesk-core = { package = "evertydesk-lite", path = "..", optional = true, d
     "evrt-wasapi",
     "live-h264",
     "live-vp9-mf",
+    "live-nvenc-sdk",
 ] }
 font8x8 = "0.3"
 iced = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "tokio", "svg"] }

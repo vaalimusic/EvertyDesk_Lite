@@ -1874,7 +1874,12 @@ fn enabled_label(enabled: bool) -> &'static str {
 }
 
 fn viewer_window_icon() -> Option<Icon> {
-    Icon::from_rgba(include_bytes!("../../assets/logo-32.rgba").to_vec(), 32, 32).ok()
+    Icon::from_rgba(
+        include_bytes!("../../assets/viewer-logo-32.rgba").to_vec(),
+        32,
+        32,
+    )
+    .ok()
 }
 
 fn local_device_name() -> String {
