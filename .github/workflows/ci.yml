@@ -1,0 +1,58 @@
+name: CI
+
+# Builds and tests the desktop-next client (Windows + macOS — see D1 in the
+# production plan: Linux stays on the old egui client, which this repo does
+# not build in CI). Runs on every push/PR that touches desktop-next or the
+# shared core it depends on.
+#
+# NOTE: the macOS leg has not been run for real yet — this repo has never
+# had a macOS build attempt outside this workflow. Expect it to need a few
+# iterations the first time it actually runs.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "desktop-next/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    paths:
+      - "desktop-next/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: desktop-next
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-next
+
+      - name: Build (debug)
+        run: cargo build --bin evertydesk-launcher --bin evertydesk-viewer --features viewer-core
+
+      - name: Test
+        run: cargo test --lib
+
+      - name: Clippy
+        run: cargo clippy --bin evertydesk-launcher --bin evertydesk-viewer --features viewer-core -- -D warnings

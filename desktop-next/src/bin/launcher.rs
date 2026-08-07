@@ -22,6 +22,7 @@ use evertydesk_desktop_next::smart_agent::{
     self, AgentNotification, AgentOperator, HeartbeatRequest, SupportRequest,
 };
 use evertydesk_desktop_next::startup_log::install_process_diagnostics;
+use evertydesk_desktop_next::updater;
 use evertydesk_desktop_next::viewer_process::{spawn_viewer, ViewerProcess};
 use evertydesk_desktop_next::windows_app::{
     set_current_process_app_user_model_id, WindowsAppUserModelId,
@@ -39,6 +40,7 @@ use std::env;
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::process::{ChildStderr, ChildStdout};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc;
@@ -94,6 +96,37 @@ type EventBus = (
 static EVENT_BUS: OnceLock<EventBus> = OnceLock::new();
 
 pub fn main() -> iced::Result {
+    // Service/agent CLI modes (Phase 1/3, TZ_HOST_SERVICE.md) must be
+    // handled before anything else: `winservice::install_service` points
+    // the Windows service's binPath at `"<current_exe>" --winservice`, and
+    // the Session-0 supervisor launches `"<current_exe>" --host-agent` into
+    // the interactive session. Since this binary (not the old
+    // `evertydesk-lite.exe`) is `current_exe()` when the install button is
+    // clicked from here, it must understand these flags itself — there is
+    // no separate binary handling them. None of these enter the iced event
+    // loop or the single-instance guard; they exit directly.
+    if let Some(exit_code) = handle_service_cli() {
+        std::process::exit(exit_code);
+    }
+
+    // Phase 1 (TZ_HOST_SERVICE.md) defaults to on for desktop-next: hosting
+    // runs in a separate `--host-agent` process (this same binary, spawned
+    // detached — see `host_agent::spawn_detached`) so a launcher crash,
+    // close, or kill doesn't end an active session, matching the resilience
+    // the OS-service path above (B2) already offers. `HostService::start`
+    // reads this once per call, so setting it here — before any window
+    // opens or `start_hosting()` runs — is sufficient. An operator can still
+    // force it off (e.g. while diagnosing an agent-mode-specific issue) by
+    // setting EVERTYDESK_HOST_AGENT=0 before launching; only an *unset* var
+    // gets this default.
+    if std::env::var_os("EVERTYDESK_HOST_AGENT").is_none() {
+        // SAFETY: single-threaded at this point in main(), before any
+        // thread that could read the environment concurrently is spawned.
+        unsafe {
+            std::env::set_var("EVERTYDESK_HOST_AGENT", "1");
+        }
+    }
+
     install_process_diagnostics("launcher");
     set_current_process_app_user_model_id(WindowsAppUserModelId::Launcher);
     match claim_single_instance() {
@@ -111,6 +144,58 @@ pub fn main() -> iced::Result {
         .theme(|launcher: &Launcher, _window: iced::window::Id| launcher.theme())
         .subscription(Launcher::subscription)
         .run()
+}
+
+/// Handles the service/agent CLI surface — see the comment at its call site
+/// in `main()`. Returns `Some(exit_code)` if `argv[1]` was one of these
+/// modes (caller must exit immediately, never enter the iced event loop),
+/// `None` for a normal launcher start.
+fn handle_service_cli() -> Option<i32> {
+    let command = std::env::args().nth(1)?;
+    match command.as_str() {
+        "--host-agent" => {
+            evertydesk_core::host_agent::run_host_agent();
+            Some(0)
+        }
+        #[cfg(windows)]
+        "--winservice" => {
+            evertydesk_core::winservice::run_winservice();
+            Some(0)
+        }
+        #[cfg(windows)]
+        "--install-service" => Some(cli_result(evertydesk_core::winservice::install_service())),
+        #[cfg(windows)]
+        "--start-service" => {
+            Some(cli_result(evertydesk_core::winservice::start_installed_service()))
+        }
+        #[cfg(windows)]
+        "--uninstall-service" => {
+            Some(cli_result(evertydesk_core::winservice::uninstall_service()))
+        }
+        #[cfg(unix)]
+        "--install-service" => {
+            Some(cli_result(evertydesk_core::host_service_unix::install_service()))
+        }
+        #[cfg(unix)]
+        "--start-service" => Some(cli_result(
+            evertydesk_core::host_service_unix::start_installed_service(),
+        )),
+        #[cfg(unix)]
+        "--uninstall-service" => {
+            Some(cli_result(evertydesk_core::host_service_unix::uninstall_service()))
+        }
+        _ => None,
+    }
+}
+
+fn cli_result(result: Result<(), String>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("[launcher] {error}");
+            1
+        }
+    }
 }
 
 fn main_window_settings() -> iced::window::Settings {
@@ -245,8 +330,101 @@ struct Launcher {
     incoming_window_id: Option<iced::window::Id>,
     auth_window_id: Option<iced::window::Id>,
     main_window_size: Size,
+    /// One-shot guard for `exclude_main_window_from_capture` — the main
+    /// window falls inside its own DXGI capture region while hosting is
+    /// active, so without this, the launcher's own repaints look like
+    /// "screen changed" to the change-detector and force continuous
+    /// re-encode (100% CPU/GPU while the window is visible, normal while
+    /// minimized). See `windows_app::exclude_window_from_capture`.
+    capture_exclusion_applied: bool,
+    /// OS-service (Phase 3/4, TZ_HOST_SERVICE.md) install/run state, cached
+    /// and re-queried at most every few seconds — see `tick_service_hint`.
+    service_hint_state: ServiceHintState,
+    service_hint_next_check: Instant,
+    update_state: UpdateState,
+    update_next_check: Instant,
     #[cfg(windows)]
     tray: Option<TrayController>,
+}
+
+/// Auto-update flow: check -> (optionally) download+verify -> hand off to
+/// the OS installer/dmg. Never applies silently — see `updater` module docs.
+#[derive(Debug, Clone, Default)]
+enum UpdateState {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate,
+    Available(updater::UpdateManifest),
+    Downloading(updater::UpdateManifest),
+    ReadyToInstall(PathBuf),
+    Error(String),
+}
+
+/// Manifest URL for update checks. Empty by default (checks are a no-op)
+/// until real hosting exists; override with `EVERTYDESK_UPDATE_URL` so this
+/// doesn't need a rebuild once you have somewhere to host `latest.json`.
+fn update_manifest_url() -> Option<String> {
+    match env::var("EVERTYDESK_UPDATE_URL") {
+        Ok(value) if !value.trim().is_empty() => Some(value),
+        _ => None,
+    }
+}
+
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+fn update_download_dir() -> PathBuf {
+    if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(local_app_data).join("EvertyDesk").join("Updates");
+    }
+    if let Some(home) = env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".cache")
+            .join("evertydesk")
+            .join("updates");
+    }
+    env::temp_dir().join("evertydesk-updates")
+}
+
+/// Mirrors `HostState` but for the *service*, not the current session: is it
+/// installed at all, and if so, running. Distinct from hosting being
+/// started/stopped inside this process — the service is what keeps hosting
+/// alive when this process isn't running at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceHintState {
+    NotInstalled,
+    InstalledNotRunning,
+    Running,
+    /// Install/start was just requested — waiting for the elevated relaunch
+    /// (Windows) or the systemctl/launchctl call (Linux/macOS) to land.
+    Installing,
+}
+
+fn query_service_hint_state() -> ServiceHintState {
+    #[cfg(windows)]
+    {
+        if evertydesk_core::winservice::is_service_running() {
+            ServiceHintState::Running
+        } else if evertydesk_core::winservice::is_service_installed() {
+            ServiceHintState::InstalledNotRunning
+        } else {
+            ServiceHintState::NotInstalled
+        }
+    }
+    #[cfg(unix)]
+    {
+        if evertydesk_core::host_service_unix::is_service_running() {
+            ServiceHintState::Running
+        } else if evertydesk_core::host_service_unix::is_service_installed() {
+            ServiceHintState::InstalledNotRunning
+        } else {
+            ServiceHintState::NotInstalled
+        }
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        ServiceHintState::NotInstalled
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -590,6 +768,11 @@ enum Message {
     ClearPermanentPassword,
     StartHosting,
     StopHosting,
+    InstallHostService,
+    StartHostService,
+    CheckForUpdates,
+    DownloadUpdate,
+    InstallUpdate,
     ApproveIncoming(bool),
     TogglePendingInput,
     TogglePendingClipboard,
@@ -599,6 +782,7 @@ enum Message {
     CopyIncomingPeer,
     UiTick,
     WindowOpened,
+    CaptureExclusionApplied(bool),
     WindowResized(iced::window::Id, Size),
     CloseRequested(iced::window::Id),
     Tray(TrayAction),
@@ -670,8 +854,15 @@ enum ProcessEvent {
     },
     AddressBook(AddressBookEvent),
     SmartAgent(SmartAgentEvent),
+    Updater(UpdaterEvent),
     CurrentUserRefreshed(Result<(AccountEntitlements, String), String>),
     SecondInstance,
+}
+
+#[derive(Debug, Clone)]
+enum UpdaterEvent {
+    Checked(Result<Option<updater::UpdateManifest>, String>),
+    Downloaded(Result<PathBuf, String>),
 }
 
 #[derive(Debug, Clone)]
@@ -881,6 +1072,11 @@ impl Launcher {
             incoming_window_id: None,
             auth_window_id: None,
             main_window_size: Size::new(920.0, 720.0),
+            capture_exclusion_applied: false,
+            service_hint_state: query_service_hint_state(),
+            service_hint_next_check: Instant::now() + Duration::from_secs(8),
+            update_state: UpdateState::Idle,
+            update_next_check: Instant::now() + Duration::from_secs(30),
             #[cfg(windows)]
             tray: None,
         };
@@ -1448,6 +1644,11 @@ impl Launcher {
                 self.stop_hosting();
                 return self.close_incoming_window();
             }
+            Message::InstallHostService => self.request_install_service(),
+            Message::StartHostService => self.request_start_service(),
+            Message::CheckForUpdates => self.check_for_updates(),
+            Message::DownloadUpdate => self.download_update(),
+            Message::InstallUpdate => self.install_update(),
             Message::ApproveIncoming(accept) => {
                 self.approve_incoming(accept);
                 if !accept {
@@ -1474,12 +1675,37 @@ impl Launcher {
             Message::CopyIncomingPeer => self.copy_incoming_peer(),
             Message::UiTick => {
                 self.tick_smart_agent();
+                self.tick_service_hint();
+                self.tick_update_check();
                 self.rotate_temporary_password_if_due();
                 if let Some(task) = self.tick_oidc_login() {
                     return task;
                 }
             }
-            Message::WindowOpened => {}
+            Message::WindowOpened => {
+                if !self.capture_exclusion_applied {
+                    if let Some(id) = self.window_id {
+                        self.capture_exclusion_applied = true;
+                        return iced::window::run(id, |handle| {
+                            let hwnd = match handle.window_handle().map(|h| h.as_raw()) {
+                                Ok(iced::window::raw_window_handle::RawWindowHandle::Win32(
+                                    win32,
+                                )) => Some(win32.hwnd.get()),
+                                _ => None,
+                            };
+                            hwnd.is_some_and(evertydesk_desktop_next::windows_app::exclude_window_from_capture)
+                        })
+                        .map(Message::CaptureExclusionApplied);
+                    }
+                }
+            }
+            Message::CaptureExclusionApplied(ok) => {
+                if !ok {
+                    self.status =
+                        "Не удалось исключить окно из захвата экрана (нужна Windows 10 2004+)"
+                            .to_owned();
+                }
+            }
             Message::WindowResized(id, size) => {
                 if self.window_id == Some(id) {
                     self.main_window_size = size;
@@ -1779,6 +2005,9 @@ impl Launcher {
             }
             Message::ProcessEvent(ProcessEvent::SmartAgent(event)) => {
                 return self.handle_smart_agent_event(event);
+            }
+            Message::ProcessEvent(ProcessEvent::Updater(event)) => {
+                self.handle_updater_event(event);
             }
             Message::ProcessEvent(ProcessEvent::CurrentUserRefreshed(result)) => {
                 return self.update(Message::CurrentUserRefreshed(result));
@@ -4863,6 +5092,63 @@ impl Launcher {
         .width(Fill)
         .style(status_bar);
 
+        // OS-service hint (Phase 3/4, TZ_HOST_SERVICE.md): hosting inside
+        // this process stops the instant it exits, even minimized to tray —
+        // a crash, log-off, or explicit kill still ends it. Installing the
+        // service keeps access working independently of this process.
+        let host_status: Element<'_, Message> = match self.service_hint_state {
+            ServiceHintState::Running => host_status.into(),
+            ServiceHintState::Installing => column![
+                host_status,
+                container(text("Установка/запуск службы...").size(12).color(MUTED))
+                    .padding(10)
+                    .width(Fill)
+                    .style(subtle_panel),
+            ]
+            .spacing(8)
+            .into(),
+            ServiceHintState::NotInstalled | ServiceHintState::InstalledNotRunning => column![
+                host_status,
+                container(
+                    row![
+                        column![
+                            text(
+                                "Хост работает внутри этого процесса — закрытие/крах остановит доступ."
+                            )
+                            .size(12),
+                            text(
+                                "Установите службу, чтобы доступ работал независимо от этого окна."
+                            )
+                            .size(11)
+                            .color(MUTED),
+                        ]
+                        .spacing(3)
+                        .width(Fill),
+                        if self.service_hint_state == ServiceHintState::NotInstalled {
+                            button("Установить службу")
+                                .on_press(Message::InstallHostService)
+                                .padding([9, 14])
+                                .style(accent_button)
+                        } else {
+                            button("Запустить службу")
+                                .on_press(Message::StartHostService)
+                                .padding([9, 14])
+                                .style(accent_button)
+                        },
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                )
+                .padding(14)
+                .width(Fill)
+                .style(subtle_panel),
+            ]
+            .spacing(8)
+            .into(),
+        };
+
+        let update_status = self.update_status_panel();
+
         let wide_settings_content = use_wide_settings_content_layout(self.main_window_size.width);
         let settings_body: Element<'_, Message> = match self.settings_section {
             SettingsSection::Security => {
@@ -4899,7 +5185,9 @@ impl Launcher {
                     .spacing(14)
                     .into()
                 };
-                column![section_content, host_status].spacing(18).into()
+                column![section_content, host_status, update_status]
+                    .spacing(18)
+                    .into()
             }
             SettingsSection::Connection => column![compatibility, host_status].spacing(18).into(),
         };
@@ -5440,6 +5728,205 @@ impl Launcher {
                 .send(HostCommand::Reconfigure(self.config.clone()));
         }
         self.status = "Пароль доступа обновлён".to_owned();
+    }
+
+    /// Re-queries `service_hint_state` at most every few seconds — on
+    /// Linux/macOS the query shells out to systemctl/launchctl, which is too
+    /// slow to run on every `UiTick`.
+    fn tick_service_hint(&mut self) {
+        if Instant::now() < self.service_hint_next_check {
+            return;
+        }
+        self.service_hint_state = query_service_hint_state();
+        self.service_hint_next_check = Instant::now() + Duration::from_secs(8);
+    }
+
+    /// One-click install (Windows: single UAC prompt via `ShellExecuteW`
+    /// runas; Linux/macOS: no elevation needed, systemd --user / launchd
+    /// LaunchAgent are per-user).
+    fn request_install_service(&mut self) {
+        self.service_hint_state = ServiceHintState::Installing;
+        #[cfg(windows)]
+        {
+            if let Err(error) = evertydesk_core::winservice::relaunch_elevated(&[
+                "--install-service",
+            ]) {
+                self.status = format!("Установка службы: {error}");
+            }
+        }
+        #[cfg(unix)]
+        {
+            if let Err(error) = evertydesk_core::host_service_unix::install_service() {
+                self.status = format!("Установка службы: {error}");
+            }
+        }
+        self.service_hint_next_check = Instant::now() + Duration::from_secs(2);
+    }
+
+    fn request_start_service(&mut self) {
+        self.service_hint_state = ServiceHintState::Installing;
+        #[cfg(windows)]
+        {
+            if let Err(error) =
+                evertydesk_core::winservice::relaunch_elevated(&["--start-service"])
+            {
+                self.status = format!("Запуск службы: {error}");
+            }
+        }
+        #[cfg(unix)]
+        {
+            if let Err(error) = evertydesk_core::host_service_unix::start_installed_service() {
+                self.status = format!("Запуск службы: {error}");
+            }
+        }
+        self.service_hint_next_check = Instant::now() + Duration::from_secs(2);
+    }
+
+    /// Background check, at most every [`UPDATE_CHECK_INTERVAL`] — never
+    /// runs at all if `EVERTYDESK_UPDATE_URL` isn't set. Does nothing while
+    /// a check/download is already in flight or a result is on screen.
+    fn tick_update_check(&mut self) {
+        if Instant::now() < self.update_next_check {
+            return;
+        }
+        self.update_next_check = Instant::now() + UPDATE_CHECK_INTERVAL;
+        if matches!(self.update_state, UpdateState::Idle | UpdateState::UpToDate) {
+            self.check_for_updates();
+        }
+    }
+
+    fn check_for_updates(&mut self) {
+        let Some(url) = update_manifest_url() else {
+            self.update_state =
+                UpdateState::Error("адрес сервера обновлений не настроен".to_owned());
+            return;
+        };
+        self.update_state = UpdateState::Checking;
+        spawn_check_for_update(url, env!("CARGO_PKG_VERSION").to_owned());
+    }
+
+    fn download_update(&mut self) {
+        let UpdateState::Available(manifest) = &self.update_state else {
+            return;
+        };
+        let manifest = manifest.clone();
+        self.update_state = UpdateState::Downloading(manifest.clone());
+        spawn_download_update(manifest, update_download_dir());
+    }
+
+    fn install_update(&mut self) {
+        let UpdateState::ReadyToInstall(path) = &self.update_state else {
+            return;
+        };
+        match updater::launch_installer(path) {
+            Ok(()) => self.status = "Установщик обновления запущен".to_owned(),
+            Err(error) => self.status = format!("Не удалось запустить установщик: {error}"),
+        }
+    }
+
+    fn update_status_panel(&self) -> Element<'_, Message> {
+        let current_version = env!("CARGO_PKG_VERSION");
+        let content: Element<'_, Message> = match &self.update_state {
+            UpdateState::Idle => row![
+                column![
+                    text("Обновления").size(13),
+                    text(format!("Текущая версия: {current_version}"))
+                        .size(11)
+                        .color(MUTED),
+                ]
+                .spacing(3)
+                .width(Fill),
+                button("Проверить обновления")
+                    .on_press(Message::CheckForUpdates)
+                    .padding([9, 14])
+                    .style(accent_button),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center)
+            .into(),
+            UpdateState::Checking => text("Проверка обновлений...").size(12).color(MUTED).into(),
+            UpdateState::UpToDate => row![
+                text(format!("Установлена последняя версия ({current_version})"))
+                    .size(12)
+                    .color(MUTED)
+                    .width(Fill),
+                button("Проверить снова")
+                    .on_press(Message::CheckForUpdates)
+                    .padding([9, 14])
+                    .style(quiet_button),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center)
+            .into(),
+            UpdateState::Available(manifest) => row![
+                column![
+                    text(format!("Доступно обновление: {}", manifest.version)).size(13),
+                    if manifest.notes.is_empty() {
+                        text("").size(11)
+                    } else {
+                        text(manifest.notes.clone()).size(11).color(MUTED)
+                    },
+                ]
+                .spacing(3)
+                .width(Fill),
+                button("Скачать и проверить")
+                    .on_press(Message::DownloadUpdate)
+                    .padding([9, 14])
+                    .style(accent_button),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center)
+            .into(),
+            UpdateState::Downloading(manifest) => {
+                text(format!("Загрузка обновления {}...", manifest.version))
+                    .size(12)
+                    .color(MUTED)
+                    .into()
+            }
+            UpdateState::ReadyToInstall(_) => row![
+                text("Обновление загружено и проверено — готово к установке.")
+                    .size(12)
+                    .width(Fill),
+                button("Установить")
+                    .on_press(Message::InstallUpdate)
+                    .padding([9, 14])
+                    .style(accent_button),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center)
+            .into(),
+            UpdateState::Error(error) => row![
+                text(error.clone()).size(12).color(MUTED).width(Fill),
+                button("Повторить")
+                    .on_press(Message::CheckForUpdates)
+                    .padding([9, 14])
+                    .style(quiet_button),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center)
+            .into(),
+        };
+        container(content).padding(14).width(Fill).style(subtle_panel).into()
+    }
+
+    fn handle_updater_event(&mut self, event: UpdaterEvent) {
+        match event {
+            UpdaterEvent::Checked(Ok(Some(manifest))) => {
+                self.update_state = UpdateState::Available(manifest);
+            }
+            UpdaterEvent::Checked(Ok(None)) => {
+                self.update_state = UpdateState::UpToDate;
+            }
+            UpdaterEvent::Checked(Err(error)) => {
+                self.update_state = UpdateState::Error(error);
+            }
+            UpdaterEvent::Downloaded(Ok(path)) => {
+                self.update_state = UpdateState::ReadyToInstall(path);
+            }
+            UpdaterEvent::Downloaded(Err(error)) => {
+                self.update_state = UpdateState::Error(error);
+            }
+        }
     }
 
     fn rotate_temporary_password_if_due(&mut self) {
@@ -6143,6 +6630,7 @@ impl Launcher {
             ProcessEvent::Tray(_) => {}
             ProcessEvent::AddressBook(_) => {}
             ProcessEvent::SmartAgent(_) => {}
+            ProcessEvent::Updater(_) => {}
             ProcessEvent::CurrentUserRefreshed(_) => {}
             ProcessEvent::SecondInstance => {}
         }
@@ -6623,7 +7111,17 @@ impl Launcher {
                 }
             }
             HostEvent::Log(message) => {
-                if message.contains("error") || message.contains("Ошибка") {
+                // '⚠' matches both the bare warning sign and the emoji-
+                // presentation form ('⚠️' = U+26A0 U+FE0F) since the base
+                // codepoint is present in either. Host-side warnings the
+                // user actually needs to act on all use this convention:
+                // the elevation-needed hint, missing macOS Screen
+                // Recording/Accessibility permission, the firewall-rule
+                // failure, and the "hardware codec unavailable" notice.
+                // Without this, they were silently dropped — visible only
+                // in `error`/`Ошибка` messages, none of which these are.
+                if message.contains("error") || message.contains("Ошибка") || message.contains('⚠')
+                {
                     self.status = message;
                 }
             }
@@ -8493,6 +8991,22 @@ fn contact_matches_text_filter(contact: &Contact, filter: &str) -> bool {
             .iter()
             .any(|tag| tag.to_lowercase().contains(filter))
         || contact.note.to_lowercase().contains(filter)
+}
+
+fn spawn_check_for_update(manifest_url: String, current_version: String) {
+    let events = event_bus().0.clone();
+    thread::spawn(move || {
+        let result = updater::check_for_update(&manifest_url, &current_version);
+        let _ = events.send_blocking(ProcessEvent::Updater(UpdaterEvent::Checked(result)));
+    });
+}
+
+fn spawn_download_update(manifest: updater::UpdateManifest, destination_dir: PathBuf) {
+    let events = event_bus().0.clone();
+    thread::spawn(move || {
+        let result = updater::download_and_verify(&manifest, &destination_dir);
+        let _ = events.send_blocking(ProcessEvent::Updater(UpdaterEvent::Downloaded(result)));
+    });
 }
 
 fn spawn_smart_agent_heartbeat(machine_id: String, local_id: String, service_key: String) {

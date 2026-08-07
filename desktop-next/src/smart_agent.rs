@@ -6,7 +6,7 @@ use std::time::Duration;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct HeartbeatRequest {
     pub machine_id: String,
     pub service_key: String,
@@ -14,6 +14,21 @@ pub struct HeartbeatRequest {
     pub os: String,
     pub os_version: String,
     pub rustdesk_id: String,
+}
+
+// Manual `Debug` (not derived) so a stray `{:?}` can never print the
+// organization's `service_key` secret — same rationale as `ViewerBootstrap`.
+impl std::fmt::Debug for HeartbeatRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeartbeatRequest")
+            .field("machine_id", &self.machine_id)
+            .field("service_key", &"<redacted>")
+            .field("hostname", &self.hostname)
+            .field("os", &self.os)
+            .field("os_version", &self.os_version)
+            .field("rustdesk_id", &self.rustdesk_id)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -62,7 +77,7 @@ pub struct ConfigUpdate {
     pub api_server: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct SupportRequest {
     pub machine_id: String,
     pub service_key: String,
@@ -71,6 +86,21 @@ pub struct SupportRequest {
     pub target_machine_id: String,
     pub target_rustdesk_id: String,
     pub from_rustdesk_id: String,
+}
+
+// Manual `Debug` (not derived) — see `HeartbeatRequest`'s impl above.
+impl std::fmt::Debug for SupportRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SupportRequest")
+            .field("machine_id", &self.machine_id)
+            .field("service_key", &"<redacted>")
+            .field("hostname", &self.hostname)
+            .field("message", &self.message)
+            .field("target_machine_id", &self.target_machine_id)
+            .field("target_rustdesk_id", &self.target_rustdesk_id)
+            .field("from_rustdesk_id", &self.from_rustdesk_id)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

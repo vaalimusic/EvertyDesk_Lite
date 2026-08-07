@@ -167,7 +167,7 @@ impl ViewerGameCodec {
 /// Stdin is used instead of command-line arguments so credentials are not
 /// exposed in process listings. Long-lived session events will use a named
 /// pipe on Windows and a Unix-domain socket on Unix.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct ViewerBootstrap {
     pub protocol_version: u16,
     pub remote_id: String,
@@ -190,6 +190,25 @@ pub struct ViewerBootstrap {
     #[serde(default)]
     #[zeroize(skip)]
     pub game_evrt2_enabled: bool,
+}
+
+// Manual `Debug` (not derived) so a stray `{:?}` — including into the
+// persistent `desktop-next.log` via `startup_log::append_log_line` — can
+// never print the plaintext password.
+impl std::fmt::Debug for ViewerBootstrap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ViewerBootstrap")
+            .field("protocol_version", &self.protocol_version)
+            .field("remote_id", &self.remote_id)
+            .field("password", &"<redacted>")
+            .field("audio_enabled", &self.audio_enabled)
+            .field("quality", &self.quality)
+            .field("scaling", &self.scaling)
+            .field("game_mode", &self.game_mode)
+            .field("game_codec", &self.game_codec)
+            .field("game_evrt2_enabled", &self.game_evrt2_enabled)
+            .finish()
+    }
 }
 
 impl ViewerBootstrap {

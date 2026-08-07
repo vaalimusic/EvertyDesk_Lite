@@ -5,6 +5,7 @@ use evertydesk_core::settings::{AppConfig, CodecPreference, DisplayConfig, Strea
 use evertydesk_core::transport::{
     ConnectionRequest, RemoteDisplay, SessionCommand, SessionEvent, TransportClient,
 };
+use evertydesk_desktop_next::frame_renderer::{FrameRenderer, FrameRendererError, ScalingMode};
 use evertydesk_desktop_next::ipc::{read_bounded_line, MAX_IPC_LINE_BYTES};
 use evertydesk_desktop_next::protocol::{
     ConnectionQuality, ViewerBootstrap, ViewerCommand, ViewerControl, ViewerGameCodec,
@@ -15,7 +16,6 @@ use evertydesk_desktop_next::windows_app::{
     set_current_process_app_user_model_id, WindowsAppUserModelId,
 };
 use font8x8::{UnicodeFonts, BASIC_FONTS};
-use pixels::{Pixels, ScalingMode, SurfaceTexture};
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
@@ -2090,7 +2090,9 @@ impl Drop for SessionControl {
 struct Viewer {
     remote_id: String,
     window: Option<Arc<Window>>,
-    pixels: Option<Pixels<'static>>,
+    // Field kept as `pixels` (not the `pixels` crate) to minimize the diff against
+    // the call sites below; `FrameRenderer` exposes the same method names.
+    pixels: Option<FrameRenderer>,
     frame_mailbox: Arc<FrameMailbox>,
     viewer_visible: Arc<AtomicBool>,
     session_connected: Arc<AtomicBool>,
@@ -2187,7 +2189,7 @@ impl Viewer {
         }
     }
 
-    fn render(&mut self) -> Result<(), pixels::Error> {
+    fn render(&mut self) -> Result<(), FrameRendererError> {
         let Some(pixels) = self.pixels.as_mut() else {
             return Ok(());
         };
@@ -2959,9 +2961,7 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
                 return;
             }
         };
-        let size = window.inner_size();
-        let surface = SurfaceTexture::new(size.width, size.height, Arc::clone(&window));
-        let mut pixels = match Pixels::new(FRAME_WIDTH, FRAME_HEIGHT, surface) {
+        let mut pixels = match FrameRenderer::new(Arc::clone(&window), FRAME_WIDTH, FRAME_HEIGHT) {
             Ok(pixels) => pixels,
             Err(error) => {
                 eprintln!("[viewer] initialize wgpu surface failed: {error}");

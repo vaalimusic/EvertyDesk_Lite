@@ -20,17 +20,19 @@ evertydesk-core = { package = "evertydesk-lite", path = "..", optional = true, d
 font8x8 = "0.3"
 iced = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "tokio", "svg"] }
 icondata = { version = "0.7", default-features = false, features = ["lucide"] }
-pixels = "0.17"
 png = "0.18"
+pollster = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 ureq = { version = "2", features = ["json"] }
+wgpu = "29"
 winit = "0.30"
 zeroize = { version = "1", features = ["derive"] }
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.24.2"
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_UI_Shell"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3.6.3", features = ["apple-native"] }
