@@ -19,7 +19,7 @@
     Version="$(var.EvertyDeskVersion)"
     UpgradeCode="8f2b8c2a-6b1a-4b1e-9f0a-9f3c9c9a2f11"
     Language="1049"
-    Codepage="1252"
+    Codepage="1251"
     InstallerVersion="500">
 
     <SummaryInformation Keywords="Installer" Description="EvertyDesk Lite installer" Manufacturer="Arthur Valiev" />
