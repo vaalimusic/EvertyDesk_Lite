@@ -86,15 +86,17 @@ jobs:
           workspaces: desktop-next
 
       - name: Install WiX v5
-        # Pinned to the 5.x range deliberately: an unpinned `dotnet tool
+        # Pinned to an exact version deliberately: an unpinned `dotnet tool
         # install --global wix` grabs whatever's latest on NuGet, which as
         # of WiX v7 requires accepting a paid "Open Source Maintenance Fee"
         # EULA (https://wixtoolset.org/osmf/) before the CLI will run at
-        # all. wix/main.wxs is written against the free v4/v5 schema — pin
-        # here so a future WiX release doesn't silently break every build
-        # by demanding a EULA/fee nobody agreed to.
+        # all. wix/main.wxs is written against the free v4/v5 schema.
+        # 5.0.2 is the latest 5.x release on nuget.org as of writing — an
+        # exact pin instead of a NuGet version range, since `dotnet tool
+        # install --version` range-syntax support isn't guaranteed across
+        # SDK versions and this failed once already trying it.
         run: |
-          dotnet tool install --global wix --version "[5.0,6.0)"
+          dotnet tool install --global wix --version 5.0.2
           wix extension add WixToolset.UI.wixext
 
       - name: Build and package
