@@ -98,8 +98,15 @@
       <ComponentRef Id="DesktopShortcut" />
     </Feature>
 
+    <!-- WixUI_Minimal (not used here) shows License+Welcome combined as the
+         very first dialog, which has a documented display bug where a
+         custom WixUILicenseRtf can silently fail to load and the
+         extension's own bundled placeholder (Lorem ipsum) shows instead —
+         that's what happened on the first real installer run. InstallDir
+         shows License as its own, second dialog, which doesn't hit that
+         bug, and lets the user pick the install directory as a bonus. -->
     <WixVariable Id="WixUILicenseRtf" Value="$(var.WixDir)\license.rtf" />
-    <ui:WixUI Id="WixUI_Minimal" />
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
 
   </Package>
 </Wix>
