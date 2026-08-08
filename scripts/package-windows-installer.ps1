@@ -57,6 +57,7 @@ wix build (Join-Path $WixDir "main.wxs") `
     -d "EvertyDeskVersion=$Version" `
     -d "BinDir=$BinDir" `
     -d "AssetsDir=$AssetsDir" `
+    -d "WixDir=$WixDir" `
     -ext WixToolset.UI.wixext `
     -arch x64 `
     -o $OutputMsi

@@ -98,7 +98,7 @@
       <ComponentRef Id="DesktopShortcut" />
     </Feature>
 
-    <WixVariable Id="WixUILicenseRtf" Value="license.rtf" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.WixDir)\license.rtf" />
     <ui:WixUI Id="WixUI_Minimal" />
 
   </Package>
