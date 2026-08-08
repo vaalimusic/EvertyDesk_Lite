@@ -2,6 +2,7 @@
 name = "evertydesk-lite"
 version = "0.2.0"
 edition = "2021"
+license = "MIT"
 
 # Библиотека для Android (.so через JNI) + обычный бинарь для desktop.
 # `lib` — для тестов/desktop, `cdylib` — нативная либа для Android.

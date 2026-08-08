@@ -1,0 +1,55 @@
+The Valiev License
+
+Copyright (c) 2026 Arthur Valiev
+
+A project like this is never really the work of one person. It stands
+on hundreds of thousands of hours of work from independent developers
+all over the world — every library, every protocol implementation,
+every codec this code touches. Use this project freely, build on it,
+ship it, put it to work wherever you find it useful — but do it with
+the same respect for the people whose work made it possible that we
+tried to show them.
+
+This project is licensed under the MIT License, deliberately. It is
+not a "viral" or copyleft license: what you build with this code is
+yours, and how you distribute or modify it is your business, not ours.
+
+We place no restriction on any government or public authority making
+use of this code where doing so helps preserve peace, health, or
+public order.
+
+We do not promise this project is perfect. It is open source,
+maintained by people, and provided as-is — see the warranty disclaimer
+below, which is not just boilerplate.
+
+---
+
+MIT License
+
+Copyright (c) 2026 Arthur Valiev
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+Third-party components vendored or bundled in this repository (see
+`vendor/`) remain under their own licenses, all MIT/Apache-2.0. A full
+list of dependency licenses can be produced at any time with
+`cargo license` — as of this writing, every dependency in this project
+is permissively licensed; none impose copyleft/"viral" obligations.
