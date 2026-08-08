@@ -95,9 +95,15 @@ jobs:
         # exact pin instead of a NuGet version range, since `dotnet tool
         # install --version` range-syntax support isn't guaranteed across
         # SDK versions and this failed once already trying it.
+        #
+        # The extension needs the exact same pin: `wix extension add` with
+        # no version also grabs latest (7.0.0), which doesn't match a 5.0.2
+        # CLI — "Could not find expected package root folder wixext5" is
+        # WiX's way of saying the extension package is for the wrong major
+        # version. WixToolset.UI.wixext 5.0.2 is confirmed on nuget.org.
         run: |
           dotnet tool install --global wix --version 5.0.2
-          wix extension add WixToolset.UI.wixext
+          wix extension add WixToolset.UI.wixext/5.0.2
 
       - name: Build and package
         shell: pwsh
