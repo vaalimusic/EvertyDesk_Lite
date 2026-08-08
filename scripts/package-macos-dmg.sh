@@ -8,6 +8,11 @@
 # > Open the first time (or `xattr -d com.apple.quarantine`).
 #
 # Usage: scripts/package-macos-dmg.sh
+#
+# Set EVERTYDESK_RELEASE_VERSION to package under a specific version (e.g.
+# for the monthly scheduled release) instead of the one committed in
+# desktop-next/Cargo.toml.
+#
 # Output: dist/EvertyDeskLite-<version>.dmg, plus a .sha256 next to it.
 
 set -euo pipefail
@@ -19,8 +24,13 @@ DIST_DIR="$REPO_ROOT/dist"
 echo "==> Building release binaries"
 (cd "$DESKTOP_NEXT" && cargo build --release --bin evertydesk-launcher --bin evertydesk-viewer --features viewer-core)
 
-VERSION=$(grep -m1 '^version' "$DESKTOP_NEXT/Cargo.toml" | sed -E 's/version *= *"([^"]+)"/\1/')
-echo "==> Packaging version $VERSION"
+if [ -n "${EVERTYDESK_RELEASE_VERSION:-}" ]; then
+    VERSION="$EVERTYDESK_RELEASE_VERSION"
+    echo "==> Packaging version $VERSION (override via EVERTYDESK_RELEASE_VERSION)"
+else
+    VERSION=$(grep -m1 '^version' "$DESKTOP_NEXT/Cargo.toml" | sed -E 's/version *= *"([^"]+)"/\1/')
+    echo "==> Packaging version $VERSION"
+fi
 
 APP_NAME="EvertyDesk Lite.app"
 STAGE_DIR=$(mktemp -d)

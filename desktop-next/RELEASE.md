@@ -13,7 +13,7 @@ and isn't built or packaged here).
 | Code signing (Authenticode / notarization) | Not started — no certificate yet |
 | Auto-update (check/download/verify) | Implemented in `src/updater.rs`, unit-tested, wired into the launcher's Settings → General panel |
 | CI (`.github/workflows/ci.yml`) | Build + test + clippy on every push/PR, windows-latest + macos-latest |
-| Release automation (`.github/workflows/release.yml`) | Package + draft GitHub Release on `vX.Y.Z` tag push |
+| Release automation (`.github/workflows/release.yml`) | Package + draft GitHub Release on `vX.Y.Z` tag push, **plus** an unattended monthly build (see below) |
 
 Everything above compiles and the auto-updater's logic is unit-tested, but
 the **installer builds themselves have never actually run** — this
@@ -100,10 +100,23 @@ The client (`src/updater.rs`):
 - `ci.yml`: on every push/PR touching `desktop-next/` or the shared core —
   `cargo build`, `cargo test`, `cargo clippy -D warnings`, windows-latest +
   macos-latest matrix.
-- `release.yml`: on `vX.Y.Z` tag push — builds both installers, uploads them
-  as workflow artifacts, and opens a draft GitHub Release with everything
-  attached via `softprops/action-gh-release`.
+- `release.yml`: two triggers, two behaviors.
+  - **Tag push** (`vX.Y.Z`) — builds both installers under that exact
+    version, opens a **draft** GitHub Release. You review and click Publish
+    yourself. This is the deliberate "I decided this is a release" path.
+  - **Monthly schedule** (1st of the month, 03:00 UTC) — builds whatever's
+    on `master`, versions it by date as `vYY.M.0` (e.g. `v26.9.0` for
+    September 2026 — two-digit year because MSI's `ProductVersion` caps the
+    major field at 255, a four-digit year would break the Windows
+    installer build), and **publishes immediately**, marked as a GitHub
+    pre-release so it never displaces a real reviewed release as "Latest".
+    No human reviews this before it's public. If you'd rather gate every
+    release, delete the `schedule:` trigger in `release.yml` and cut
+    releases by tag only.
+  - Both legs pass the resolved version to the packaging scripts via
+    `EVERTYDESK_RELEASE_VERSION` (falls back to reading `Cargo.toml` when
+    unset, e.g. for local manual runs).
 
-Both are scoped to `desktop-next` only. The old egui client (`src/main.rs`)
-is not built by CI, matching the existing "builds locally" convention
-documented in the repo's `CLAUDE.md`.
+Both workflows are scoped to `desktop-next` only. The old egui client
+(`src/main.rs`) is not built by CI, matching the existing "builds locally"
+convention documented in the repo's `CLAUDE.md`.

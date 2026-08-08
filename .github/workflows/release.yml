@@ -1,29 +1,79 @@
 name: Release
 
 # Builds unsigned installers for desktop-next and attaches them to a GitHub
-# Release. Triggered by pushing a tag like `v0.2.0`.
+# Release. Two ways in:
+#   - push a tag like `v0.2.0` -> builds that version, publishes as a DRAFT
+#     (you review and click Publish yourself — this is the deliberate,
+#     "I decided this is a release" path).
+#   - the 1st of every month at 03:00 UTC -> builds whatever's on the
+#     default branch, versions it by date (vYY.M.0, e.g. v26.9.0 for
+#     September 2026 — two-digit year because MSI's ProductVersion caps the
+#     major field at 255), and PUBLISHES IMMEDIATELY, no human in the loop,
+#     marked as a GitHub pre-release so it never displaces a real reviewed
+#     release as "Latest". This is the "always have a current build
+#     available" path — if you want to gate it, remove the `schedule:`
+#     trigger below and cut releases by tag only.
 #
 # Unsigned: no code-signing certificate exists yet (see desktop-next/RELEASE.md).
 # Windows SmartScreen and macOS Gatekeeper will both warn users on first run
 # until that's set up — this workflow does not attempt to work around that.
 #
 # NOTE: the macOS packaging leg is unverified — this repo has never had a
-# real macOS build/package run. Expect the first tagged release to need a
+# real macOS build/package run. Expect the first release to need a
 # follow-up fix once the actual failure (if any) is visible in the logs.
 
 on:
   push:
     tags:
       - "v*.*.*"
+  schedule:
+    - cron: "0 3 1 * *"
   workflow_dispatch:
     inputs:
       tag:
         description: "Tag to build (e.g. v0.2.0) — for manual re-runs"
         required: false
 
+permissions:
+  contents: write
+
 jobs:
+  determine-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.compute.outputs.version }}
+      tag: ${{ steps.compute.outputs.tag }}
+      is_scheduled: ${{ steps.compute.outputs.is_scheduled }}
+    steps:
+      - id: compute
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            # Two-digit year: MSI's ProductVersion caps the major field at
+            # 255, so a plain four-digit year (e.g. 2026.9.0) would exceed
+            # that and break the Windows installer build.
+            VERSION=$(date -u +'%y.%-m.0')
+            TAG="v$VERSION"
+            IS_SCHEDULED=true
+          elif [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+            VERSION="${TAG#v}"
+            IS_SCHEDULED=false
+          else
+            TAG="${{ github.ref_name }}"
+            VERSION="${TAG#v}"
+            IS_SCHEDULED=false
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "is_scheduled=$IS_SCHEDULED" >> "$GITHUB_OUTPUT"
+          echo "Building $TAG (version $VERSION), scheduled=$IS_SCHEDULED"
+
   windows-installer:
+    needs: determine-version
     runs-on: windows-latest
+    env:
+      EVERTYDESK_RELEASE_VERSION: ${{ needs.determine-version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -52,7 +102,10 @@ jobs:
             dist/*.sha256
 
   macos-dmg:
+    needs: determine-version
     runs-on: macos-latest
+    env:
+      EVERTYDESK_RELEASE_VERSION: ${{ needs.determine-version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -77,7 +130,7 @@ jobs:
             dist/*.sha256
 
   publish-release:
-    needs: [windows-installer, macos-dmg]
+    needs: [determine-version, windows-installer, macos-dmg]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -88,7 +141,10 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          draft: true
+          tag_name: ${{ needs.determine-version.outputs.tag }}
+          name: ${{ needs.determine-version.outputs.is_scheduled == 'true' && format('Monthly build {0}', needs.determine-version.outputs.version) || needs.determine-version.outputs.tag }}
+          draft: ${{ needs.determine-version.outputs.is_scheduled == 'false' }}
+          prerelease: ${{ needs.determine-version.outputs.is_scheduled == 'true' }}
           generate_release_notes: true
           files: |
             dist-artifacts/*.msi
