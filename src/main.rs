@@ -1,3 +1,12 @@
+// ============================================================================
+// ARCHIVED: this is EvertyDesk Lite, the original egui/eframe desktop
+// client. It still builds and still works, but it is NOT maintained going
+// forward — all new development happens in desktop-next/ (EvertyDesk Next,
+// built on Iced). Come here only if you specifically need the egui client
+// (e.g. Linux, which desktop-next doesn't target yet); for anything else,
+// see the root README.md and desktop-next/.
+// ============================================================================
+
 #![cfg_attr(
     all(not(debug_assertions), target_os = "windows"),
     windows_subsystem = "windows"

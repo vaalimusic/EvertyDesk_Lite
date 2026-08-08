@@ -7,12 +7,18 @@ and the latency-sensitive remote desktop viewer.
 
 - `evertydesk-launcher`: Iced launcher for connection setup, contacts, recent
   connections, live session management and, later, tray and account management.
-- `evertydesk-viewer`: independent `winit` + `pixels`/WGPU process. It owns its
-  event loop, outgoing `TransportClient` session, decoder, input capture, and
-  presentation.
+- `evertydesk-viewer`: independent `winit` + WGPU process (own
+  `frame_renderer::FrameRenderer`, not the `pixels` crate — see C1 in
+  `RELEASE.md`'s history). It owns its event loop, outgoing
+  `TransportClient` session, decoder, input capture, and presentation.
+- `evertydesk-rdp-viewer`: a third, much smaller process for connecting
+  straight to a VM's RDP endpoint (currently Hyper-V Enhanced Session),
+  bypassing EvertyDesk's own transport entirely.
 
-The existing `evertydesk-lite` binary remains untouched while the new desktop
-stack is brought up feature by feature.
+This is the actively developed client (EvertyDesk Next). The original
+egui/eframe client (`evertydesk-lite`, `src/main.rs` at the repo root) is
+archived — still builds, not maintained — see the notice at the top of that
+file and the root README.md.
 
 ## Build and run
 
