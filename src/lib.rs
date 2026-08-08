@@ -72,6 +72,16 @@ pub mod hyperv;
 // Session), поверх ironrdp-* — отдельный путь от evrt_client/transport,
 // не через host/relay. Exposed here (was main.rs-only `mod`) so desktop-next
 // can offer the same VM-console connection the egui client has.
+//
+// Windows-only: uses native-tls for the VRDE TLS handshake, and native-tls
+// itself is a [target.'cfg(windows)'.dependencies] entry in Cargo.toml (not
+// available to link against on macOS/Linux at all). This was already true
+// when this lived as an ungated `mod vbox_rdp;` in main.rs — it just never
+// surfaced because main.rs was never actually compiled on those platforms
+// either. desktop-next doesn't call into vbox_rdp at all yet (only
+// hyperv_rdp, which is Windows-only for its own separate reason — Hyper-V
+// itself doesn't exist elsewhere), so this costs nothing today.
+#[cfg(windows)]
 pub mod vbox_rdp;
 #[cfg(windows)]
 pub mod hyperv_rdp;
