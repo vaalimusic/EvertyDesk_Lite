@@ -2,6 +2,10 @@
 # Builds evertydesk-launcher / evertydesk-viewer in release mode, wraps the
 # launcher in a minimal .app bundle, and packages it as an unsigned DMG.
 #
+# Doesn't bundle evertydesk-rdp-viewer: Hyper-V (the only backend it
+# currently supports) doesn't exist on macOS, so there's nothing useful for
+# it to do there yet — see rdp_viewer.rs's module doc.
+#
 # Unsigned + not notarized: Gatekeeper will block first launch until this is
 # signed with a real Apple Developer ID and notarized. See
 # desktop-next/RELEASE.md for that TODO. Until then, users need to right-click
@@ -13,7 +17,7 @@
 # for the monthly scheduled release) instead of the one committed in
 # desktop-next/Cargo.toml.
 #
-# Output: dist/EvertyDeskLite-<version>.dmg, plus a .sha256 next to it.
+# Output: dist/EvertyDeskNext-<version>.dmg, plus a .sha256 next to it.
 
 set -euo pipefail
 
@@ -32,7 +36,7 @@ else
     echo "==> Packaging version $VERSION"
 fi
 
-APP_NAME="EvertyDesk Lite.app"
+APP_NAME="EvertyDesk Next.app"
 STAGE_DIR=$(mktemp -d)
 APP_DIR="$STAGE_DIR/$APP_NAME"
 CONTENTS_DIR="$APP_DIR/Contents"
@@ -52,11 +56,11 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>EvertyDesk Lite</string>
+    <string>EvertyDesk Next</string>
     <key>CFBundleDisplayName</key>
-    <string>EvertyDesk Lite</string>
+    <string>EvertyDesk Next</string>
     <key>CFBundleIdentifier</key>
-    <string>ru.everty.evertydesk-lite</string>
+    <string>ru.everty.evertydesk-next</string>
     <key>CFBundleVersion</key>
     <string>$VERSION</string>
     <key>CFBundleShortVersionString</key>
@@ -70,7 +74,7 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>EvertyDesk Lite streams system audio during a remote session.</string>
+    <string>EvertyDesk Next streams system audio during a remote session.</string>
 </dict>
 </plist>
 PLIST
@@ -80,10 +84,10 @@ PLIST
 # AppIcon.icns, then add CFBundleIconFile=AppIcon to Info.plist above.
 
 mkdir -p "$DIST_DIR"
-OUTPUT_DMG="$DIST_DIR/EvertyDeskLite-$VERSION.dmg"
+OUTPUT_DMG="$DIST_DIR/EvertyDeskNext-$VERSION.dmg"
 rm -f "$OUTPUT_DMG"
 
-hdiutil create -volname "EvertyDesk Lite" -srcfolder "$STAGE_DIR" -ov -format UDZO "$OUTPUT_DMG"
+hdiutil create -volname "EvertyDesk Next" -srcfolder "$STAGE_DIR" -ov -format UDZO "$OUTPUT_DMG"
 rm -rf "$STAGE_DIR"
 
 shasum -a 256 "$OUTPUT_DMG" | awk '{print $1}' > "$OUTPUT_DMG.sha256"

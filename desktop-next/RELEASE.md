@@ -69,8 +69,8 @@ endpoint out of the box):
 {
   "version": "0.2.0",
   "notes": "Fixes the thing.",
-  "windows": { "url": "https://.../EvertyDeskLite-0.2.0-x64.msi", "sha256": "<hex>" },
-  "macos":   { "url": "https://.../EvertyDeskLite-0.2.0.dmg",     "sha256": "<hex>" }
+  "windows": { "url": "https://.../EvertyDeskNext-0.2.0-x64.msi", "sha256": "<hex>" },
+  "macos":   { "url": "https://.../EvertyDeskNext-0.2.0.dmg",     "sha256": "<hex>" }
 }
 ```
 

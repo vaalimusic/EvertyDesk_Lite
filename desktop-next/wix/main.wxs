@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  EvertyDesk Lite (desktop-next) — Windows installer, built with WiX v5.
+  EvertyDesk Next (desktop-next) — Windows installer, built with WiX v5.
 
   Unsigned for now (no Authenticode certificate yet) — Windows SmartScreen
   will warn on first run until this is signed. See ../RELEASE.md for the
@@ -14,7 +14,7 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package
-    Name="EvertyDesk Lite"
+    Name="EvertyDesk Next"
     Manufacturer="Arthur Valiev"
     Version="$(var.EvertyDeskVersion)"
     UpgradeCode="8f2b8c2a-6b1a-4b1e-9f0a-9f3c9c9a2f11"
@@ -22,10 +22,10 @@
     Codepage="1251"
     InstallerVersion="500">
 
-    <SummaryInformation Keywords="Installer" Description="EvertyDesk Lite installer" Manufacturer="Arthur Valiev" />
+    <SummaryInformation Keywords="Installer" Description="EvertyDesk Next installer" Manufacturer="Arthur Valiev" />
 
     <MajorUpgrade
-      DowngradeErrorMessage="Установлена более новая версия EvertyDesk Lite. Сначала удалите её."
+      DowngradeErrorMessage="Установлена более новая версия EvertyDesk Next. Сначала удалите её."
       Schedule="afterInstallInitialize" />
 
     <MediaTemplate EmbedCab="yes" />
@@ -36,30 +36,33 @@
     <Property Id="ARPNOREPAIR" Value="1" />
 
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="INSTALLFOLDER" Name="EvertyDesk Lite">
+      <Directory Id="INSTALLFOLDER" Name="EvertyDesk Next">
         <Component Id="LauncherExe" Guid="*">
           <File Id="LauncherExeFile" Source="$(var.BinDir)\evertydesk-launcher.exe" KeyPath="yes" />
         </Component>
         <Component Id="ViewerExe" Guid="*">
           <File Id="ViewerExeFile" Source="$(var.BinDir)\evertydesk-viewer.exe" KeyPath="yes" />
         </Component>
+        <Component Id="RdpViewerExe" Guid="*">
+          <File Id="RdpViewerExeFile" Source="$(var.BinDir)\evertydesk-rdp-viewer.exe" KeyPath="yes" />
+        </Component>
       </Directory>
     </StandardDirectory>
 
     <StandardDirectory Id="ProgramMenuFolder">
-      <Directory Id="ApplicationProgramsFolder" Name="EvertyDesk Lite">
+      <Directory Id="ApplicationProgramsFolder" Name="EvertyDesk Next">
         <Component Id="StartMenuShortcut" Guid="*">
           <Shortcut
             Id="EvertyDeskStartMenuShortcut"
-            Name="EvertyDesk Lite"
-            Description="Удалённый доступ EvertyDesk Lite"
+            Name="EvertyDesk Next"
+            Description="Удалённый доступ EvertyDesk Next"
             Target="[INSTALLFOLDER]evertydesk-launcher.exe"
             WorkingDirectory="INSTALLFOLDER"
             Icon="EvertyDeskIcon.ico" />
           <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
           <RegistryValue
             Root="HKCU"
-            Key="Software\EvertyDesk\Lite"
+            Key="Software\EvertyDesk\Next"
             Name="StartMenuShortcutInstalled"
             Type="integer"
             Value="1"
@@ -72,14 +75,14 @@
       <Component Id="DesktopShortcut" Guid="*">
         <Shortcut
           Id="EvertyDeskDesktopShortcut"
-          Name="EvertyDesk Lite"
-          Description="Удалённый доступ EvertyDesk Lite"
+          Name="EvertyDesk Next"
+          Description="Удалённый доступ EvertyDesk Next"
           Target="[INSTALLFOLDER]evertydesk-launcher.exe"
           WorkingDirectory="INSTALLFOLDER"
           Icon="EvertyDeskIcon.ico" />
         <RegistryValue
           Root="HKCU"
-          Key="Software\EvertyDesk\Lite"
+          Key="Software\EvertyDesk\Next"
           Name="DesktopShortcutInstalled"
           Type="integer"
           Value="1"
@@ -87,13 +90,15 @@
       </Component>
     </StandardDirectory>
 
-    <Feature Id="MainFeature" Title="EvertyDesk Lite" Level="1">
+    <Feature Id="MainFeature" Title="EvertyDesk Next" Level="1">
       <ComponentRef Id="LauncherExe" />
       <ComponentRef Id="ViewerExe" />
+      <ComponentRef Id="RdpViewerExe" />
       <ComponentRef Id="StartMenuShortcut" />
       <ComponentRef Id="DesktopShortcut" />
     </Feature>
 
+    <WixVariable Id="WixUILicenseRtf" Value="license.rtf" />
     <ui:WixUI Id="WixUI_Minimal" />
 
   </Package>

@@ -1,9 +1,9 @@
-# Builds evertydesk-launcher.exe / evertydesk-viewer.exe in release mode and
-# packages them into an unsigned MSI via WiX v5.
+# Builds evertydesk-launcher.exe / evertydesk-viewer.exe / evertydesk-rdp-viewer.exe
+# in release mode and packages them into an unsigned MSI via WiX v5.
 #
 # Prerequisites (not installed by this script):
-#   dotnet tool install --global wix
-#   wix extension add WixToolset.UI.wixext
+#   dotnet tool install --global wix --version 5.0.2
+#   wix extension add WixToolset.UI.wixext/5.0.2
 #
 # Usage:
 #   powershell -File scripts\package-windows-installer.ps1
@@ -13,7 +13,7 @@
 # desktop-next\Cargo.toml. Must fit MSI's ProductVersion limits
 # (Major <= 255, Minor <= 255, Build <= 65535) or the wix build step fails.
 #
-# Output: dist\EvertyDeskLite-<version>-x64.msi, plus a .sha256 file next to
+# Output: dist\EvertyDeskNext-<version>-x64.msi, plus a .sha256 file next to
 # it (paste that hash straight into your update manifest's "sha256" field).
 #
 # Unsigned: Windows SmartScreen will warn on first run until this is signed
@@ -28,7 +28,7 @@ $DistDir = Join-Path $RepoRoot "dist"
 Write-Host "==> Building release binaries"
 Push-Location $DesktopNext
 try {
-    cargo build --release --bin evertydesk-launcher --bin evertydesk-viewer --features viewer-core
+    cargo build --release --bin evertydesk-launcher --bin evertydesk-viewer --bin evertydesk-rdp-viewer --features viewer-core
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 } finally {
     Pop-Location
@@ -51,7 +51,7 @@ if ($env:EVERTYDESK_RELEASE_VERSION) {
 }
 
 New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
-$OutputMsi = Join-Path $DistDir "EvertyDeskLite-$Version-x64.msi"
+$OutputMsi = Join-Path $DistDir "EvertyDeskNext-$Version-x64.msi"
 
 wix build (Join-Path $WixDir "main.wxs") `
     -d "EvertyDeskVersion=$Version" `
