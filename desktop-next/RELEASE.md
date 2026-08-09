@@ -1,122 +1,200 @@
 # Release engineering (desktop-next)
 
-Covers packaging, auto-update, and CI for the `desktop-next` client
-(Windows + macOS — Linux stays on the old egui client per the D1 decision,
-and isn't built or packaged here).
+This document covers packaging, auto-update, and CI for the `desktop-next`
+client.
+
+Scope:
+
+- Windows: launcher, native viewer, RDP/VM viewer, MSI, portable zip.
+- macOS: launcher, native viewer, RDP/VM viewer, `.app`, DMG.
+- Linux: not packaged here; it stays on the old egui client for now.
 
 ## Status
 
 | Piece | State |
 |---|---|
-| Windows installer (MSI via WiX v5) | Written, **not run** — no WiX toolset in the dev sandbox that built this |
-| macOS installer (.app + DMG) | Written, **not run** — no macOS available in the dev sandbox |
-| Code signing (Authenticode / notarization) | Not started — no certificate yet |
-| Auto-update (check/download/verify) | Implemented in `src/updater.rs`, unit-tested, wired into the launcher's Settings → General panel |
-| CI (`.github/workflows/ci.yml`) | Build + test + clippy on every push/PR, windows-latest + macos-latest |
-| Release automation (`.github/workflows/release.yml`) | Package + draft GitHub Release on `vX.Y.Z` tag push, **plus** an unattended monthly build (see below) |
+| Windows installer (MSI via WiX v5) | Written, not run locally because WiX is not installed in this dev environment |
+| Windows portable zip | Implemented, built locally, smoke-tested after extraction |
+| macOS installer (.app + DMG) | Written, not run locally because this environment is Windows |
+| Code signing (Authenticode / notarization) | Not started; no certificate configured yet |
+| Auto-update | Implemented in `src/updater.rs`, unit-tested, wired into Settings -> General |
+| CI (`.github/workflows/ci.yml`) | Build + test + clippy on every push/PR, Windows + macOS matrix |
+| Release automation (`.github/workflows/release.yml`) | Package + draft GitHub Release on `vX.Y.Z` tag push, generate `latest.json`, plus unattended monthly pre-release build |
 
-Everything above compiles and the auto-updater's logic is unit-tested, but
-the **installer builds themselves have never actually run** — this
-environment has neither the WiX toolset nor a macOS machine. Treat the first
-real CI run as the actual first test of `wix/main.wxs` and
-`scripts/package-macos-dmg.sh`, and expect to iterate.
+The application binaries compile and the updater logic is unit-tested. The MSI
+and DMG scripts still need their first real run in CI or on the target OS.
+Expect to iterate on the first WiX/macOS packaging run.
 
 ## Cutting a release
 
 1. Bump `version` in `desktop-next/Cargo.toml`.
 2. Commit, tag `vX.Y.Z`, push the tag.
-3. `release.yml` builds both installers and opens a **draft** GitHub Release
-   with them attached — review and publish it manually (nothing goes out
-   automatically).
-4. Update your hosted `latest.json` (see below) with the new version and the
-   `.sha256` files the workflow produced. Auto-update won't offer the new
-   version to existing installs until you do this.
+3. `release.yml` builds Windows/macOS packages and opens a draft GitHub Release.
+4. Review the draft release manually before publishing.
+5. Publish or copy the generated `latest.json` from the GitHub Release to the
+   update endpoint used by `EVERTYDESK_UPDATE_URL`.
 
-Building locally instead of via CI:
+Local Windows packaging:
+
 ```powershell
-# Windows — needs: dotnet tool install --global wix ; wix extension add WixToolset.UI.wixext
-.\scripts\package-windows-installer.ps1
+cd D:\github_project\EvertyDesk_Lite\desktop-next
+
+# Needs WiX:
+#   dotnet tool install --global wix --version 5.0.2
+#   wix extension add WixToolset.UI.wixext/5.0.2
+.\scripts\package-windows-installer.ps1 -StopRunningBuildProcesses
+
+# Does not need WiX; useful for tester builds.
+.\scripts\package-windows-portable.ps1 -StopRunningBuildProcesses
+
+# Fast static MSI input/layout check; needs release binaries but not WiX.
+.\scripts\validate-windows-installer-layout.ps1
 ```
+
+Local macOS packaging:
+
 ```bash
-# macOS
+cd desktop-next
 ./scripts/package-macos-dmg.sh
 ```
 
-## Signing (not done yet)
+## Smoke checks
 
-- **Windows**: needs an Authenticode certificate (EV recommended — avoids
-  the SmartScreen reputation ramp-up that a standard cert still gets warned
-  on for a while). Once you have one, sign the MSI (or better, sign
-  `evertydesk-launcher.exe`/`evertydesk-viewer.exe` themselves *before*
-  `wix build` packages them) with `signtool sign /fd sha256 /tr <timestamp-url> /td sha256 ...`.
-- **macOS**: needs an Apple Developer ID Application certificate. Sign the
-  `.app` (`codesign --deep --sign "Developer ID Application: ..." ...`)
-  before `hdiutil create`, then notarize the DMG (`xcrun notarytool submit
-  ... --wait`) and staple the ticket (`xcrun stapler staple`).
-- Until both exist, `dist/` output is unsigned and the CI workflows don't
-  attempt either step — wiring them in is a matter of adding the signing
-  commands to the two package scripts once secrets/certs are available.
+Run this after a release build:
+
+```powershell
+.\tools\portable-smoke.ps1 -Configuration release -StopAllExistingLaunchers
+```
+
+Run this after extracting the portable zip:
+
+```powershell
+.\tools\portable-smoke.ps1 -BinaryDirectory C:\path\to\extracted\EvertyDeskNext -StopAllExistingLaunchers
+```
+
+The smoke script verifies:
+
+- `evertydesk-launcher.exe` exists.
+- `evertydesk-viewer.exe` exists next to the launcher.
+- `evertydesk-rdp-viewer.exe` exists next to the launcher.
+- the launcher has an icon resource;
+- the window starts and responds;
+- exactly one primary launcher process is active for the tested path;
+- the host-agent process starts;
+- the tested processes are stopped by default after the check.
+
+Use `-LeaveRunning` only when you intentionally want to inspect the GUI after
+the smoke check.
+
+## Signing
+
+Windows:
+
+- Sign `evertydesk-launcher.exe`, `evertydesk-viewer.exe`, and
+  `evertydesk-rdp-viewer.exe` before MSI packaging.
+- Sign the final MSI.
+- Use a timestamp URL.
+- Without signing, SmartScreen warnings are expected.
+
+macOS:
+
+- Sign the `.app` with Developer ID Application.
+- Notarize the DMG.
+- Staple the notarization ticket.
+- Without signing/notarization, Gatekeeper warnings are expected.
 
 ## Auto-update manifest contract
 
-Host this JSON wherever you like (S3, your own server, a GitHub Release
-asset) and point the client at it via the `EVERTYDESK_UPDATE_URL`
-environment variable (unset by default — update checks are a no-op until
-this is configured, deliberately, so nothing points at a nonexistent
-endpoint out of the box):
+The client reads an HTTPS JSON manifest from `EVERTYDESK_UPDATE_URL`. If the
+environment variable is not set, update checks are a no-op by design.
+
+Release automation generates `latest.json` from the packaged artifacts:
+
+```powershell
+.\scripts\generate-update-manifest.ps1 `
+  -Version 2.0.0 `
+  -BaseUrl https://github.com/<owner>/<repo>/releases/download/v2.0.0 `
+  -DistDir .\dist `
+  -OutFile .\dist\latest.json `
+  -Notes v2.0.0
+```
+
+Validate release artifacts before publishing:
+
+```powershell
+.\scripts\validate-release-artifacts.ps1 `
+  -Version 2.0.0 `
+  -DistDir .\dist `
+  -Manifest .\dist\latest.json `
+  -RequireWindows `
+  -RequireWindowsPortable
+```
+
+For portable archives, validation also opens the zip and checks that
+`evertydesk-launcher.exe`, `evertydesk-viewer.exe`, `evertydesk-rdp-viewer.exe`,
+and `README.txt` are present at the top level.
+
+`package-windows-portable.ps1` runs that validation automatically after writing
+the zip and `.sha256` sidecar, but deliberately skips `latest.json` because the
+manifest is generated later by the release job.
+
+Example:
 
 ```json
 {
-  "version": "0.2.0",
-  "notes": "Fixes the thing.",
-  "windows": { "url": "https://.../EvertyDeskNext-0.2.0-x64.msi", "sha256": "<hex>" },
-  "macos":   { "url": "https://.../EvertyDeskNext-0.2.0.dmg",     "sha256": "<hex>" }
+  "version": "2.0.0",
+  "notes": "EvertyDesk Next 2 release.",
+  "windows": {
+    "url": "https://example.com/EvertyDeskNext-2.0.0-x64.msi",
+    "sha256": "<hex>"
+  },
+  "macos": {
+    "url": "https://example.com/EvertyDeskNext-2.0.0.dmg",
+    "sha256": "<hex>"
+  }
 }
 ```
 
-Both `windows`/`macos` sections are optional — the client only requires the
-one matching its own OS. `sha256` is mandatory and enforced: the downloaded
-file is hashed and deleted if it doesn't match before the user is ever
-offered "Install". Both the manifest URL and every artifact URL inside it
-**must** be `https://` — this is enforced unconditionally, with no
-local-testing bypass, because a plaintext manifest is fully attacker-
-controlled by anyone on-path, including the `sha256` it claims to be
-correct.
+Rules enforced by the client:
 
-The client (`src/updater.rs`):
-- Checks at most every 6 hours in the background, plus on-demand via the
-  "Проверить обновления" button in Settings → General.
-- Never applies an update silently. It surfaces "update available", and on
-  "Скачать и проверить" downloads to `%LOCALAPPDATA%\EvertyDesk\Updates`
-  (Windows) / `~/.cache/evertydesk/updates` (macOS/Linux fallback),
-  verifies the hash, and only then offers "Установить", which launches the
-  installer/DMG and lets the user finish it — no self-replacement, no
-  forced restart.
-- Version comparison is numeric-dot-separated (`0.10.0` > `0.9.0`), not
-  lexical string comparison.
+- manifest URL must be HTTPS;
+- artifact URLs must be HTTPS;
+- SHA-256 is mandatory;
+- downloaded files are deleted if the hash does not match;
+- downloads are finalized only after SHA-256 verification;
+- updates are never installed silently;
+- version comparison is numeric-dot-separated, so `2.10.0` is newer than
+  `2.9.0`.
 
 ## CI
 
-- `ci.yml`: on every push/PR touching `desktop-next/` or the shared core —
-  `cargo build`, `cargo test`, `cargo clippy -D warnings`, windows-latest +
-  macos-latest matrix.
-- `release.yml`: two triggers, two behaviors.
-  - **Tag push** (`vX.Y.Z`) — builds both installers under that exact
-    version, opens a **draft** GitHub Release. You review and click Publish
-    yourself. This is the deliberate "I decided this is a release" path.
-  - **Monthly schedule** (1st of the month, 03:00 UTC) — builds whatever's
-    on `master`, versions it by date as `vYY.M.0` (e.g. `v26.9.0` for
-    September 2026 — two-digit year because MSI's `ProductVersion` caps the
-    major field at 255, a four-digit year would break the Windows
-    installer build), and **publishes immediately**, marked as a GitHub
-    pre-release so it never displaces a real reviewed release as "Latest".
-    No human reviews this before it's public. If you'd rather gate every
-    release, delete the `schedule:` trigger in `release.yml` and cut
-    releases by tag only.
-  - Both legs pass the resolved version to the packaging scripts via
-    `EVERTYDESK_RELEASE_VERSION` (falls back to reading `Cargo.toml` when
-    unset, e.g. for local manual runs).
+`ci.yml` runs for `desktop-next/` and shared-core changes:
 
-Both workflows are scoped to `desktop-next` only. The old egui client
-(`src/main.rs`) is not built by CI, matching the existing "builds locally"
-convention documented in the repo's `CLAUDE.md`.
+```powershell
+cargo build --features viewer-core --bins
+cargo test --features viewer-core --bins --lib
+cargo clippy --features viewer-core --bins -- -D warnings
+```
+
+`release.yml` has two paths:
+
+- Tag push `vX.Y.Z`: build packages and create a draft GitHub Release.
+- Monthly schedule: build `master`, publish a GitHub pre-release versioned by
+  date as `vYY.M.0`.
+
+Both release paths pass `EVERTYDESK_RELEASE_VERSION` to the packaging scripts.
+When the variable is not set, the scripts read `Cargo.toml`.
+
+The publish job also attaches `latest.json`. The client uses only `windows`
+and `macos`; extra fields such as `windows_portable` are for humans/testers and
+are ignored by the updater.
+
+## Current local artifact
+
+The local portable package built during production-hardening:
+
+- `dist/EvertyDeskNext-2.0.0-windows-x64-portable.zip`
+- SHA-256:
+  `9d2de1fc548a0335c61093b027e0dee1f1ca09f3a33971b9f373d493907bea00`
+
+`dist/` is ignored by git and should not be committed.

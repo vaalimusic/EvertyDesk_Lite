@@ -4,8 +4,7 @@ use evertydesk_core::host::{HostCommand, HostEvent, HostService, HostState};
 #[cfg(windows)]
 use evertydesk_core::hyperv;
 use evertydesk_core::settings::{
-    generate_numeric_token, AppConfig, ContactEntry, FsrQualitySetting, ServerConfig,
-    StreamingMode,
+    generate_numeric_token, AppConfig, ContactEntry, FsrQualitySetting, ServerConfig, StreamingMode,
 };
 use evertydesk_core::virtualbox;
 use evertydesk_core::vm_bridge;
@@ -166,25 +165,23 @@ fn handle_service_cli() -> Option<i32> {
         #[cfg(windows)]
         "--install-service" => Some(cli_result(evertydesk_core::winservice::install_service())),
         #[cfg(windows)]
-        "--start-service" => {
-            Some(cli_result(evertydesk_core::winservice::start_installed_service()))
-        }
+        "--start-service" => Some(cli_result(
+            evertydesk_core::winservice::start_installed_service(),
+        )),
         #[cfg(windows)]
-        "--uninstall-service" => {
-            Some(cli_result(evertydesk_core::winservice::uninstall_service()))
-        }
+        "--uninstall-service" => Some(cli_result(evertydesk_core::winservice::uninstall_service())),
         #[cfg(unix)]
-        "--install-service" => {
-            Some(cli_result(evertydesk_core::host_service_unix::install_service()))
-        }
+        "--install-service" => Some(cli_result(
+            evertydesk_core::host_service_unix::install_service(),
+        )),
         #[cfg(unix)]
         "--start-service" => Some(cli_result(
             evertydesk_core::host_service_unix::start_installed_service(),
         )),
         #[cfg(unix)]
-        "--uninstall-service" => {
-            Some(cli_result(evertydesk_core::host_service_unix::uninstall_service()))
-        }
+        "--uninstall-service" => Some(cli_result(
+            evertydesk_core::host_service_unix::uninstall_service(),
+        )),
         _ => None,
     }
 }
@@ -376,7 +373,9 @@ const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 fn update_download_dir() -> PathBuf {
     if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
-        return PathBuf::from(local_app_data).join("EvertyDesk").join("Updates");
+        return PathBuf::from(local_app_data)
+            .join("EvertyDesk")
+            .join("Updates");
     }
     if let Some(home) = env::var_os("HOME") {
         return PathBuf::from(home)
@@ -1477,15 +1476,16 @@ impl Launcher {
                     return Task::none();
                 };
                 let bootstrap = RdpBootstrap {
-                    target: RdpTarget::HyperV { vm_guid: vm_guid.clone() },
+                    target: RdpTarget::HyperV {
+                        vm_guid: vm_guid.clone(),
+                    },
                     username: String::new(),
                     password: String::new(),
                     domain: String::new(),
                 };
                 match spawn_rdp_viewer(&bootstrap) {
                     Ok(()) => {
-                        self.vm_bridge_status =
-                            format!("RDP-консоль открыта для {vm_guid}");
+                        self.vm_bridge_status = format!("RDP-консоль открыта для {vm_guid}");
                     }
                     Err(error) => {
                         self.vm_bridge_status = format!("Не удалось открыть RDP-консоль: {error}");
@@ -1723,7 +1723,9 @@ impl Launcher {
                                 )) => Some(win32.hwnd.get()),
                                 _ => None,
                             };
-                            hwnd.is_some_and(evertydesk_desktop_next::windows_app::exclude_window_from_capture)
+                            hwnd.is_some_and(
+                                evertydesk_desktop_next::windows_app::exclude_window_from_capture,
+                            )
                         })
                         .map(Message::CaptureExclusionApplied);
                     }
@@ -3804,17 +3806,16 @@ impl Launcher {
                 // RDP console (Hyper-V Enhanced Session only for now — VirtualBox
                 // VRDE needs port-discovery plumbing this doesn't have yet, see
                 // rdp_viewer.rs's module doc).
-                let rdp_button: Element<'_, Message> = if vm.connectable
-                    && vm_inventory_group_key(&vm.id) == "1_hyperv"
-                {
-                    button("RDP")
-                        .on_press(Message::ConnectVmRdp(vm.id.clone()))
-                        .padding([7, 10])
-                        .style(quiet_button)
-                        .into()
-                } else {
-                    Space::new().width(Length::Fixed(0.0)).into()
-                };
+                let rdp_button: Element<'_, Message> =
+                    if vm.connectable && vm_inventory_group_key(&vm.id) == "1_hyperv" {
+                        button("RDP")
+                            .on_press(Message::ConnectVmRdp(vm.id.clone()))
+                            .padding([7, 10])
+                            .style(quiet_button)
+                            .into()
+                    } else {
+                        Space::new().width(Length::Fixed(0.0)).into()
+                    };
                 group_column = group_column.push(
                     container(
                         row![
@@ -4184,13 +4185,13 @@ impl Launcher {
                         sync_button,
                         icon_action(
                             icondata::LuBadgeCheck,
-                            "РћР±РЅРѕРІРёС‚СЊ РїСЂР°РІР° Р°РєРєР°СѓРЅС‚Р°",
+                            "Refresh account permissions",
                             Message::RefreshCurrentUser,
                             false
                         ),
                         icon_action(
                             icondata::LuLogOut,
-                            "Выйти из аккаунта",
+                            "Sign out",
                             Message::SignOutAddressBook,
                             true
                         ),
@@ -5848,9 +5849,9 @@ impl Launcher {
         self.service_hint_state = ServiceHintState::Installing;
         #[cfg(windows)]
         {
-            if let Err(error) = evertydesk_core::winservice::relaunch_elevated(&[
-                "--install-service",
-            ]) {
+            if let Err(error) =
+                evertydesk_core::winservice::relaunch_elevated(&["--install-service"])
+            {
                 self.status = format!("Установка службы: {error}");
             }
         }
@@ -5867,8 +5868,7 @@ impl Launcher {
         self.service_hint_state = ServiceHintState::Installing;
         #[cfg(windows)]
         {
-            if let Err(error) =
-                evertydesk_core::winservice::relaunch_elevated(&["--start-service"])
+            if let Err(error) = evertydesk_core::winservice::relaunch_elevated(&["--start-service"])
             {
                 self.status = format!("Запуск службы: {error}");
             }
@@ -5891,6 +5891,9 @@ impl Launcher {
         }
         self.update_next_check = Instant::now() + UPDATE_CHECK_INTERVAL;
         if matches!(self.update_state, UpdateState::Idle | UpdateState::UpToDate) {
+            if update_manifest_url().is_none() {
+                return;
+            }
             self.check_for_updates();
         }
     }
@@ -6006,7 +6009,11 @@ impl Launcher {
             .align_y(Alignment::Center)
             .into(),
         };
-        container(content).padding(14).width(Fill).style(subtle_panel).into()
+        container(content)
+            .padding(14)
+            .width(Fill)
+            .style(subtle_panel)
+            .into()
     }
 
     fn handle_updater_event(&mut self, event: UpdaterEvent) {
@@ -8042,9 +8049,7 @@ fn spawn_rdp_viewer(bootstrap: &RdpBootstrap) -> io::Result<()> {
     let mut executable = directory.join("evertydesk-rdp-viewer");
     executable.set_extension(std::env::consts::EXE_EXTENSION);
 
-    let encoded = zeroize::Zeroizing::new(
-        serde_json::to_vec(bootstrap).map_err(io::Error::other)?,
-    );
+    let encoded = zeroize::Zeroizing::new(serde_json::to_vec(bootstrap).map_err(io::Error::other)?);
 
     let mut child = std::process::Command::new(&executable)
         .arg("--bootstrap-stdin")
@@ -8059,9 +8064,10 @@ fn spawn_rdp_viewer(bootstrap: &RdpBootstrap) -> io::Result<()> {
             )
         })?;
 
-    let mut stdin = child.stdin.take().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::BrokenPipe, "rdp-viewer stdin unavailable")
-    })?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "rdp-viewer stdin unavailable"))?;
     let write_result = stdin
         .write_all(&encoded)
         .and_then(|()| stdin.write_all(b"\n"))

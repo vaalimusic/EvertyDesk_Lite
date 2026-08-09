@@ -32,7 +32,7 @@ use winit::window::{Window, WindowAttributes, WindowId};
 const DEFAULT_WIDTH: u16 = 1280;
 const DEFAULT_HEIGHT: u16 = 800;
 /// How often to poll the session thread's frame/status channels.
-const POLL_INTERVAL: Duration = Duration::from_millis(8);
+const POLL_INTERVAL: Duration = Duration::from_millis(16);
 
 fn main() {
     install_process_diagnostics("rdp-viewer");
@@ -52,7 +52,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    event_loop.set_control_flow(ControlFlow::Poll);
+    event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = App::new(bootstrap);
     if let Err(error) = event_loop.run_app(&mut app) {
@@ -150,8 +150,7 @@ impl App {
 
     #[cfg(not(windows))]
     fn connect(&mut self) {
-        self.status =
-            "RDP-подключение к ВМ поддерживается только на Windows (Hyper-V)".to_owned();
+        self.status = "RDP-подключение к ВМ поддерживается только на Windows (Hyper-V)".to_owned();
         self.set_window_title();
     }
 
@@ -196,6 +195,7 @@ impl App {
                 }
             }
         }
+        let mut latest_frame = None;
         loop {
             let Some(session) = self.session.as_ref() else {
                 return;
@@ -203,7 +203,7 @@ impl App {
             let outcome = session.poll_frame();
             match outcome {
                 evertydesk_core::vbox_rdp::Poll::Item((width, height, rgba)) => {
-                    self.present_frame(width, height, rgba);
+                    latest_frame = Some((width, height, rgba));
                 }
                 evertydesk_core::vbox_rdp::Poll::Empty => break,
                 evertydesk_core::vbox_rdp::Poll::Dead => {
@@ -213,6 +213,9 @@ impl App {
                     return;
                 }
             }
+        }
+        if let Some((width, height, rgba)) = latest_frame {
+            self.present_frame(width, height, rgba);
         }
     }
 
@@ -360,11 +363,12 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if self.last_poll.elapsed() >= POLL_INTERVAL {
             self.last_poll = Instant::now();
             self.poll_session();
         }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.last_poll + POLL_INTERVAL));
     }
 }
 
@@ -377,7 +381,8 @@ impl App {
             return;
         };
         let pressed = event.state == ElementState::Pressed;
-        let combo = self.modifiers.control_key() || self.modifiers.alt_key() || self.modifiers.super_key();
+        let combo =
+            self.modifiers.control_key() || self.modifiers.alt_key() || self.modifiers.super_key();
 
         // Printable characters go through Unicode keyboard events (matches
         // the egui client's `egui_key_is_plain_text` gate) unless a modifier

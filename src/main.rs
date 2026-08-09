@@ -8158,13 +8158,23 @@ impl EvertyDeskApp {
             }
         }
 
-        // Keep egui awake while any VM session is active
-        if self.hyperv_session.is_some()
-            || self.vbox_session.is_some()
-            || self.vbox_vrde_session.is_some()
-            || self.hyperv_rdp_session.is_some()
-        {
-            ctx.request_repaint_after(Duration::from_millis(16)); // 60fps polling
+        // Keep egui awake while a VM session is active, but do not wake the UI
+        // at 60 FPS for slow provider APIs that cannot deliver frames that
+        // quickly anyway. This was a real CPU-risk pattern for VM dashboards:
+        // RDP/VRDE needs low-latency polling, WMI thumbnails target ~20 FPS,
+        // and VBox screenshot polling is only 5 FPS.
+        let vm_repaint_after =
+            if self.vbox_vrde_session.is_some() || self.hyperv_rdp_session.is_some() {
+                Some(Duration::from_millis(16))
+            } else if self.hyperv_session.is_some() {
+                Some(Duration::from_millis(50))
+            } else if self.vbox_session.is_some() {
+                Some(crate::virtualbox::SCREENSHOT_INTERVAL)
+            } else {
+                None
+            };
+        if let Some(delay) = vm_repaint_after {
+            ctx.request_repaint_after(delay);
         }
     }
 

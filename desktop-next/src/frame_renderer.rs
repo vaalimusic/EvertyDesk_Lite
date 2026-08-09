@@ -191,38 +191,37 @@ impl FrameRenderer {
         });
         queue.write_buffer(&uniform_buffer, 0, &uniform_bytes);
 
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("evertydesk_scale_bind_group_layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                        },
-                        count: None,
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("evertydesk_scale_bind_group_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(uniform_bytes.len() as u64),
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: wgpu::BufferSize::new(uniform_bytes.len() as u64),
-                        },
-                        count: None,
-                    },
-                ],
-            });
+                    count: None,
+                },
+            ],
+        });
 
         let bind_group_nearest = create_bind_group(
             &device,
@@ -380,7 +379,8 @@ impl FrameRenderer {
         let texture_size = (self.texture_size.0 as f32, self.texture_size.1 as f32);
         let surface_size = (self.surface_size.0 as f32, self.surface_size.1 as f32);
         let uniform_bytes = uniform_buffer_bytes(texture_size, surface_size, self.scaling_mode);
-        self.queue.write_buffer(&self.uniform_buffer, 0, &uniform_bytes);
+        self.queue
+            .write_buffer(&self.uniform_buffer, 0, &uniform_bytes);
         self.clip_rect = clip_rect_for(texture_size, surface_size, self.scaling_mode);
     }
 

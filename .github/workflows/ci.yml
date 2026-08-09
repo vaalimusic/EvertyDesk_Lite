@@ -1,13 +1,11 @@
 name: CI
 
-# Builds and tests the desktop-next client (Windows + macOS — see D1 in the
-# production plan: Linux stays on the old egui client, which this repo does
-# not build in CI). Runs on every push/PR that touches desktop-next or the
-# shared core it depends on.
+# Builds and tests the desktop-next client on Windows and macOS.
+# Linux packaging stays on the old egui client for now, but shared core changes
+# are still covered by the Windows core/bench check below.
 #
-# NOTE: the macOS leg has not been run for real yet — this repo has never
-# had a macOS build attempt outside this workflow. Expect it to need a few
-# iterations the first time it actually runs.
+# NOTE: the macOS leg has not been run for real yet. Expect the first actual
+# macOS run to expose packaging or permission issues that need follow-up fixes.
 
 on:
   push:
@@ -28,6 +26,43 @@ on:
   workflow_dispatch:
 
 jobs:
+  core-bench-check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check EVRTCK production bench runner
+        run: cargo check --bin evrtck_prod_bench
+
+      - name: Check PowerShell release and diagnostic scripts
+        shell: pwsh
+        run: |
+          $scripts = @(
+            ".\scripts\collect-next-diagnostics.ps1",
+            ".\scripts\diagnose-vm-cpu.ps1",
+            ".\scripts\run-evrtck-prod-bench.ps1",
+            ".\scripts\summarize-evrtck-prod-bench.ps1",
+            ".\desktop-next\scripts\generate-update-manifest.ps1",
+            ".\desktop-next\scripts\package-windows-installer.ps1",
+            ".\desktop-next\scripts\package-windows-portable.ps1",
+            ".\desktop-next\scripts\validate-windows-installer-layout.ps1",
+            ".\desktop-next\scripts\validate-release-artifacts.ps1"
+          )
+          foreach ($script in $scripts) {
+            $errors = $null
+            [System.Management.Automation.PSParser]::Tokenize((Get-Content $script -Raw), [ref]$errors) | Out-Null
+            if ($errors) {
+              $errors
+              exit 1
+            }
+          }
+
   build-and-test:
     strategy:
       fail-fast: false
@@ -49,10 +84,10 @@ jobs:
           workspaces: desktop-next
 
       - name: Build (debug)
-        run: cargo build --bin evertydesk-launcher --bin evertydesk-viewer --features viewer-core
+        run: cargo build --features viewer-core --bins
 
       - name: Test
-        run: cargo test --lib
+        run: cargo test --features viewer-core --bins --lib
 
       - name: Clippy
-        run: cargo clippy --bin evertydesk-launcher --bin evertydesk-viewer --features viewer-core -- -D warnings
+        run: cargo clippy --features viewer-core --bins -- -D warnings

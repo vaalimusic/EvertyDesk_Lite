@@ -3,22 +3,22 @@ name: Release
 # Builds unsigned installers for desktop-next and attaches them to a GitHub
 # Release. Two ways in:
 #   - push a tag like `v0.2.0` -> builds that version, publishes as a DRAFT
-#     (you review and click Publish yourself — this is the deliberate,
+#     (you review and click Publish yourself -- this is the deliberate,
 #     "I decided this is a release" path).
 #   - the 1st of every month at 03:00 UTC -> builds whatever's on the
 #     default branch, versions it by date (vYY.M.0, e.g. v26.9.0 for
-#     September 2026 — two-digit year because MSI's ProductVersion caps the
+#     September 2026 -- two-digit year because MSI's ProductVersion caps the
 #     major field at 255), and PUBLISHES IMMEDIATELY, no human in the loop,
 #     marked as a GitHub pre-release so it never displaces a real reviewed
 #     release as "Latest". This is the "always have a current build
-#     available" path — if you want to gate it, remove the `schedule:`
+#     available" path -- if you want to gate it, remove the `schedule:`
 #     trigger below and cut releases by tag only.
 #
 # Unsigned: no code-signing certificate exists yet (see desktop-next/RELEASE.md).
 # Windows SmartScreen and macOS Gatekeeper will both warn users on first run
-# until that's set up — this workflow does not attempt to work around that.
+# until that's set up -- this workflow does not attempt to work around that.
 #
-# NOTE: the macOS packaging leg is unverified — this repo has never had a
+# NOTE: the macOS packaging leg is unverified -- this repo has never had a
 # real macOS build/package run. Expect the first release to need a
 # follow-up fix once the actual failure (if any) is visible in the logs.
 
@@ -31,7 +31,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to build (e.g. v0.2.0) — for manual re-runs"
+        description: "Tag to build (e.g. v0.2.0) -- for manual re-runs"
         required: false
 
 permissions:
@@ -91,14 +91,14 @@ jobs:
         # of WiX v7 requires accepting a paid "Open Source Maintenance Fee"
         # EULA (https://wixtoolset.org/osmf/) before the CLI will run at
         # all. wix/main.wxs is written against the free v4/v5 schema.
-        # 5.0.2 is the latest 5.x release on nuget.org as of writing — an
+        # 5.0.2 is the latest 5.x release on nuget.org as of writing -- an
         # exact pin instead of a NuGet version range, since `dotnet tool
         # install --version` range-syntax support isn't guaranteed across
         # SDK versions and this failed once already trying it.
         #
         # The extension needs the exact same pin: `wix extension add` with
         # no version also grabs latest (7.0.0), which doesn't match a 5.0.2
-        # CLI — "Could not find expected package root folder wixext5" is
+        # CLI -- "Could not find expected package root folder wixext5" is
         # WiX's way of saying the extension package is for the wrong major
         # version. WixToolset.UI.wixext 5.0.2 is confirmed on nuget.org.
         run: |
@@ -107,14 +107,17 @@ jobs:
 
       - name: Build and package
         shell: pwsh
-        run: ./scripts/package-windows-installer.ps1
+        run: |
+          ./desktop-next/scripts/package-windows-installer.ps1
+          ./desktop-next/scripts/package-windows-portable.ps1
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows-installer
           path: |
-            dist/*.msi
-            dist/*.sha256
+            desktop-next/dist/*.msi
+            desktop-next/dist/*.zip
+            desktop-next/dist/*.sha256
 
   macos-dmg:
     needs: determine-version
@@ -134,24 +137,47 @@ jobs:
 
       - name: Build and package
         run: |
-          chmod +x scripts/package-macos-dmg.sh
-          scripts/package-macos-dmg.sh
+          chmod +x desktop-next/scripts/package-macos-dmg.sh
+          desktop-next/scripts/package-macos-dmg.sh
 
       - uses: actions/upload-artifact@v4
         with:
           name: macos-dmg
           path: |
-            dist/*.dmg
-            dist/*.sha256
+            desktop-next/dist/*.dmg
+            desktop-next/dist/*.sha256
 
   publish-release:
     needs: [determine-version, windows-installer, macos-dmg]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: dist-artifacts
           merge-multiple: true
+
+      - name: Generate update manifest
+        shell: pwsh
+        run: |
+          ./desktop-next/scripts/generate-update-manifest.ps1 `
+            -Version "${{ needs.determine-version.outputs.version }}" `
+            -BaseUrl "https://github.com/${{ github.repository }}/releases/download/${{ needs.determine-version.outputs.tag }}" `
+            -DistDir "dist-artifacts" `
+            -OutFile "dist-artifacts/latest.json" `
+            -Notes "${{ needs.determine-version.outputs.tag }}"
+
+      - name: Validate release artifacts
+        shell: pwsh
+        run: |
+          ./desktop-next/scripts/validate-release-artifacts.ps1 `
+            -Version "${{ needs.determine-version.outputs.version }}" `
+            -DistDir "dist-artifacts" `
+            -Manifest "dist-artifacts/latest.json" `
+            -RequireWindows `
+            -RequireMacos `
+            -RequireWindowsPortable
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -163,5 +189,7 @@ jobs:
           generate_release_notes: true
           files: |
             dist-artifacts/*.msi
+            dist-artifacts/*.zip
             dist-artifacts/*.dmg
             dist-artifacts/*.sha256
+            dist-artifacts/latest.json

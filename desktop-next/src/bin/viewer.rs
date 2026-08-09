@@ -2254,7 +2254,10 @@ impl Viewer {
         let upscaled_bgra = fsr.process_bgra(&bgra, frame.width, frame.height, native_w, native_h);
 
         let mut out_rgba = vec![0u8; upscaled_bgra.len()];
-        for (src, dst) in upscaled_bgra.chunks_exact(4).zip(out_rgba.chunks_exact_mut(4)) {
+        for (src, dst) in upscaled_bgra
+            .chunks_exact(4)
+            .zip(out_rgba.chunks_exact_mut(4))
+        {
             dst[0] = src[2]; // R
             dst[1] = src[1]; // G
             dst[2] = src[0]; // B
@@ -3553,7 +3556,6 @@ fn normalized_wheel_delta(delta: MouseScrollDelta) -> (i32, i32) {
     };
     (normalize(x), normalize(y))
 }
-
 
 fn audio_frame_is_audible(enabled: &AtomicBool, pcm: &[u8]) -> bool {
     !pcm.is_empty() && pcm.len() <= MAX_AUDIO_FRAME_BYTES && enabled.load(Ordering::Acquire)

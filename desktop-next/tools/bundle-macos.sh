@@ -12,11 +12,11 @@ ICONSET_DIR="$TARGET_DIR/EvertyDeskNext.iconset"
 
 LAUNCHER="$TARGET_DIR/evertydesk-launcher"
 VIEWER="$TARGET_DIR/evertydesk-viewer"
+RDP_VIEWER="$TARGET_DIR/evertydesk-rdp-viewer"
 
-if [[ ! -x "$LAUNCHER" || ! -x "$VIEWER" ]]; then
-  echo "Build launcher and viewer before bundling:" >&2
-  echo "  cargo build --manifest-path desktop-next/Cargo.toml --bin evertydesk-launcher --features viewer-core" >&2
-  echo "  cargo build --manifest-path desktop-next/Cargo.toml --bin evertydesk-viewer --features viewer-core" >&2
+if [[ ! -x "$LAUNCHER" || ! -x "$VIEWER" || ! -x "$RDP_VIEWER" ]]; then
+  echo "Build all desktop-next binaries before bundling:" >&2
+  echo "  cargo build --manifest-path desktop-next/Cargo.toml --features viewer-core --bins" >&2
   exit 1
 fi
 
@@ -25,7 +25,11 @@ mkdir -p "$MACOS_DIR" "$RESOURCES_DIR" "$ICONSET_DIR"
 cp "$ROOT_DIR/macos/Info.plist" "$CONTENTS_DIR/Info.plist"
 cp "$LAUNCHER" "$MACOS_DIR/evertydesk-launcher"
 cp "$VIEWER" "$MACOS_DIR/evertydesk-viewer"
-chmod 755 "$MACOS_DIR/evertydesk-launcher" "$MACOS_DIR/evertydesk-viewer"
+cp "$RDP_VIEWER" "$MACOS_DIR/evertydesk-rdp-viewer"
+chmod 755 \
+  "$MACOS_DIR/evertydesk-launcher" \
+  "$MACOS_DIR/evertydesk-viewer" \
+  "$MACOS_DIR/evertydesk-rdp-viewer"
 
 sips -z 16 16 "$ROOT_DIR/desktop-next-logo.png" --out "$ICONSET_DIR/icon_16x16.png" >/dev/null
 sips -z 32 32 "$ROOT_DIR/desktop-next-logo.png" --out "$ICONSET_DIR/icon_16x16@2x.png" >/dev/null

@@ -58,6 +58,17 @@ desktop/support use, not a general video codec. For full-motion content
 H.264/H.265/VP8/VP9/AV1 via NVENC, Windows Media Foundation, and
 openh264, RustDesk-protocol-compatible.
 
+For publishable EVRTCK numbers, use the production benchmark runner instead
+of copying ad-hoc Criterion output:
+
+```powershell
+.\scripts\run-evrtck-prod-bench.ps1 -Iterations 300 -Warmup 30
+```
+
+It writes metadata, CSV, and JSONL reports with CPU/OS/rustc/commit hash,
+payload sizes, p50/p95/p99, and separate encode/decode/roundtrip timings.
+See [`docs/EVRTCK_BENCHMARKING.md`](docs/EVRTCK_BENCHMARKING.md).
+
 ## Transport: EVRT
 
 A UDP protocol (24-byte header, MTU-safe) with a feedback loop and

@@ -82,19 +82,19 @@ pub mod hyperv;
 // hyperv_rdp, which is Windows-only for its own separate reason — Hyper-V
 // itself doesn't exist elsewhere), so this costs nothing today.
 #[cfg(windows)]
-pub mod vbox_rdp;
-#[cfg(windows)]
 pub mod hyperv_rdp;
+#[cfg(windows)]
+pub mod vbox_rdp;
 
 // Phase 3/4 (TZ_HOST_SERVICE.md): OS service install/query — Windows service
 // (Session 0 + linked-token elevation) / systemd --user / launchd. Exposed
 // from the core library, not just main.rs's own binary, so other desktop
 // front-ends (e.g. desktop-next) can offer the same "install service" path
 // without reimplementing it.
-#[cfg(windows)]
-pub mod winservice;
 #[cfg(unix)]
 pub mod host_service_unix;
+#[cfg(windows)]
+pub mod winservice;
 
 #[cfg(feature = "live-vpx-system")]
 pub mod vpx_system;

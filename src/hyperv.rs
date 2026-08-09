@@ -4,12 +4,20 @@
 //! Screen: Hyper-V thumbnail snapshots, converted from RGB565 to RGBA.
 //! Input:  Msvm_Keyboard / Msvm_SyntheticMouse WMI methods.
 
-use std::{collections::HashMap, mem::ManuallyDrop, sync::mpsc, time::Duration};
+use std::{
+    collections::HashMap,
+    mem::ManuallyDrop,
+    process::{Command, Output, Stdio},
+    sync::{mpsc, Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const VMRUN_CMD_TIMEOUT: Duration = Duration::from_secs(4);
+const VMRUN_LIST_CACHE_TTL: Duration = Duration::from_secs(30);
 
 use windows::{
     core::{BSTR, PCWSTR},
@@ -509,17 +517,25 @@ fn list_virtualbox_vms() -> Vec<VmInfo> {
 }
 
 fn list_vmware_vms() -> Vec<VmInfo> {
+    static CACHE: OnceLock<Mutex<Option<(Instant, Vec<VmInfo>)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some((updated_at, cached)) = &*guard {
+            if updated_at.elapsed() < VMRUN_LIST_CACHE_TTL {
+                return cached.clone();
+            }
+        }
+    }
+
     let Some(vmrun) = find_vmrun() else {
         return Vec::new();
     };
-    let mut vm_cmd = std::process::Command::new(&vmrun);
+    let mut vm_cmd = Command::new(&vmrun);
     vm_cmd.arg("list");
-    #[cfg(windows)]
-    vm_cmd.creation_flags(CREATE_NO_WINDOW);
-    let Ok(out) = vm_cmd.output() else {
+    let Some(out) = command_output_timeout(vm_cmd, VMRUN_CMD_TIMEOUT) else {
         return Vec::new();
     };
-    String::from_utf8_lossy(&out.stdout)
+    let vms: Vec<VmInfo> = String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter(|line| line.trim_end().ends_with(".vmx"))
         .map(|path| {
@@ -538,27 +554,59 @@ fn list_vmware_vms() -> Vec<VmInfo> {
                 console_mode: ConsoleMode::Other,
             }
         })
-        .collect()
+        .collect();
+
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((Instant::now(), vms.clone()));
+    }
+    vms
 }
 
 fn find_vmrun() -> Option<String> {
-    let mut probe = std::process::Command::new("vmrun");
-    probe.arg("list");
+    static CACHE: OnceLock<Option<String>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let mut probe = Command::new("vmrun");
+            probe.arg("list");
+            if command_output_timeout(probe, VMRUN_CMD_TIMEOUT).is_some() {
+                return Some("vmrun".to_owned());
+            }
+            for path in [
+                r"C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe",
+                r"C:\Program Files\VMware\VMware Workstation\vmrun.exe",
+                r"C:\Program Files (x86)\VMware\VMware Player\vmrun.exe",
+            ] {
+                if std::path::Path::new(path).exists() {
+                    return Some(path.to_owned());
+                }
+            }
+            None
+        })
+        .clone()
+}
+
+fn command_output_timeout(mut cmd: Command, timeout: Duration) -> Option<Output> {
     #[cfg(windows)]
-    probe.creation_flags(CREATE_NO_WINDOW);
-    if probe.output().is_ok() {
-        return Some("vmrun".to_owned());
-    }
-    for path in [
-        r"C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe",
-        r"C:\Program Files\VMware\VMware Workstation\vmrun.exe",
-        r"C:\Program Files (x86)\VMware\VMware Player\vmrun.exe",
-    ] {
-        if std::path::Path::new(path).exists() {
-            return Some(path.to_owned());
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => return child.wait_with_output().ok(),
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => return None,
         }
     }
-    None
 }
 
 /// Query Msvm_SummaryInformation for heartbeat status of all VMs.
