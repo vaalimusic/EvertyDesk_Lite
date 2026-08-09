@@ -101,9 +101,16 @@ jobs:
         # CLI -- "Could not find expected package root folder wixext5" is
         # WiX's way of saying the extension package is for the wrong major
         # version. WixToolset.UI.wixext 5.0.2 is confirmed on nuget.org.
+        #
+        # `-g` (global) is required here too: a non-global `wix extension add`
+        # caches the extension scoped to the current working directory, but
+        # `wix build` runs later from desktop-next/ (a different directory,
+        # via the packaging script's Push-Location) and would report
+        # WIX0144 "extension could not be found" otherwise. The build
+        # invocation also pins the version on `-ext` for the same reason.
         run: |
           dotnet tool install --global wix --version 5.0.2
-          wix extension add WixToolset.UI.wixext/5.0.2
+          wix extension add -g WixToolset.UI.wixext/5.0.2
 
       - name: Build and package
         shell: pwsh

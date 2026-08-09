@@ -75,19 +75,47 @@ fn read_bootstrap() -> Result<RdpBootstrap, String> {
 
 #[cfg(windows)]
 type RdpSessionHandle = evertydesk_core::hyperv_rdp::RdpSession;
+#[cfg(windows)]
+use evertydesk_core::vbox_rdp::{Poll, VrdeCmd};
+
+// `hyperv_rdp::RdpSession` (Windows-only, backed by real ironrdp/VRDE
+// plumbing) reuses `vbox_rdp`'s `Poll`/`VrdeCmd` as its own command and
+// poll-result vocabulary, and that whole module is Windows-only (it needs
+// `native_tls`, a `[target.'cfg(windows)'.dependencies]`-only crate — see
+// src/lib.rs). Everywhere below constructs `VrdeCmd` and matches `Poll`
+// unconditionally, so non-Windows needs same-named stand-ins even though
+// `self.session` is always `None` there (see the `connect()` stub above)
+// and none of this ever actually runs.
+#[cfg(not(windows))]
+enum VrdeCmd {
+    MouseMove { x: u16, y: u16 },
+    MouseButton { button: u8, down: bool },
+    MouseWheel { delta: i16 },
+    KeyDown { scancode: u8, extended: bool },
+    KeyUp { scancode: u8, extended: bool },
+    Text(String),
+    Stop,
+}
+
+#[cfg(not(windows))]
+enum Poll<T> {
+    Item(T),
+    Empty,
+    Dead,
+}
 
 #[cfg(not(windows))]
 struct RdpSessionHandle;
 
 #[cfg(not(windows))]
 impl RdpSessionHandle {
-    fn poll_frame(&self) -> evertydesk_core::vbox_rdp::Poll<(u32, u32, Vec<u8>)> {
-        evertydesk_core::vbox_rdp::Poll::Dead
+    fn poll_frame(&self) -> Poll<(u32, u32, Vec<u8>)> {
+        Poll::Dead
     }
-    fn poll_status(&self) -> evertydesk_core::vbox_rdp::Poll<String> {
-        evertydesk_core::vbox_rdp::Poll::Dead
+    fn poll_status(&self) -> Poll<String> {
+        Poll::Dead
     }
-    fn send(&self, _cmd: evertydesk_core::vbox_rdp::VrdeCmd) {}
+    fn send(&self, _cmd: VrdeCmd) {}
 }
 
 struct App {
@@ -167,7 +195,7 @@ impl App {
         };
         for button in self.pressed_mouse_buttons.drain(..) {
             if let Some(index) = mouse_button_index(button) {
-                session.send(evertydesk_core::vbox_rdp::VrdeCmd::MouseButton {
+                session.send(VrdeCmd::MouseButton {
                     button: index,
                     down: false,
                 });
@@ -182,12 +210,12 @@ impl App {
             };
             let outcome = session.poll_status();
             match outcome {
-                evertydesk_core::vbox_rdp::Poll::Item(message) => {
+                Poll::Item(message) => {
                     self.status = message;
                     self.set_window_title();
                 }
-                evertydesk_core::vbox_rdp::Poll::Empty => break,
-                evertydesk_core::vbox_rdp::Poll::Dead => {
+                Poll::Empty => break,
+                Poll::Dead => {
                     self.status = "Сессия завершена".to_owned();
                     self.set_window_title();
                     self.session = None;
@@ -202,11 +230,11 @@ impl App {
             };
             let outcome = session.poll_frame();
             match outcome {
-                evertydesk_core::vbox_rdp::Poll::Item((width, height, rgba)) => {
+                Poll::Item((width, height, rgba)) => {
                     latest_frame = Some((width, height, rgba));
                 }
-                evertydesk_core::vbox_rdp::Poll::Empty => break,
-                evertydesk_core::vbox_rdp::Poll::Dead => {
+                Poll::Empty => break,
+                Poll::Dead => {
                     self.status = "Сессия завершена".to_owned();
                     self.set_window_title();
                     self.session = None;
@@ -284,7 +312,7 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => {
                 self.release_pressed_buttons();
                 if let Some(session) = self.session.take() {
-                    session.send(evertydesk_core::vbox_rdp::VrdeCmd::Stop);
+                    session.send(VrdeCmd::Stop);
                 }
                 event_loop.exit();
             }
@@ -309,7 +337,7 @@ impl ApplicationHandler for App {
                 let y = y.min(u16::MAX as usize) as u16;
                 self.cursor_position = Some((i32::from(x), i32::from(y)));
                 if let Some(session) = &self.session {
-                    session.send(evertydesk_core::vbox_rdp::VrdeCmd::MouseMove { x, y });
+                    session.send(VrdeCmd::MouseMove { x, y });
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -325,7 +353,7 @@ impl ApplicationHandler for App {
                     self.pressed_mouse_buttons.retain(|held| *held != button);
                 }
                 if let Some(session) = &self.session {
-                    session.send(evertydesk_core::vbox_rdp::VrdeCmd::MouseButton {
+                    session.send(VrdeCmd::MouseButton {
                         button: index,
                         down,
                     });
@@ -341,7 +369,7 @@ impl ApplicationHandler for App {
                 }
                 let delta = (steps.clamp(-10.0, 10.0) * 120.0) as i16;
                 if let Some(session) = &self.session {
-                    session.send(evertydesk_core::vbox_rdp::VrdeCmd::MouseWheel { delta });
+                    session.send(VrdeCmd::MouseWheel { delta });
                 }
             }
             WindowEvent::ModifiersChanged(modifiers) => {
@@ -392,7 +420,7 @@ impl App {
         }
         if !combo && pressed && rdp_key_is_plain_text(code) {
             if let Some(text) = event.text.as_ref().filter(|text| !text.is_empty()) {
-                session.send(evertydesk_core::vbox_rdp::VrdeCmd::Text(text.to_string()));
+                session.send(VrdeCmd::Text(text.to_string()));
                 return;
             }
         }
@@ -417,16 +445,16 @@ impl App {
 
         if pressed {
             for (m_scancode, m_extended) in &mods {
-                session.send(evertydesk_core::vbox_rdp::VrdeCmd::KeyDown {
+                session.send(VrdeCmd::KeyDown {
                     scancode: *m_scancode,
                     extended: *m_extended,
                 });
             }
-            session.send(evertydesk_core::vbox_rdp::VrdeCmd::KeyDown { scancode, extended });
+            session.send(VrdeCmd::KeyDown { scancode, extended });
         } else {
-            session.send(evertydesk_core::vbox_rdp::VrdeCmd::KeyUp { scancode, extended });
+            session.send(VrdeCmd::KeyUp { scancode, extended });
             for (m_scancode, m_extended) in mods.iter().rev() {
-                session.send(evertydesk_core::vbox_rdp::VrdeCmd::KeyUp {
+                session.send(VrdeCmd::KeyUp {
                     scancode: *m_scancode,
                     extended: *m_extended,
                 });

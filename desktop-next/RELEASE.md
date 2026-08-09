@@ -41,7 +41,10 @@ cd D:\github_project\EvertyDesk_Lite\desktop-next
 
 # Needs WiX:
 #   dotnet tool install --global wix --version 5.0.2
-#   wix extension add WixToolset.UI.wixext/5.0.2
+#   wix extension add -g WixToolset.UI.wixext/5.0.2
+# (the -g/global flag matters: a non-global extension add is cached
+# relative to the current directory, and this script runs wix build from
+# desktop-next/, not the repo root)
 .\scripts\package-windows-installer.ps1 -StopRunningBuildProcesses
 
 # Does not need WiX; useful for tester builds.

@@ -75,7 +75,7 @@ try {
 
     wix build `
         "$wxs" `
-        -ext WixToolset.UI.wixext `
+        -ext WixToolset.UI.wixext/5.0.2 `
         -d EvertyDeskVersion=$version `
         -d BinDir="$binDir" `
         -d AssetsDir="$assetsDir" `

@@ -78,9 +78,12 @@ pub mod hyperv;
 // available to link against on macOS/Linux at all). This was already true
 // when this lived as an ungated `mod vbox_rdp;` in main.rs — it just never
 // surfaced because main.rs was never actually compiled on those platforms
-// either. desktop-next doesn't call into vbox_rdp at all yet (only
-// hyperv_rdp, which is Windows-only for its own separate reason — Hyper-V
-// itself doesn't exist elsewhere), so this costs nothing today.
+// either. hyperv_rdp reuses vbox_rdp's Poll/VrdeCmd types and ironrdp
+// helpers, so both are Windows-only together. desktop-next/src/bin/
+// rdp_viewer.rs references vbox_rdp::{Poll, VrdeCmd} too — its non-Windows
+// build defines local same-named stand-ins instead of depending on this
+// module, since RdpSessionHandle there is a no-op stub on non-Windows
+// anyway (see the #[cfg(not(windows))] block in rdp_viewer.rs).
 #[cfg(windows)]
 pub mod hyperv_rdp;
 #[cfg(windows)]
