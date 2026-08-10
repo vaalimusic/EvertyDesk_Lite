@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_RECENT_CONNECTIONS: usize = 12;
 const MAX_STORE_BYTES: u64 = 1024 * 1024;
+pub const DEFAULT_UPDATE_GITHUB_REPO: &str = "vaalimusic/EvertyDesk_Lite";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LauncherStore {
@@ -22,6 +23,20 @@ pub struct LauncherStore {
     pub audio_enabled: bool,
     #[serde(default = "default_true")]
     pub start_host_on_launch: bool,
+    #[serde(default)]
+    pub launch_on_startup: bool,
+    #[serde(default)]
+    pub show_start_menu_shortcut: bool,
+    #[serde(default)]
+    pub keep_taskbar_icon_on_close: bool,
+    #[serde(default)]
+    pub language: LanguagePreference,
+    #[serde(default = "default_update_channel")]
+    pub update_channel: UpdateChannelPreference,
+    #[serde(default)]
+    pub update_manifest_url: String,
+    #[serde(default = "default_update_github_repo")]
+    pub update_github_repo: String,
     /// Non-secret account identifier. The access token is kept in the OS
     /// credential vault and is deliberately never serialized here.
     #[serde(default)]
@@ -59,6 +74,13 @@ impl Default for LauncherStore {
             scaling: ViewerScaling::default(),
             audio_enabled: true,
             start_host_on_launch: true,
+            launch_on_startup: false,
+            show_start_menu_shortcut: false,
+            keep_taskbar_icon_on_close: false,
+            language: LanguagePreference::default(),
+            update_channel: UpdateChannelPreference::GithubRelease,
+            update_manifest_url: String::new(),
+            update_github_repo: DEFAULT_UPDATE_GITHUB_REPO.to_owned(),
             address_book_account: String::new(),
             address_book_guid: String::new(),
             address_book_last_sync_unix: 0,
@@ -77,6 +99,72 @@ impl Default for LauncherStore {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_update_channel() -> UpdateChannelPreference {
+    UpdateChannelPreference::GithubRelease
+}
+
+fn default_update_github_repo() -> String {
+    DEFAULT_UPDATE_GITHUB_REPO.to_owned()
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LanguagePreference {
+    #[default]
+    System,
+    Russian,
+    English,
+}
+
+impl LanguagePreference {
+    pub const ALL: [Self; 3] = [Self::System, Self::Russian, Self::English];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::Russian => "Русский",
+            Self::English => "English",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::System => "Use the operating system language when a translation exists.",
+            Self::Russian => "Русский интерфейс.",
+            Self::English => "English interface.",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateChannelPreference {
+    #[default]
+    Disabled,
+    ManifestUrl,
+    GithubRelease,
+}
+
+impl UpdateChannelPreference {
+    pub const ALL: [Self; 3] = [Self::Disabled, Self::ManifestUrl, Self::GithubRelease];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "Отключено",
+            Self::ManifestUrl => "Manifest URL",
+            Self::GithubRelease => "GitHub Releases",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Disabled => "Автоматическая проверка обновлений не выполняется.",
+            Self::ManifestUrl => "Проверять HTTPS latest.json с вашим manifest-контрактом.",
+            Self::GithubRelease => "Искать latest.json в последнем GitHub Release.",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,7 +279,12 @@ impl LauncherStore {
 
     pub fn load_from(path: &Path) -> io::Result<Self> {
         match read_store(path) {
-            Ok(store) => Ok(store),
+            Ok(mut store) => {
+                if store.repair_legacy_mojibake() {
+                    let _ = store.save_to(path);
+                }
+                Ok(store)
+            }
             Err(primary_error)
                 if matches!(
                     primary_error.kind(),
@@ -200,11 +293,14 @@ impl LauncherStore {
             {
                 let backup = backup_path(path);
                 match read_store(&backup) {
-                    Ok(store) => {
+                    Ok(mut store) => {
                         if primary_error.kind() == io::ErrorKind::InvalidData {
                             let _ = fs::rename(path, corrupt_path(path));
                         }
                         let _ = fs::copy(&backup, path);
+                        if store.repair_legacy_mojibake() {
+                            let _ = store.save_to(path);
+                        }
                         Ok(store)
                     }
                     Err(backup_error) if backup_error.kind() == io::ErrorKind::NotFound => {
@@ -472,6 +568,51 @@ impl LauncherStore {
         self.recent.clear();
         true
     }
+
+    fn repair_legacy_mojibake(&mut self) -> bool {
+        let mut changed = false;
+        changed |= repair_legacy_mojibake_field(&mut self.address_book_account);
+        changed |= repair_legacy_mojibake_field(&mut self.address_book_guid);
+        changed |= repair_legacy_mojibake_field(&mut self.vm_target_id);
+        changed |= repair_legacy_mojibake_field(&mut self.update_manifest_url);
+        changed |= repair_legacy_mojibake_field(&mut self.update_github_repo);
+        if self.update_channel == UpdateChannelPreference::Disabled
+            && self.update_manifest_url.trim().is_empty()
+            && self.update_github_repo.trim().is_empty()
+        {
+            self.update_channel = UpdateChannelPreference::GithubRelease;
+            self.update_github_repo = DEFAULT_UPDATE_GITHUB_REPO.to_owned();
+            changed = true;
+        }
+        for contact in &mut self.contacts {
+            changed |= repair_legacy_mojibake_field(&mut contact.name);
+            changed |= repair_legacy_mojibake_field(&mut contact.group);
+            changed |= repair_legacy_mojibake_field(&mut contact.note);
+            let tags = contact
+                .tags
+                .iter()
+                .map(|tag| repair_legacy_mojibake_text(tag))
+                .collect();
+            if contact.tags != tags {
+                changed = true;
+                contact.tags = tags;
+            }
+            let normalized_tags = normalize_contact_tags(&contact.tags);
+            if contact.tags != normalized_tags {
+                changed = true;
+                contact.tags = normalized_tags;
+            }
+        }
+        for connection in &mut self.recent {
+            let reason =
+                sanitize_end_reason(&repair_legacy_mojibake_text(&connection.last_end_reason));
+            if connection.last_end_reason != reason {
+                changed = true;
+                connection.last_end_reason = reason;
+            }
+        }
+        changed
+    }
 }
 
 fn sanitize_end_reason(reason: &str) -> String {
@@ -482,6 +623,82 @@ fn sanitize_end_reason(reason: &str) -> String {
         .take(120)
         .collect()
 }
+
+fn repair_legacy_mojibake_text(text: &str) -> String {
+    if !looks_like_legacy_mojibake(text) {
+        return text.to_owned();
+    }
+    let mut bytes = Vec::with_capacity(text.len());
+    for character in text.chars() {
+        match encode_windows_1251(character) {
+            Some(byte) => bytes.push(byte),
+            None => return text.to_owned(),
+        }
+    }
+    let Ok(repaired) = String::from_utf8(bytes) else {
+        return text.to_owned();
+    };
+    if mojibake_score(&repaired) < mojibake_score(text) {
+        repaired
+    } else {
+        text.to_owned()
+    }
+}
+
+fn repair_legacy_mojibake_field(field: &mut String) -> bool {
+    let repaired = repair_legacy_mojibake_text(field);
+    if *field == repaired {
+        false
+    } else {
+        *field = repaired;
+        true
+    }
+}
+
+fn looks_like_legacy_mojibake(text: &str) -> bool {
+    text.contains("Р")
+        || text.contains("С")
+        || text.contains("В«")
+        || text.contains("В»")
+        || text.contains("В·")
+        || text.contains("вЂ")
+}
+
+fn mojibake_score(text: &str) -> usize {
+    text.matches('Р').count()
+        + text.matches('С').count()
+        + text.matches('В').count()
+        + text.matches("вЂ").count() * 3
+}
+
+fn encode_windows_1251(character: char) -> Option<u8> {
+    if character.is_ascii() {
+        return Some(character as u8);
+    }
+    WINDOWS_1251_DECODE
+        .iter()
+        .position(|decoded| *decoded == character)
+        .map(|index| 0x80 + index as u8)
+}
+
+const WINDOWS_1251_DECODE: [char; 128] = [
+    '\u{0402}', '\u{0403}', '\u{201A}', '\u{0453}', '\u{201E}', '\u{2026}', '\u{2020}', '\u{2021}',
+    '\u{20AC}', '\u{2030}', '\u{0409}', '\u{2039}', '\u{040A}', '\u{040C}', '\u{040B}', '\u{040F}',
+    '\u{0452}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{2022}', '\u{2013}', '\u{2014}',
+    '\u{0098}', '\u{2122}', '\u{0459}', '\u{203A}', '\u{045A}', '\u{045C}', '\u{045B}', '\u{045F}',
+    '\u{00A0}', '\u{040E}', '\u{045E}', '\u{0408}', '\u{00A4}', '\u{0490}', '\u{00A6}', '\u{00A7}',
+    '\u{0401}', '\u{00A9}', '\u{0404}', '\u{00AB}', '\u{00AC}', '\u{00AD}', '\u{00AE}', '\u{0407}',
+    '\u{00B0}', '\u{00B1}', '\u{0406}', '\u{0456}', '\u{0491}', '\u{00B5}', '\u{00B6}', '\u{00B7}',
+    '\u{0451}', '\u{2116}', '\u{0454}', '\u{00BB}', '\u{0458}', '\u{0405}', '\u{0455}', '\u{0457}',
+    '\u{0410}', '\u{0411}', '\u{0412}', '\u{0413}', '\u{0414}', '\u{0415}', '\u{0416}', '\u{0417}',
+    '\u{0418}', '\u{0419}', '\u{041A}', '\u{041B}', '\u{041C}', '\u{041D}', '\u{041E}', '\u{041F}',
+    '\u{0420}', '\u{0421}', '\u{0422}', '\u{0423}', '\u{0424}', '\u{0425}', '\u{0426}', '\u{0427}',
+    '\u{0428}', '\u{0429}', '\u{042A}', '\u{042B}', '\u{042C}', '\u{042D}', '\u{042E}', '\u{042F}',
+    '\u{0430}', '\u{0431}', '\u{0432}', '\u{0433}', '\u{0434}', '\u{0435}', '\u{0436}', '\u{0437}',
+    '\u{0438}', '\u{0439}', '\u{043A}', '\u{043B}', '\u{043C}', '\u{043D}', '\u{043E}', '\u{043F}',
+    '\u{0440}', '\u{0441}', '\u{0442}', '\u{0443}', '\u{0444}', '\u{0445}', '\u{0446}', '\u{0447}',
+    '\u{0448}', '\u{0449}', '\u{044A}', '\u{044B}', '\u{044C}', '\u{044D}', '\u{044E}', '\u{044F}',
+];
 
 fn normalize_contact_id(id: &str) -> String {
     id.chars()
@@ -775,6 +992,12 @@ mod tests {
         store.toggle_favorite("123 456 789");
         store.record_recent("123 456 789");
         store.start_host_on_launch = true;
+        store.launch_on_startup = true;
+        store.show_start_menu_shortcut = true;
+        store.keep_taskbar_icon_on_close = true;
+        store.language = LanguagePreference::English;
+        store.update_channel = UpdateChannelPreference::GithubRelease;
+        store.update_github_repo = "EvertyDesk/EvertyDesk_Lite".to_owned();
 
         let encoded = serde_json::to_vec(&store).unwrap();
         let decoded: LauncherStore = serde_json::from_slice(&encoded).unwrap();
@@ -888,6 +1111,79 @@ mod tests {
     }
 
     #[test]
+    fn legacy_mojibake_store_text_is_repaired_on_load() {
+        let directory = TestDirectory::new("legacy-mojibake");
+        let store_path = directory.store_path();
+        fs::write(
+            &store_path,
+            r#"{
+              "contacts": [
+                {
+                  "name": "\u0420\u040e\u0421\u201a\u0420\u00b0\u0421\u0402\u0420\u00bb\u0420\u0451\u0420\u0405\u0420\u0454 \u0420\u0459\u0420\u00b0\u0421\u0403\u0421\u0403\u0420\u00b0",
+                  "remote_id": "424748656",
+                  "favorite": false,
+                  "group": "",
+                  "tags": [],
+                  "note": "laptop-tv032i24"
+                },
+                {
+                  "name": "1123286472",
+                  "remote_id": "1123286472",
+                  "favorite": true,
+                  "group": "\u0420\u040e\u0420\u00b5\u0420\u0458\u0421\u040a\u0421\u040f",
+                  "tags": ["\u0420\u2018\u0421\u0402\u0420\u00b0\u0421\u201a"],
+                  "note": "timurvicomp"
+                }
+              ],
+              "recent": [
+                {
+                  "remote_id": "037350529",
+                  "last_used_unix": 1,
+                  "direction": "outgoing",
+                  "duration_seconds": 55,
+                  "reconnect_count": 0,
+                  "last_end_reason": "\u0420\u045b\u0421\u201a\u0420\u0454\u0420\u00bb\u0421\u040b\u0421\u2021\u0420\u00b5\u0420\u0405\u0420\u0455 \u0420\u0457\u0420\u0455\u0420\u00bb\u0421\u040a\u0420\u00b7\u0420\u0455\u0420\u0406\u0420\u00b0\u0421\u201a\u0420\u00b5\u0420\u00bb\u0420\u00b5\u0420\u0458"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let store = LauncherStore::load_from(&store_path).unwrap();
+
+        assert_eq!(store.contacts[0].name, "Старлинк Касса");
+        assert_eq!(store.contacts[1].group, "Семья");
+        assert_eq!(store.contacts[1].tags, vec!["Брат".to_owned()]);
+        assert_eq!(store.recent[0].last_end_reason, "Отключено пользователем");
+    }
+
+    #[test]
+    fn legacy_mojibake_repair_keeps_valid_russian_text() {
+        let mut store = LauncherStore::default();
+        store
+            .upsert_contact_details_with_tags(
+                "Рабочий ПК",
+                "123",
+                "Офис / Касса",
+                "Нормальная заметка",
+                &["Прод".to_owned()],
+            )
+            .unwrap();
+        store.record_recent("123");
+        store.finish_incoming("123", 10, "Окно viewer закрыто пользователем");
+
+        store.repair_legacy_mojibake();
+
+        assert_eq!(store.contacts[0].name, "Рабочий ПК");
+        assert_eq!(store.contacts[0].group, "Офис / Касса");
+        assert_eq!(store.contacts[0].tags, vec!["Прод".to_owned()]);
+        assert_eq!(
+            store.recent[0].last_end_reason,
+            "Окно viewer закрыто пользователем"
+        );
+    }
+
+    #[test]
     fn incoming_session_records_direction_duration_and_bounded_reason() {
         let mut store = LauncherStore::default();
         store.record_incoming(" 456 ");
@@ -909,6 +1205,16 @@ mod tests {
         assert_eq!(decoded.scaling, ViewerScaling::SmoothFit);
         assert!(decoded.audio_enabled);
         assert!(decoded.start_host_on_launch);
+        assert!(!decoded.launch_on_startup);
+        assert!(!decoded.show_start_menu_shortcut);
+        assert!(!decoded.keep_taskbar_icon_on_close);
+        assert_eq!(decoded.language, LanguagePreference::System);
+        assert_eq!(
+            decoded.update_channel,
+            UpdateChannelPreference::GithubRelease
+        );
+        assert!(decoded.update_manifest_url.is_empty());
+        assert_eq!(decoded.update_github_repo, DEFAULT_UPDATE_GITHUB_REPO);
         assert!(decoded.address_book_account.is_empty());
         assert!(decoded.address_book_guid.is_empty());
         assert_eq!(decoded.address_book_last_sync_unix, 0);

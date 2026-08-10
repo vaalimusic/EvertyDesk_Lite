@@ -9,10 +9,13 @@ use evertydesk_core::settings::{
 use evertydesk_core::virtualbox;
 use evertydesk_core::vm_bridge;
 use evertydesk_desktop_next::credential_store;
+use evertydesk_desktop_next::i18n::{tr, TextKey, UiLanguage};
 use evertydesk_desktop_next::ipc::{read_bounded_line, MAX_IPC_LINE_BYTES};
+#[cfg(test)]
+use evertydesk_desktop_next::launcher_store::DEFAULT_UPDATE_GITHUB_REPO;
 use evertydesk_desktop_next::launcher_store::{
-    normalize_contact_tags, ConnectionDirection, Contact, GameCodecPreference, LauncherStore,
-    RecentConnection, VmProviderPreference,
+    normalize_contact_tags, ConnectionDirection, Contact, GameCodecPreference, LanguagePreference,
+    LauncherStore, RecentConnection, UpdateChannelPreference, VmProviderPreference,
 };
 use evertydesk_desktop_next::protocol::{
     ConnectionQuality, RdpBootstrap, RdpTarget, ViewerBootstrap, ViewerCommand, ViewerControl,
@@ -37,10 +40,14 @@ use iced::{
 };
 use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, VecDeque};
 use std::env;
+#[cfg(windows)]
+use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::path::PathBuf;
+#[cfg(windows)]
+use std::process::Command;
 use std::process::{ChildStderr, ChildStdout};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc;
@@ -65,6 +72,7 @@ const MAX_PERMANENT_PASSWORD_CHARS: usize = 128;
 const APPROVAL_UI_TIMEOUT: Duration = Duration::from_secs(40);
 const SINGLE_INSTANCE_PORT: u16 = 47_831;
 const SINGLE_INSTANCE_REQUEST: &str = "EVERTYDESK_LAUNCHER_FOCUS_V1";
+const SINGLE_INSTANCE_BACKGROUND_REQUEST: &str = "EVERTYDESK_LAUNCHER_BACKGROUND_V1";
 const SINGLE_INSTANCE_RESPONSE: &str = "EVERTYDESK_LAUNCHER_PRIMARY_V1";
 const SINGLE_INSTANCE_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_STARTUP_ENV_VALUE_CHARS: usize = 96;
@@ -129,7 +137,8 @@ pub fn main() -> iced::Result {
 
     install_process_diagnostics("launcher");
     set_current_process_app_user_model_id(WindowsAppUserModelId::Launcher);
-    match claim_single_instance() {
+    let start_in_background = launcher_start_in_background();
+    match claim_single_instance(start_in_background) {
         Ok(true) => {}
         Ok(false) => return Ok(()),
         Err(error) => {
@@ -196,6 +205,12 @@ fn cli_result(result: Result<(), String>) -> i32 {
     }
 }
 
+fn launcher_start_in_background() -> bool {
+    env::args()
+        .skip(1)
+        .any(|argument| matches!(argument.as_str(), "--background" | "--tray" | "--minimized"))
+}
+
 fn main_window_settings() -> iced::window::Settings {
     let mut window = iced::window::Settings {
         size: Size::new(920.0, 720.0),
@@ -208,6 +223,15 @@ fn main_window_settings() -> iced::window::Settings {
         window.exit_on_close_request = false;
         window.icon = iced::window::icon::from_rgba(tray_icon_rgba(), 32, 32).ok();
     }
+    window
+}
+
+fn background_init_window_settings() -> iced::window::Settings {
+    let mut window = main_window_settings();
+    window.visible = false;
+    window.decorations = false;
+    window.min_size = None;
+    window.size = Size::new(1.0, 1.0);
     window
 }
 
@@ -325,8 +349,11 @@ struct Launcher {
     permanent_password_status: String,
     last_temp_password_rotation: Instant,
     window_id: Option<iced::window::Id>,
+    background_window_id: Option<iced::window::Id>,
+    background_hide_attempts: u8,
     incoming_window_id: Option<iced::window::Id>,
     auth_window_id: Option<iced::window::Id>,
+    about_open: bool,
     main_window_size: Size,
     /// One-shot guard for `exclude_main_window_from_capture` — the main
     /// window falls inside its own DXGI capture region while hosting is
@@ -359,6 +386,12 @@ enum UpdateState {
     Error(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UpdateSource {
+    ManifestUrl(String),
+    GithubRelease(String),
+}
+
 /// Manifest URL for update checks. Empty by default (checks are a no-op)
 /// until real hosting exists; override with `EVERTYDESK_UPDATE_URL` so this
 /// doesn't need a rebuild once you have somewhere to host `latest.json`.
@@ -366,6 +399,28 @@ fn update_manifest_url() -> Option<String> {
     match env::var("EVERTYDESK_UPDATE_URL") {
         Ok(value) if !value.trim().is_empty() => Some(value),
         _ => None,
+    }
+}
+
+fn update_source_from_store(store: &LauncherStore) -> Option<UpdateSource> {
+    match store.update_channel {
+        UpdateChannelPreference::Disabled => update_manifest_url().map(UpdateSource::ManifestUrl),
+        UpdateChannelPreference::ManifestUrl => {
+            let url = store.update_manifest_url.trim();
+            if url.is_empty() {
+                None
+            } else {
+                Some(UpdateSource::ManifestUrl(url.to_owned()))
+            }
+        }
+        UpdateChannelPreference::GithubRelease => {
+            let repo = store.update_github_repo.trim();
+            if repo.is_empty() {
+                None
+            } else {
+                Some(UpdateSource::GithubRelease(repo.to_owned()))
+            }
+        }
     }
 }
 
@@ -384,6 +439,148 @@ fn update_download_dir() -> PathBuf {
             .join("updates");
     }
     env::temp_dir().join("evertydesk-updates")
+}
+
+#[cfg(windows)]
+fn set_launch_on_startup(enabled: bool) -> Result<(), String> {
+    let run_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+    let value_name = "EvertyDesk Next";
+    if enabled {
+        let exe = env::current_exe()
+            .map_err(|error| format!("cannot resolve current executable: {error}"))?;
+        let command = windows_run_command_value(&exe.to_string_lossy());
+        let status = Command::new("reg")
+            .args(["add", run_key, "/v", value_name, "/t", "REG_SZ", "/d"])
+            .arg(command)
+            .args(["/f"])
+            .status()
+            .map_err(|error| format!("cannot run reg.exe: {error}"))?;
+        if !status.success() {
+            return Err(format!("reg add failed with status {status}"));
+        }
+    } else {
+        let query_status = Command::new("reg")
+            .args(["query", run_key, "/v", value_name])
+            .status()
+            .map_err(|error| format!("cannot run reg.exe: {error}"))?;
+        if !query_status.success() {
+            return Ok(());
+        }
+        let status = Command::new("reg")
+            .args(["delete", run_key, "/v", value_name, "/f"])
+            .status()
+            .map_err(|error| format!("cannot run reg.exe: {error}"))?;
+        if !status.success() {
+            return Err(format!("reg delete failed with status {status}"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_launch_on_startup_enabled() -> Result<bool, String> {
+    let run_key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+    let value_name = "EvertyDesk Next";
+    let output = Command::new("reg")
+        .args(["query", run_key, "/v", value_name])
+        .output()
+        .map_err(|error| format!("cannot run reg.exe: {error}"))?;
+    Ok(output.status.success())
+}
+
+#[cfg(not(windows))]
+fn is_launch_on_startup_enabled() -> Result<bool, String> {
+    Ok(false)
+}
+
+#[cfg(not(windows))]
+fn set_launch_on_startup(_enabled: bool) -> Result<(), String> {
+    Err("system autostart is implemented for Windows only".to_owned())
+}
+
+#[cfg(windows)]
+fn windows_run_command_value(executable: &str) -> String {
+    format!("\"{}\" --background", executable.replace('"', "\\\""))
+}
+
+#[cfg(windows)]
+fn set_start_menu_shortcut(enabled: bool) -> Result<(), String> {
+    let shortcut_path = start_menu_shortcut_path()?;
+    if enabled {
+        let exe = env::current_exe()
+            .map_err(|error| format!("cannot resolve current executable: {error}"))?;
+        let shortcut_dir = shortcut_path
+            .parent()
+            .ok_or_else(|| "cannot resolve Start Menu shortcut directory".to_owned())?;
+        fs::create_dir_all(shortcut_dir)
+            .map_err(|error| format!("cannot create Start Menu directory: {error}"))?;
+        let working_dir = exe
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let icon_location = format!("{},0", exe.display());
+        let status = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                "$shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($args[0]); $shortcut.TargetPath = $args[1]; $shortcut.WorkingDirectory = $args[2]; $shortcut.IconLocation = $args[3]; $shortcut.Save()",
+            ])
+            .arg(&shortcut_path)
+            .arg(&exe)
+            .arg(&working_dir)
+            .arg(icon_location)
+            .status()
+            .map_err(|error| format!("cannot run PowerShell shortcut creator: {error}"))?;
+        if !status.success() {
+            return Err(format!(
+                "PowerShell shortcut creator failed with status {status}"
+            ));
+        }
+    } else if shortcut_path.exists() {
+        fs::remove_file(&shortcut_path)
+            .map_err(|error| format!("cannot remove Start Menu shortcut: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn is_start_menu_shortcut_enabled() -> Result<bool, String> {
+    Ok(start_menu_shortcut_path()?.exists())
+}
+
+#[cfg(not(windows))]
+fn is_start_menu_shortcut_enabled() -> Result<bool, String> {
+    Ok(false)
+}
+
+#[cfg(not(windows))]
+fn set_start_menu_shortcut(_enabled: bool) -> Result<(), String> {
+    Err("Start Menu shortcuts are implemented for Windows only".to_owned())
+}
+
+#[cfg(windows)]
+fn start_menu_shortcut_path() -> Result<PathBuf, String> {
+    let appdata = env::var_os("APPDATA")
+        .ok_or_else(|| "APPDATA is not set; cannot resolve user Start Menu".to_owned())?;
+    Ok(PathBuf::from(appdata)
+        .join("Microsoft")
+        .join("Windows")
+        .join("Start Menu")
+        .join("Programs")
+        .join("EvertyDesk Next")
+        .join("EvertyDesk.lnk"))
+}
+
+fn refresh_system_integration_state(store: &mut LauncherStore) {
+    if let Ok(enabled) = is_launch_on_startup_enabled() {
+        store.launch_on_startup = enabled;
+    }
+    if let Ok(enabled) = is_start_menu_shortcut_enabled() {
+        store.show_start_menu_shortcut = enabled;
+    }
 }
 
 /// Mirrors `HostState` but for the *service*, not the current session: is it
@@ -472,27 +669,61 @@ enum AddressBookFilter {
 impl SettingsSection {
     const ALL: [Self; 3] = [Self::Security, Self::General, Self::Connection];
 
-    fn label(self) -> &'static str {
-        match self {
-            Self::Security => "Безопасность",
-            Self::General => "Общее",
-            Self::Connection => "Подключение",
-        }
-    }
-
-    fn hint(self) -> &'static str {
-        match self {
-            Self::Security => "Пароли, подтверждение и права входящих сессий",
-            Self::General => "Качество, режимы, звук и интеграции",
-            Self::Connection => "RustDesk-совместимые серверы и состояние",
-        }
-    }
-
     fn icon(self) -> icondata::Icon {
         match self {
             Self::Security => icondata::LuShieldCheck,
             Self::General => icondata::LuSlidersHorizontal,
             Self::Connection => icondata::LuNetwork,
+        }
+    }
+}
+
+fn settings_section_label(section: SettingsSection, language: UiLanguage) -> &'static str {
+    match section {
+        SettingsSection::Security => tr(language, TextKey::SettingsSectionSecurity),
+        SettingsSection::General => tr(language, TextKey::SettingsSectionGeneral),
+        SettingsSection::Connection => tr(language, TextKey::SettingsSectionConnection),
+    }
+}
+
+fn settings_section_hint(section: SettingsSection, language: UiLanguage) -> &'static str {
+    match section {
+        SettingsSection::Security => tr(language, TextKey::SettingsHintSecurity),
+        SettingsSection::General => tr(language, TextKey::SettingsHintGeneral),
+        SettingsSection::Connection => tr(language, TextKey::SettingsHintConnection),
+    }
+}
+
+fn language_preference_label(preference: LanguagePreference, language: UiLanguage) -> &'static str {
+    match preference {
+        LanguagePreference::System => tr(language, TextKey::LanguageSystem),
+        LanguagePreference::Russian => tr(language, TextKey::LanguageRussian),
+        LanguagePreference::English => tr(language, TextKey::LanguageEnglish),
+    }
+}
+
+fn language_preference_hint(preference: LanguagePreference, language: UiLanguage) -> &'static str {
+    match preference {
+        LanguagePreference::System => tr(language, TextKey::LanguageSystemHint),
+        LanguagePreference::Russian => tr(language, TextKey::LanguageRussianHint),
+        LanguagePreference::English => tr(language, TextKey::LanguageEnglishHint),
+    }
+}
+
+fn update_channel_label(channel: UpdateChannelPreference, language: UiLanguage) -> &'static str {
+    match channel {
+        UpdateChannelPreference::Disabled => tr(language, TextKey::UpdateChannelDisabled),
+        UpdateChannelPreference::ManifestUrl => tr(language, TextKey::UpdateChannelManifestUrl),
+        UpdateChannelPreference::GithubRelease => tr(language, TextKey::UpdateChannelGithubRelease),
+    }
+}
+
+fn update_channel_hint(channel: UpdateChannelPreference, language: UiLanguage) -> &'static str {
+    match channel {
+        UpdateChannelPreference::Disabled => tr(language, TextKey::UpdateChannelDisabledHint),
+        UpdateChannelPreference::ManifestUrl => tr(language, TextKey::UpdateChannelManifestUrlHint),
+        UpdateChannelPreference::GithubRelease => {
+            tr(language, TextKey::UpdateChannelGithubReleaseHint)
         }
     }
 }
@@ -701,6 +932,13 @@ enum Message {
     SetAllowKeyboardMouse(bool),
     SetAllowClipboard(bool),
     SetViewerAudioDefault(bool),
+    SetLaunchOnStartup(bool),
+    SetStartMenuShortcut(bool),
+    SetKeepTaskbarIconOnClose(bool),
+    SetLanguage(LanguagePreference),
+    SetUpdateChannel(UpdateChannelPreference),
+    UpdateManifestUrlChanged(String),
+    UpdateGithubRepoChanged(String),
     SetStreamingMode(StreamingMode),
     SetFsrQuality(FsrQualitySetting),
     ToggleCompatibilitySettings,
@@ -772,6 +1010,12 @@ enum Message {
     StopHosting,
     InstallHostService,
     StartHostService,
+    OpenAbout,
+    CloseAbout,
+    OpenAboutGithub,
+    OpenAboutHabr,
+    OpenAboutDesk,
+    CopyAboutEmail,
     CheckForUpdates,
     DownloadUpdate,
     InstallUpdate,
@@ -784,6 +1028,8 @@ enum Message {
     CopyIncomingPeer,
     UiTick,
     WindowOpened,
+    BackgroundWindowOpened(iced::window::Id),
+    BackgroundWindowHidden(bool),
     CaptureExclusionApplied(bool),
     WindowResized(iced::window::Id, Size),
     CloseRequested(iced::window::Id),
@@ -960,15 +1206,23 @@ enum ViewerTimeoutKind {
 
 impl Launcher {
     fn new() -> (Self, Task<Message>) {
-        let (main_window_id, open_main_window) = iced::window::open(main_window_settings());
+        let start_in_background = launcher_start_in_background();
+        let (main_window_id, open_main_window) = if start_in_background {
+            let (id, open_window) = iced::window::open(background_init_window_settings());
+            (Some(id), open_window.map(Message::BackgroundWindowOpened))
+        } else {
+            let (id, open_window) = iced::window::open(main_window_settings());
+            (Some(id), open_window.map(|_| Message::WindowOpened))
+        };
         let mut config = AppConfig::load_or_create();
-        let (store, status) = match LauncherStore::load_default() {
+        let (mut store, status) = match LauncherStore::load_default() {
             Ok(store) => (store, "Готов к подключению".to_owned()),
             Err(error) => (
                 LauncherStore::default(),
                 format!("Не удалось загрузить локальные данные: {error}"),
             ),
         };
+        refresh_system_integration_state(&mut store);
         let address_book_account = store.address_book_account.clone();
         let (address_book_access_token, address_book_signed_in, token_error) =
             if address_book_account.is_empty() {
@@ -1070,9 +1324,12 @@ impl Launcher {
             permanent_password_visible: false,
             permanent_password_status,
             last_temp_password_rotation: Instant::now(),
-            window_id: Some(main_window_id),
+            window_id: main_window_id,
+            background_window_id: None,
+            background_hide_attempts: 0,
             incoming_window_id: None,
             auth_window_id: None,
+            about_open: false,
             main_window_size: Size::new(920.0, 720.0),
             capture_exclusion_applied: false,
             service_hint_state: query_service_hint_state(),
@@ -1101,7 +1358,7 @@ impl Launcher {
                 launcher.start_hosting();
             }
         }
-        (launcher, open_main_window.map(|_| Message::WindowOpened))
+        (launcher, open_main_window)
     }
 
     fn theme(&self) -> Theme {
@@ -1322,6 +1579,61 @@ impl Launcher {
             Message::SetViewerAudioDefault(value) => {
                 self.store.audio_enabled = value;
                 self.persist_store("Настройка звука удалённого компьютера сохранена");
+            }
+            Message::SetLaunchOnStartup(value) => {
+                self.store.launch_on_startup = value;
+                match set_launch_on_startup(value) {
+                    Ok(()) => self.persist_store(if value {
+                        "Автозапуск EvertyDesk включён"
+                    } else {
+                        "Автозапуск EvertyDesk выключен"
+                    }),
+                    Err(error) => {
+                        self.store.launch_on_startup = !value;
+                        self.status = format!("Не удалось изменить автозапуск: {error}");
+                    }
+                }
+            }
+            Message::SetStartMenuShortcut(value) => {
+                self.store.show_start_menu_shortcut = value;
+                match set_start_menu_shortcut(value) {
+                    Ok(()) => self.persist_store(if value {
+                        "Ярлык EvertyDesk добавлен в меню Пуск"
+                    } else {
+                        "Ярлык EvertyDesk удалён из меню Пуск"
+                    }),
+                    Err(error) => {
+                        self.store.show_start_menu_shortcut = !value;
+                        self.status = format!("Не удалось изменить ярлык в меню Пуск: {error}");
+                    }
+                }
+            }
+            Message::SetKeepTaskbarIconOnClose(value) => {
+                self.store.keep_taskbar_icon_on_close = value;
+                self.persist_store(if value {
+                    "При закрытии окно будет сворачиваться на панель задач"
+                } else {
+                    "При закрытии окно будет скрываться в системный трей"
+                });
+            }
+            Message::SetLanguage(language) => {
+                self.store.language = language;
+                self.persist_store(tr(self.ui_language(), TextKey::LanguageSaved));
+            }
+            Message::SetUpdateChannel(channel) => {
+                self.store.update_channel = channel;
+                self.update_state = UpdateState::Idle;
+                self.persist_store(tr(self.ui_language(), TextKey::UpdateChannelSaved));
+            }
+            Message::UpdateManifestUrlChanged(value) => {
+                self.store.update_manifest_url = value.trim().to_owned();
+                self.update_state = UpdateState::Idle;
+                self.persist_store(tr(self.ui_language(), TextKey::UpdateManifestUrlSaved));
+            }
+            Message::UpdateGithubRepoChanged(value) => {
+                self.store.update_github_repo = value.trim().to_owned();
+                self.update_state = UpdateState::Idle;
+                self.persist_store(tr(self.ui_language(), TextKey::UpdateGithubRepoSaved));
             }
             Message::SetStreamingMode(mode) => {
                 self.config.display.streaming_mode = mode;
@@ -1676,6 +1988,25 @@ impl Launcher {
             }
             Message::InstallHostService => self.request_install_service(),
             Message::StartHostService => self.request_start_service(),
+            Message::OpenAbout => {
+                self.about_open = true;
+            }
+            Message::CloseAbout => {
+                self.about_open = false;
+            }
+            Message::OpenAboutGithub => {
+                self.status =
+                    open_about_link("https://github.com/vaalimusic/EvertyDesk_Lite", "GitHub");
+            }
+            Message::OpenAboutHabr => {
+                self.status = open_about_link("https://habr.com/ru/users/vaalimusic/", "Хабр");
+            }
+            Message::OpenAboutDesk => {
+                self.status = open_about_link("https://desk.everty.ru", "desk.everty.ru");
+            }
+            Message::CopyAboutEmail => {
+                self.copy_to_clipboard("info@everty.ru".to_owned(), "Email скопирован", false);
+            }
             Message::CheckForUpdates => self.check_for_updates(),
             Message::DownloadUpdate => self.download_update(),
             Message::InstallUpdate => self.install_update(),
@@ -1708,6 +2039,9 @@ impl Launcher {
                 self.tick_service_hint();
                 self.tick_update_check();
                 self.rotate_temporary_password_if_due();
+                if self.background_window_id.is_some() && self.background_hide_attempts < 5 {
+                    return self.hide_background_window();
+                }
                 if let Some(task) = self.tick_oidc_login() {
                     return task;
                 }
@@ -1731,6 +2065,16 @@ impl Launcher {
                     }
                 }
             }
+            Message::BackgroundWindowOpened(id) => {
+                if self.window_id == Some(id) {
+                    self.window_id = None;
+                    self.capture_exclusion_applied = false;
+                    self.background_window_id = Some(id);
+                    self.background_hide_attempts = 0;
+                    return self.hide_background_window();
+                }
+            }
+            Message::BackgroundWindowHidden(_) => {}
             Message::CaptureExclusionApplied(ok) => {
                 if !ok {
                     self.status =
@@ -1760,10 +2104,9 @@ impl Launcher {
                     }
                     return self.close_incoming_window();
                 }
-                self.password.zeroize();
-                self.password_visible = false;
-                self.status = "EvertyDesk продолжает работать в системном трее".to_owned();
-                return iced::window::minimize(id, true);
+                if self.window_id == Some(id) {
+                    return self.close_main_window_to_background(id);
+                }
             }
             Message::Tray(TrayAction::Open) => {
                 self.status = if self.host.is_some() {
@@ -1771,13 +2114,7 @@ impl Launcher {
                 } else {
                     "Готов к подключению".to_owned()
                 };
-                let mut tasks = Vec::new();
-                if let Some(id) = self.window_id {
-                    tasks.extend([
-                        iced::window::minimize(id, false),
-                        iced::window::gain_focus(id),
-                    ]);
-                }
+                let mut tasks = vec![self.ensure_main_window()];
                 if self.pending_approval.is_some()
                     || self.incoming_accepting.is_some()
                     || self.incoming_session.is_some()
@@ -2046,12 +2383,7 @@ impl Launcher {
             }
             Message::ProcessEvent(ProcessEvent::SecondInstance) => {
                 self.status = "EvertyDesk уже был запущен — окно восстановлено".to_owned();
-                if let Some(id) = self.window_id {
-                    return Task::batch([
-                        iced::window::minimize(id, false),
-                        iced::window::gain_focus(id),
-                    ]);
-                }
+                return self.ensure_main_window();
             }
             Message::ProcessEvent(event) => {
                 self.handle_process_event(event);
@@ -2104,6 +2436,60 @@ impl Launcher {
             .map_or_else(Task::none, iced::window::close)
     }
 
+    fn hide_background_window(&mut self) -> Task<Message> {
+        const MAX_BACKGROUND_HIDE_ATTEMPTS: u8 = 5;
+        let Some(id) = self.background_window_id else {
+            return Task::none();
+        };
+        if self.background_hide_attempts >= MAX_BACKGROUND_HIDE_ATTEMPTS {
+            return Task::none();
+        }
+        self.background_hide_attempts = self.background_hide_attempts.saturating_add(1);
+        let _ =
+            evertydesk_desktop_next::windows_app::hide_current_process_background_event_windows();
+        iced::window::run(id, |handle| {
+            let hwnd = match handle.window_handle().map(|h| h.as_raw()) {
+                Ok(iced::window::raw_window_handle::RawWindowHandle::Win32(win32)) => {
+                    Some(win32.hwnd.get())
+                }
+                _ => None,
+            };
+            hwnd.is_some_and(evertydesk_desktop_next::windows_app::hide_window)
+        })
+        .map(Message::BackgroundWindowHidden)
+    }
+
+    fn ensure_main_window(&mut self) -> Task<Message> {
+        if let Some(id) = self.window_id {
+            Task::batch([
+                iced::window::minimize(id, false),
+                iced::window::gain_focus(id),
+            ])
+        } else {
+            let (id, open_window) = iced::window::open(main_window_settings());
+            self.window_id = Some(id);
+            self.capture_exclusion_applied = false;
+            open_window.map(|_| Message::WindowOpened)
+        }
+    }
+
+    fn close_main_window_to_background(&mut self, id: iced::window::Id) -> Task<Message> {
+        self.password.zeroize();
+        self.password_visible = false;
+        self.status = if self.store.keep_taskbar_icon_on_close {
+            "EvertyDesk свёрнут. Доступ и трей продолжают работать.".to_owned()
+        } else {
+            "EvertyDesk скрыт в системный трей. Доступ продолжает работать.".to_owned()
+        };
+        if self.store.keep_taskbar_icon_on_close {
+            iced::window::minimize(id, true)
+        } else {
+            self.window_id = None;
+            self.capture_exclusion_applied = false;
+            iced::window::close(id)
+        }
+    }
+
     fn window_title(&self, id: iced::window::Id) -> String {
         if self.auth_window_id == Some(id) {
             "EvertyDesk — авторизация".to_owned()
@@ -2129,18 +2515,30 @@ impl Launcher {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        let ui_language = self.ui_language();
         let navigation = row![
-            nav_button("Главная", Page::Home, self.page),
-            nav_button("Адресная книга", Page::Devices, self.page),
+            nav_button(tr(ui_language, TextKey::NavHome), Page::Home, self.page),
+            nav_button(
+                tr(ui_language, TextKey::NavAddressBook),
+                Page::Devices,
+                self.page,
+            ),
             nav_icon_button(icondata::LuMonitor, "VM", Page::Vm, self.page),
             nav_icon_button(icondata::LuMousePointer2, "Game", Page::Game, self.page),
-            nav_button("Настройки", Page::Settings, self.page),
+            nav_button(
+                tr(ui_language, TextKey::NavSettings),
+                Page::Settings,
+                self.page,
+            ),
         ]
         .spacing(4);
 
         let header = container(
             row![
-                brand_badge(40.0, 23),
+                button(brand_badge(40.0, 23))
+                    .on_press(Message::OpenAbout)
+                    .padding(0)
+                    .style(quiet_button),
                 column![
                     text("EvertyDesk").size(24),
                     text("REMOTE DESKTOP").size(10).color(MUTED),
@@ -2166,51 +2564,55 @@ impl Launcher {
         .padding([15, 28])
         .style(header_style);
 
-        let page_content: Element<'_, Message> = match self.page {
-            Page::Home => column![
-                self.local_access_card(),
-                self.connection_status_bar(),
-                self.sessions_section(),
-                self.home_recent_section(),
-            ]
-            .spacing(22)
-            .into(),
-            Page::Devices => column![
-                page_title(
-                    "Адресная книга",
-                    "Контакты, группы, заметки и история подключений"
-                ),
-                self.devices_section(),
-            ]
-            .spacing(18)
-            .into(),
-            Page::Vm => column![
+        let page_content: Element<'_, Message> = if self.about_open {
+            self.about_card()
+        } else {
+            match self.page {
+                Page::Home => column![
+                    self.local_access_card(),
+                    self.connection_status_bar(),
+                    self.sessions_section(),
+                    self.home_recent_section(),
+                ]
+                .spacing(22)
+                .into(),
+                Page::Devices => column![
+                    page_title(
+                        tr(ui_language, TextKey::AddressBookTitle),
+                        tr(ui_language, TextKey::AddressBookSubtitle)
+                    ),
+                    self.devices_section(),
+                ]
+                .spacing(18)
+                .into(),
+                Page::Vm => column![
                 page_title(
                     "Виртуальные машины",
                     "Agentless VM Bridge: Hyper-V и VirtualBox через старый EvertyDesk Lite core"
                 ),
                 self.vm_page_section(),
             ]
-            .spacing(18)
-            .into(),
-            Page::Game => column![
+                .spacing(18)
+                .into(),
+                Page::Game => column![
                 page_title(
                     "Game режим",
                     "Минимальная задержка для динамичного изображения и интерактивного управления"
                 ),
                 self.game_page_section(),
             ]
-            .spacing(18)
-            .into(),
-            Page::Settings => column![
-                page_title(
-                    "Настройки",
-                    "Безопасность входящих подключений и поведение приложения"
-                ),
-                self.settings_card(),
-            ]
-            .spacing(18)
-            .into(),
+                .spacing(18)
+                .into(),
+                Page::Settings => column![
+                    page_title(
+                        tr(ui_language, TextKey::SettingsTitle),
+                        tr(ui_language, TextKey::SettingsSubtitle)
+                    ),
+                    self.settings_card(),
+                ]
+                .spacing(18)
+                .into(),
+            }
         };
 
         let content = column![
@@ -2254,6 +2656,130 @@ impl Launcher {
             .height(Fill),
         ]
         .height(Fill)
+        .into()
+    }
+
+    fn about_card(&self) -> Element<'_, Message> {
+        let ui_language = self.ui_language();
+        let version = env!("CARGO_PKG_VERSION");
+        let info = column![
+            about_info_row(
+                tr(ui_language, TextKey::AboutAuthor),
+                "Артур Валиев",
+                icondata::LuUser
+            ),
+            about_info_row(
+                tr(ui_language, TextKey::AboutVersion),
+                version,
+                icondata::LuInfo
+            ),
+            about_info_row(
+                tr(ui_language, TextKey::AboutContact),
+                "info@everty.ru",
+                icondata::LuMail
+            ),
+        ]
+        .spacing(8);
+
+        let links = row![
+            about_action_button(
+                tr(ui_language, TextKey::AboutGithub),
+                icondata::LuGithub,
+                Message::OpenAboutGithub
+            ),
+            about_action_button(
+                tr(ui_language, TextKey::AboutHabr),
+                icondata::LuExternalLink,
+                Message::OpenAboutHabr
+            ),
+            about_action_button(
+                tr(ui_language, TextKey::AboutDesk),
+                icondata::LuBookOpen,
+                Message::OpenAboutDesk
+            ),
+            about_action_button(
+                tr(ui_language, TextKey::AboutCopyEmail),
+                icondata::LuCopy,
+                Message::CopyAboutEmail
+            ),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+
+        container(
+            column![
+                row![
+                    brand_badge(58.0, 30),
+                    column![
+                        text(tr(ui_language, TextKey::AboutTitle)).size(25),
+                        text(tr(ui_language, TextKey::AboutSubtitle))
+                            .size(12)
+                            .color(MUTED),
+                    ]
+                    .spacing(3)
+                    .width(Fill),
+                    button(lucide_icon(icondata::LuX, 18.0, MUTED))
+                        .on_press(Message::CloseAbout)
+                        .padding(8)
+                        .style(quiet_button),
+                ]
+                .spacing(14)
+                .align_y(Alignment::Center),
+                container(info).padding(14).width(Fill).style(subtle_panel),
+                container(
+                    column![
+                        row![
+                            lucide_icon(icondata::LuBookOpen, 18.0, ACCENT),
+                            text(tr(ui_language, TextKey::AboutDesk)).size(17),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                        text(tr(ui_language, TextKey::AboutDeskDescription))
+                            .size(12)
+                            .color(MUTED),
+                    ]
+                    .spacing(7),
+                )
+                .padding(14)
+                .width(Fill)
+                .style(subtle_panel),
+                links,
+                container(
+                    column![
+                        row![
+                            text(tr(ui_language, TextKey::UpdatesTitle)).size(17),
+                            Space::new().width(Fill),
+                            button(label_with_icon(
+                                tr(ui_language, TextKey::AboutCheckUpdates),
+                                icondata::LuRefreshCw,
+                                Color::WHITE
+                            ))
+                            .on_press(Message::CheckForUpdates)
+                            .padding([8, 12])
+                            .style(accent_button),
+                        ]
+                        .align_y(Alignment::Center),
+                        self.update_status_panel(),
+                    ]
+                    .spacing(10),
+                )
+                .padding(14)
+                .width(Fill)
+                .style(subtle_panel),
+                row![
+                    Space::new().width(Fill),
+                    button(tr(ui_language, TextKey::AboutClose))
+                        .on_press(Message::CloseAbout)
+                        .padding([9, 16])
+                        .style(quiet_button),
+                ],
+            ]
+            .spacing(16),
+        )
+        .padding(22)
+        .width(Fill)
+        .max_width(680)
+        .style(card_style)
         .into()
     }
 
@@ -2558,6 +3084,7 @@ impl Launcher {
     }
 
     fn credential_window_view(&self) -> Element<'_, Message> {
+        let ui_language = self.ui_language();
         let remote_id = self.auth_remote_id.as_deref().unwrap_or("—");
         let status: Element<'_, Message> = if self.auth_status.is_empty() {
             Space::new().height(0).into()
@@ -2574,9 +3101,10 @@ impl Launcher {
                 row![
                     brand_badge(58.0, 30),
                     column![
-                        text("Авторизация").size(24),
+                        text(tr(ui_language, TextKey::HomeCredentialTitle)).size(24),
                         text(format!(
-                            "Подключение к {}",
+                            "{} {}",
+                            tr(ui_language, TextKey::HomeCredentialSubtitlePrefix),
                             format_local_id(remote_id)
                         ))
                         .size(13)
@@ -2586,30 +3114,33 @@ impl Launcher {
                 ]
                 .spacing(15)
                 .align_y(Alignment::Center),
-                text_input("Пароль удалённого устройства", &self.password)
-                    .on_input(Message::PasswordChanged)
-                    .secure(true)
-                    .on_submit(Message::SubmitCredentials)
-                    .padding(13)
-                    .size(15)
-                    .style(input_style)
-                    .width(Fill),
+                text_input(
+                    tr(ui_language, TextKey::HomeRemotePasswordPlaceholder),
+                    &self.password
+                )
+                .on_input(Message::PasswordChanged)
+                .secure(true)
+                .on_submit(Message::SubmitCredentials)
+                .padding(13)
+                .size(15)
+                .style(input_style)
+                .width(Fill),
                 checkbox(self.remember_password)
-                    .label("Запомнить пароль на этом компьютере")
+                    .label(tr(ui_language, TextKey::HomeRememberPassword))
                     .on_toggle(Message::ToggleRememberPassword)
                     .size(17),
-                text("Пароль хранится в Windows Credential Manager и не записывается в настройки EvertyDesk.")
+                text(tr(ui_language, TextKey::HomeRememberPasswordHint))
                     .size(11)
                     .color(MUTED),
                 status,
                 row![
-                    button("Отмена")
+                    button(tr(ui_language, TextKey::HomeCancel))
                         .on_press(Message::CancelCredentials)
                         .height(Length::Fixed(42.0))
                         .width(Length::Fixed(130.0))
                         .style(quiet_button),
                     Space::new().width(Fill),
-                    button(text("Подключиться").color(Color::WHITE))
+                    button(text(tr(ui_language, TextKey::HomeConnect)).color(Color::WHITE))
                         .on_press(Message::SubmitCredentials)
                         .height(Length::Fixed(42.0))
                         .width(Length::Fixed(180.0))
@@ -2627,13 +3158,14 @@ impl Launcher {
     }
 
     fn local_access_card(&self) -> Element<'_, Message> {
+        let ui_language = self.ui_language();
         let host_online = self.host.is_some();
         let host_action = if host_online {
-            button("Остановить приём")
+            button(tr(ui_language, TextKey::HomeStopReceiving))
                 .on_press(Message::StopHosting)
                 .style(danger_text_button)
         } else {
-            button("Включить доступ")
+            button(tr(ui_language, TextKey::HomeEnableAccess))
                 .on_press(Message::StartHosting)
                 .style(accent_button)
         }
@@ -2645,18 +3177,18 @@ impl Launcher {
             "•".repeat(self.config.local_password.chars().count().max(6))
         };
         let visibility_label = if self.password_visible {
-            "Скрыть"
+            tr(ui_language, TextKey::HomeHide)
         } else {
-            "Показать"
+            tr(ui_language, TextKey::HomeShow)
         };
 
         let mut body = column![
             row![
-                text("Это рабочее место").size(18),
+                text(tr(ui_language, TextKey::HomeThisWorkspace)).size(18),
                 text(format_local_id(&self.config.local_id))
                     .size(34)
                     .color(ACCENT),
-                button("Копировать")
+                button(tr(ui_language, TextKey::HomeCopy))
                     .on_press(Message::CopyLocalId)
                     .padding([8, 12])
                     .style(quiet_button),
@@ -2666,17 +3198,19 @@ impl Launcher {
             .align_y(Alignment::Center),
             container(
                 row![
-                    text("Одноразовый пароль").size(13).color(MUTED),
+                    text(tr(ui_language, TextKey::HomeOneTimePassword))
+                        .size(13)
+                        .color(MUTED),
                     text(password).size(19).width(Length::Fixed(120.0)),
                     button(visibility_label)
                         .on_press(Message::TogglePasswordVisibility)
                         .padding([7, 10])
                         .style(quiet_button),
-                    button("Копировать")
+                    button(tr(ui_language, TextKey::HomeCopy))
                         .on_press(Message::CopyLocalPassword)
                         .padding([7, 10])
                         .style(quiet_button),
-                    button("Обновить сейчас")
+                    button(tr(ui_language, TextKey::HomeRefreshNow))
                         .on_press(Message::RegeneratePassword)
                         .padding([7, 10])
                         .style(quiet_button),
@@ -2782,9 +3316,10 @@ impl Launcher {
     }
 
     fn quick_connect_bar(&self) -> Element<'_, Message> {
+        let ui_language = self.ui_language();
         let can_connect = !self.remote_id.trim().is_empty();
         let connect_content = row![
-            text("Подключиться").size(14),
+            text(tr(ui_language, TextKey::HomeConnect)).size(14),
             lucide_icon(icondata::LuArrowRight, 16.0, Color::WHITE),
         ]
         .spacing(8)
@@ -2802,13 +3337,16 @@ impl Launcher {
         container(
             row![
                 text("●").size(12).color(Color::from_rgb(0.18, 0.76, 0.43)),
-                text_input("Введите удалённый адрес", &self.remote_id)
-                    .on_input(Message::RemoteIdChanged)
-                    .on_submit(Message::Connect)
-                    .padding(10)
-                    .size(15)
-                    .style(quick_input_style)
-                    .width(Fill),
+                text_input(
+                    tr(ui_language, TextKey::HomeRemoteAddressPlaceholder),
+                    &self.remote_id
+                )
+                .on_input(Message::RemoteIdChanged)
+                .on_submit(Message::Connect)
+                .padding(10)
+                .size(15)
+                .style(quick_input_style)
+                .width(Fill),
                 connect_button,
             ]
             .spacing(12)
@@ -2999,6 +3537,7 @@ impl Launcher {
     }
 
     fn home_recent_section(&self) -> Element<'_, Message> {
+        let ui_language = self.ui_language();
         let favorites: Vec<_> = self
             .store
             .contacts
@@ -3039,7 +3578,7 @@ impl Launcher {
 
             column![
                 row![
-                    text("Избранное").size(18),
+                    text(tr(ui_language, TextKey::HomeFavorites)).size(18),
                     Space::new().width(Fill),
                     lucide_icon(icondata::LuStar, 16.0, ACCENT),
                 ]
@@ -3055,8 +3594,8 @@ impl Launcher {
             recent_cards = recent_cards.push(
                 container(
                     column![
-                        text("Здесь появятся последние подключения").size(14),
-                        text("Введите удалённый адрес в верхней строке, чтобы начать.")
+                        text(tr(ui_language, TextKey::HomeRecentEmptyTitle)).size(14),
+                        text(tr(ui_language, TextKey::HomeRecentEmptyHint))
                             .size(11)
                             .color(MUTED),
                     ]
@@ -3074,7 +3613,7 @@ impl Launcher {
                     });
                 let title = contact
                     .map(|contact| contact.name.as_str())
-                    .unwrap_or("Удалённое устройство");
+                    .unwrap_or(tr(ui_language, TextKey::HomeRemoteDevice));
                 recent_cards = recent_cards.push(
                     button(
                         column![
@@ -3097,10 +3636,10 @@ impl Launcher {
             favorites_section,
             column![
                 row![
-                    text("Недавние сеансы").size(18),
+                    text(tr(ui_language, TextKey::HomeRecentSessions)).size(18),
                     Space::new().width(Fill),
                     button(label_with_icon(
-                        "Адресная книга",
+                        tr(ui_language, TextKey::NavAddressBook),
                         icondata::LuArrowRight,
                         ACCENT,
                     ))
@@ -3411,6 +3950,7 @@ impl Launcher {
     }
 
     fn compatibility_settings_section(&self) -> Element<'_, Message> {
+        let ui_language = self.ui_language();
         let expanded = self.store.compatibility_settings_expanded;
         let custom_active = server_config_is_custom(&self.config);
         let chevron = if expanded {
@@ -3422,11 +3962,11 @@ impl Launcher {
             row![
                 lucide_icon(chevron, 17.0, ACCENT),
                 column![
-                    text("RustDesk-совместимость и серверы").size(18),
+                    text(tr(ui_language, TextKey::SettingsCompatibilityTitle)).size(18),
                     text(if custom_active {
-                        "Используется другой ID/Relay/API сервер"
+                        tr(ui_language, TextKey::SettingsCompatibilityCustom)
                     } else {
-                        "Сейчас используются встроенные серверы EvertyDesk"
+                        tr(ui_language, TextKey::SettingsCompatibilityDefault)
                     })
                     .size(12)
                     .color(MUTED),
@@ -3434,9 +3974,9 @@ impl Launcher {
                 .spacing(2)
                 .width(Fill),
                 text(if expanded {
-                    "Свернуть"
+                    tr(ui_language, TextKey::SettingsCompatibilityHide)
                 } else {
-                    "Развернуть"
+                    tr(ui_language, TextKey::SettingsCompatibilityShow)
                 })
                 .size(12)
                 .color(ACCENT),
@@ -3453,9 +3993,11 @@ impl Launcher {
         if expanded {
             let default_server = ServerConfig::default();
             let discover_button = if self.server_discovery_busy {
-                button("Проверка…").padding([8, 12]).style(quiet_button)
+                button(tr(ui_language, TextKey::SettingsCompatibilityDiscovering))
+                    .padding([8, 12])
+                    .style(quiet_button)
             } else {
-                button("Получить из API")
+                button(tr(ui_language, TextKey::SettingsCompatibilityDiscover))
                     .on_press(Message::DiscoverServerSettings)
                     .padding([8, 12])
                     .style(quiet_button)
@@ -3464,7 +4006,7 @@ impl Launcher {
                 row![
                     discover_button,
                     text(if self.server_discovery_status.is_empty() {
-                        "GET /public/connection заполняет ID/Relay и Public Key, если токен имеет право."
+                        tr(ui_language, TextKey::SettingsCompatibilityDiscoveryHint)
                     } else {
                         &self.server_discovery_status
                     })
@@ -3484,7 +4026,10 @@ impl Launcher {
                     .style(input_style),
                     text_input(
                         "ID server",
-                        &server_input_value(&self.config.server.id_server, &default_server.id_server)
+                        &server_input_value(
+                            &self.config.server.id_server,
+                            &default_server.id_server
+                        )
                     )
                     .on_input(Message::ServerIdChanged)
                     .padding(10)
@@ -3515,11 +4060,14 @@ impl Launcher {
                 ]
                 .spacing(10),
                 row![
-                    text("Пустые поля означают встроенные серверы EvertyDesk; значения по умолчанию не показываются.")
-                        .size(11)
-                        .color(MUTED),
+                    text(tr(
+                        ui_language,
+                        TextKey::SettingsCompatibilityEmptyFieldsHint
+                    ))
+                    .size(11)
+                    .color(MUTED),
                     Space::new().width(Fill),
-                    button("Сбросить")
+                    button(tr(ui_language, TextKey::SettingsReset))
                         .on_press(Message::ResetServerSettings)
                         .padding([8, 12])
                         .style(danger_text_button),
@@ -3955,6 +4503,7 @@ impl Launcher {
     }
 
     fn game_page_section(&self) -> Element<'_, Message> {
+        let ui_language = self.ui_language();
         let game_selected = self.config.display.streaming_mode == StreamingMode::Game;
         let entitlement_note = commercial_feature_note(
             self.account_entitlements.known,
@@ -3974,7 +4523,7 @@ impl Launcher {
         for quality in ConnectionQuality::ALL {
             let selected = self.store.quality == quality;
             quality_buttons = quality_buttons.push(
-                button(text(quality.label()).size(13))
+                button(text(quality_label(quality, ui_language)).size(13))
                     .on_press(Message::SetQuality(quality))
                     .padding([8, 14])
                     .style(move |theme, status| {
@@ -4132,6 +4681,7 @@ impl Launcher {
     }
 
     fn devices_section(&self) -> Element<'_, Message> {
+        let ui_language = self.ui_language();
         let filter = self.device_filter.trim().to_lowercase();
         let recent_ids = normalized_recent_ids(&self.store.recent);
         let mut groups: BTreeMap<String, usize> = BTreeMap::new();
@@ -4142,7 +4692,7 @@ impl Launcher {
                 favorites += 1;
             }
             let group = if contact.group.trim().is_empty() {
-                "Без группы".to_owned()
+                tr(ui_language, TextKey::AddressBookNoGroup).to_owned()
             } else {
                 format_group_path(&contact.group)
             };
@@ -4157,195 +4707,7 @@ impl Launcher {
                 *tags.entry(tag.clone()).or_default() += 1;
             }
         }
-        let account_panel: Element<'_, Message> = if self.address_book_signed_in {
-            let sync_button: Element<'_, Message> = if self.address_book_busy {
-                button(lucide_icon(icondata::LuRefreshCw, 17.0, MUTED))
-                    .padding([7, 11])
-                    .style(quiet_button)
-                    .into()
-            } else {
-                icon_action(
-                    icondata::LuRefreshCw,
-                    "Синхронизировать адресную книгу",
-                    Message::SyncAddressBook,
-                    false,
-                )
-            };
-            container(
-                column![
-                    row![
-                        column![
-                            text("Облачная адресная книга").size(18),
-                            text(format!("Аккаунт: {}", self.address_book_account.trim()))
-                                .size(12)
-                                .color(MUTED),
-                        ]
-                        .spacing(3)
-                        .width(Fill),
-                        sync_button,
-                        icon_action(
-                            icondata::LuBadgeCheck,
-                            "Refresh account permissions",
-                            Message::RefreshCurrentUser,
-                            false
-                        ),
-                        icon_action(
-                            icondata::LuLogOut,
-                            "Sign out",
-                            Message::SignOutAddressBook,
-                            true
-                        ),
-                    ]
-                    .spacing(8)
-                    .align_y(Alignment::Center),
-                    row![
-                        Space::new().width(Length::Shrink),
-                        Space::new().width(Length::Shrink),
-                        text(if self.account_entitlements_status.is_empty() {
-                            "Права аккаунта будут обновляться через currentUser при изменении тарифа."
-                        } else {
-                            &self.account_entitlements_status
-                        })
-                            .size(11)
-                            .color(MUTED)
-                            .width(Fill),
-                    ]
-                    .spacing(8)
-                    .align_y(Alignment::Center),
-                    account_entitlement_badges(&self.account_entitlements),
-                    text(if self.address_book_status.is_empty() {
-                        if self.store.address_book_last_sync_unix == 0 {
-                            "Вход восстановлен из защищённого хранилища. Запустите синхронизацию."
-                        } else {
-                            "Контакты доступны из локального кэша."
-                        }
-                    } else {
-                        &self.address_book_status
-                    })
-                    .size(12)
-                    .color(MUTED),
-                ]
-                .spacing(10),
-            )
-            .padding(14)
-            .style(subtle_panel)
-            .into()
-        } else {
-            let can_sign_in = !self.address_book_busy
-                && !self.address_book_account.trim().is_empty()
-                && !self.address_book_password.is_empty();
-            let sign_in_button = if can_sign_in {
-                button(label_with_icon(
-                    "Войти",
-                    icondata::LuArrowRight,
-                    Color::WHITE,
-                ))
-                .on_press(Message::SignInAddressBook)
-                .style(accent_button)
-            } else if self.address_book_busy {
-                button("Вход…").style(accent_button)
-            } else {
-                button(label_with_icon(
-                    "Войти",
-                    icondata::LuArrowRight,
-                    Color::WHITE,
-                ))
-                .style(accent_button)
-            };
-            let sso_button: Element<'_, Message> = if self.login_options_busy {
-                button("Проверка SSO…")
-                    .padding([9, 12])
-                    .style(quiet_button)
-                    .into()
-            } else {
-                button("Проверить SSO")
-                    .on_press(Message::RefreshLoginOptions)
-                    .padding([9, 12])
-                    .style(quiet_button)
-                    .into()
-            };
-            let yandex_button: Element<'_, Message> =
-                if has_login_provider(&self.login_options, "yandex")
-                    && !self.address_book_busy
-                    && self.oidc_code.is_none()
-                {
-                    button(label_with_icon(
-                        "Яндекс",
-                        icondata::LuExternalLink,
-                        Color::WHITE,
-                    ))
-                    .on_press(Message::StartYandexOidc)
-                    .padding([9, 14])
-                    .style(accent_button)
-                    .into()
-                } else if self.oidc_code.is_some() {
-                    button("Ожидаю Яндекс…")
-                        .padding([9, 14])
-                        .style(quiet_button)
-                        .into()
-                } else {
-                    button("Яндекс недоступен")
-                        .padding([9, 14])
-                        .style(quiet_button)
-                        .into()
-                };
-            let cancel_oidc_button: Element<'_, Message> = if self.oidc_code.is_some() {
-                button("Отменить")
-                    .on_press(Message::CancelYandexOidc)
-                    .padding([9, 12])
-                    .style(danger_text_button)
-                    .into()
-            } else {
-                Space::new().width(Length::Shrink).into()
-            };
-            container(
-                column![
-                    text("Вход в EvertyDesk").size(18),
-                    text("Авторизация открывает облачную адресную книгу. Локальные контакты работают и без входа.")
-                        .size(12)
-                        .color(MUTED),
-                    row![
-                        text_input("Логин или e-mail", &self.address_book_account)
-                            .on_input(Message::AddressBookAccountChanged)
-                            .padding(11)
-                            .style(input_style)
-                            .width(Length::FillPortion(2)),
-                        text_input("Пароль или токен", &self.address_book_password)
-                            .on_input(Message::AddressBookPasswordChanged)
-                            .on_submit(Message::SignInAddressBook)
-                            .secure(true)
-                            .padding(11)
-                            .style(input_style)
-                            .width(Length::FillPortion(2)),
-                        sign_in_button.padding([10, 18]),
-                    ]
-                    .spacing(8)
-                    .align_y(Alignment::Center),
-                    row![
-                        sso_button,
-                        yandex_button,
-                        cancel_oidc_button,
-                        text("Кнопка Яндекс появляется только если сервер вернул oidc/yandex.")
-                            .size(11)
-                            .color(MUTED)
-                            .width(Fill),
-                    ]
-                    .spacing(8)
-                    .align_y(Alignment::Center),
-                    text(if self.address_book_status.is_empty() {
-                        "Пароль не сохраняется; токен находится в системном защищённом хранилище."
-                    } else {
-                        &self.address_book_status
-                    })
-                    .size(12)
-                    .color(MUTED),
-                ]
-                .spacing(10),
-            )
-            .padding(14)
-            .style(subtle_panel)
-            .into()
-        };
+        let account_panel = self.address_book_sync_banner();
         let can_save = !self.remote_id.trim().is_empty() && !self.contact_name.trim().is_empty();
         let editing = self.editing_contact_id.is_some();
         let remote_id_editor: Element<'_, Message> = if editing {
@@ -4371,8 +4733,12 @@ impl Launcher {
 
         let mut contacts = column![row![
             column![
-                text(address_book_filter_label(&self.address_book_filter)).size(20),
-                text("Локальные и облачные устройства")
+                text(address_book_filter_label(
+                    &self.address_book_filter,
+                    ui_language
+                ))
+                .size(20),
+                text(tr(ui_language, TextKey::AddressBookLocalCloudDevices))
                     .size(12)
                     .color(MUTED),
             ]
@@ -4421,7 +4787,7 @@ impl Launcher {
             let mut last_group: Option<&str> = None;
             for contact in visible_contacts {
                 let group = if contact.group.is_empty() {
-                    "Без группы"
+                    tr(ui_language, TextKey::AddressBookNoGroup)
                 } else {
                     contact.group.as_str()
                 };
@@ -4722,7 +5088,7 @@ impl Launcher {
             .style(card_style);
             let mut side_column = column![editor_panel].spacing(14);
             if let Some(contact) = selected_contact.clone() {
-                side_column = side_column.push(contact_detail_panel(contact));
+                side_column = side_column.push(contact_detail_panel(contact, ui_language));
             }
 
             if self.main_window_size.width >= 1_180.0 {
@@ -4738,7 +5104,7 @@ impl Launcher {
                     .into()
             }
         } else if let Some(contact) = selected_contact {
-            let details = contact_detail_panel(contact);
+            let details = contact_detail_panel(contact, ui_language);
             if self.main_window_size.width >= 1_180.0 {
                 row![
                     container(lists).width(Fill),
@@ -4805,17 +5171,17 @@ impl Launcher {
         let search_panel = container(
             row![
                 lucide_icon(icondata::LuSearch, 20.0, MUTED),
-                address_book_filter_badge(&self.address_book_filter),
+                address_book_filter_badge(&self.address_book_filter, ui_language),
                 text_input(
-                    "Поиск по имени, ID, группе, метке или заметке",
+                    tr(ui_language, TextKey::AddressBookSearchPlaceholder),
                     &self.device_filter
                 )
                 .on_input(Message::DeviceFilterChanged)
                 .padding(10)
                 .style(input_style)
                 .width(Fill),
-                text(format!(
-                    "{} показано · {} всего",
+                text(address_book_count_summary(
+                    ui_language,
                     visible_contact_count,
                     self.store.contacts.len()
                 ))
@@ -4846,7 +5212,194 @@ impl Launcher {
         }
     }
 
+    fn address_book_sync_banner(&self) -> Element<'_, Message> {
+        let ui_language = self.ui_language();
+        if self.address_book_signed_in {
+            let sync_button: Element<'_, Message> = if self.address_book_busy {
+                button(lucide_icon(icondata::LuRefreshCw, 17.0, MUTED))
+                    .padding([7, 11])
+                    .style(quiet_button)
+                    .into()
+            } else {
+                icon_action(
+                    icondata::LuRefreshCw,
+                    tr(ui_language, TextKey::AddressBookSync),
+                    Message::SyncAddressBook,
+                    false,
+                )
+            };
+
+            let status = if self.address_book_status.is_empty() {
+                if self.store.address_book_last_sync_unix == 0 {
+                    tr(ui_language, TextKey::AddressBookSyncRestored)
+                } else {
+                    tr(ui_language, TextKey::AddressBookSyncAvailable)
+                }
+            } else {
+                &self.address_book_status
+            };
+
+            container(
+                column![
+                    row![
+                        lucide_icon(icondata::LuCloud, 18.0, ACCENT),
+                        column![
+                            text(tr(ui_language, TextKey::AddressBookSyncEnabled)).size(16),
+                            text(format!("Аккаунт: {}", self.address_book_account.trim()))
+                                .size(11)
+                                .color(MUTED),
+                        ]
+                        .spacing(2)
+                        .width(Fill),
+                        sync_button,
+                        icon_action(
+                            icondata::LuBadgeCheck,
+                            tr(ui_language, TextKey::AddressBookRefreshEntitlements),
+                            Message::RefreshCurrentUser,
+                            false,
+                        ),
+                        icon_action(
+                            icondata::LuLogOut,
+                            tr(ui_language, TextKey::AddressBookSignOutCloud),
+                            Message::SignOutAddressBook,
+                            true,
+                        ),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                    account_entitlement_badges(&self.account_entitlements),
+                    text(status).size(12).color(MUTED),
+                ]
+                .spacing(8),
+            )
+            .padding(12)
+            .style(subtle_panel)
+            .into()
+        } else {
+            let can_sign_in = !self.address_book_busy
+                && !self.address_book_account.trim().is_empty()
+                && !self.address_book_password.is_empty();
+            let sign_in_button = if can_sign_in {
+                button(label_with_icon(
+                    tr(ui_language, TextKey::AddressBookSignIn),
+                    icondata::LuArrowRight,
+                    Color::WHITE,
+                ))
+                .on_press(Message::SignInAddressBook)
+                .style(accent_button)
+            } else if self.address_book_busy {
+                button(tr(ui_language, TextKey::AddressBookSigningIn)).style(accent_button)
+            } else {
+                button(label_with_icon(
+                    tr(ui_language, TextKey::AddressBookSignIn),
+                    icondata::LuArrowRight,
+                    Color::WHITE,
+                ))
+                .style(accent_button)
+            };
+            let sso_button: Element<'_, Message> = if self.login_options_busy {
+                button("SSO…").padding([9, 12]).style(quiet_button).into()
+            } else {
+                button("SSO")
+                    .on_press(Message::RefreshLoginOptions)
+                    .padding([9, 12])
+                    .style(quiet_button)
+                    .into()
+            };
+            let yandex_button: Element<'_, Message> =
+                if has_login_provider(&self.login_options, "yandex")
+                    && !self.address_book_busy
+                    && self.oidc_code.is_none()
+                {
+                    button(label_with_icon(
+                        tr(ui_language, TextKey::AddressBookYandex),
+                        icondata::LuExternalLink,
+                        Color::WHITE,
+                    ))
+                    .on_press(Message::StartYandexOidc)
+                    .padding([9, 14])
+                    .style(accent_button)
+                    .into()
+                } else if self.oidc_code.is_some() {
+                    button(tr(ui_language, TextKey::AddressBookWaitingYandex))
+                        .padding([9, 14])
+                        .style(quiet_button)
+                        .into()
+                } else {
+                    button(tr(ui_language, TextKey::AddressBookYandex))
+                        .padding([9, 14])
+                        .style(quiet_button)
+                        .into()
+                };
+            let cancel_oidc_button: Element<'_, Message> = if self.oidc_code.is_some() {
+                button(tr(ui_language, TextKey::AddressBookCancel))
+                    .on_press(Message::CancelYandexOidc)
+                    .padding([9, 12])
+                    .style(danger_text_button)
+                    .into()
+            } else {
+                Space::new().width(Length::Shrink).into()
+            };
+            let status = if self.address_book_status.is_empty() {
+                tr(ui_language, TextKey::AddressBookLocalWorks)
+            } else {
+                &self.address_book_status
+            };
+
+            let identity_row = row![
+                lucide_icon(icondata::LuHardDrive, 18.0, ACCENT),
+                column![
+                    text(tr(ui_language, TextKey::AddressBookLocalTitle)).size(16),
+                    text(status).size(11).color(MUTED),
+                ]
+                .spacing(2)
+                .width(Fill),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center);
+
+            let sign_in_row = row![
+                text_input(
+                    tr(ui_language, TextKey::AddressBookLoginPlaceholder),
+                    &self.address_book_account
+                )
+                .on_input(Message::AddressBookAccountChanged)
+                .padding(9)
+                .style(input_style)
+                .width(Length::Fixed(190.0)),
+                text_input(
+                    tr(ui_language, TextKey::AddressBookPasswordPlaceholder),
+                    &self.address_book_password
+                )
+                .on_input(Message::AddressBookPasswordChanged)
+                .on_submit(Message::SignInAddressBook)
+                .secure(true)
+                .padding(9)
+                .style(input_style)
+                .width(Length::Fixed(190.0)),
+                sign_in_button.padding([9, 14]),
+                sso_button,
+                yandex_button,
+                cancel_oidc_button,
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center);
+
+            let content: Element<'_, Message> = if self.main_window_size.width >= 1_320.0 {
+                row![identity_row.width(Fill), sign_in_row]
+                    .spacing(12)
+                    .align_y(Alignment::Center)
+                    .into()
+            } else {
+                column![identity_row, sign_in_row].spacing(8).into()
+            };
+
+            container(content).padding(12).style(subtle_panel).into()
+        }
+    }
+
     fn settings_card(&self) -> Element<'_, Message> {
+        let ui_language = self.ui_language();
         let mut quality_buttons = row![].spacing(8);
         for quality in ConnectionQuality::ALL {
             let selected = self.store.quality == quality;
@@ -4926,25 +5479,31 @@ impl Launcher {
             column![
                 row![
                     lucide_icon(icondata::LuKeyRound, 16.0, ACCENT),
-                    text("Постоянный пароль").size(13),
+                    text(tr(ui_language, TextKey::SettingsPermanentPassword)).size(13),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
-                text("Используется для unattended-доступа. Хранится отдельно в системном credential store, не в config.json.")
-                    .size(11)
-                    .color(MUTED),
+                text(tr(
+                    ui_language,
+                    TextKey::SettingsPermanentPasswordDescription
+                ))
+                .size(11)
+                .color(MUTED),
                 row![
-                    text_input("Задайте постоянный пароль", &self.permanent_password)
-                        .on_input(Message::PermanentPasswordChanged)
-                        .on_submit(Message::SavePermanentPassword)
-                        .secure(!self.permanent_password_visible)
-                        .padding(10)
-                        .style(input_style)
-                        .width(Fill),
+                    text_input(
+                        tr(ui_language, TextKey::SettingsPermanentPasswordPlaceholder),
+                        &self.permanent_password
+                    )
+                    .on_input(Message::PermanentPasswordChanged)
+                    .on_submit(Message::SavePermanentPassword)
+                    .secure(!self.permanent_password_visible)
+                    .padding(10)
+                    .style(input_style)
+                    .width(Fill),
                     button(if self.permanent_password_visible {
-                        "Скрыть"
+                        tr(ui_language, TextKey::HomeHide)
                     } else {
-                        "Показать"
+                        tr(ui_language, TextKey::HomeShow)
                     })
                     .on_press(Message::TogglePermanentPasswordVisibility)
                     .padding([9, 12])
@@ -4954,18 +5513,18 @@ impl Launcher {
                 .align_y(Alignment::Center),
                 row![
                     text(if self.permanent_password_status.is_empty() {
-                        "Одноразовый пароль обновляется автоматически каждые 10 минут."
+                        tr(ui_language, TextKey::SettingsTemporaryPasswordRotates)
                     } else {
                         &self.permanent_password_status
                     })
                     .size(11)
                     .color(MUTED)
                     .width(Fill),
-                    button("Удалить")
+                    button(tr(ui_language, TextKey::SettingsDelete))
                         .on_press(Message::ClearPermanentPassword)
                         .padding([8, 12])
                         .style(danger_text_button),
-                    button("Сохранить")
+                    button(tr(ui_language, TextKey::SettingsSave))
                         .on_press(Message::SavePermanentPassword)
                         .padding([8, 14])
                         .style(accent_button),
@@ -4980,18 +5539,18 @@ impl Launcher {
         .style(subtle_panel);
 
         let incoming = column![
-            text("Входящие подключения").size(18),
-            text("Определяет, как другие устройства получают доступ к этому компьютеру.")
+            text(tr(ui_language, TextKey::SettingsIncomingTitle)).size(18),
+            text(tr(ui_language, TextKey::SettingsIncomingDescription))
                 .size(12)
                 .color(MUTED),
             permanent_access,
             container(
                 column![
                     checkbox(self.config.security.require_confirmation)
-                        .label("Всегда запрашивать подтверждение")
+                        .label(tr(ui_language, TextKey::SettingsAlwaysAskConfirmation))
                         .on_toggle(Message::SetRequireConfirmation)
                         .size(16),
-                    text("Показывать запрос «Принять / Отклонить» перед началом сессии.")
+                    text(tr(ui_language, TextKey::SettingsAlwaysAskConfirmationHint))
                         .size(11)
                         .color(MUTED),
                 ]
@@ -5002,8 +5561,8 @@ impl Launcher {
             .style(subtle_panel),
             container(
                 column![
-                    text("Доступ включается автоматически при открытии EvertyDesk").size(13),
-                    text("Если нужно временно закрыть устройство для входящих подключений, используйте кнопку «Остановить приём» на главной странице.")
+                    text(tr(ui_language, TextKey::SettingsAccessAutoTitle)).size(13),
+                    text(tr(ui_language, TextKey::SettingsAccessAutoHint))
                         .size(11)
                         .color(MUTED),
                 ]
@@ -5016,17 +5575,17 @@ impl Launcher {
         .spacing(10);
 
         let permissions = column![
-            text("Разрешения сессии").size(18),
-            text("Ограничения применяются ко всем новым входящим подключениям.")
+            text(tr(ui_language, TextKey::SettingsPermissionsTitle)).size(18),
+            text(tr(ui_language, TextKey::SettingsPermissionsDescription))
                 .size(12)
                 .color(MUTED),
             container(
                 column![
                     checkbox(self.config.security.allow_keyboard_mouse)
-                        .label("Клавиатура и мышь")
+                        .label(tr(ui_language, TextKey::SettingsKeyboardMouse))
                         .on_toggle(Message::SetAllowKeyboardMouse)
                         .size(16),
-                    text("Разрешить удалённому пользователю управлять системой.")
+                    text(tr(ui_language, TextKey::SettingsKeyboardMouseHint))
                         .size(11)
                         .color(MUTED),
                 ]
@@ -5038,10 +5597,10 @@ impl Launcher {
             container(
                 column![
                     checkbox(self.config.security.allow_clipboard)
-                        .label("Общий буфер обмена")
+                        .label(tr(ui_language, TextKey::SettingsSharedClipboard))
                         .on_toggle(Message::SetAllowClipboard)
                         .size(16),
-                    text("Синхронизировать текст при копировании и вставке.")
+                    text(tr(ui_language, TextKey::SettingsSharedClipboardHint))
                         .size(11)
                         .color(MUTED),
                 ]
@@ -5054,15 +5613,15 @@ impl Launcher {
         .spacing(10);
 
         let outgoing = column![
-            text("Исходящие подключения").size(18),
-            text("Значения по умолчанию для новых удалённых сессий.")
+            text(tr(ui_language, TextKey::SettingsOutgoingTitle)).size(18),
+            text(tr(ui_language, TextKey::SettingsOutgoingDescription))
                 .size(12)
                 .color(MUTED),
             container(
                 column![
-                    text("Качество изображения").size(13),
+                    text(tr(ui_language, TextKey::SettingsImageQuality)).size(13),
                     quality_buttons,
-                    text("Профиль можно изменить во время активной сессии.")
+                    text(tr(ui_language, TextKey::SettingsQualityHint))
                         .size(11)
                         .color(MUTED),
                 ]
@@ -5073,26 +5632,12 @@ impl Launcher {
             .style(subtle_panel),
             container(
                 column![
-                    text("Режим трансляции").size(13),
+                    text(tr(ui_language, TextKey::SettingsStreamingMode)).size(13),
                     mode_buttons,
-                    text(streaming_mode_hint(self.config.display.streaming_mode))
-                        .size(11)
-                        .color(MUTED),
-                ]
-                .spacing(8),
-            )
-            .padding(14)
-            .width(Fill)
-            .style(subtle_panel),
-            container(
-                column![
-                    text("Апскейл изображения (FSR)").size(13),
-                    fsr_buttons,
-                    text(
-                        "Досрезчает картинку, если хост передаёт кадр ниже своего \
-                         нативного разрешения — полезно с «Поддержкой»/«Игрой» на \
-                         медленной сети. По умолчанию выключен."
-                    )
+                    text(streaming_mode_hint(
+                        self.config.display.streaming_mode,
+                        ui_language
+                    ))
                     .size(11)
                     .color(MUTED),
                 ]
@@ -5103,15 +5648,185 @@ impl Launcher {
             .style(subtle_panel),
             container(
                 column![
+                    text(tr(ui_language, TextKey::SettingsFsrUpscale)).size(13),
+                    fsr_buttons,
+                    text(tr(ui_language, TextKey::SettingsFsrHint))
+                        .size(11)
+                        .color(MUTED),
+                ]
+                .spacing(8),
+            )
+            .padding(14)
+            .width(Fill)
+            .style(subtle_panel),
+            container(
+                column![
                     checkbox(self.store.audio_enabled)
-                        .label("Воспроизводить звук удалённого компьютера")
+                        .label(tr(ui_language, TextKey::SettingsPlayRemoteAudio))
                         .on_toggle(Message::SetViewerAudioDefault)
                         .size(16),
-                    text("Звук также можно отключить отдельно в окне viewer.")
+                    text(tr(ui_language, TextKey::SettingsPlayRemoteAudioHint))
                         .size(11)
                         .color(MUTED),
                 ]
                 .spacing(5),
+            )
+            .padding(14)
+            .width(Fill)
+            .style(subtle_panel),
+        ]
+        .spacing(10);
+
+        let app_behavior = column![
+            text(tr(ui_language, TextKey::SettingsAppBehaviorTitle)).size(18),
+            text(tr(ui_language, TextKey::SettingsAppBehaviorDescription))
+                .size(12)
+                .color(MUTED),
+            container(
+                column![
+                    checkbox(self.store.launch_on_startup)
+                        .label(tr(ui_language, TextKey::SettingsLaunchOnStartup))
+                        .on_toggle(Message::SetLaunchOnStartup)
+                        .size(16),
+                    text(tr(ui_language, TextKey::SettingsLaunchOnStartupHint))
+                        .size(11)
+                        .color(MUTED),
+                ]
+                .spacing(5),
+            )
+            .padding(14)
+            .width(Fill)
+            .style(subtle_panel),
+            container(
+                column![
+                    checkbox(self.store.show_start_menu_shortcut)
+                        .label(tr(ui_language, TextKey::SettingsShowStartMenuShortcut))
+                        .on_toggle(Message::SetStartMenuShortcut)
+                        .size(16),
+                    text(tr(ui_language, TextKey::SettingsShowStartMenuShortcutHint))
+                        .size(11)
+                        .color(MUTED),
+                ]
+                .spacing(5),
+            )
+            .padding(14)
+            .width(Fill)
+            .style(subtle_panel),
+            container(
+                column![
+                    checkbox(self.store.keep_taskbar_icon_on_close)
+                        .label(tr(ui_language, TextKey::SettingsKeepTaskbarIcon))
+                        .on_toggle(Message::SetKeepTaskbarIconOnClose)
+                        .size(16),
+                    text(if self.store.keep_taskbar_icon_on_close {
+                        tr(ui_language, TextKey::SettingsKeepTaskbarIconHintOn)
+                    } else {
+                        tr(ui_language, TextKey::SettingsKeepTaskbarIconHintOff)
+                    })
+                    .size(11)
+                    .color(MUTED),
+                ]
+                .spacing(5),
+            )
+            .padding(14)
+            .width(Fill)
+            .style(subtle_panel),
+        ]
+        .spacing(10);
+
+        let mut language_buttons = row![].spacing(8).align_y(Alignment::Center);
+        for language in LanguagePreference::ALL {
+            let selected = self.store.language == language;
+            language_buttons = language_buttons.push(
+                button(text(language_preference_label(language, ui_language)).size(13))
+                    .on_press(Message::SetLanguage(language))
+                    .padding([8, 14])
+                    .style(move |theme, status| {
+                        if selected {
+                            selected_segment(theme, status)
+                        } else {
+                            quiet_button(theme, status)
+                        }
+                    }),
+            );
+        }
+        let language_settings = column![
+            text(tr(ui_language, TextKey::LanguageTitle)).size(18),
+            text(tr(ui_language, TextKey::LanguageDescription))
+                .size(12)
+                .color(MUTED),
+            container(
+                column![
+                    language_buttons,
+                    text(language_preference_hint(self.store.language, ui_language))
+                        .size(11)
+                        .color(MUTED),
+                ]
+                .spacing(8),
+            )
+            .padding(14)
+            .width(Fill)
+            .style(subtle_panel),
+        ]
+        .spacing(10);
+
+        let mut update_channel_buttons = row![].spacing(8).align_y(Alignment::Center);
+        for channel in UpdateChannelPreference::ALL {
+            let selected = self.store.update_channel == channel;
+            update_channel_buttons = update_channel_buttons.push(
+                button(text(update_channel_label(channel, ui_language)).size(13))
+                    .on_press(Message::SetUpdateChannel(channel))
+                    .padding([8, 14])
+                    .style(move |theme, status| {
+                        if selected {
+                            selected_segment(theme, status)
+                        } else {
+                            quiet_button(theme, status)
+                        }
+                    }),
+            );
+        }
+        let update_source_fields: Element<'_, Message> = match self.store.update_channel {
+            UpdateChannelPreference::Disabled => {
+                text(tr(ui_language, TextKey::UpdatesDisabledHint))
+                    .size(11)
+                    .color(MUTED)
+                    .into()
+            }
+            UpdateChannelPreference::ManifestUrl => text_input(
+                tr(ui_language, TextKey::UpdatesManifestPlaceholder),
+                &self.store.update_manifest_url,
+            )
+            .on_input(Message::UpdateManifestUrlChanged)
+            .padding(9)
+            .style(input_style)
+            .width(Fill)
+            .into(),
+            UpdateChannelPreference::GithubRelease => text_input(
+                tr(ui_language, TextKey::UpdatesGithubPlaceholder),
+                &self.store.update_github_repo,
+            )
+            .on_input(Message::UpdateGithubRepoChanged)
+            .padding(9)
+            .style(input_style)
+            .width(Fill)
+            .into(),
+        };
+        let update_settings = column![
+            text(tr(ui_language, TextKey::UpdatesTitle)).size(18),
+            text(tr(ui_language, TextKey::UpdatesDescription))
+                .size(12)
+                .color(MUTED),
+            container(
+                column![
+                    update_channel_buttons,
+                    text(update_channel_hint(self.store.update_channel, ui_language))
+                        .size(11)
+                        .color(MUTED),
+                    update_source_fields,
+                    self.update_status_panel(),
+                ]
+                .spacing(9),
             )
             .padding(14)
             .width(Fill)
@@ -5124,29 +5839,32 @@ impl Launcher {
             self.account_entitlements.smart_agent,
             "Smart Agent",
         )
-        .unwrap_or("Smart Agent доступен в правах аккаунта.");
+        .unwrap_or(tr(ui_language, TextKey::SettingsSmartAgentAvailable));
 
         let smart_agent = column![
-            text("Интеграция с desk.everty.ru").size(18),
-            text("Регистрация устройства и сообщения Smart Agent.")
+            text(tr(ui_language, TextKey::SettingsSmartAgentTitle)).size(18),
+            text(tr(ui_language, TextKey::SettingsSmartAgentDescription))
                 .size(12)
                 .color(MUTED),
             text(smart_agent_entitlement_note).size(11).color(MUTED),
             container(
                 column![
                     checkbox(self.store.smart_agent_enabled)
-                        .label("Включить Smart Agent")
+                        .label(tr(ui_language, TextKey::SettingsSmartAgentEnable))
                         .on_toggle(Message::SetSmartAgentEnabled)
                         .size(16),
                     text_input(
-                        "Ключ организации (service_key)",
+                        tr(
+                            ui_language,
+                            TextKey::SettingsSmartAgentServiceKeyPlaceholder
+                        ),
                         &self.store.smart_agent_service_key
                     )
                     .on_input(Message::SmartAgentServiceKeyChanged)
                     .padding(9)
                     .style(input_style),
                     text(if self.smart_agent_status.is_empty() {
-                        "Heartbeat отправляется раз в минуту, новые сообщения проверяются раз в 30 секунд."
+                        tr(ui_language, TextKey::SettingsSmartAgentIdleHint)
                     } else {
                         &self.smart_agent_status
                     })
@@ -5248,8 +5966,6 @@ impl Launcher {
             .into(),
         };
 
-        let update_status = self.update_status_panel();
-
         let wide_settings_content = use_wide_settings_content_layout(self.main_window_size.width);
         let settings_body: Element<'_, Message> = match self.settings_section {
             SettingsSection::Security => {
@@ -5274,30 +5990,34 @@ impl Launcher {
                 let section_content: Element<'_, Message> = if wide_settings_content {
                     row![
                         container(outgoing).width(Fill),
-                        container(smart_agent).width(Fill),
+                        container(column![app_behavior, language_settings].spacing(14)).width(Fill),
+                        container(column![update_settings, smart_agent].spacing(14)).width(Fill),
                     ]
                     .spacing(24)
                     .into()
                 } else {
                     column![
                         container(outgoing).width(Fill),
+                        container(app_behavior).width(Fill),
+                        container(language_settings).width(Fill),
+                        container(update_settings).width(Fill),
                         container(smart_agent).width(Fill),
                     ]
                     .spacing(14)
                     .into()
                 };
-                column![section_content, host_status, update_status]
-                    .spacing(18)
-                    .into()
+                column![section_content, host_status].spacing(18).into()
             }
             SettingsSection::Connection => column![compatibility, host_status].spacing(18).into(),
         };
 
         let mut settings_menu = column![
-            text("\u{0420}\u{0430}\u{0437}\u{0434}\u{0435}\u{043B}\u{044B}")
+            text(tr(ui_language, TextKey::SettingsSectionsTitle))
                 .size(12)
                 .color(MUTED),
-            text(self.settings_section.hint()).size(11).color(MUTED),
+            text(settings_section_hint(self.settings_section, ui_language))
+                .size(11)
+                .color(MUTED),
         ]
         .spacing(8);
         for section in SettingsSection::ALL {
@@ -5306,7 +6026,9 @@ impl Launcher {
                 button(
                     row![
                         lucide_icon(section.icon(), 17.0, if selected { ACCENT } else { MUTED }),
-                        text(section.label()).size(14).width(Fill),
+                        text(settings_section_label(section, ui_language))
+                            .size(14)
+                            .width(Fill),
                     ]
                     .spacing(9)
                     .align_y(Alignment::Center),
@@ -5891,7 +6613,7 @@ impl Launcher {
         }
         self.update_next_check = Instant::now() + UPDATE_CHECK_INTERVAL;
         if matches!(self.update_state, UpdateState::Idle | UpdateState::UpToDate) {
-            if update_manifest_url().is_none() {
+            if update_source_from_store(&self.store).is_none() {
                 return;
             }
             self.check_for_updates();
@@ -5899,13 +6621,14 @@ impl Launcher {
     }
 
     fn check_for_updates(&mut self) {
-        let Some(url) = update_manifest_url() else {
-            self.update_state =
-                UpdateState::Error("адрес сервера обновлений не настроен".to_owned());
+        let Some(source) = update_source_from_store(&self.store) else {
+            self.update_state = UpdateState::Error(
+                tr(self.ui_language(), TextKey::UpdatesChannelNotConfigured).to_owned(),
+            );
             return;
         };
         self.update_state = UpdateState::Checking;
-        spawn_check_for_update(url, env!("CARGO_PKG_VERSION").to_owned());
+        spawn_check_for_update(source, env!("CARGO_PKG_VERSION").to_owned());
     }
 
     fn download_update(&mut self) {
@@ -5927,19 +6650,27 @@ impl Launcher {
         }
     }
 
+    fn ui_language(&self) -> UiLanguage {
+        UiLanguage::from_preference(self.store.language)
+    }
+
     fn update_status_panel(&self) -> Element<'_, Message> {
+        let language = self.ui_language();
         let current_version = env!("CARGO_PKG_VERSION");
         let content: Element<'_, Message> = match &self.update_state {
             UpdateState::Idle => row![
                 column![
-                    text("Обновления").size(13),
-                    text(format!("Текущая версия: {current_version}"))
-                        .size(11)
-                        .color(MUTED),
+                    text(tr(language, TextKey::UpdatesTitle)).size(13),
+                    text(format!(
+                        "{}: {current_version}",
+                        tr(language, TextKey::UpdatesCurrentVersion)
+                    ))
+                    .size(11)
+                    .color(MUTED),
                 ]
                 .spacing(3)
                 .width(Fill),
-                button("Проверить обновления")
+                button(tr(language, TextKey::UpdatesCheck))
                     .on_press(Message::CheckForUpdates)
                     .padding([9, 14])
                     .style(accent_button),
@@ -5947,13 +6678,19 @@ impl Launcher {
             .spacing(10)
             .align_y(Alignment::Center)
             .into(),
-            UpdateState::Checking => text("Проверка обновлений...").size(12).color(MUTED).into(),
+            UpdateState::Checking => text(tr(language, TextKey::UpdatesChecking))
+                .size(12)
+                .color(MUTED)
+                .into(),
             UpdateState::UpToDate => row![
-                text(format!("Установлена последняя версия ({current_version})"))
-                    .size(12)
-                    .color(MUTED)
-                    .width(Fill),
-                button("Проверить снова")
+                text(format!(
+                    "{} ({current_version})",
+                    tr(language, TextKey::UpdatesUpToDate)
+                ))
+                .size(12)
+                .color(MUTED)
+                .width(Fill),
+                button(tr(language, TextKey::UpdatesCheckAgain))
                     .on_press(Message::CheckForUpdates)
                     .padding([9, 14])
                     .style(quiet_button),
@@ -5963,7 +6700,12 @@ impl Launcher {
             .into(),
             UpdateState::Available(manifest) => row![
                 column![
-                    text(format!("Доступно обновление: {}", manifest.version)).size(13),
+                    text(format!(
+                        "{}: {}",
+                        tr(language, TextKey::UpdatesAvailable),
+                        manifest.version
+                    ))
+                    .size(13),
                     if manifest.notes.is_empty() {
                         text("").size(11)
                     } else {
@@ -5972,7 +6714,7 @@ impl Launcher {
                 ]
                 .spacing(3)
                 .width(Fill),
-                button("Скачать и проверить")
+                button(tr(language, TextKey::UpdatesDownloadAndVerify))
                     .on_press(Message::DownloadUpdate)
                     .padding([9, 14])
                     .style(accent_button),
@@ -5980,17 +6722,19 @@ impl Launcher {
             .spacing(10)
             .align_y(Alignment::Center)
             .into(),
-            UpdateState::Downloading(manifest) => {
-                text(format!("Загрузка обновления {}...", manifest.version))
-                    .size(12)
-                    .color(MUTED)
-                    .into()
-            }
+            UpdateState::Downloading(manifest) => text(format!(
+                "{} {}...",
+                tr(language, TextKey::UpdatesDownloading),
+                manifest.version
+            ))
+            .size(12)
+            .color(MUTED)
+            .into(),
             UpdateState::ReadyToInstall(_) => row![
-                text("Обновление загружено и проверено — готово к установке.")
+                text(tr(language, TextKey::UpdatesReadyToInstall))
                     .size(12)
                     .width(Fill),
-                button("Установить")
+                button(tr(language, TextKey::UpdatesInstall))
                     .on_press(Message::InstallUpdate)
                     .padding([9, 14])
                     .style(accent_button),
@@ -6000,7 +6744,7 @@ impl Launcher {
             .into(),
             UpdateState::Error(error) => row![
                 text(error.clone()).size(12).color(MUTED).width(Fill),
-                button("Повторить")
+                button(tr(language, TextKey::UpdatesRetry))
                     .on_press(Message::CheckForUpdates)
                     .padding([9, 14])
                     .style(quiet_button),
@@ -6542,6 +7286,7 @@ impl Launcher {
                         self.status = format!("Не удалось сохранить итоги сессии: {error}");
                     }
                 }
+                let ui_language = self.ui_language();
                 if let Some(entry) = self.viewers.get_mut(&process_id) {
                     if !matches!(
                         &status,
@@ -6550,7 +7295,7 @@ impl Launcher {
                             | ViewerStatus::Codec { .. }
                             | ViewerStatus::Heartbeat { .. }
                     ) {
-                        entry.status = status_text(&status);
+                        entry.status = status_text(&status, ui_language);
                     }
                     match status {
                         ViewerStatus::Starting => reset_viewer_telemetry(entry),
@@ -6587,14 +7332,14 @@ impl Launcher {
                         ViewerStatus::ControlApplied { control } => {
                             if entry.pending_controls.remove(control) {
                                 apply_viewer_control(entry, control);
-                                entry.status = viewer_control_applied_text(control);
+                                entry.status = viewer_control_applied_text(control, ui_language);
                                 self.status = format!("{}: {}", entry.remote_id, entry.status);
                             }
                         }
                         ViewerStatus::ControlState { control } => {
                             entry.pending_controls.remove_kind(control);
                             apply_viewer_control(entry, control);
-                            entry.status = viewer_control_applied_text(control);
+                            entry.status = viewer_control_applied_text(control, ui_language);
                             self.status = format!("{}: {}", entry.remote_id, entry.status);
                         }
                         ViewerStatus::Failed { error } => {
@@ -6700,12 +7445,19 @@ impl Launcher {
                 token,
                 control,
             } => {
+                let ui_language = self.ui_language();
                 if let Some(entry) = self.viewers.get_mut(&process_id) {
                     if entry.session_token == token && entry.pending_controls.remove(control) {
-                        entry.status = format!(
-                            "Viewer не подтвердил настройку «{}»",
-                            viewer_control_label(control)
-                        );
+                        entry.status = match ui_language {
+                            UiLanguage::Russian => format!(
+                                "Viewer не подтвердил настройку «{}»",
+                                viewer_control_label(control, ui_language)
+                            ),
+                            UiLanguage::English => format!(
+                                "Viewer did not confirm “{}”",
+                                viewer_control_label(control, ui_language)
+                            ),
+                        };
                         self.status = format!("{}: {}", entry.remote_id, entry.status);
                     }
                 }
@@ -7681,6 +8433,36 @@ fn label_with_icon(
         .into()
 }
 
+fn about_info_row(
+    label: &'static str,
+    value: &'static str,
+    icon: icondata::Icon,
+) -> Element<'static, Message> {
+    row![
+        lucide_icon(icon, 17.0, ACCENT),
+        text(label).size(12).color(MUTED).width(Length::Fixed(84.0)),
+        text(value).size(14).width(Fill),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn about_action_button(
+    label: &'static str,
+    icon: icondata::Icon,
+    message: Message,
+) -> iced::widget::Button<'static, Message> {
+    button(
+        row![lucide_icon(icon, 16.0, ACCENT), text(label).size(13)]
+            .spacing(7)
+            .align_y(Alignment::Center),
+    )
+    .on_press(message)
+    .padding([8, 12])
+    .style(quiet_button)
+}
+
 fn config_update_details(update: smart_agent::ConfigUpdate) -> Element<'static, Message> {
     let mut details = column![].spacing(5);
     if !update.server.trim().is_empty() {
@@ -7831,11 +8613,19 @@ fn streaming_mode_label(mode: StreamingMode) -> &'static str {
     }
 }
 
-fn streaming_mode_hint(mode: StreamingMode) -> &'static str {
+fn quality_label(quality: ConnectionQuality, language: UiLanguage) -> &'static str {
+    match quality {
+        ConnectionQuality::Smooth => tr(language, TextKey::QualitySmooth),
+        ConnectionQuality::Balanced => tr(language, TextKey::QualityBalanced),
+        ConnectionQuality::Sharp => tr(language, TextKey::QualitySharp),
+    }
+}
+
+fn streaming_mode_hint(mode: StreamingMode, language: UiLanguage) -> &'static str {
     match mode {
-        StreamingMode::Support => "Обычная удалённая поддержка: стабильность и экономия трафика.",
-        StreamingMode::Interactive => "Баланс реакции и качества для повседневной работы.",
-        StreamingMode::Game => "Минимальная задержка: 60 FPS, adaptive quality выключается.",
+        StreamingMode::Support => tr(language, TextKey::StreamingModeSupportHint),
+        StreamingMode::Interactive => tr(language, TextKey::StreamingModeInteractiveHint),
+        StreamingMode::Game => tr(language, TextKey::StreamingModeGameHint),
     }
 }
 
@@ -8721,7 +9511,7 @@ fn contact_filter_chip(
     .into()
 }
 
-fn contact_detail_panel(contact: Contact) -> Element<'static, Message> {
+fn contact_detail_panel(contact: Contact, language: UiLanguage) -> Element<'static, Message> {
     let mut metadata = column![row![
         container(text(device_initial(&contact.name)).color(ACCENT))
             .center_x(Length::Fixed(40.0))
@@ -8766,8 +9556,8 @@ fn contact_detail_panel(contact: Contact) -> Element<'static, Message> {
         column![
             row![
                 column![
-                    text("Детали контакта").size(18),
-                    text("Быстрые действия без открытия формы")
+                    text(tr(language, TextKey::AddressBookContactDetails)).size(18),
+                    text(tr(language, TextKey::AddressBookQuickActions))
                         .size(11)
                         .color(MUTED),
                 ]
@@ -8775,7 +9565,7 @@ fn contact_detail_panel(contact: Contact) -> Element<'static, Message> {
                 .width(Fill),
                 icon_action(
                     icondata::LuX,
-                    "Скрыть детали",
+                    tr(language, TextKey::AddressBookHideDetails),
                     Message::SelectContact(String::new()),
                     true,
                 ),
@@ -8785,41 +9575,41 @@ fn contact_detail_panel(contact: Contact) -> Element<'static, Message> {
             row![
                 icon_action(
                     icondata::LuCopy,
-                    "Скопировать ID",
+                    tr(language, TextKey::AddressBookCopyId),
                     Message::CopyContactId(contact.remote_id.clone()),
                     false,
                 ),
                 icon_action(
                     icondata::LuMousePointer2,
-                    "Подставить адрес",
+                    tr(language, TextKey::AddressBookUseAddress),
                     Message::SelectRemote(contact.remote_id.clone()),
                     false,
                 ),
                 icon_action(
                     icondata::LuArrowRight,
-                    "Подключиться",
+                    tr(language, TextKey::AddressBookConnect),
                     Message::ConnectRemote(contact.remote_id.clone()),
                     false,
                 ),
                 icon_action(
                     icondata::LuPencil,
-                    "Редактировать",
+                    tr(language, TextKey::AddressBookEditContact),
                     Message::EditContact(contact.remote_id.clone()),
                     false,
                 ),
                 icon_action(
                     icondata::LuStar,
                     if contact.favorite {
-                        "Убрать из избранного"
+                        tr(language, TextKey::AddressBookRemoveFromFavorites)
                     } else {
-                        "Добавить в избранное"
+                        tr(language, TextKey::AddressBookAddToFavorites)
                     },
                     Message::ToggleFavorite(contact.remote_id.clone()),
                     contact.favorite,
                 ),
                 icon_action(
                     icondata::LuTrash2,
-                    "Удалить контакт",
+                    tr(language, TextKey::AddressBookDeleteContact),
                     Message::RemoveContact(contact.remote_id),
                     true,
                 ),
@@ -8848,11 +9638,14 @@ fn form_suggestions(
     .into()
 }
 
-fn address_book_filter_badge(filter: &AddressBookFilter) -> Element<'static, Message> {
+fn address_book_filter_badge(
+    filter: &AddressBookFilter,
+    language: UiLanguage,
+) -> Element<'static, Message> {
     if matches!(filter, AddressBookFilter::All) {
         return Space::new().width(Length::Shrink).into();
     }
-    let label = address_book_filter_display(filter);
+    let label = address_book_filter_display(filter, language);
     row![
         contact_filter_chip(
             icondata::LuListFilter,
@@ -8861,7 +9654,7 @@ fn address_book_filter_badge(filter: &AddressBookFilter) -> Element<'static, Mes
         ),
         icon_action(
             icondata::LuX,
-            "Сбросить фильтр адресной книги",
+            tr(language, TextKey::AddressBookResetFilter),
             Message::ClearAddressBookFilter,
             true,
         ),
@@ -9036,23 +9829,30 @@ fn commercial_feature_note(
     }
 }
 
-fn address_book_filter_label(filter: &AddressBookFilter) -> &'static str {
+fn address_book_filter_label(filter: &AddressBookFilter, language: UiLanguage) -> &'static str {
     match filter {
-        AddressBookFilter::All => "Все контакты",
-        AddressBookFilter::Favorites => "Избранные",
-        AddressBookFilter::Recent => "Недавние контакты",
-        AddressBookFilter::Group(_) => "Контакты группы",
-        AddressBookFilter::Tag(_) => "Контакты с меткой",
+        AddressBookFilter::All => tr(language, TextKey::AddressBookAllContacts),
+        AddressBookFilter::Favorites => tr(language, TextKey::AddressBookFavorites),
+        AddressBookFilter::Recent => tr(language, TextKey::AddressBookRecentContacts),
+        AddressBookFilter::Group(_) => tr(language, TextKey::AddressBookGroupContacts),
+        AddressBookFilter::Tag(_) => tr(language, TextKey::AddressBookTaggedContacts),
     }
 }
 
-fn address_book_filter_display(filter: &AddressBookFilter) -> String {
+fn address_book_filter_display(filter: &AddressBookFilter, language: UiLanguage) -> String {
     match filter {
-        AddressBookFilter::All => "Все".to_owned(),
-        AddressBookFilter::Favorites => "Избранные".to_owned(),
-        AddressBookFilter::Recent => "Недавние".to_owned(),
+        AddressBookFilter::All => tr(language, TextKey::AddressBookAllShort).to_owned(),
+        AddressBookFilter::Favorites => tr(language, TextKey::AddressBookFavorites).to_owned(),
+        AddressBookFilter::Recent => tr(language, TextKey::AddressBookRecent).to_owned(),
         AddressBookFilter::Group(group) => group.clone(),
         AddressBookFilter::Tag(tag) => format!("#{tag}"),
+    }
+}
+
+fn address_book_count_summary(language: UiLanguage, visible: usize, total: usize) -> String {
+    match language {
+        UiLanguage::Russian => format!("{visible} показано · {total} всего"),
+        UiLanguage::English => format!("{visible} shown · {total} total"),
     }
 }
 
@@ -9150,10 +9950,17 @@ fn contact_matches_text_filter(contact: &Contact, filter: &str) -> bool {
         || contact.note.to_lowercase().contains(filter)
 }
 
-fn spawn_check_for_update(manifest_url: String, current_version: String) {
+fn spawn_check_for_update(source: UpdateSource, current_version: String) {
     let events = event_bus().0.clone();
     thread::spawn(move || {
-        let result = updater::check_for_update(&manifest_url, &current_version);
+        let result = match source {
+            UpdateSource::ManifestUrl(manifest_url) => {
+                updater::check_for_update(&manifest_url, &current_version)
+            }
+            UpdateSource::GithubRelease(owner_repo) => {
+                updater::check_github_release_for_update(&owner_repo, &current_version)
+            }
+        };
         let _ = events.send_blocking(ProcessEvent::Updater(UpdaterEvent::Checked(result)));
     });
 }
@@ -9314,6 +10121,13 @@ fn open_system_browser(url: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+fn open_about_link(url: &'static str, label: &'static str) -> String {
+    match open_system_browser(url) {
+        Ok(()) => format!("{label}: ссылка открыта"),
+        Err(error) => format!("{label}: не удалось открыть ссылку: {error}"),
+    }
+}
+
 fn sanitize_support_message(value: &str) -> String {
     value
         .chars()
@@ -9463,7 +10277,7 @@ fn event_bus() -> &'static EventBus {
     EVENT_BUS.get_or_init(async_channel::unbounded)
 }
 
-fn claim_single_instance() -> io::Result<bool> {
+fn claim_single_instance(start_in_background: bool) -> io::Result<bool> {
     let address = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, SINGLE_INSTANCE_PORT));
     match TcpListener::bind(address) {
         Ok(listener) => {
@@ -9471,7 +10285,7 @@ fn claim_single_instance() -> io::Result<bool> {
             Ok(true)
         }
         Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
-            let notify_result = notify_primary_instance(address);
+            let notify_result = notify_primary_instance(address, start_in_background);
             if should_start_after_single_instance_notify(&notify_result) {
                 if let Err(error) = notify_result {
                     eprintln!(
@@ -9502,11 +10316,13 @@ fn start_single_instance_listener(listener: TcpListener) -> io::Result<()> {
                     let mut reader = BufReader::new(&mut stream);
                     read_bounded_line(&mut reader, 64).ok().flatten()
                 };
-                if request.as_deref().is_some_and(is_focus_request) {
+                if request.as_deref().is_some_and(is_single_instance_request) {
                     let response = format!("{SINGLE_INSTANCE_RESPONSE}\n");
                     if stream.write_all(response.as_bytes()).is_ok() {
                         let _ = stream.flush();
-                        let _ = events.send_blocking(ProcessEvent::SecondInstance);
+                        if request.as_deref().is_some_and(is_focus_request) {
+                            let _ = events.send_blocking(ProcessEvent::SecondInstance);
+                        }
                     }
                 }
             }
@@ -9514,11 +10330,16 @@ fn start_single_instance_listener(listener: TcpListener) -> io::Result<()> {
     Ok(())
 }
 
-fn notify_primary_instance(address: SocketAddr) -> io::Result<()> {
+fn notify_primary_instance(address: SocketAddr, start_in_background: bool) -> io::Result<()> {
     let mut stream = TcpStream::connect_timeout(&address, SINGLE_INSTANCE_TIMEOUT)?;
     stream.set_read_timeout(Some(SINGLE_INSTANCE_TIMEOUT))?;
     stream.set_write_timeout(Some(SINGLE_INSTANCE_TIMEOUT))?;
-    stream.write_all(format!("{SINGLE_INSTANCE_REQUEST}\n").as_bytes())?;
+    let request = if start_in_background {
+        SINGLE_INSTANCE_BACKGROUND_REQUEST
+    } else {
+        SINGLE_INSTANCE_REQUEST
+    };
+    stream.write_all(format!("{request}\n").as_bytes())?;
     stream.flush()?;
     let response = {
         let mut reader = BufReader::new(&mut stream);
@@ -9578,6 +10399,10 @@ fn sanitize_startup_env_value(value: &str) -> String {
 
 fn is_focus_request(request: &str) -> bool {
     request == SINGLE_INSTANCE_REQUEST
+}
+
+fn is_single_instance_request(request: &str) -> bool {
+    request == SINGLE_INSTANCE_REQUEST || request == SINGLE_INSTANCE_BACKGROUND_REQUEST
 }
 
 fn clipboard_fingerprint(value: &str) -> u64 {
@@ -9993,28 +10818,69 @@ fn apply_viewer_control(entry: &mut ViewerEntry, control: ViewerControl) {
     }
 }
 
-fn viewer_control_label(control: ViewerControl) -> &'static str {
-    match control {
-        ViewerControl::InputEnabled { .. } => "управление",
-        ViewerControl::AudioEnabled { .. } => "звук",
-        ViewerControl::ClipboardEnabled { .. } => "clipboard",
-        ViewerControl::Quality { .. } => "качество",
-        ViewerControl::Scaling { .. } => "масштабирование",
+fn viewer_control_label(control: ViewerControl, language: UiLanguage) -> &'static str {
+    match (language, control) {
+        (_, ViewerControl::ClipboardEnabled { .. }) => "clipboard",
+        (UiLanguage::Russian, ViewerControl::InputEnabled { .. }) => "управление",
+        (UiLanguage::Russian, ViewerControl::AudioEnabled { .. }) => "звук",
+        (UiLanguage::Russian, ViewerControl::Quality { .. }) => "качество",
+        (UiLanguage::Russian, ViewerControl::Scaling { .. }) => "масштабирование",
+        (UiLanguage::English, ViewerControl::InputEnabled { .. }) => "input",
+        (UiLanguage::English, ViewerControl::AudioEnabled { .. }) => "audio",
+        (UiLanguage::English, ViewerControl::Quality { .. }) => "quality",
+        (UiLanguage::English, ViewerControl::Scaling { .. }) => "scaling",
     }
 }
 
-fn viewer_control_applied_text(control: ViewerControl) -> String {
-    match control {
-        ViewerControl::InputEnabled { enabled: true } => "Управление включено".to_owned(),
-        ViewerControl::InputEnabled { enabled: false } => "Режим «только просмотр»".to_owned(),
-        ViewerControl::AudioEnabled { enabled: true } => "Звук включён".to_owned(),
-        ViewerControl::AudioEnabled { enabled: false } => "Звук отключён".to_owned(),
-        ViewerControl::ClipboardEnabled { enabled: true } => "Clipboard включён".to_owned(),
-        ViewerControl::ClipboardEnabled { enabled: false } => "Clipboard отключён".to_owned(),
-        ViewerControl::Quality { quality } => {
-            format!("Профиль «{}» подтверждён", quality.label())
+fn viewer_control_applied_text(control: ViewerControl, language: UiLanguage) -> String {
+    match (language, control) {
+        (UiLanguage::Russian, ViewerControl::InputEnabled { enabled: true }) => {
+            "Управление включено".to_owned()
         }
-        ViewerControl::Scaling { scaling } => scaling.label().to_owned(),
+        (UiLanguage::Russian, ViewerControl::InputEnabled { enabled: false }) => {
+            "Режим «только просмотр»".to_owned()
+        }
+        (UiLanguage::Russian, ViewerControl::AudioEnabled { enabled: true }) => {
+            "Звук включён".to_owned()
+        }
+        (UiLanguage::Russian, ViewerControl::AudioEnabled { enabled: false }) => {
+            "Звук отключён".to_owned()
+        }
+        (UiLanguage::Russian, ViewerControl::ClipboardEnabled { enabled: true }) => {
+            "Clipboard включён".to_owned()
+        }
+        (UiLanguage::Russian, ViewerControl::ClipboardEnabled { enabled: false }) => {
+            "Clipboard отключён".to_owned()
+        }
+        (UiLanguage::Russian, ViewerControl::Quality { quality }) => {
+            format!("Профиль «{}» подтверждён", quality_label(quality, language))
+        }
+        (UiLanguage::Russian, ViewerControl::Scaling { scaling }) => scaling.label().to_owned(),
+        (UiLanguage::English, ViewerControl::InputEnabled { enabled: true }) => {
+            "Input enabled".to_owned()
+        }
+        (UiLanguage::English, ViewerControl::InputEnabled { enabled: false }) => {
+            "View-only mode".to_owned()
+        }
+        (UiLanguage::English, ViewerControl::AudioEnabled { enabled: true }) => {
+            "Audio enabled".to_owned()
+        }
+        (UiLanguage::English, ViewerControl::AudioEnabled { enabled: false }) => {
+            "Audio disabled".to_owned()
+        }
+        (UiLanguage::English, ViewerControl::ClipboardEnabled { enabled: true }) => {
+            "Clipboard enabled".to_owned()
+        }
+        (UiLanguage::English, ViewerControl::ClipboardEnabled { enabled: false }) => {
+            "Clipboard disabled".to_owned()
+        }
+        (UiLanguage::English, ViewerControl::Quality { quality }) => {
+            format!("Profile “{}” confirmed", quality_label(quality, language))
+        }
+        (UiLanguage::English, ViewerControl::Scaling { scaling }) => match scaling {
+            ViewerScaling::SmoothFit => "Scaling: smooth".to_owned(),
+            ViewerScaling::PixelPerfect => "Scaling: 1:1".to_owned(),
+        },
     }
 }
 
@@ -10031,59 +10897,106 @@ fn watch_host(service: HostService) {
         });
 }
 
-fn status_text(status: &ViewerStatus) -> String {
-    match status {
-        ViewerStatus::Starting => "Запуск viewer…".to_owned(),
-        ViewerStatus::Progress { percent, message } => format!("{percent}% — {message}"),
-        ViewerStatus::Info { message } => message.clone(),
-        ViewerStatus::Connected { peer } => format!("Подключено: {peer}"),
-        ViewerStatus::Latency { milliseconds } => {
+fn status_text(status: &ViewerStatus, language: UiLanguage) -> String {
+    match (language, status) {
+        (UiLanguage::Russian, ViewerStatus::Starting) => "Запуск viewer…".to_owned(),
+        (UiLanguage::English, ViewerStatus::Starting) => "Starting viewer…".to_owned(),
+        (_, ViewerStatus::Progress { percent, message }) => format!("{percent}% — {message}"),
+        (_, ViewerStatus::Info { message }) => message.clone(),
+        (UiLanguage::Russian, ViewerStatus::Connected { peer }) => format!("Подключено: {peer}"),
+        (UiLanguage::English, ViewerStatus::Connected { peer }) => format!("Connected: {peer}"),
+        (UiLanguage::Russian, ViewerStatus::Latency { milliseconds }) => {
             format!("Подключено · {milliseconds} мс")
         }
-        ViewerStatus::Codec { name } => format!("Кодек: {name}"),
-        ViewerStatus::Performance {
-            fps_times_100,
-            input_kbps,
-            dropped_frames,
-            session_seconds,
-            reconnect_count,
-        } => format_performance(
+        (UiLanguage::English, ViewerStatus::Latency { milliseconds }) => {
+            format!("Connected · {milliseconds} ms")
+        }
+        (UiLanguage::Russian, ViewerStatus::Codec { name }) => format!("Кодек: {name}"),
+        (UiLanguage::English, ViewerStatus::Codec { name }) => format!("Codec: {name}"),
+        (
+            _,
+            ViewerStatus::Performance {
+                fps_times_100,
+                input_kbps,
+                dropped_frames,
+                session_seconds,
+                reconnect_count,
+            },
+        ) => format_performance(
             *fps_times_100,
             *input_kbps,
             *dropped_frames,
             *session_seconds,
             *reconnect_count,
+            language,
         ),
-        ViewerStatus::Recovery { reason } => format!("Восстановление видео · {reason}"),
-        ViewerStatus::ScreenshotSaved { path } => {
+        (UiLanguage::Russian, ViewerStatus::Recovery { reason }) => {
+            format!("Восстановление видео · {reason}")
+        }
+        (UiLanguage::English, ViewerStatus::Recovery { reason }) => {
+            format!("Video recovery · {reason}")
+        }
+        (UiLanguage::Russian, ViewerStatus::ScreenshotSaved { path }) => {
             format!("Снимок сохранён: {path}")
         }
-        ViewerStatus::SessionSummary {
-            session_seconds,
-            reconnect_count,
-            end_reason,
-            ..
-        } => {
+        (UiLanguage::English, ViewerStatus::ScreenshotSaved { path }) => {
+            format!("Screenshot saved: {path}")
+        }
+        (
+            language,
+            ViewerStatus::SessionSummary {
+                session_seconds,
+                reconnect_count,
+                end_reason,
+                ..
+            },
+        ) => {
             let reason = if end_reason.is_empty() {
-                "Сессия завершена"
+                match language {
+                    UiLanguage::Russian => "Сессия завершена",
+                    UiLanguage::English => "Session ended",
+                }
             } else {
                 end_reason
             };
-            format!(
-                "{reason} · {} · восстановлений {}",
-                format_duration(*session_seconds),
-                reconnect_count
-            )
+            match language {
+                UiLanguage::Russian => format!(
+                    "{reason} · {} · восстановлений {}",
+                    format_duration(*session_seconds),
+                    reconnect_count
+                ),
+                UiLanguage::English => format!(
+                    "{reason} · {} · reconnects {}",
+                    format_duration(*session_seconds),
+                    reconnect_count
+                ),
+            }
         }
-        ViewerStatus::Reconnecting {
-            attempt,
-            delay_seconds,
-        } => format!("Попытка {attempt} · переподключение через {delay_seconds} с"),
-        ViewerStatus::Heartbeat { sequence } => format!("Heartbeat {sequence}"),
-        ViewerStatus::ControlApplied { control } => viewer_control_applied_text(*control),
-        ViewerStatus::ControlState { control } => viewer_control_applied_text(*control),
-        ViewerStatus::Failed { error } => format!("Ошибка: {error}"),
-        ViewerStatus::Closed => "Закрыто".to_owned(),
+        (
+            UiLanguage::Russian,
+            ViewerStatus::Reconnecting {
+                attempt,
+                delay_seconds,
+            },
+        ) => format!("Попытка {attempt} · переподключение через {delay_seconds} с"),
+        (
+            UiLanguage::English,
+            ViewerStatus::Reconnecting {
+                attempt,
+                delay_seconds,
+            },
+        ) => format!("Attempt {attempt} · reconnecting in {delay_seconds}s"),
+        (_, ViewerStatus::Heartbeat { sequence }) => format!("Heartbeat {sequence}"),
+        (_, ViewerStatus::ControlApplied { control }) => {
+            viewer_control_applied_text(*control, language)
+        }
+        (_, ViewerStatus::ControlState { control }) => {
+            viewer_control_applied_text(*control, language)
+        }
+        (UiLanguage::Russian, ViewerStatus::Failed { error }) => format!("Ошибка: {error}"),
+        (UiLanguage::English, ViewerStatus::Failed { error }) => format!("Error: {error}"),
+        (UiLanguage::Russian, ViewerStatus::Closed) => "Закрыто".to_owned(),
+        (UiLanguage::English, ViewerStatus::Closed) => "Closed".to_owned(),
     }
 }
 
@@ -10093,6 +11006,7 @@ fn format_performance(
     dropped_frames: u64,
     session_seconds: u64,
     reconnect_count: u32,
+    language: UiLanguage,
 ) -> String {
     let whole_fps = fps_times_100 / 100;
     let fractional_fps = fps_times_100 % 100;
@@ -10100,17 +11014,29 @@ fn format_performance(
     let reconnects = if reconnect_count == 0 {
         String::new()
     } else {
-        format!(" · восстановлений {reconnect_count}")
+        match language {
+            UiLanguage::Russian => format!(" · восстановлений {reconnect_count}"),
+            UiLanguage::English => format!(" · reconnects {reconnect_count}"),
+        }
     };
     let dropped = if dropped_frames == 0 {
         String::new()
     } else {
-        format!(" · пропущено {dropped_frames}")
+        match language {
+            UiLanguage::Russian => format!(" · пропущено {dropped_frames}"),
+            UiLanguage::English => format!(" · dropped {dropped_frames}"),
+        }
     };
-    format!(
-        "Подключено {} · {whole_fps}.{fractional_fps:02} FPS · {bandwidth}{dropped}{reconnects}",
-        format_duration(session_seconds)
-    )
+    match language {
+        UiLanguage::Russian => format!(
+            "Подключено {} · {whole_fps}.{fractional_fps:02} FPS · {bandwidth}{dropped}{reconnects}",
+            format_duration(session_seconds)
+        ),
+        UiLanguage::English => format!(
+            "Connected {} · {whole_fps}.{fractional_fps:02} FPS · {bandwidth}{dropped}{reconnects}",
+            format_duration(session_seconds)
+        ),
+    }
 }
 
 fn format_bandwidth(input_kbps: u64) -> String {
@@ -10476,6 +11402,11 @@ mod security_tests {
     #[test]
     fn single_instance_handshake_is_exact_and_round_trips_on_loopback() {
         assert!(is_focus_request(SINGLE_INSTANCE_REQUEST));
+        assert!(!is_focus_request(SINGLE_INSTANCE_BACKGROUND_REQUEST));
+        assert!(is_single_instance_request(SINGLE_INSTANCE_REQUEST));
+        assert!(is_single_instance_request(
+            SINGLE_INSTANCE_BACKGROUND_REQUEST
+        ));
         assert!(!is_focus_request("EVERTYDESK_LAUNCHER_FOCUS_V2"));
 
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -10493,7 +11424,30 @@ mod security_tests {
             stream.flush().unwrap();
         });
 
-        notify_primary_instance(address).unwrap();
+        notify_primary_instance(address, false).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn background_single_instance_handshake_does_not_request_focus() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = {
+                let mut reader = BufReader::new(&mut stream);
+                read_bounded_line(&mut reader, 64).unwrap().unwrap()
+            };
+            assert_eq!(request, SINGLE_INSTANCE_BACKGROUND_REQUEST);
+            assert!(!is_focus_request(&request));
+            assert!(is_single_instance_request(&request));
+            stream
+                .write_all(format!("{SINGLE_INSTANCE_RESPONSE}\n").as_bytes())
+                .unwrap();
+            stream.flush().unwrap();
+        });
+
+        notify_primary_instance(address, true).unwrap();
         server.join().unwrap();
     }
 
@@ -10639,18 +11593,30 @@ mod security_tests {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_run_command_value_quotes_executable_path() {
+        assert_eq!(
+            windows_run_command_value(r"C:\Program Files\EvertyDesk\evertydesk-launcher.exe"),
+            r#""C:\Program Files\EvertyDesk\evertydesk-launcher.exe" --background"#
+        );
+    }
+
     #[test]
     fn settings_sidebar_sections_are_stable_and_ordered() {
         assert_eq!(
-            SettingsSection::ALL.map(SettingsSection::label),
-            ["\u{411}\u{435}\u{437}\u{43E}\u{43F}\u{430}\u{441}\u{43D}\u{43E}\u{441}\u{442}\u{44C}", "\u{41E}\u{431}\u{449}\u{435}\u{435}", "\u{41F}\u{43E}\u{434}\u{43A}\u{43B}\u{44E}\u{447}\u{435}\u{43D}\u{438}\u{435}"]
+            SettingsSection::ALL
+                .map(|section| settings_section_label(section, UiLanguage::Russian)),
+            ["Безопасность", "Общее", "Подключение"]
         );
-        assert!(SettingsSection::Security
-            .hint()
-            .contains("\u{41F}\u{430}\u{440}\u{43E}\u{43B}\u{438}"));
-        assert!(SettingsSection::Connection
-            .hint()
-            .contains("\u{441}\u{435}\u{440}\u{432}\u{435}\u{440}\u{44B}"));
+        assert!(
+            settings_section_hint(SettingsSection::Security, UiLanguage::Russian)
+                .contains("Пароли")
+        );
+        assert!(
+            settings_section_hint(SettingsSection::Connection, UiLanguage::Russian)
+                .contains("серверы")
+        );
     }
 
     #[test]
@@ -10775,15 +11741,24 @@ mod tests {
             &AddressBookFilter::Group("Офис".to_owned())
         ));
         assert_eq!(
-            address_book_filter_label(&AddressBookFilter::Tag("prod".to_owned())),
+            address_book_filter_label(
+                &AddressBookFilter::Tag("prod".to_owned()),
+                UiLanguage::Russian
+            ),
             "Контакты с меткой"
         );
         assert_eq!(
-            address_book_filter_display(&AddressBookFilter::Group("Офис".to_owned())),
+            address_book_filter_display(
+                &AddressBookFilter::Group("Офис".to_owned()),
+                UiLanguage::Russian
+            ),
             "Офис"
         );
         assert_eq!(
-            address_book_filter_display(&AddressBookFilter::Tag("prod".to_owned())),
+            address_book_filter_display(
+                &AddressBookFilter::Tag("prod".to_owned()),
+                UiLanguage::Russian
+            ),
             "#prod"
         );
     }
@@ -10936,6 +11911,59 @@ mod tests {
         assert!(!use_wide_settings_content_layout(1_200.0));
         assert!(!use_wide_settings_content_layout(1_259.0));
         assert!(use_wide_settings_content_layout(1_260.0));
+    }
+
+    #[test]
+    fn settings_language_and_update_labels_are_localized() {
+        assert_eq!(
+            settings_section_label(SettingsSection::Security, UiLanguage::English),
+            "Security"
+        );
+        assert_eq!(
+            settings_section_label(SettingsSection::Security, UiLanguage::Russian),
+            "Безопасность"
+        );
+        assert_eq!(
+            language_preference_label(LanguagePreference::System, UiLanguage::English),
+            "System"
+        );
+        assert_eq!(
+            update_channel_label(UpdateChannelPreference::Disabled, UiLanguage::English),
+            "Disabled"
+        );
+        assert_eq!(
+            update_channel_label(UpdateChannelPreference::Disabled, UiLanguage::Russian),
+            "Отключено"
+        );
+    }
+
+    #[test]
+    fn update_source_prefers_explicit_settings() {
+        let mut store = LauncherStore::default();
+        assert_eq!(
+            update_source_from_store(&store),
+            Some(UpdateSource::GithubRelease(
+                DEFAULT_UPDATE_GITHUB_REPO.to_owned()
+            ))
+        );
+
+        store.update_channel = UpdateChannelPreference::ManifestUrl;
+        store.update_manifest_url = " https://example.com/latest.json ".to_owned();
+        assert_eq!(
+            update_source_from_store(&store),
+            Some(UpdateSource::ManifestUrl(
+                "https://example.com/latest.json".to_owned()
+            ))
+        );
+
+        store.update_channel = UpdateChannelPreference::GithubRelease;
+        store.update_github_repo = "EvertyDesk/EvertyDesk_Lite".to_owned();
+        assert_eq!(
+            update_source_from_store(&store),
+            Some(UpdateSource::GithubRelease(
+                "EvertyDesk/EvertyDesk_Lite".to_owned()
+            ))
+        );
     }
 
     #[test]
@@ -11232,11 +12260,11 @@ mod tests {
     #[test]
     fn performance_status_formats_lan_and_wan_rates() {
         assert_eq!(
-            format_performance(5_998, 850, 0, 9, 0),
+            format_performance(5_998, 850, 0, 9, 0, UiLanguage::Russian),
             "Подключено 9с · 59.98 FPS · 850 Кбит/с"
         );
         assert_eq!(
-            format_performance(3_000, 2_500, 4, 3_661, 2),
+            format_performance(3_000, 2_500, 4, 3_661, 2, UiLanguage::Russian),
             "Подключено 1ч 01м · 30.00 FPS · 2.5 Мбит/с · пропущено 4 · восстановлений 2"
         );
         assert_eq!(format_duration(125), "2м 05с");

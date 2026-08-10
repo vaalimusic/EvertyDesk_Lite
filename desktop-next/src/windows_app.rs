@@ -68,6 +68,86 @@ pub fn exclude_window_from_capture(_hwnd: isize) -> bool {
     false
 }
 
+#[cfg(windows)]
+pub fn hide_window(hwnd: isize) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+
+    let hwnd = HWND(hwnd as *mut core::ffi::c_void);
+    unsafe { ShowWindow(hwnd, SW_HIDE).as_bool() }
+}
+
+#[cfg(not(windows))]
+pub fn hide_window(_hwnd: isize) -> bool {
+    false
+}
+
+#[cfg(windows)]
+pub fn hide_current_process_background_event_windows() -> u32 {
+    use windows::core::BOOL;
+    use windows::Win32::Foundation::{HWND, LPARAM, RECT};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextLengthW, GetWindowThreadProcessId,
+        IsWindowVisible, ShowWindow, SW_HIDE,
+    };
+
+    struct HideState {
+        pid: u32,
+        hidden: u32,
+    }
+
+    unsafe extern "system" fn enum_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let state = unsafe { &mut *(lparam.0 as *mut HideState) };
+        let mut pid = 0;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        }
+        if pid != state.pid || !unsafe { IsWindowVisible(hwnd).as_bool() } {
+            return BOOL(1);
+        }
+
+        let mut class_name = [0u16; 128];
+        let class_len = unsafe { GetClassNameW(hwnd, &mut class_name) }.max(0) as usize;
+        let class_name = String::from_utf16_lossy(&class_name[..class_len]);
+        let text_len = unsafe { GetWindowTextLengthW(hwnd) };
+        let mut rect = RECT::default();
+        let rect_ok = unsafe { GetWindowRect(hwnd, &mut rect).is_ok() };
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+
+        if class_name == "Winit Thread Event Target"
+            && text_len == 0
+            && rect_ok
+            && width <= 32
+            && height <= 32
+        {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+            state.hidden = state.hidden.saturating_add(1);
+        }
+
+        BOOL(1)
+    }
+
+    let mut state = HideState {
+        pid: std::process::id(),
+        hidden: 0,
+    };
+    let lparam = LPARAM((&mut state as *mut HideState) as isize);
+    if let Err(error) = unsafe { EnumWindows(Some(enum_window), lparam) } {
+        eprintln!(
+            "[windows-app] EnumWindows failed while hiding background event windows: {error}"
+        );
+    }
+    state.hidden
+}
+
+#[cfg(not(windows))]
+pub fn hide_current_process_background_event_windows() -> u32 {
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

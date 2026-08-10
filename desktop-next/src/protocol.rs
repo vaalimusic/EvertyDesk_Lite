@@ -162,6 +162,77 @@ impl ViewerGameCodec {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewerTransportProfile {
+    DesktopEvrtck,
+    Game { codec: ViewerGameCodec, evrt2: bool },
+}
+
+impl ViewerTransportProfile {
+    pub const fn from_bootstrap(bootstrap: &ViewerBootstrap) -> Self {
+        if bootstrap.game_mode {
+            Self::Game {
+                codec: bootstrap.game_codec,
+                evrt2: bootstrap.game_evrt2_enabled,
+            }
+        } else {
+            Self::DesktopEvrtck
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::DesktopEvrtck => "Desktop EVRTCK",
+            Self::Game {
+                codec: ViewerGameCodec::Auto,
+                evrt2: false,
+            } => "Game H264",
+            Self::Game {
+                codec: ViewerGameCodec::Auto,
+                evrt2: true,
+            } => "Game H264 + EVRT2",
+            Self::Game {
+                codec: ViewerGameCodec::H265,
+                evrt2: false,
+            } => "Game H265",
+            Self::Game {
+                codec: ViewerGameCodec::H265,
+                evrt2: true,
+            } => "Game H265 + EVRT2",
+            Self::Game {
+                codec: ViewerGameCodec::H264,
+                evrt2: false,
+            } => "Game H264",
+            Self::Game {
+                codec: ViewerGameCodec::H264,
+                evrt2: true,
+            } => "Game H264 + EVRT2",
+            Self::Game {
+                codec: ViewerGameCodec::Av1,
+                evrt2: false,
+            } => "Game AV1",
+            Self::Game {
+                codec: ViewerGameCodec::Av1,
+                evrt2: true,
+            } => "Game AV1 + EVRT2",
+        }
+    }
+
+    pub const fn game_codec(self) -> Option<ViewerGameCodec> {
+        match self {
+            Self::DesktopEvrtck => None,
+            Self::Game { codec, .. } => Some(codec),
+        }
+    }
+
+    pub const fn evrt2_requested(self) -> bool {
+        match self {
+            Self::DesktopEvrtck => false,
+            Self::Game { evrt2, .. } => evrt2,
+        }
+    }
+}
+
 /// One-shot bootstrap message sent over the viewer's stdin.
 ///
 /// Stdin is used instead of command-line arguments so credentials are not
@@ -449,6 +520,43 @@ mod tests {
         assert!(decoded.game_mode);
         assert_eq!(decoded.game_codec.label(), "H264");
         assert!(decoded.game_evrt2_enabled);
+    }
+
+    #[test]
+    fn bootstrap_transport_profile_is_explicit_and_safe_by_default() {
+        let desktop = ViewerBootstrap::new("123", "");
+        assert_eq!(
+            ViewerTransportProfile::from_bootstrap(&desktop),
+            ViewerTransportProfile::DesktopEvrtck
+        );
+        assert_eq!(
+            ViewerTransportProfile::from_bootstrap(&desktop).label(),
+            "Desktop EVRTCK"
+        );
+        assert!(!ViewerTransportProfile::from_bootstrap(&desktop).evrt2_requested());
+
+        let game =
+            ViewerBootstrap::new("456", "").with_game_profile(true, ViewerGameCodec::Av1, true);
+        assert_eq!(
+            ViewerTransportProfile::from_bootstrap(&game),
+            ViewerTransportProfile::Game {
+                codec: ViewerGameCodec::Av1,
+                evrt2: true,
+            }
+        );
+        assert_eq!(
+            ViewerTransportProfile::from_bootstrap(&game).label(),
+            "Game AV1 + EVRT2"
+        );
+        assert!(ViewerTransportProfile::from_bootstrap(&game).evrt2_requested());
+
+        let stale_game_flags =
+            ViewerBootstrap::new("789", "").with_game_profile(false, ViewerGameCodec::H265, true);
+        assert_eq!(
+            ViewerTransportProfile::from_bootstrap(&stale_game_flags),
+            ViewerTransportProfile::DesktopEvrtck
+        );
+        assert!(!ViewerTransportProfile::from_bootstrap(&stale_game_flags).evrt2_requested());
     }
 
     #[test]

@@ -12,7 +12,7 @@ use evertydesk_desktop_next::frame_renderer::{FrameRenderer, FrameRendererError,
 use evertydesk_desktop_next::ipc::{read_bounded_line, MAX_IPC_LINE_BYTES};
 use evertydesk_desktop_next::protocol::{
     ConnectionQuality, ViewerBootstrap, ViewerCommand, ViewerControl, ViewerGameCodec,
-    ViewerScaling, ViewerStatus,
+    ViewerScaling, ViewerStatus, ViewerTransportProfile,
 };
 use evertydesk_desktop_next::startup_log::install_process_diagnostics;
 use evertydesk_desktop_next::windows_app::{
@@ -604,11 +604,8 @@ impl SessionControl {
     ) -> io::Result<Self> {
         let mut config = AppConfig::load_or_create();
         apply_quality_profile(&mut config.display, bootstrap.quality);
-        apply_transport_profile(
-            &mut config.display,
-            bootstrap.game_mode,
-            bootstrap.game_codec,
-        );
+        let transport_profile = ViewerTransportProfile::from_bootstrap(&bootstrap);
+        apply_transport_profile(&mut config.display, transport_profile);
         if bootstrap.game_mode {
             emit_status(&ViewerStatus::Progress {
                 percent: 8,
@@ -625,10 +622,8 @@ impl SessionControl {
         }
         let scaling = bootstrap.scaling;
         let quality = bootstrap.quality;
-        let request_evrt2_experiment =
-            should_request_evrt2_experiment(bootstrap.game_mode, bootstrap.game_evrt2_enabled);
-        let transport_profile_label =
-            viewer_transport_profile_label(bootstrap.game_mode, bootstrap.game_codec);
+        let request_evrt2_experiment = transport_profile.evrt2_requested();
+        let transport_profile_label = transport_profile.label().to_owned();
         let allow_clipboard = config.security.allow_clipboard;
         let fsr_quality = config.display.fsr_quality;
         let fsr_sharpness = config.display.fsr_sharpness;
@@ -1004,8 +999,8 @@ fn apply_quality_profile(display: &mut DisplayConfig, quality: ConnectionQuality
     display.adaptive_quality = adaptive_quality;
 }
 
-fn apply_transport_profile(display: &mut DisplayConfig, game_mode: bool, codec: ViewerGameCodec) {
-    if game_mode {
+fn apply_transport_profile(display: &mut DisplayConfig, profile: ViewerTransportProfile) {
+    if let Some(codec) = profile.game_codec() {
         display.streaming_mode = StreamingMode::Game;
         display.target_fps = 60;
         display.min_fps = display.min_fps.max(30);
@@ -1019,18 +1014,6 @@ fn apply_transport_profile(display: &mut DisplayConfig, game_mode: bool, codec: 
     } else {
         display.streaming_mode = StreamingMode::Support;
         display.codec = CodecPreference::Evrtck;
-    }
-}
-
-fn should_request_evrt2_experiment(game_mode: bool, evrt2_enabled: bool) -> bool {
-    game_mode && evrt2_enabled
-}
-
-fn viewer_transport_profile_label(game_mode: bool, codec: ViewerGameCodec) -> String {
-    if game_mode {
-        format!("Game {}", codec.label())
-    } else {
-        "Desktop EVRTCK".to_owned()
     }
 }
 
@@ -3849,7 +3832,13 @@ mod quality_tests {
     fn game_profile_forces_concrete_codec_and_low_latency_settings() {
         let mut display = DisplayConfig::default();
         apply_quality_profile(&mut display, ConnectionQuality::Sharp);
-        apply_transport_profile(&mut display, true, ViewerGameCodec::H265);
+        apply_transport_profile(
+            &mut display,
+            ViewerTransportProfile::Game {
+                codec: ViewerGameCodec::H265,
+                evrt2: false,
+            },
+        );
 
         assert_eq!(display.streaming_mode, StreamingMode::Game);
         assert_eq!(display.target_fps, 60);
@@ -3857,7 +3846,13 @@ mod quality_tests {
         assert!(!display.adaptive_quality);
         assert_eq!(display.codec, CodecPreference::H265);
 
-        apply_transport_profile(&mut display, true, ViewerGameCodec::Auto);
+        apply_transport_profile(
+            &mut display,
+            ViewerTransportProfile::Game {
+                codec: ViewerGameCodec::Auto,
+                evrt2: false,
+            },
+        );
         assert_eq!(display.codec, CodecPreference::H264);
     }
 
@@ -3869,7 +3864,7 @@ mod quality_tests {
             ..DisplayConfig::default()
         };
 
-        apply_transport_profile(&mut display, false, ViewerGameCodec::Av1);
+        apply_transport_profile(&mut display, ViewerTransportProfile::DesktopEvrtck);
 
         assert_eq!(display.streaming_mode, StreamingMode::Support);
         assert_eq!(display.codec, CodecPreference::Evrtck);
@@ -3877,21 +3872,40 @@ mod quality_tests {
 
     #[test]
     fn evrt2_experiment_is_requested_only_for_game_opt_in() {
-        assert!(should_request_evrt2_experiment(true, true));
-        assert!(!should_request_evrt2_experiment(true, false));
-        assert!(!should_request_evrt2_experiment(false, true));
-        assert!(!should_request_evrt2_experiment(false, false));
+        assert!(ViewerTransportProfile::Game {
+            codec: ViewerGameCodec::H264,
+            evrt2: true,
+        }
+        .evrt2_requested());
+        assert!(!ViewerTransportProfile::Game {
+            codec: ViewerGameCodec::H264,
+            evrt2: false,
+        }
+        .evrt2_requested());
+        assert!(!ViewerTransportProfile::DesktopEvrtck.evrt2_requested());
     }
 
     #[test]
     fn transport_profile_label_distinguishes_desktop_and_game() {
         assert_eq!(
-            viewer_transport_profile_label(false, ViewerGameCodec::Av1),
+            ViewerTransportProfile::DesktopEvrtck.label(),
             "Desktop EVRTCK"
         );
         assert_eq!(
-            viewer_transport_profile_label(true, ViewerGameCodec::H265),
+            ViewerTransportProfile::Game {
+                codec: ViewerGameCodec::H265,
+                evrt2: false,
+            }
+            .label(),
             "Game H265"
+        );
+        assert_eq!(
+            ViewerTransportProfile::Game {
+                codec: ViewerGameCodec::Av1,
+                evrt2: true,
+            }
+            .label(),
+            "Game AV1 + EVRT2"
         );
     }
 

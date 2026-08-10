@@ -5,6 +5,7 @@
 
 pub mod credential_store;
 pub mod frame_renderer;
+pub mod i18n;
 pub mod ipc;
 pub mod launcher_store;
 pub mod protocol;

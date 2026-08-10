@@ -36,6 +36,9 @@ const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_VERSION_BYTES: usize = 32;
 const MAX_NOTES_BYTES: usize = 8 * 1024;
+const GITHUB_API_BASE: &str = "https://api.github.com/repos";
+const GITHUB_UPDATE_MANIFEST_ASSETS: [&str; 3] =
+    ["latest.json", "evertydesk-update.json", "update.json"];
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdateManifest {
@@ -52,6 +55,21 @@ pub struct UpdateManifest {
 struct PlatformArtifact {
     url: String,
     sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    assets: Vec<GithubAsset>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GithubAsset {
+    name: String,
+    browser_download_url: String,
 }
 
 impl UpdateManifest {
@@ -101,6 +119,34 @@ pub fn check_for_update(
     }
 }
 
+/// Checks the latest GitHub Release for a manifest asset (`latest.json`,
+/// `evertydesk-update.json`, or `update.json`) and then runs the same manifest
+/// validation/download flow as the self-hosted channel. GitHub hosts the
+/// manifest, but the manifest still carries platform artifact SHA-256 hashes.
+pub fn check_github_release_for_update(
+    owner_repo: &str,
+    current_version: &str,
+) -> Result<Option<UpdateManifest>, String> {
+    let owner_repo = validate_github_owner_repo(owner_repo)?;
+    let release_url = format!("{GITHUB_API_BASE}/{owner_repo}/releases/latest");
+    let body = http_get_string(&release_url, MAX_MANIFEST_BYTES)?;
+    let release: GithubRelease =
+        serde_json::from_str(&body).map_err(|error| format!("invalid GitHub release: {error}"))?;
+
+    let manifest_url = github_manifest_asset_url(&release)
+        .ok_or_else(|| "GitHub release does not contain latest.json manifest asset".to_owned())?;
+    let mut update = check_for_update(&manifest_url, current_version)?;
+    if let Some(manifest) = &mut update {
+        if manifest.notes.trim().is_empty() {
+            manifest.notes = release.body.trim().to_owned();
+        }
+        if manifest.version.trim().is_empty() {
+            manifest.version = normalize_github_tag_version(&release.tag_name);
+        }
+    }
+    Ok(update)
+}
+
 /// Rejects anything but `https://`. A plaintext manifest is fully
 /// attacker-controlled by any on-path network position -- including the
 /// `sha256` field it carries, so verifying the download's hash against a
@@ -112,6 +158,67 @@ fn require_https(url: &str) -> Result<(), String> {
     } else {
         Err("update URL must use https://".to_owned())
     }
+}
+
+fn http_get_string(url: &str, max_bytes: u64) -> Result<String, String> {
+    require_https(url)?;
+    let agent = ureq::AgentBuilder::new().timeout(REQUEST_TIMEOUT).build();
+    let response = agent
+        .get(url)
+        .set("User-Agent", "EvertyDesk-DesktopNext-Updater")
+        .call()
+        .map_err(|error| format!("failed to request {url}: {error}"))?;
+    let mut limited = response.into_reader().take(max_bytes);
+    let mut body = String::new();
+    limited
+        .read_to_string(&mut body)
+        .map_err(|error| format!("failed to read response from {url}: {error}"))?;
+    Ok(body)
+}
+
+fn validate_github_owner_repo(owner_repo: &str) -> Result<String, String> {
+    let value = owner_repo.trim().trim_matches('/');
+    let mut parts = value.split('/');
+    let Some(owner) = parts.next() else {
+        return Err("GitHub repository must be owner/repo".to_owned());
+    };
+    let Some(repo) = parts.next() else {
+        return Err("GitHub repository must be owner/repo".to_owned());
+    };
+    if parts.next().is_some()
+        || !github_path_component_is_safe(owner)
+        || !github_path_component_is_safe(repo)
+    {
+        return Err("GitHub repository must be a safe owner/repo value".to_owned());
+    }
+    Ok(format!("{owner}/{repo}"))
+}
+
+fn github_path_component_is_safe(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 100
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+}
+
+fn github_manifest_asset_url(release: &GithubRelease) -> Option<String> {
+    release.assets.iter().find_map(|asset| {
+        let name = asset.name.trim();
+        if GITHUB_UPDATE_MANIFEST_ASSETS
+            .iter()
+            .any(|expected| name.eq_ignore_ascii_case(expected))
+            && asset.browser_download_url.starts_with("https://")
+        {
+            Some(asset.browser_download_url.clone())
+        } else {
+            None
+        }
+    })
+}
+
+fn normalize_github_tag_version(tag_name: &str) -> String {
+    tag_name.trim().trim_start_matches(['v', 'V']).to_owned()
 }
 
 /// Downloads the update artifact for the current platform into `destination_dir`,
@@ -379,6 +486,45 @@ mod tests {
             assert!(manifest.artifact_for_current_platform().is_some());
             assert!(validate_artifact(manifest.artifact_for_current_platform().unwrap()).is_ok());
         }
+    }
+
+    #[test]
+    fn github_release_channel_uses_manifest_asset_not_raw_installer() {
+        let release: GithubRelease = serde_json::from_str(
+            r#"{
+                "tag_name": "v2.0.1",
+                "body": "release notes",
+                "assets": [
+                    {
+                        "name": "EvertyDeskNext-2.0.1-x64.msi",
+                        "browser_download_url": "https://github.com/everty/desk/releases/download/v2.0.1/EvertyDeskNext-2.0.1-x64.msi"
+                    },
+                    {
+                        "name": "latest.json",
+                        "browser_download_url": "https://github.com/everty/desk/releases/download/v2.0.1/latest.json"
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(normalize_github_tag_version(&release.tag_name), "2.0.1");
+        assert_eq!(
+            github_manifest_asset_url(&release).as_deref(),
+            Some("https://github.com/everty/desk/releases/download/v2.0.1/latest.json")
+        );
+    }
+
+    #[test]
+    fn github_owner_repo_validation_rejects_paths_and_urls() {
+        assert_eq!(
+            validate_github_owner_repo(" EvertyDesk/EvertyDesk_Lite ").as_deref(),
+            Ok("EvertyDesk/EvertyDesk_Lite")
+        );
+        assert!(validate_github_owner_repo("https://github.com/a/b").is_err());
+        assert!(validate_github_owner_repo("a/b/c").is_err());
+        assert!(validate_github_owner_repo("a/../b").is_err());
+        assert!(validate_github_owner_repo("a/").is_err());
     }
 
     #[test]

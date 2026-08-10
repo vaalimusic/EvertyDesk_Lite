@@ -43,6 +43,7 @@ foreach ($process in $existing) {
 }
 
 $workingDirectory = if ([string]::IsNullOrWhiteSpace($BinaryDirectory)) { $root } else { $targetDir }
+$startedAt = Get-Date
 $process = Start-Process -FilePath $launcher -WorkingDirectory $workingDirectory -PassThru
 try {
     $deadline = (Get-Date).AddSeconds(30)
@@ -70,6 +71,15 @@ try {
         throw "Launcher process is not responding after startup timeout. Check log: $logPath"
     }
 
+    $logPath = Join-Path $env:LOCALAPPDATA "EvertyDesk\desktop-next.log"
+    if (!(Test-Path -LiteralPath $logPath -PathType Leaf)) {
+        throw "Launcher did not create diagnostic log: $logPath"
+    }
+    $log = Get-Item -LiteralPath $logPath
+    if ($log.LastWriteTime -lt $startedAt.AddSeconds(-1)) {
+        throw "Launcher diagnostic log was not updated during startup: $logPath"
+    }
+
     $samePathProcesses = Get-CimInstance Win32_Process -Filter "name='evertydesk-launcher.exe'" |
         Where-Object { $_.ExecutablePath -eq $launcher }
     $primaryProcesses = @($samePathProcesses | Where-Object { $_.CommandLine -notmatch ' --host-agent(\s|$)' })
@@ -79,7 +89,6 @@ try {
         throw "Expected exactly one primary launcher for this build, got $($primaryProcesses.Count)"
     }
 
-    $logPath = Join-Path $env:LOCALAPPDATA "EvertyDesk\desktop-next.log"
     [pscustomobject]@{
         Launcher      = $launcher
         Viewer        = $viewer
@@ -91,6 +100,7 @@ try {
         HostAgents    = $hostAgents.Count
         Icon          = "$($icon.Width)x$($icon.Height)"
         DiagnosticLog = $logPath
+        LogUpdatedAt  = $log.LastWriteTime
     }
 }
 finally {
