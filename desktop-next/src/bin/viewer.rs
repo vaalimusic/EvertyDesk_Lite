@@ -886,6 +886,25 @@ fn spawn_session(
                         port,
                     } => {
                         let endpoint = format!("{host_addr}:{port}");
+                        if !active && strict_evrt_required(&transport_profile_label) {
+                            let error = format!(
+                                "{transport_profile_label}: EVRT UDP inactive; TCP fallback is disabled for this profile"
+                            );
+                            emit_status(&ViewerStatus::Transport {
+                                profile: transport_profile_label.clone(),
+                                route: "blocked".to_owned(),
+                                reason: error.clone(),
+                            });
+                            emit_status(&ViewerStatus::Failed {
+                                error: error.clone(),
+                            });
+                            let _ = proxy.send_event(ViewerEvent::EvrtStatus {
+                                active,
+                                endpoint,
+                            });
+                            let _ = proxy.send_event(ViewerEvent::Failed { generation, error });
+                            break;
+                        }
                         let status = if active {
                             format!("EVRT UDP active - {endpoint}")
                         } else {
@@ -1037,6 +1056,10 @@ fn apply_transport_profile(display: &mut DisplayConfig, profile: ViewerTransport
         display.streaming_mode = StreamingMode::Support;
         display.codec = CodecPreference::Evrtck;
     }
+}
+
+fn strict_evrt_required(transport_profile_label: &str) -> bool {
+    transport_profile_label == ViewerTransportProfile::DesktopEvrtck.label()
 }
 
 fn desired_video_fps(paused: bool, visible: bool, target_fps: u32) -> i32 {
@@ -3929,6 +3952,20 @@ mod quality_tests {
             .label(),
             "Game AV1 + EVRT2"
         );
+    }
+
+    #[test]
+    fn desktop_evrtck_requires_strict_evrt_transport() {
+        assert!(strict_evrt_required(
+            ViewerTransportProfile::DesktopEvrtck.label()
+        ));
+        assert!(!strict_evrt_required(
+            ViewerTransportProfile::Game {
+                codec: ViewerGameCodec::H264,
+                evrt2: false,
+            }
+            .label()
+        ));
     }
 
     #[test]
