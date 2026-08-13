@@ -79,7 +79,8 @@ function HardwareOperationRank($operation) {
     switch ([string]$operation) {
         "roundtrip" { return 0 }
         "decode" { return 1 }
-        "encode" { return 2 }
+        "encode_drain" { return 2 }
+        "encode" { return 3 }
         default { return 99 }
     }
 }
@@ -112,7 +113,7 @@ foreach ($decision in $evrtckSummary.decisions) {
     $hardwareForScenario = $hardwareRows |
         Where-Object {
             $_.scenario -eq $scenario -and
-            $_.operation -in @("roundtrip", "decode", "encode") -and
+            $_.operation -in @("roundtrip", "decode", "encode_drain", "encode") -and
             $_.available -eq "true"
         } |
         ForEach-Object {
@@ -165,7 +166,7 @@ $fallbackHardware = $decisions | Where-Object {
     $null -ne $_.hardware_operation -and $_.hardware_operation -ne "roundtrip"
 }
 if ($fallbackHardware.Count -gt 0) {
-    $warnings += "some hardware comparisons use decode/encode fallback because roundtrip rows were unavailable"
+    $warnings += "some hardware comparisons use decode/encode_drain/encode fallback because roundtrip rows were unavailable"
     $publishable = $false
 }
 $missingRoundtrip = $decisions | Where-Object {
@@ -230,7 +231,7 @@ $md.Add("")
 $md.Add("Notes:")
 $md.Add("")
 $md.Add("- EVRTCK values use hinted roundtrip when available: encode + decode after base-frame state is established.")
-$md.Add("- Hardware values prefer roundtrip rows. If roundtrip is unavailable, the report falls back to decode/encode rows and marks the comparison non-publishable.")
+$md.Add("- Hardware values prefer roundtrip rows. If roundtrip is unavailable, the report falls back to decode/encode_drain/encode rows and marks the comparison non-publishable.")
 $md.Add("- A hardware winner here means the scheduler should prefer silicon for this scene class, not that transport/presentation latency is already solved.")
 
 $md | Set-Content -LiteralPath $outMdPath -Encoding utf8
