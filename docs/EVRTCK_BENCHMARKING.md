@@ -52,6 +52,30 @@ You can regenerate only the summary from an existing report:
 .\scripts\summarize-evrtck-prod-bench.ps1 -ReportDir .\reports\evrtck-prod\<timestamp>
 ```
 
+## Hardware codec comparison smoke
+
+The same repository also contains a Media Foundation encode harness for
+H.264/H.265 comparison on a matching scene set:
+
+```powershell
+cargo run --release --features live-vp9-mf --bin hardware_codec_prod_bench -- --quick
+```
+
+For publishable comparison data, use the same resolution, iteration count, and
+warmup count as the EVRTCK full run:
+
+```powershell
+cargo run --release --features live-vp9-mf --bin hardware_codec_prod_bench -- --iterations 300 --warmup 30 --width 1920 --height 1080 --codec H264,H265
+```
+
+Output is written to:
+
+```text
+reports/hardware-codec-prod/<timestamp>/
+  hardware_codec_prod_bench.csv
+  hardware_codec_prod_bench.jsonl
+```
+
 ## Metadata captured
 
 `metadata.json` records:
@@ -144,9 +168,11 @@ Payload bytes:
 
 ## Current limitations
 
-This runner measures EVRTCK software-path codec cost. It does not yet benchmark:
+The EVRTCK runner measures EVRTCK software-path codec cost. The separate
+`hardware_codec_prod_bench` runner measures Media Foundation H.264/H.265 encode
+cost on matching synthetic and realistic scenes. The combined benchmark set
+still does not yet benchmark:
 
-- hardware H.264/H.265 encode on the same scene;
 - hardware decode latency;
 - capture latency;
 - EVRT network packetization/reassembly;
