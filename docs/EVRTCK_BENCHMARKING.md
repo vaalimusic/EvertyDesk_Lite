@@ -114,6 +114,11 @@ P-frame encode:
 - creates an encoder and encodes the base frame before the timed section;
 - measures only encoding the changed P-frame;
 - this answers the steady-state desktop-stream question.
+- realistic IDE/browser/terminal scenes use their own matching base frame, not
+  a synthetic solid-color baseline.
+- hinted realistic scroll scenes feed explicit EVRTCK copy rects plus dirty
+  rects, matching the capture-metadata path expected from Desktop Duplication
+  move rects.
 
 Decode:
 
@@ -127,6 +132,8 @@ Roundtrip:
 - measures P-frame encode plus P-frame decode;
 - does not include network, encryption, UI painting, capture, or sleep/scheduler
   delay.
+- validates before timing that every normal and hinted P-frame decodes exactly
+  to the expected RGBA frame reconstructed from the BGRA capture input.
 
 Payload bytes:
 

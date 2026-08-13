@@ -873,6 +873,9 @@ impl EvrtckEncoderBackend for CpuEvrtckEncoder {
         if self.pending_keyframe {
             return self.encode_inner(bgra, frame_id);
         }
+        if bgra == self.prev.as_slice() {
+            return self.encode_inner(bgra, frame_id);
+        }
         if let Some(copy_rect) =
             detect_full_width_vertical_scroll(&self.prev, bgra, self.width, self.height)
         {
@@ -2927,6 +2930,22 @@ mod tests {
     }
 
     #[test]
+    fn scroll_detection_keeps_static_frame_as_nop() {
+        let (w, h) = (256usize, 256usize);
+        let base = scrolling_text_like_frame(w, h);
+        let mut enc = EvrtckEncoder::new(w, h);
+        enc.encode(&base, 1);
+
+        let (pkt, stats) = enc.encode_with_scroll_detection(&base, 2);
+
+        assert_eq!(pkt.data.len(), FRAME_HEADER_LEN);
+        assert_eq!(pkt.data[4], VERSION);
+        assert!(pkt.data[5] & FLAG_NOP != 0);
+        assert_eq!(stats.dirty_tiles, 0);
+        assert_eq!(stats.encoded_bytes, FRAME_HEADER_LEN as u32);
+    }
+
+    #[test]
     fn capture_dirty_rect_limits_pframe_tile_scan() {
         let (w, h) = (128usize, 128usize);
         let base = checkerboard(w, h);
@@ -3257,6 +3276,31 @@ mod tests {
         let mut dec = EvrtckDecoder::new();
         let pkt = enc.encode(&frame, 1);
         assert_eq!(dec.decode(&pkt).unwrap(), frame.as_slice());
+    }
+
+    #[test]
+    fn pframe_noise_roundtrip_is_strict_rgba() {
+        let (w, h) = (96usize, 64usize);
+        let base = solid_frame(w, h, [30, 40, 90, 255]);
+        let mut frame = base.clone();
+        let mut rng = 0x4556_5254_434b_u64;
+        for y in 16..48 {
+            for x in 24..72 {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let off = (y * w + x) * 4;
+                frame[off] = rng as u8;
+                frame[off + 1] = (rng >> 8) as u8;
+                frame[off + 2] = (rng >> 16) as u8;
+                frame[off + 3] = 255;
+            }
+        }
+
+        let mut enc = EvrtckEncoder::new(w, h);
+        let mut dec = EvrtckDecoder::new();
+        dec.decode(&enc.encode(&base, 1)).unwrap();
+        let pkt = enc.encode(&frame, 2);
+
+        assert_eq!(dec.decode(&pkt).unwrap(), bgra_to_rgba(&frame).as_slice());
     }
 
     #[test]

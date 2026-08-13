@@ -1,4 +1,4 @@
-use evertydesk_core::evrtck::{DirtyRect, EvrtckDecoder, EvrtckEncoder, TILE_SIZE};
+use evertydesk_core::evrtck::{CopyRect, DirtyRect, EvrtckDecoder, EvrtckEncoder, TILE_SIZE};
 use serde::Serialize;
 use std::fs::{self, File};
 use std::hint::black_box;
@@ -364,7 +364,9 @@ fn run_pframe_scenario(
     scenario: Scenario,
 ) -> Vec<BenchRow> {
     let scene = make_scene(config, base, synthetic_frame, scenario);
+    let base = scene.base.as_slice();
     let frame = scene.frame.as_slice();
+    let copy_rects = scene.copy_rects.as_slice();
     let dirty_rects = scene.dirty_rects.as_slice();
 
     let mut reference_encoder = EvrtckEncoder::new(config.width, config.height);
@@ -375,8 +377,16 @@ fn run_pframe_scenario(
     let mut hinted_reference_encoder = EvrtckEncoder::new(config.width, config.height);
     hinted_reference_encoder.encode(base, 1);
     let (hinted_pframe, hinted_stats) =
-        hinted_reference_encoder.encode_with_capture_hints(frame, 2, &[], dirty_rects);
+        hinted_reference_encoder.encode_with_capture_hints(frame, 2, copy_rects, dirty_rects);
     let hinted_payload_bytes = hinted_pframe.data.len();
+    assert_packet_decodes_to_frame(&keyframe.data, &pframe.data, frame, scenario.name, "pframe");
+    assert_packet_decodes_to_frame(
+        &keyframe.data,
+        &hinted_pframe.data,
+        frame,
+        scenario.name,
+        "pframe_hinted",
+    );
 
     let encode_samples = measure(config, || {
         let mut enc = EvrtckEncoder::new(config.width, config.height);
@@ -392,7 +402,12 @@ fn run_pframe_scenario(
         let mut enc = EvrtckEncoder::new(config.width, config.height);
         enc.encode(black_box(base), 1);
         let started = Instant::now();
-        let pkt = enc.encode_with_capture_hints(black_box(frame), 2, &[], black_box(dirty_rects));
+        let pkt = enc.encode_with_capture_hints(
+            black_box(frame),
+            2,
+            black_box(copy_rects),
+            black_box(dirty_rects),
+        );
         let elapsed = started.elapsed();
         black_box(pkt.0.data.len());
         elapsed
@@ -437,7 +452,12 @@ fn run_pframe_scenario(
         let mut dec = EvrtckDecoder::new();
         dec.decode_wire(black_box(&kf.data)).unwrap();
         let started = Instant::now();
-        let pkt = enc.encode_with_capture_hints(black_box(frame), 2, &[], black_box(dirty_rects));
+        let pkt = enc.encode_with_capture_hints(
+            black_box(frame),
+            2,
+            black_box(copy_rects),
+            black_box(dirty_rects),
+        );
         let pixels = dec.decode_wire(black_box(&pkt.0.data)).unwrap();
         let elapsed = started.elapsed();
         black_box((pkt.0.data.len(), pixels.len()));
@@ -514,15 +534,51 @@ fn run_pframe_scenario(
     ]
 }
 
+fn assert_packet_decodes_to_frame(
+    keyframe: &[u8],
+    packet: &[u8],
+    expected_bgra: &[u8],
+    scenario: &str,
+    operation: &str,
+) {
+    let expected_rgba = bgra_to_rgba(expected_bgra);
+    let mut dec = EvrtckDecoder::new();
+    dec.decode_wire(keyframe)
+        .unwrap_or_else(|err| panic!("{scenario}/{operation}: keyframe decode failed: {err}"));
+    let decoded = dec
+        .decode_wire(packet)
+        .unwrap_or_else(|err| panic!("{scenario}/{operation}: pframe decode failed: {err}"));
+    assert_eq!(
+        decoded,
+        expected_rgba.as_slice(),
+        "{scenario}/{operation}: decoded pixels differ from expected frame"
+    );
+}
+
+fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity(bgra.len());
+    for px in bgra.chunks_exact(4) {
+        rgba.push(px[2]);
+        rgba.push(px[1]);
+        rgba.push(px[0]);
+        rgba.push(px[3]);
+    }
+    rgba
+}
+
 struct Scene {
+    base: Vec<u8>,
     frame: Vec<u8>,
+    copy_rects: Vec<CopyRect>,
     dirty_rects: Vec<DirtyRect>,
 }
 
 fn make_scene(config: &Config, base: &[u8], synthetic_frame: &[u8], scenario: Scenario) -> Scene {
     match scenario.scene {
         SceneKind::SyntheticDirty => Scene {
+            base: base.to_vec(),
             frame: synthetic_frame.to_vec(),
+            copy_rects: Vec::new(),
             dirty_rects: dirty_rects_for_tiles(
                 config.width,
                 config.height,
@@ -537,7 +593,7 @@ fn make_scene(config: &Config, base: &[u8], synthetic_frame: &[u8], scenario: Sc
         },
         SceneKind::IdeTyping => ide_typing_scene(config.width, config.height),
         SceneKind::BrowserScroll => browser_scroll_scene(config.width, config.height),
-        SceneKind::TerminalScroll => terminal_scroll_scene(base, config.width, config.height),
+        SceneKind::TerminalScroll => terminal_scroll_scene(config.width, config.height),
     }
 }
 
@@ -736,7 +792,8 @@ fn dirty_rects_for_tiles(w: usize, h: usize, tile_indices: &[usize]) -> Vec<Dirt
 }
 
 fn ide_typing_scene(w: usize, h: usize) -> Scene {
-    let mut frame = ide_base_frame(w, h);
+    let base = ide_base_frame(w, h);
+    let mut frame = base.clone();
     let editor_left = (w / 5).min(360);
     let editor_top = (h / 8).min(140);
     let line_h = 22usize;
@@ -772,7 +829,9 @@ fn ide_typing_scene(w: usize, h: usize) -> Scene {
     );
 
     Scene {
+        base,
         frame,
+        copy_rects: Vec::new(),
         dirty_rects: vec![DirtyRect {
             left: x0 as u32,
             top: y0 as u32,
@@ -783,18 +842,27 @@ fn ide_typing_scene(w: usize, h: usize) -> Scene {
 }
 
 fn browser_scroll_scene(w: usize, h: usize) -> Scene {
-    let mut frame = browser_base_frame(w, h, 0);
+    let base = browser_base_frame(w, h, 0);
+    let mut frame = base.clone();
     let scroll_px = 96usize.min(h / 4).max(1);
-    let old = browser_base_frame(w, h, 0);
     let newer = browser_base_frame(w, h, scroll_px);
     let content_top = (h / 10).max(80).min(h);
     let content_bottom = h.saturating_sub(24);
+    let mut copy_rects = Vec::new();
     if content_bottom > content_top + scroll_px {
         for y in content_top..(content_bottom - scroll_px) {
             let src = ((y + scroll_px) * w) * 4;
             let dst = (y * w) * 4;
-            frame[dst..dst + w * 4].copy_from_slice(&old[src..src + w * 4]);
+            frame[dst..dst + w * 4].copy_from_slice(&base[src..src + w * 4]);
         }
+        copy_rects.push(CopyRect {
+            src_x: 0,
+            src_y: (content_top + scroll_px) as u32,
+            dst_x: 0,
+            dst_y: content_top as u32,
+            width: w as u32,
+            height: (content_bottom - content_top - scroll_px) as u32,
+        });
     }
     let dirty_top = content_bottom.saturating_sub(scroll_px);
     let bytes_start = dirty_top * w * 4;
@@ -802,7 +870,9 @@ fn browser_scroll_scene(w: usize, h: usize) -> Scene {
         .copy_from_slice(&newer[bytes_start..content_bottom * w * 4]);
 
     Scene {
+        base,
         frame,
+        copy_rects,
         dirty_rects: vec![DirtyRect {
             left: 0,
             top: dirty_top as u32,
@@ -812,15 +882,25 @@ fn browser_scroll_scene(w: usize, h: usize) -> Scene {
     }
 }
 
-fn terminal_scroll_scene(base: &[u8], w: usize, h: usize) -> Scene {
-    let mut frame = base.to_vec();
+fn terminal_scroll_scene(w: usize, h: usize) -> Scene {
+    let base = terminal_base_frame(w, h);
+    let mut frame = base.clone();
     let scroll_px = 32usize.min(h / 8).max(1);
+    let mut copy_rects = Vec::new();
     if h > scroll_px {
         for y in 0..(h - scroll_px) {
             let src = (y + scroll_px) * w * 4;
             let dst = y * w * 4;
             frame.copy_within(src..src + w * 4, dst);
         }
+        copy_rects.push(CopyRect {
+            src_x: 0,
+            src_y: scroll_px as u32,
+            dst_x: 0,
+            dst_y: 0,
+            width: w as u32,
+            height: (h - scroll_px) as u32,
+        });
     }
     let y0 = h.saturating_sub(scroll_px);
     fill_rect(&mut frame, w, h, 0, y0, w, scroll_px, [18, 18, 18, 255]);
@@ -836,7 +916,9 @@ fn terminal_scroll_scene(base: &[u8], w: usize, h: usize) -> Scene {
     }
 
     Scene {
+        base,
         frame,
+        copy_rects,
         dirty_rects: vec![DirtyRect {
             left: 0,
             top: y0 as u32,
@@ -866,6 +948,30 @@ fn ide_base_frame(w: usize, h: usize) -> Vec<u8> {
             3,
             [92, 99, 112, 255],
         );
+    }
+    frame
+}
+
+fn terminal_base_frame(w: usize, h: usize) -> Vec<u8> {
+    let mut frame = solid_frame(w, h, [18, 18, 18, 255]);
+    for row in 0..(h / 18).max(1) {
+        let y = 8 + row * 18;
+        if y + 4 >= h {
+            break;
+        }
+        for col in 0..96usize {
+            let x = 16 + col * 9;
+            if x + 6 >= w {
+                break;
+            }
+            let color = match (row + col) % 11 {
+                0 => [97, 175, 239, 255],
+                1 => [224, 108, 117, 255],
+                2 => [152, 195, 121, 255],
+                _ => [120, 132, 150, 255],
+            };
+            fill_rect(&mut frame, w, h, x, y, 6, 3, color);
+        }
     }
     frame
 }
