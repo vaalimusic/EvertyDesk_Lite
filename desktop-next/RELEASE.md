@@ -115,18 +115,18 @@ Release automation generates `latest.json` from the packaged artifacts:
 
 ```powershell
 .\scripts\generate-update-manifest.ps1 `
-  -Version 2.0.0 `
-  -BaseUrl https://github.com/<owner>/<repo>/releases/download/v2.0.0 `
+  -Version 2.0.1 `
+  -BaseUrl https://github.com/<owner>/<repo>/releases/download/v2.0.1 `
   -DistDir .\dist `
   -OutFile .\dist\latest.json `
-  -Notes v2.0.0
+  -Notes v2.0.1
 ```
 
 Validate release artifacts before publishing:
 
 ```powershell
 .\scripts\validate-release-artifacts.ps1 `
-  -Version 2.0.0 `
+  -Version 2.0.1 `
   -DistDir .\dist `
   -Manifest .\dist\latest.json `
   -RequireWindows `
@@ -145,14 +145,14 @@ Example:
 
 ```json
 {
-  "version": "2.0.0",
+  "version": "2.0.1",
   "notes": "EvertyDesk Next 2 release.",
   "windows": {
-    "url": "https://example.com/EvertyDeskNext-2.0.0-x64.msi",
+    "url": "https://example.com/EvertyDeskNext-2.0.1-x64.msi",
     "sha256": "<hex>"
   },
   "macos": {
-    "url": "https://example.com/EvertyDeskNext-2.0.0.dmg",
+    "url": "https://example.com/EvertyDeskNext-2.0.1.dmg",
     "sha256": "<hex>"
   }
 }
@@ -196,8 +196,8 @@ are ignored by the updater.
 
 The local portable package built during production-hardening:
 
-- `dist/EvertyDeskNext-2.0.0-windows-x64-portable.zip`
+- `dist/EvertyDeskNext-2.0.1-windows-x64-portable.zip`
 - SHA-256:
-  `9d2de1fc548a0335c61093b027e0dee1f1ca09f3a33971b9f373d493907bea00`
+  `4b0b696f10b7322f6f9395aaedcd3f8106deb0fbf98c370620b4d053a93255ab`
 
 `dist/` is ignored by git and should not be committed.

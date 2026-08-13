@@ -1,6 +1,6 @@
 # EvertyDesk Next 2 production checklist
 
-Target version: `2.0.0`
+Target version: `2.0.1`
 
 This checklist tracks what must be true before publishing EvertyDesk Next 2 as a production build.
 
@@ -28,14 +28,14 @@ This checklist tracks what must be true before publishing EvertyDesk Next 2 as a
 - `tools/portable-smoke.ps1 -Configuration release -StopAllExistingLaunchers` passed locally on Windows:
   release launcher starts from the intended directory, window responds, icon resource is present, viewer and RDP viewer are next to launcher, and smoke cleanup stops launcher/host-agent by default.
 - `scripts/package-windows-portable.ps1 -StopRunningBuildProcesses` produced
-  `dist/EvertyDeskNext-2.0.0-windows-x64-portable.zip` and `.sha256`.
+  `dist/EvertyDeskNext-2.0.1-windows-x64-portable.zip` and `.sha256`.
 - Extracted portable zip passed `tools/portable-smoke.ps1 -BinaryDirectory <extracted-dir> -StopAllExistingLaunchers`.
 
 ## Release blockers
 
 1. Run the Windows MSI package job for real.
    - Required: WiX CLI `5.0.2` and `WixToolset.UI.wixext/5.0.2`.
-   - Expected output: `dist/EvertyDeskNext-2.0.0-x64.msi` and `.sha256`.
+   - Expected output: `dist/EvertyDeskNext-2.0.1-x64.msi` and `.sha256`.
 
 2. Run the macOS package job on macOS for real.
    - The DMG path is implemented, but cannot be validated on Windows.
