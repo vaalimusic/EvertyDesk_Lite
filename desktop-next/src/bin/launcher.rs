@@ -134,6 +134,13 @@ pub fn main() -> iced::Result {
             std::env::set_var("EVERTYDESK_HOST_AGENT", "1");
         }
     }
+    if std::env::var_os("EVERTYDESK_DISABLE_RELAY_FALLBACK").is_none() {
+        // SAFETY: single-threaded at this point in main(), before any
+        // thread that could read the environment concurrently is spawned.
+        unsafe {
+            std::env::set_var("EVERTYDESK_DISABLE_RELAY_FALLBACK", "1");
+        }
+    }
 
     install_process_diagnostics("launcher");
     set_current_process_app_user_model_id(WindowsAppUserModelId::Launcher);
@@ -805,6 +812,8 @@ struct ViewerEntry {
     remote_id: String,
     status: String,
     codec: String,
+    transport: String,
+    transport_reason: String,
     latency_ms: Option<u32>,
     fps_times_100: u32,
     input_kbps: u64,
@@ -3411,6 +3420,11 @@ impl Launcher {
                 } else {
                     entry.codec.as_str()
                 };
+                let transport = if entry.transport.is_empty() {
+                    "ожидание"
+                } else {
+                    entry.transport.as_str()
+                };
                 let latency = entry
                     .latency_ms
                     .map_or_else(|| "—".to_owned(), |value| format!("{value} мс"));
@@ -3427,6 +3441,7 @@ impl Launcher {
                     column![
                         row![
                             text(format!("Состояние: {health}")).size(12),
+                            text(format!("Транспорт: {transport}")).size(12),
                             text(format!("Кодек: {codec}")).size(12),
                             text(format!(
                                 "FPS: {}.{:02}",
@@ -3447,6 +3462,9 @@ impl Launcher {
                             .size(11)
                             .color(MUTED),
                             text(format!("Пропущено кадров: {}", entry.dropped_frames))
+                                .size(11)
+                                .color(MUTED),
+                            text(format!("Причина route: {}", entry.transport_reason))
                                 .size(11)
                                 .color(MUTED),
                             text(format!(
@@ -3503,6 +3521,14 @@ impl Launcher {
                         .align_y(Alignment::Center),
                         row![
                             text(game_profile_label).size(11).color(MUTED),
+                            text(&entry.transport).size(11).color(MUTED),
+                            text(if entry.codec.is_empty() {
+                                "Codec —"
+                            } else {
+                                entry.codec.as_str()
+                            })
+                            .size(11)
+                            .color(MUTED),
                             text(format!(
                                 "FPS {}.{:02}",
                                 entry.fps_times_100 / 100,
@@ -6298,6 +6324,12 @@ impl Launcher {
                         remote_id: remote_id.clone(),
                         status: format!("Запуск · {}", self.store.quality.label()),
                         codec: String::new(),
+                        transport: viewer_game_profile_label(
+                            game_mode,
+                            game_codec,
+                            game_evrt2_enabled,
+                        ),
+                        transport_reason: "ожидание выбора маршрута".to_owned(),
                         latency_ms: None,
                         fps_times_100: 0,
                         input_kbps: 0,
@@ -7293,6 +7325,7 @@ impl Launcher {
                         ViewerStatus::ControlApplied { .. }
                             | ViewerStatus::ControlState { .. }
                             | ViewerStatus::Codec { .. }
+                            | ViewerStatus::Transport { .. }
                             | ViewerStatus::Heartbeat { .. }
                     ) {
                         entry.status = status_text(&status, ui_language);
@@ -7301,6 +7334,22 @@ impl Launcher {
                         ViewerStatus::Starting => reset_viewer_telemetry(entry),
                         ViewerStatus::Codec { name } => {
                             entry.codec = sanitize_diagnostic_value(&name, 48);
+                        }
+                        ViewerStatus::Transport {
+                            profile,
+                            route,
+                            reason,
+                        } => {
+                            let route = sanitize_diagnostic_value(&route, 96);
+                            let profile = sanitize_diagnostic_value(&profile, 64);
+                            entry.transport = if profile.is_empty() {
+                                route
+                            } else if route.is_empty() {
+                                profile
+                            } else {
+                                format!("{profile} · {route}")
+                            };
+                            entry.transport_reason = sanitize_diagnostic_value(&reason, 120);
                         }
                         ViewerStatus::Latency { milliseconds } => {
                             entry.latency_ms = Some(milliseconds);
@@ -10914,6 +10963,34 @@ fn status_text(status: &ViewerStatus, language: UiLanguage) -> String {
         (UiLanguage::Russian, ViewerStatus::Codec { name }) => format!("Кодек: {name}"),
         (UiLanguage::English, ViewerStatus::Codec { name }) => format!("Codec: {name}"),
         (
+            UiLanguage::Russian,
+            ViewerStatus::Transport {
+                profile,
+                route,
+                reason,
+            },
+        ) => {
+            if reason.is_empty() {
+                format!("Транспорт: {profile} · {route}")
+            } else {
+                format!("Транспорт: {profile} · {route} · {reason}")
+            }
+        }
+        (
+            UiLanguage::English,
+            ViewerStatus::Transport {
+                profile,
+                route,
+                reason,
+            },
+        ) => {
+            if reason.is_empty() {
+                format!("Transport: {profile} · {route}")
+            } else {
+                format!("Transport: {profile} · {route} · {reason}")
+            }
+        }
+        (
             _,
             ViewerStatus::Performance {
                 fps_times_100,
@@ -11077,6 +11154,7 @@ fn viewer_connection_health(
 
 fn reset_viewer_telemetry(entry: &mut ViewerEntry) {
     entry.codec.clear();
+    entry.transport_reason = "ожидание выбора маршрута".to_owned();
     entry.latency_ms = None;
     entry.fps_times_100 = 0;
     entry.input_kbps = 0;
@@ -11102,6 +11180,8 @@ fn viewer_diagnostics_report(entry: &ViewerEntry) -> String {
             viewer_connection_health(entry.latency_ms, entry.fps_times_100, age)
         ),
         format!("Статус: {}", entry.status),
+        format!("Транспорт: {}", entry.transport),
+        format!("Причина route: {}", entry.transport_reason),
         format!("Кодек: {codec}"),
         format!(
             "FPS: {}.{:02}",

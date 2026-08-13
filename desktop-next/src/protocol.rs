@@ -23,6 +23,12 @@ pub enum ViewerStatus {
     Codec {
         name: String,
     },
+    Transport {
+        profile: String,
+        route: String,
+        #[serde(default)]
+        reason: String,
+    },
     Performance {
         fps_times_100: u32,
         input_kbps: u64,
@@ -571,6 +577,16 @@ mod tests {
             })
             .unwrap(),
             r#"{"event":"codec","name":"H264"}"#
+        );
+
+        assert_eq!(
+            serde_json::to_string(&ViewerStatus::Transport {
+                profile: "Desktop EVRTCK".to_owned(),
+                route: "TCP fallback".to_owned(),
+                reason: "EVRT UDP inactive".to_owned(),
+            })
+            .unwrap(),
+            r#"{"event":"transport","profile":"Desktop EVRTCK","route":"TCP fallback","reason":"EVRT UDP inactive"}"#
         );
 
         let reconnecting = ViewerStatus::Reconnecting {

@@ -1263,6 +1263,9 @@ fn handle_rendezvous_msg(
                     ph.force_relay
                 ),
             );
+            let relay_fallback_disabled = std::env::var("EVERTYDESK_DISABLE_RELAY_FALLBACK")
+                .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+                .unwrap_or(false);
 
             // PunchHole: логируем адрес клиента и переходим к TCP relay.
             // EVRT активируется из video_pipeline через evrt_send_loop —
@@ -1281,6 +1284,13 @@ fn handle_rendezvous_msg(
                         thread::sleep(Duration::from_millis(30));
                     }
                 }
+            }
+            if relay_fallback_disabled {
+                host_log(
+                    events,
+                    "Relay fallback disabled: refusing TCP relay for PunchHole; direct EVRT/UDP must succeed or the session must fail".to_owned(),
+                );
+                return None;
             }
 
             // force_relay=true или адрес не декодируется → стандартный TCP relay

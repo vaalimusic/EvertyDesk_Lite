@@ -87,6 +87,9 @@ pub struct ConnectionRequest {
     /// no EVRT1 UDP threads) — the EVRT2 experiment stream is started
     /// separately once connected.
     pub evrt2_only: bool,
+    /// Fail instead of silently degrading to the TCP relay path when direct
+    /// transport cannot be established.
+    pub require_direct_transport: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1752,9 +1755,9 @@ fn establish_session(
     String,
 > {
     let session_started = Instant::now();
-    let relay_first = relay_first_fast_path();
+    let relay_first = relay_first_fast_path() && !request.require_direct_transport;
     let udp_probe = blocking_udp_nat_probe_enabled();
-    let direct_tcp_probe = direct_tcp_probe_enabled();
+    let direct_tcp_probe = direct_tcp_probe_enabled() || request.require_direct_transport;
     let control_only = request.control_only;
 
     progress(5, "Validating input".to_owned());
@@ -1860,6 +1863,12 @@ fn establish_session(
     let rendezvous = match rendezvous_info {
         Ok(info) => info,
         Err(_) => {
+            if request.require_direct_transport {
+                return Err(
+                    "Direct transport required: EVRT rendezvous probe failed; TCP relay fallback is disabled"
+                        .to_owned(),
+                );
+            }
             progress(
                 82,
                 "EVRT probe failed, retrying with force_relay=true".to_owned(),
@@ -1952,6 +1961,11 @@ fn establish_session(
                 ));
             }
             Err(err) => {
+                if request.require_direct_transport {
+                    return Err(format!(
+                        "Direct transport required: direct TCP candidate {peer_addr} failed: {err}; TCP relay fallback is disabled"
+                    ));
+                }
                 progress(
                     88,
                     format!("Direct TCP failed; falling back to relay: {err}"),
@@ -1978,11 +1992,27 @@ fn establish_session(
                     "Rendezvous returned UDP/KCP direct candidate -> {peer_addr}; KCP backend pending, using relay fallback"
                 ),
             );
+            if request.require_direct_transport {
+                return Err(format!(
+                    "Direct transport required: rendezvous returned UDP/KCP candidate {peer_addr}, but KCP/UDP session backend is not available; TCP relay fallback is disabled"
+                ));
+            }
         }
     } else if relay_uuid_from_rendezvous.is_some() {
         progress(
             86,
             "Rendezvous selected relay; no direct candidate returned".to_owned(),
+        );
+        if request.require_direct_transport {
+            return Err(
+                "Direct transport required: rendezvous selected relay and returned no direct candidate; TCP relay fallback is disabled"
+                    .to_owned(),
+            );
+        }
+    } else if request.require_direct_transport {
+        return Err(
+            "Direct transport required: rendezvous returned no direct transport candidate; TCP relay fallback is disabled"
+                .to_owned(),
         );
     }
 

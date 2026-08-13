@@ -421,6 +421,7 @@ fn start_android_session(
         control_only: control_only || evrt2_only,
         audio_enabled: Arc::new(AtomicBool::new(true)),
         evrt2_only,
+        require_direct_transport: false,
     };
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>();

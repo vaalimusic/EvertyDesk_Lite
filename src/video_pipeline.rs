@@ -1765,7 +1765,10 @@ fn encode_loop(
                 }
                 let analysis = enc.as_ref().unwrap().analyze_next_frame(bgra);
                 evrtck_analysis_for_frame = Some(analysis);
-                let pkt = enc.as_mut().unwrap().encode(bgra, frame_id);
+                let (pkt, _stats) = enc
+                    .as_mut()
+                    .unwrap()
+                    .encode_with_scroll_detection(bgra, frame_id);
                 if !evrtck_logged {
                     evrtck_logged = true;
                     log(

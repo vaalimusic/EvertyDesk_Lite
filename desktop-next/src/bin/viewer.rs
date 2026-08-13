@@ -624,6 +624,11 @@ impl SessionControl {
         let quality = bootstrap.quality;
         let request_evrt2_experiment = transport_profile.evrt2_requested();
         let transport_profile_label = transport_profile.label().to_owned();
+        emit_status(&ViewerStatus::Transport {
+            profile: transport_profile_label.clone(),
+            route: "negotiating".to_owned(),
+            reason: "waiting for route selection".to_owned(),
+        });
         let allow_clipboard = config.security.allow_clipboard;
         let fsr_quality = config.display.fsr_quality;
         let fsr_sharpness = config.display.fsr_sharpness;
@@ -638,6 +643,7 @@ impl SessionControl {
             control_only: false,
             audio_enabled: Arc::clone(&audio_enabled),
             evrt2_only: false,
+            require_direct_transport: true,
         };
 
         let generation = 1;
@@ -647,6 +653,7 @@ impl SessionControl {
             Arc::clone(&frame_mailbox),
             generation,
             request_evrt2_experiment,
+            transport_profile_label.clone(),
         )?;
 
         Ok(Self {
@@ -695,6 +702,7 @@ impl SessionControl {
             Arc::clone(&self.frame_mailbox),
             self.generation,
             self.request_evrt2_experiment,
+            self.transport_profile_label.clone(),
         )?;
         self.commands = commands;
         self.stop = stop;
@@ -756,6 +764,7 @@ fn spawn_session(
     frame_mailbox: Arc<FrameMailbox>,
     generation: u64,
     request_evrt2_experiment: bool,
+    transport_profile_label: String,
 ) -> io::Result<(mpsc::Sender<SessionCommand>, Arc<AtomicBool>)> {
     let (commands, command_rx) = mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel();
@@ -882,6 +891,19 @@ fn spawn_session(
                         } else {
                             "EVRT UDP stopped - TCP fallback".to_owned()
                         };
+                        emit_status(&ViewerStatus::Transport {
+                            profile: transport_profile_label.clone(),
+                            route: if active {
+                                format!("EVRT UDP {endpoint}")
+                            } else {
+                                "TCP fallback".to_owned()
+                            },
+                            reason: if active {
+                                "direct/udp route confirmed".to_owned()
+                            } else {
+                                "EVRT UDP inactive; using TCP fallback".to_owned()
+                            },
+                        });
                         let _ = proxy.send_event(ViewerEvent::EvrtStatus { active, endpoint });
                         let _ = proxy.send_event(ViewerEvent::Status(status));
                     }

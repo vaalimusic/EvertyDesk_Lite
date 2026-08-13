@@ -60,6 +60,7 @@ use std::sync::OnceLock;
 
 pub const MAGIC: &[u8; 4] = b"EVCK";
 pub const VERSION: u8 = 2;
+pub const VERSION_COPY_RECTS: u8 = 3;
 
 /// Pixels per tile edge. 32×32 = 1024 px, maps well onto L1 cache lines.
 pub const TILE_SIZE: usize = 32;
@@ -289,7 +290,25 @@ pub struct FrameAnalysis {
 pub(crate) const FLAG_KEYFRAME: u8 = 0x01;
 // NOP frame: cur == prev, frame buffer unchanged. No tile map or payload.
 pub(crate) const FLAG_NOP: u8 = 0x02;
+// v3 frame contains copy/move rectangles before the dirty tile map.
+pub(crate) const FLAG_COPY_RECTS: u8 = 0x04;
 const FRAME_HEADER_LEN: usize = 20;
+
+/// A lossless framebuffer copy operation applied before tile deltas.
+///
+/// This is the missing primitive for scroll/drag/window-move scenes: instead
+/// of marking every shifted tile dirty, the stream can say "copy this
+/// rectangle from the previous framebuffer, then patch the newly exposed
+/// strip with normal EVRTCK tiles".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopyRect {
+    pub src_x: u32,
+    pub src_y: u32,
+    pub dst_x: u32,
+    pub dst_y: u32,
+    pub width: u32,
+    pub height: u32,
+}
 
 // ── Backend trait ─────────────────────────────────────────────────────────────
 
@@ -323,6 +342,22 @@ pub trait EvrtckEncoderBackend: Send {
     ) -> (EvrtckPacket, FrameStats, Vec<TileOffset>) {
         let (packet, stats) = self.encode_inner(bgra, frame_id);
         (packet, stats, Vec::new())
+    }
+    fn encode_inner_with_copy_rects(
+        &mut self,
+        bgra: &[u8],
+        frame_id: u32,
+        copy_rects: &[CopyRect],
+    ) -> (EvrtckPacket, FrameStats) {
+        let _ = copy_rects;
+        self.encode_inner(bgra, frame_id)
+    }
+    fn encode_inner_with_scroll_detection(
+        &mut self,
+        bgra: &[u8],
+        frame_id: u32,
+    ) -> (EvrtckPacket, FrameStats) {
+        self.encode_inner(bgra, frame_id)
     }
     /// Signal that the next frame must be a full keyframe (resets prev to black).
     fn request_keyframe(&mut self);
@@ -543,6 +578,65 @@ impl EvrtckEncoderBackend for CpuEvrtckEncoder {
         self.encode_inner_impl(bgra, frame_id, true)
     }
 
+    fn encode_inner_with_copy_rects(
+        &mut self,
+        bgra: &[u8],
+        frame_id: u32,
+        copy_rects: &[CopyRect],
+    ) -> (EvrtckPacket, FrameStats) {
+        if self.pending_keyframe || copy_rects.is_empty() {
+            return self.encode_inner(bgra, frame_id);
+        }
+        debug_assert_eq!(bgra.len(), self.width * self.height * 4);
+
+        let valid_copy_rects: Vec<CopyRect> = copy_rects
+            .iter()
+            .copied()
+            .filter(|rect| copy_rect_is_valid(*rect, self.width, self.height))
+            .collect();
+        if valid_copy_rects.is_empty() {
+            return self.encode_inner(bgra, frame_id);
+        }
+
+        let mut predicted = self.prev.clone();
+        apply_copy_rects(&mut predicted, self.width, self.height, &valid_copy_rects);
+        let (data, stats, _offsets) = encode_frame_with_offsets_and_copy_rects(
+            bgra,
+            &predicted,
+            self.width,
+            self.height,
+            frame_id,
+            &valid_copy_rects,
+            self.focus,
+            false,
+        );
+        self.pending_keyframe = false;
+        self.prev.copy_from_slice(bgra);
+        let pkt = EvrtckPacket {
+            frame_id,
+            width: self.width as u32,
+            height: self.height as u32,
+            data,
+        };
+        (pkt, stats)
+    }
+
+    fn encode_inner_with_scroll_detection(
+        &mut self,
+        bgra: &[u8],
+        frame_id: u32,
+    ) -> (EvrtckPacket, FrameStats) {
+        if self.pending_keyframe {
+            return self.encode_inner(bgra, frame_id);
+        }
+        if let Some(copy_rect) =
+            detect_full_width_vertical_scroll(&self.prev, bgra, self.width, self.height)
+        {
+            return self.encode_inner_with_copy_rects(bgra, frame_id, &[copy_rect]);
+        }
+        self.encode_inner(bgra, frame_id)
+    }
+
     fn request_keyframe(&mut self) {
         self.prev.fill(0);
         self.pending_keyframe = true;
@@ -651,6 +745,36 @@ impl EvrtckEncoder {
         frame_id: u32,
     ) -> (EvrtckPacket, FrameStats, Vec<TileOffset>) {
         self.inner.encode_inner_with_offsets(rgba, frame_id)
+    }
+
+    /// Encode a P-frame using precomputed copy/move rectangles.
+    ///
+    /// Feed this from DXGI move rects, platform capture metadata, or the
+    /// optional scroll detector. The decoder applies copy rects first, then
+    /// normal EVRTCK tile deltas for the residual/newly exposed pixels.
+    pub fn encode_with_copy_rects(
+        &mut self,
+        rgba: &[u8],
+        frame_id: u32,
+        copy_rects: &[CopyRect],
+    ) -> (EvrtckPacket, FrameStats) {
+        self.inner
+            .encode_inner_with_copy_rects(rgba, frame_id, copy_rects)
+    }
+
+    /// Encode with a conservative built-in scroll detector.
+    ///
+    /// This is a bridge until platform capture backends feed real move rects
+    /// (DXGI move rects on Windows, equivalent APIs elsewhere). It only
+    /// recognizes exact full-width vertical copies and falls back to ordinary
+    /// EVRTCK if no safe copy is found.
+    pub fn encode_with_scroll_detection(
+        &mut self,
+        rgba: &[u8],
+        frame_id: u32,
+    ) -> (EvrtckPacket, FrameStats) {
+        self.inner
+            .encode_inner_with_scroll_detection(rgba, frame_id)
     }
 
     /// Force-key: decoder will reset its frame buffer before applying this frame.
@@ -1184,6 +1308,163 @@ pub(crate) fn encode_frame_with_offsets(
     (out, stats, offsets)
 }
 
+pub(crate) fn encode_frame_with_offsets_and_copy_rects(
+    rgba: &[u8],
+    predicted_prev: &[u8],
+    width: usize,
+    height: usize,
+    frame_id: u32,
+    copy_rects: &[CopyRect],
+    focus: Option<(usize, usize)>,
+    want_offsets: bool,
+) -> (Vec<u8>, FrameStats, Vec<TileOffset>) {
+    let tiles_x = tiles_in_dim(width);
+    let tiles_y = tiles_in_dim(height);
+    let tile_count = tiles_x * tiles_y;
+
+    if rgba == predicted_prev {
+        let mut out = Vec::with_capacity(20 + 2 + copy_rects.len() * 24);
+        out.extend_from_slice(MAGIC);
+        out.push(VERSION_COPY_RECTS);
+        out.push(FLAG_COPY_RECTS);
+        out.extend_from_slice(&frame_id.to_le_bytes());
+        out.extend_from_slice(&(width as u32).to_le_bytes());
+        out.extend_from_slice(&(height as u32).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        write_copy_rects(&mut out, copy_rects);
+        let encoded_bytes = out.len() as u32;
+        return (
+            out,
+            FrameStats {
+                total_tiles: tile_count as u32,
+                encoded_bytes,
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+    }
+
+    let mut dirty_tiles: Vec<(usize, Vec<u8>, u8)> = if !use_rayon(tile_count) {
+        (0..tile_count)
+            .filter_map(|idx| {
+                if tile_is_dirty(
+                    rgba,
+                    predicted_prev,
+                    width,
+                    height,
+                    idx % tiles_x,
+                    idx / tiles_x,
+                ) {
+                    let (data, mode) = encode_tile_buf(
+                        rgba,
+                        predicted_prev,
+                        width,
+                        height,
+                        idx % tiles_x,
+                        idx / tiles_x,
+                        false,
+                    );
+                    Some((idx, data, mode))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    } else {
+        (0..tile_count)
+            .into_par_iter()
+            .filter_map(|idx| {
+                if tile_is_dirty(
+                    rgba,
+                    predicted_prev,
+                    width,
+                    height,
+                    idx % tiles_x,
+                    idx / tiles_x,
+                ) {
+                    let (data, mode) = encode_tile_buf(
+                        rgba,
+                        predicted_prev,
+                        width,
+                        height,
+                        idx % tiles_x,
+                        idx / tiles_x,
+                        false,
+                    );
+                    Some((idx, data, mode))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+
+    let map_bytes = tile_count.div_ceil(8);
+    let mut tile_map = vec![0u8; map_bytes];
+    let mut solid_count = 0u32;
+    let mut delta_count = 0u32;
+    for &(idx, _, mode) in &dirty_tiles {
+        tile_map[idx / 8] |= 1 << (idx % 8);
+        match mode {
+            MODE_SOLID => solid_count += 1,
+            _ => delta_count += 1,
+        }
+    }
+    let dirty_count = dirty_tiles.len() as u32;
+    order_by_focus(&mut dirty_tiles, tiles_x, focus);
+
+    let mut out =
+        Vec::with_capacity(20 + 2 + copy_rects.len() * 24 + map_bytes + dirty_tiles.len() * 32);
+    out.extend_from_slice(MAGIC);
+    out.push(VERSION_COPY_RECTS);
+    out.push(FLAG_COPY_RECTS);
+    out.extend_from_slice(&frame_id.to_le_bytes());
+    out.extend_from_slice(&(width as u32).to_le_bytes());
+    out.extend_from_slice(&(height as u32).to_le_bytes());
+    out.extend_from_slice(&(map_bytes as u16).to_le_bytes());
+    write_copy_rects(&mut out, copy_rects);
+    out.extend_from_slice(&tile_map);
+
+    let mut offsets = if want_offsets {
+        Vec::with_capacity(dirty_tiles.len())
+    } else {
+        Vec::new()
+    };
+    for (idx, data, _) in &dirty_tiles {
+        let entry_start = out.len();
+        out.extend_from_slice(&(*idx as u16).to_le_bytes());
+        out.extend_from_slice(data);
+        if want_offsets {
+            offsets.push(TileOffset {
+                tile_idx: *idx as u16,
+                byte_start: entry_start,
+                byte_len: out.len() - entry_start,
+            });
+        }
+    }
+
+    let stats = FrameStats {
+        total_tiles: tile_count as u32,
+        dirty_tiles: dirty_count,
+        solid_tiles: solid_count,
+        delta_tiles: delta_count,
+        encoded_bytes: out.len() as u32,
+    };
+    (out, stats, offsets)
+}
+
+fn write_copy_rects(out: &mut Vec<u8>, copy_rects: &[CopyRect]) {
+    out.extend_from_slice(&(copy_rects.len().min(u16::MAX as usize) as u16).to_le_bytes());
+    for rect in copy_rects.iter().take(u16::MAX as usize) {
+        out.extend_from_slice(&rect.src_x.to_le_bytes());
+        out.extend_from_slice(&rect.src_y.to_le_bytes());
+        out.extend_from_slice(&rect.dst_x.to_le_bytes());
+        out.extend_from_slice(&rect.dst_y.to_le_bytes());
+        out.extend_from_slice(&rect.width.to_le_bytes());
+        out.extend_from_slice(&rect.height.to_le_bytes());
+    }
+}
+
 /// ROADMAP.md Phase 6.4 (cross-codec splicing): encodes ONLY the given
 /// tiles, each forced into ABSOLUTE (self-contained, prev-independent)
 /// encoding via `encode_tile_buf(..., is_keyframe=true)` — never MODE_DELTA.
@@ -1408,6 +1689,124 @@ pub(crate) fn tile_is_dirty(
     false
 }
 
+fn copy_rect_is_valid(rect: CopyRect, width: usize, height: usize) -> bool {
+    if rect.width == 0 || rect.height == 0 {
+        return false;
+    }
+    let width = width as u64;
+    let height = height as u64;
+    let src_x = rect.src_x as u64;
+    let src_y = rect.src_y as u64;
+    let dst_x = rect.dst_x as u64;
+    let dst_y = rect.dst_y as u64;
+    let rect_w = rect.width as u64;
+    let rect_h = rect.height as u64;
+    src_x + rect_w <= width
+        && dst_x + rect_w <= width
+        && src_y + rect_h <= height
+        && dst_y + rect_h <= height
+}
+
+fn apply_copy_rects(frame: &mut [u8], width: usize, height: usize, copy_rects: &[CopyRect]) {
+    for &rect in copy_rects {
+        if !copy_rect_is_valid(rect, width, height) {
+            continue;
+        }
+        let rect_w = rect.width as usize;
+        let rect_h = rect.height as usize;
+        let src_x = rect.src_x as usize;
+        let src_y = rect.src_y as usize;
+        let dst_x = rect.dst_x as usize;
+        let dst_y = rect.dst_y as usize;
+        let row_bytes = rect_w * 4;
+        let mut temp = Vec::with_capacity(row_bytes * rect_h);
+        for row in 0..rect_h {
+            let start = ((src_y + row) * width + src_x) * 4;
+            temp.extend_from_slice(&frame[start..start + row_bytes]);
+        }
+        for row in 0..rect_h {
+            let dst = ((dst_y + row) * width + dst_x) * 4;
+            let src = row * row_bytes;
+            frame[dst..dst + row_bytes].copy_from_slice(&temp[src..src + row_bytes]);
+        }
+    }
+}
+
+fn detect_full_width_vertical_scroll(
+    prev: &[u8],
+    bgra: &[u8],
+    width: usize,
+    height: usize,
+) -> Option<CopyRect> {
+    if prev.len() != bgra.len() || width == 0 || height == 0 {
+        return None;
+    }
+    let row_bytes = width.checked_mul(4)?;
+    let candidate_offsets = [
+        8usize,
+        16,
+        TILE_SIZE,
+        TILE_SIZE * 2,
+        TILE_SIZE * 3,
+        TILE_SIZE * 4,
+        TILE_SIZE * 5,
+        TILE_SIZE * 6,
+        TILE_SIZE * 7,
+        TILE_SIZE * 8,
+    ];
+    let mut best: Option<(usize, bool)> = None;
+    for dy in candidate_offsets {
+        if dy >= height {
+            continue;
+        }
+        let moved_rows = height - dy;
+        let moved_bytes = moved_rows * row_bytes;
+        // Scroll up: current top equals previous area below it.
+        let prev_src = dy * row_bytes;
+        if prev[prev_src..prev_src + moved_bytes] == bgra[..moved_bytes] {
+            best = choose_larger_scroll(best, dy, true);
+        }
+        // Scroll down: current lower area equals previous top area.
+        let cur_dst = dy * row_bytes;
+        if prev[..moved_bytes] == bgra[cur_dst..cur_dst + moved_bytes] {
+            best = choose_larger_scroll(best, dy, false);
+        }
+    }
+
+    best.map(|(dy, up)| {
+        if up {
+            CopyRect {
+                src_x: 0,
+                src_y: dy as u32,
+                dst_x: 0,
+                dst_y: 0,
+                width: width as u32,
+                height: (height - dy) as u32,
+            }
+        } else {
+            CopyRect {
+                src_x: 0,
+                src_y: 0,
+                dst_x: 0,
+                dst_y: dy as u32,
+                width: width as u32,
+                height: (height - dy) as u32,
+            }
+        }
+    })
+}
+
+fn choose_larger_scroll(
+    current: Option<(usize, bool)>,
+    dy: usize,
+    up: bool,
+) -> Option<(usize, bool)> {
+    match current {
+        Some((best_dy, _)) if best_dy >= dy => current,
+        _ => Some((dy, up)),
+    }
+}
+
 /// Encode one dirty tile, returning (encoded_bytes, mode).
 /// Called in parallel — no shared mutable state.
 ///
@@ -1580,7 +1979,7 @@ fn decode_frame_prioritized(
         return Err(EvrtckError::InvalidMagic);
     }
     let ver = read_bytes!(1)[0];
-    if ver != VERSION {
+    if ver != VERSION && ver != VERSION_COPY_RECTS {
         return Err(EvrtckError::UnsupportedVersion(ver));
     }
     let flags = read_bytes!(1)[0];
@@ -1603,6 +2002,24 @@ fn decode_frame_prioritized(
     }
 
     let map_bytes = read_u16!() as usize;
+    if ver == VERSION_COPY_RECTS || flags & FLAG_COPY_RECTS != 0 {
+        let copy_rect_count = read_u16!() as usize;
+        let mut copy_rects = Vec::with_capacity(copy_rect_count);
+        for _ in 0..copy_rect_count {
+            let rect = CopyRect {
+                src_x: read_u32!(),
+                src_y: read_u32!(),
+                dst_x: read_u32!(),
+                dst_y: read_u32!(),
+                width: read_u32!(),
+                height: read_u32!(),
+            };
+            if copy_rect_is_valid(rect, width, height) {
+                copy_rects.push(rect);
+            }
+        }
+        apply_copy_rects(frame, width, height, &copy_rects);
+    }
     // Borrow tile_map directly from data — no allocation needed. v2 uses this
     // ONLY for its popcount (how many tile entries follow) — tile IDENTITY and
     // stream POSITION come from each entry's explicit tile_idx below, not from
@@ -1924,6 +2341,117 @@ mod tests {
             }
         }
         f
+    }
+
+    fn scrolling_text_like_frame(w: usize, h: usize) -> Vec<u8> {
+        let mut f = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let off = (y * w + x) * 4;
+                let line = y / 12;
+                let glyph = (x / 7 + line * 13) % 11 == 0;
+                let shade = if glyph {
+                    230
+                } else {
+                    24 + ((line * 9) % 28) as u8
+                };
+                f[off] = shade / 2;
+                f[off + 1] = shade;
+                f[off + 2] = shade;
+                f[off + 3] = 255;
+            }
+        }
+        f
+    }
+
+    fn scroll_up_with_new_bottom(base: &[u8], w: usize, h: usize, dy: usize) -> Vec<u8> {
+        let mut out = vec![0u8; base.len()];
+        let row_bytes = w * 4;
+        for y in 0..h - dy {
+            let dst = y * row_bytes;
+            let src = (y + dy) * row_bytes;
+            out[dst..dst + row_bytes].copy_from_slice(&base[src..src + row_bytes]);
+        }
+        for y in h - dy..h {
+            for x in 0..w {
+                let off = (y * w + x) * 4;
+                let v = 80u8.wrapping_add(((x * 17 + y * 31) & 0xff) as u8);
+                out[off] = v;
+                out[off + 1] = v.wrapping_add(40);
+                out[off + 2] = v.wrapping_add(90);
+                out[off + 3] = 255;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn copy_rect_frame_decodes_scroll_without_reencoding_moved_area() {
+        let (w, h) = (256usize, 256usize);
+        let dy = 32usize;
+        let base = scrolling_text_like_frame(w, h);
+        let scrolled = scroll_up_with_new_bottom(&base, w, h, dy);
+        let copy_rect = CopyRect {
+            src_x: 0,
+            src_y: dy as u32,
+            dst_x: 0,
+            dst_y: 0,
+            width: w as u32,
+            height: (h - dy) as u32,
+        };
+
+        let mut plain = EvrtckEncoder::new(w, h);
+        plain.encode(&base, 1);
+        let plain_scroll = plain.encode(&scrolled, 2);
+
+        let mut moved = EvrtckEncoder::new(w, h);
+        moved.encode(&base, 1);
+        let (copy_scroll, stats) = moved.encode_with_copy_rects(&scrolled, 2, &[copy_rect]);
+
+        let mut dec = EvrtckDecoder::new();
+        dec.decode(&EvrtckPacket {
+            frame_id: 1,
+            width: w as u32,
+            height: h as u32,
+            data: EvrtckEncoder::new(w, h).encode(&base, 1).data,
+        })
+        .unwrap();
+        let decoded = dec.decode(&copy_scroll).unwrap().to_vec();
+        assert_eq!(decoded, bgra_to_rgba(&scrolled));
+        assert_eq!(copy_scroll.data[4], VERSION_COPY_RECTS);
+        assert!(copy_scroll.data[5] & FLAG_COPY_RECTS != 0);
+        assert!(
+            copy_scroll.data.len() < plain_scroll.data.len(),
+            "copy-rect payload={} must beat plain tile-delta payload={}",
+            copy_scroll.data.len(),
+            plain_scroll.data.len()
+        );
+        let exposed_tile_budget = (tiles_in_dim(w) * tiles_in_dim(dy)) as u32;
+        assert!(
+            stats.dirty_tiles <= exposed_tile_budget,
+            "copy rect should leave only exposed strip dirty; got {} tiles, budget {}",
+            stats.dirty_tiles,
+            exposed_tile_budget
+        );
+    }
+
+    #[test]
+    fn scroll_detection_emits_copy_rect_frame_for_exact_vertical_scroll() {
+        let (w, h) = (256usize, 256usize);
+        let dy = TILE_SIZE;
+        let base = scrolling_text_like_frame(w, h);
+        let scrolled = scroll_up_with_new_bottom(&base, w, h, dy);
+
+        let mut enc = EvrtckEncoder::new(w, h);
+        let keyframe = enc.encode(&base, 1);
+        let (pkt, stats) = enc.encode_with_scroll_detection(&scrolled, 2);
+
+        let mut dec = EvrtckDecoder::new();
+        dec.decode(&keyframe).unwrap();
+        assert_eq!(dec.decode(&pkt).unwrap(), bgra_to_rgba(&scrolled));
+        assert_eq!(pkt.data[4], VERSION_COPY_RECTS);
+        assert!(pkt.data[5] & FLAG_COPY_RECTS != 0);
+        assert_eq!(stats.dirty_tiles, tiles_in_dim(w) as u32);
     }
 
     fn dirty_tiles_frame(
