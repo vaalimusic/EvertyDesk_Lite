@@ -23,12 +23,12 @@ mod inner {
                 MFVideoFormat_H264, MFVideoFormat_H264_ES, MFVideoFormat_H265, MFVideoFormat_HEVC,
                 MFVideoFormat_HEVC_ES, MFVideoFormat_NV12, MFSTARTUP_NOSOCKET,
                 MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_HARDWARE,
-                MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_COMMAND_FLUSH,
-                MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
-                MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO, MFT_REGISTER_TYPE_INFO,
-                MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE,
-                MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO,
-                MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
+                MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_COMMAND_DRAIN,
+                MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+                MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO,
+                MFT_REGISTER_TYPE_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AVG_BITRATE,
+                MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
+                MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_TRANSFORM_ASYNC_UNLOCK, MF_VERSION,
             },
             System::Com::{
                 CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED, VARIANT, VARIANT_0,
@@ -225,6 +225,25 @@ mod inner {
                 }
                 self.run()
                     .map_err(|err| format!("MF encode {}: {err}", self.codec.label()))
+            }
+        }
+
+        pub fn drain_packets(&mut self, max_outputs: usize) -> Result<Vec<NvencPacket>, String> {
+            unsafe {
+                self.transform
+                    .ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0)
+                    .map_err(|err| format!("MF encode {} drain: {err}", self.codec.label()))?;
+                let mut packets = Vec::new();
+                for _ in 0..max_outputs {
+                    match self
+                        .process_output()
+                        .map_err(|err| format!("MF encode {} drain: {err}", self.codec.label()))?
+                    {
+                        Some(packet) => packets.push(packet),
+                        None => break,
+                    }
+                }
+                Ok(packets)
             }
         }
 

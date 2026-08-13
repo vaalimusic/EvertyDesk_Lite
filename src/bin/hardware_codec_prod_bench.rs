@@ -236,21 +236,19 @@ fn run_codec(codec: NvencCodec, config: &Config) -> Vec<BenchRow> {
     let backend = mf_encoder_status().label();
     let available = codec_available(codec);
     if !available {
-        let mut rows = vec![unavailable_row(
-            codec,
-            config,
-            Scenario {
-                name: "keyframe_gradient",
-                dirty_ratio: 1.0,
-                distribution: DirtyDistribution::Clustered,
-                entropy: DirtyEntropy::Invert,
-                scene: SceneKind::KeyframeGradient,
-            },
-            "encode",
-            &backend,
-        )];
+        let keyframe_scenario = Scenario {
+            name: "keyframe_gradient",
+            dirty_ratio: 1.0,
+            distribution: DirtyDistribution::Clustered,
+            entropy: DirtyEntropy::Invert,
+            scene: SceneKind::KeyframeGradient,
+        };
+        let mut rows = vec![
+            unavailable_row(codec, config, keyframe_scenario, "encode", &backend),
+            unavailable_row(codec, config, keyframe_scenario, "encode_drain", &backend),
+        ];
         for scenario in scenarios() {
-            for operation in ["encode", "decode", "roundtrip"] {
+            for operation in ["encode", "encode_drain", "decode", "roundtrip"] {
                 rows.push(unavailable_row(
                     codec, config, *scenario, operation, &backend,
                 ));
@@ -278,6 +276,15 @@ fn run_codec(codec: NvencCodec, config: &Config) -> Vec<BenchRow> {
         None,
         true,
     ));
+    rows.push(run_encode_drain_scenario(
+        codec,
+        config,
+        keyframe_scenario,
+        &backend,
+        &keyframe,
+        None,
+        true,
+    ));
     rows.extend(run_decode_and_roundtrip_scenario(
         codec,
         config,
@@ -291,6 +298,15 @@ fn run_codec(codec: NvencCodec, config: &Config) -> Vec<BenchRow> {
     for scenario in scenarios() {
         let frame = make_frame(config, &base, *scenario);
         rows.push(run_encode_scenario(
+            codec,
+            config,
+            *scenario,
+            &backend,
+            &frame,
+            Some(&base),
+            false,
+        ));
+        rows.push(run_encode_drain_scenario(
             codec,
             config,
             *scenario,
@@ -361,7 +377,6 @@ fn run_decode_and_roundtrip_scenario(
 
 struct ReferencePackets {
     key_packet: Option<Vec<u8>>,
-    frame_packet: Vec<u8>,
     decode_stream_packets: Vec<Vec<u8>>,
 }
 
@@ -381,6 +396,7 @@ struct DecodeChildRequest {
 struct DecodeChildResult {
     available: bool,
     frames_decoded: usize,
+    payload_bytes: usize,
     error: String,
     mean_us: f64,
     p50_us: f64,
@@ -483,7 +499,6 @@ fn child_decode_row(
     config: &Config,
     scenario: Scenario,
     backend: &str,
-    reference: &ReferencePackets,
     result: DecodeChildResult,
 ) -> BenchRow {
     BenchRow {
@@ -500,7 +515,7 @@ fn child_decode_row(
         iterations: config.iterations,
         warmup: config.warmup,
         raw_bytes: config.width * config.height * 4,
-        payload_bytes: reference.frame_packet.len(),
+        payload_bytes: result.payload_bytes,
         packets_emitted: result.frames_decoded,
         available: result.available,
         backend: backend.to_owned(),
@@ -562,6 +577,7 @@ fn execute_decode_child(request: &DecodeChildRequest) -> DecodeChildResult {
     let mut first_error = String::new();
     let mut frames_decoded = 0usize;
     let mut meaningful_packets = 0usize;
+    let mut payload_bytes = 0usize;
     let samples = measure(&child_config, || {
         let Some(packet) = packets.get(packet_index) else {
             return None;
@@ -576,6 +592,7 @@ fn execute_decode_child(request: &DecodeChildRequest) -> DecodeChildResult {
             }
             return None;
         }
+        payload_bytes = payload_bytes.max(packet.len());
         let started = Instant::now();
         match decode_until_frame(&mut dec, std::slice::from_ref(packet), 8) {
             Ok(Some((_, _, rgba))) => {
@@ -604,6 +621,7 @@ fn execute_decode_child(request: &DecodeChildRequest) -> DecodeChildResult {
     DecodeChildResult {
         available,
         frames_decoded,
+        payload_bytes,
         error: if available {
             String::new()
         } else if packet_index
@@ -645,6 +663,7 @@ fn decode_child_error(error: String) -> DecodeChildResult {
     DecodeChildResult {
         available: false,
         frames_decoded: 0,
+        payload_bytes: 0,
         error,
         mean_us: 0.0,
         p50_us: 0.0,
@@ -834,7 +853,7 @@ fn execute_roundtrip_child(request: &RoundtripChildRequest) -> RoundtripChildRes
         };
 
     if let Some(base) = &base_frame {
-        let key = match encode_until_packet(&mut enc, base, true, 60) {
+        let key = match encode_drain_until_meaningful_packet(&mut enc, base, true) {
             Ok(Some(packet)) => packet.bytes,
             Ok(None) => {
                 return roundtrip_child_error("encoder produced no base key packet".to_owned())
@@ -863,11 +882,10 @@ fn execute_roundtrip_child(request: &RoundtripChildRequest) -> RoundtripChildRes
         let stream_frame =
             stream_variant_frame(&frame, request.width, request.height, packets_emitted);
         let started = Instant::now();
-        let packet = match encode_until_packet(
+        let packet = match encode_drain_until_meaningful_packet(
             &mut enc,
             black_box(&stream_frame),
             request.force_key && packets_emitted == 0,
-            60,
         ) {
             Ok(Some(packet)) => packet,
             Ok(None) => {
@@ -883,15 +901,6 @@ fn execute_roundtrip_child(request: &RoundtripChildRequest) -> RoundtripChildRes
                 return None;
             }
         };
-        if packet.bytes.len() < MIN_MEANINGFUL_HARDWARE_PACKET_BYTES {
-            if first_error.is_empty() {
-                first_error = format!(
-                    "hardware packet too small to count as meaningful roundtrip payload: {} bytes",
-                    packet.bytes.len()
-                );
-            }
-            return None;
-        }
         match decode_until_frame(&mut dec, std::slice::from_ref(&packet.bytes), 8) {
             Ok(Some((_, _, rgba))) => {
                 let elapsed = started.elapsed();
@@ -982,9 +991,6 @@ fn reference_packets(
     } else {
         None
     };
-    let frame_packet = encode_until_packet(&mut enc, frame, force_key, 60)?
-        .ok_or_else(|| "encoder produced no frame packet".to_owned())?
-        .bytes;
     let stream_count = config.warmup.saturating_add(config.iterations).max(1);
     let mut stream_enc = MfVideoEncoder::new(
         codec,
@@ -996,22 +1002,24 @@ fn reference_packets(
     let mut decode_stream_packets = Vec::with_capacity(stream_count);
     if let Some(base) = base_frame {
         decode_stream_packets.push(
-            encode_until_packet(&mut stream_enc, base, true, 60)?
+            encode_drain_until_meaningful_packet(&mut stream_enc, base, true)?
                 .ok_or_else(|| "stream encoder produced no base key packet".to_owned())?
                 .bytes,
         );
     }
     for idx in 0..stream_count {
         let stream_frame = stream_variant_frame(frame, config.width, config.height, idx);
-        let packet =
-            encode_until_packet(&mut stream_enc, &stream_frame, force_key && idx == 0, 60)?
-                .ok_or_else(|| "stream encoder produced no frame packet".to_owned())?
-                .bytes;
+        let packet = encode_drain_until_meaningful_packet(
+            &mut stream_enc,
+            &stream_frame,
+            force_key && idx == 0,
+        )?
+        .ok_or_else(|| "stream encoder produced no frame packet".to_owned())?
+        .bytes;
         decode_stream_packets.push(packet);
     }
     Ok(ReferencePackets {
         key_packet,
-        frame_packet,
         decode_stream_packets,
     })
 }
@@ -1024,7 +1032,7 @@ fn run_decode_scenario(
     reference: &ReferencePackets,
 ) -> BenchRow {
     match run_decode_child_process(codec, config, reference) {
-        Ok(result) => child_decode_row(codec, config, scenario, backend, reference, result),
+        Ok(result) => child_decode_row(codec, config, scenario, backend, result),
         Err(err) => operation_error_row(codec, config, scenario, "decode", backend, err),
     }
 }
@@ -1148,6 +1156,112 @@ fn run_encode_scenario(
     }
 }
 
+fn run_encode_drain_scenario(
+    codec: NvencCodec,
+    config: &Config,
+    scenario: Scenario,
+    backend: &str,
+    frame: &[u8],
+    base_frame: Option<&[u8]>,
+    force_key: bool,
+) -> BenchRow {
+    let mut payload_bytes = 0usize;
+    let mut packets_emitted = 0usize;
+    let mut first_error = String::new();
+
+    let samples = measure(config, || {
+        let mut enc = match MfVideoEncoder::new(
+            codec,
+            config.width as u32,
+            config.height as u32,
+            config.fps,
+            config.bitrate,
+        ) {
+            Ok(enc) => enc,
+            Err(err) => {
+                if first_error.is_empty() {
+                    first_error = err;
+                }
+                return None;
+            }
+        };
+        if let Some(base) = base_frame {
+            if let Err(err) = encode_until_packet(&mut enc, black_box(base), true, 60) {
+                if first_error.is_empty() {
+                    first_error = format!("base-frame encode failed: {err}");
+                }
+                return None;
+            }
+        }
+        let started = Instant::now();
+        if let Err(err) = enc.encode_bgra(black_box(frame), force_key) {
+            if first_error.is_empty() {
+                first_error = err;
+            }
+            return None;
+        }
+        let drained = match enc.drain_packets(64) {
+            Ok(packets) => packets,
+            Err(err) => {
+                if first_error.is_empty() {
+                    first_error = err;
+                }
+                return None;
+            }
+        };
+        let elapsed = started.elapsed();
+        if drained.is_empty() {
+            if first_error.is_empty() {
+                first_error = "encoder drain produced no packet".to_owned();
+            }
+            return None;
+        }
+        let sample_payload = drained
+            .iter()
+            .map(|packet| packet.bytes.len())
+            .sum::<usize>();
+        payload_bytes = payload_bytes.max(sample_payload);
+        packets_emitted = packets_emitted.saturating_add(drained.len());
+        black_box(sample_payload);
+        Some(elapsed)
+    });
+
+    let summary = summarize(&samples);
+    let available = packets_emitted > 0 && !samples.is_empty();
+    BenchRow {
+        codec: codec.label().to_owned(),
+        scenario: scenario.name.to_owned(),
+        operation: "encode_drain".to_owned(),
+        width: config.width,
+        height: config.height,
+        fps: config.fps,
+        bitrate: config.bitrate,
+        dirty_ratio_target: scenario.dirty_ratio,
+        dirty_distribution: scenario.distribution,
+        dirty_entropy: scenario.entropy,
+        iterations: config.iterations,
+        warmup: config.warmup,
+        raw_bytes: config.width * config.height * 4,
+        payload_bytes,
+        packets_emitted,
+        available,
+        backend: backend.to_owned(),
+        error: if available {
+            String::new()
+        } else if first_error.is_empty() {
+            "encoder drain produced no packet".to_owned()
+        } else {
+            first_error
+        },
+        mean_us: summary.mean_us,
+        p50_us: summary.p50_us,
+        p95_us: summary.p95_us,
+        p99_us: summary.p99_us,
+        min_us: summary.min_us,
+        max_us: summary.max_us,
+    }
+}
+
 fn encode_until_packet(
     enc: &mut MfVideoEncoder,
     frame: &[u8],
@@ -1156,6 +1270,24 @@ fn encode_until_packet(
 ) -> Result<Option<evertydesk_core::nvenc::NvencPacket>, String> {
     for attempt in 0..max_inputs {
         if let Some(packet) = enc.encode_bgra(frame, force_key && attempt == 0)? {
+            return Ok(Some(packet));
+        }
+    }
+    Ok(None)
+}
+
+fn encode_drain_until_meaningful_packet(
+    enc: &mut MfVideoEncoder,
+    frame: &[u8],
+    force_key: bool,
+) -> Result<Option<evertydesk_core::nvenc::NvencPacket>, String> {
+    if let Some(packet) = enc.encode_bgra(frame, force_key)? {
+        if packet.bytes.len() >= MIN_MEANINGFUL_HARDWARE_PACKET_BYTES {
+            return Ok(Some(packet));
+        }
+    }
+    for packet in enc.drain_packets(64)? {
+        if packet.bytes.len() >= MIN_MEANINGFUL_HARDWARE_PACKET_BYTES {
             return Ok(Some(packet));
         }
     }
