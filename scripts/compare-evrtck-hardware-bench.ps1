@@ -168,6 +168,13 @@ if ($fallbackHardware.Count -gt 0) {
     $warnings += "some hardware comparisons use decode/encode fallback because roundtrip rows were unavailable"
     $publishable = $false
 }
+$missingRoundtrip = $decisions | Where-Object {
+    $null -eq $_.hardware_operation -or $_.hardware_operation -ne "roundtrip"
+}
+if ($missingRoundtrip.Count -gt 0) {
+    $warnings += "hardware roundtrip rows are missing for $($missingRoundtrip.Count) scenario(s)"
+    $publishable = $false
+}
 $tinyHardwarePayload = $decisions | Where-Object {
     $null -ne $_.hardware_operation -and
     $_.hardware_operation -eq "roundtrip" -and
