@@ -189,10 +189,13 @@ Payload bytes:
 
 The EVRTCK runner measures EVRTCK software-path codec cost. The separate
 `hardware_codec_prod_bench` runner measures Media Foundation H.264/H.265 encode
-cost on matching synthetic and realistic scenes. The combined benchmark set
-still does not yet benchmark:
+cost on matching synthetic and realistic scenes. Hardware decode/roundtrip rows
+are intentionally marked unavailable until they run in a crash-isolated child
+process: in-process Windows HEVC decoder MFTs can crash on some systems, and
+tiny synthetic H.264 P-packets are not a reliable decoder-latency workload.
+The combined benchmark set still does not yet benchmark:
 
-- hardware decode latency;
+- hardware decode latency in a crash-isolated GOP-oriented harness;
 - capture latency;
 - EVRT network packetization/reassembly;
 - real recorded IDE/browser/scroll traces.

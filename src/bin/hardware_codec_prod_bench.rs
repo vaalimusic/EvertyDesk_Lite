@@ -1,4 +1,5 @@
 use evertydesk_core::mf_encode::{mf_encoder_status, MfVideoEncoder};
+use evertydesk_core::mf_video::{mf_video_decode_status, MfVideoCodec, MfVideoDecoder};
 use evertydesk_core::nvenc::NvencCodec;
 use serde::Serialize;
 use std::fs::{self, File};
@@ -205,7 +206,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     jsonl.flush()?;
 
     println!("Hardware codec production bench complete");
-    println!("status={}", mf_encoder_status().label());
+    println!("encode_status={}", mf_encoder_status().label());
+    println!("decode_status={}", mf_video_decode_status().label());
     println!("csv={}", csv_path.display());
     println!("jsonl={}", jsonl_path.display());
     Ok(())
@@ -215,26 +217,54 @@ fn run_codec(codec: NvencCodec, config: &Config) -> Vec<BenchRow> {
     let backend = mf_encoder_status().label();
     let available = codec_available(codec);
     if !available {
-        return scenarios()
-            .iter()
-            .map(|scenario| unavailable_row(codec, config, *scenario, &backend))
-            .collect();
+        let mut rows = vec![unavailable_row(
+            codec,
+            config,
+            Scenario {
+                name: "keyframe_gradient",
+                dirty_ratio: 1.0,
+                distribution: DirtyDistribution::Clustered,
+                entropy: DirtyEntropy::Invert,
+                scene: SceneKind::KeyframeGradient,
+            },
+            "encode",
+            &backend,
+        )];
+        for scenario in scenarios() {
+            for operation in ["encode", "decode", "roundtrip"] {
+                rows.push(unavailable_row(
+                    codec, config, *scenario, operation, &backend,
+                ));
+            }
+        }
+        return rows;
     }
 
     let base = solid_frame(config.width, config.height, [30, 30, 30, 255]);
     let mut rows = Vec::new();
+    let keyframe_scenario = Scenario {
+        name: "keyframe_gradient",
+        dirty_ratio: 1.0,
+        distribution: DirtyDistribution::Clustered,
+        entropy: DirtyEntropy::Invert,
+        scene: SceneKind::KeyframeGradient,
+    };
+    let keyframe = gradient_frame(config.width, config.height);
     rows.push(run_encode_scenario(
         codec,
         config,
-        Scenario {
-            name: "keyframe_gradient",
-            dirty_ratio: 1.0,
-            distribution: DirtyDistribution::Clustered,
-            entropy: DirtyEntropy::Invert,
-            scene: SceneKind::KeyframeGradient,
-        },
+        keyframe_scenario,
         &backend,
-        &gradient_frame(config.width, config.height),
+        &keyframe,
+        None,
+        true,
+    ));
+    rows.extend(run_decode_and_roundtrip_scenario(
+        codec,
+        config,
+        keyframe_scenario,
+        &backend,
+        &keyframe,
         None,
         true,
     ));
@@ -242,6 +272,15 @@ fn run_codec(codec: NvencCodec, config: &Config) -> Vec<BenchRow> {
     for scenario in scenarios() {
         let frame = make_frame(config, &base, *scenario);
         rows.push(run_encode_scenario(
+            codec,
+            config,
+            *scenario,
+            &backend,
+            &frame,
+            Some(&base),
+            false,
+        ));
+        rows.extend(run_decode_and_roundtrip_scenario(
             codec,
             config,
             *scenario,
@@ -261,6 +300,290 @@ fn codec_available(codec: NvencCodec) -> bool {
         NvencCodec::H265 => status.has_hardware_h265(),
         NvencCodec::Av1 => status.has_hardware_av1(),
     }
+}
+
+fn run_decode_and_roundtrip_scenario(
+    codec: NvencCodec,
+    config: &Config,
+    scenario: Scenario,
+    backend: &str,
+    frame: &[u8],
+    base_frame: Option<&[u8]>,
+    force_key: bool,
+) -> Vec<BenchRow> {
+    let Some(decode_codec) = mf_decode_codec(codec) else {
+        let reason = format!(
+            "{} decode is disabled in-process; use a crash-isolated child decoder bench",
+            codec.label()
+        );
+        return vec![
+            operation_error_row(codec, config, scenario, "decode", backend, reason.clone()),
+            operation_error_row(codec, config, scenario, "roundtrip", backend, reason),
+        ];
+    };
+
+    let reference = match reference_packets(codec, config, frame, base_frame, force_key) {
+        Ok(reference) => reference,
+        Err(err) => {
+            return vec![
+                operation_error_row(codec, config, scenario, "decode", backend, err.clone()),
+                operation_error_row(codec, config, scenario, "roundtrip", backend, err),
+            ];
+        }
+    };
+
+    vec![
+        run_decode_scenario(codec, decode_codec, config, scenario, backend, &reference),
+        run_roundtrip_scenario(
+            codec,
+            decode_codec,
+            config,
+            scenario,
+            backend,
+            frame,
+            base_frame,
+            force_key,
+        ),
+    ]
+}
+
+struct ReferencePackets {
+    key_packet: Option<Vec<u8>>,
+    frame_packet: Vec<u8>,
+}
+
+fn reference_packets(
+    codec: NvencCodec,
+    config: &Config,
+    frame: &[u8],
+    base_frame: Option<&[u8]>,
+    force_key: bool,
+) -> Result<ReferencePackets, String> {
+    let mut enc = MfVideoEncoder::new(
+        codec,
+        config.width as u32,
+        config.height as u32,
+        config.fps,
+        config.bitrate,
+    )?;
+    let key_packet = if let Some(base) = base_frame {
+        Some(
+            encode_until_packet(&mut enc, base, true, 60)?
+                .ok_or_else(|| "encoder produced no base key packet".to_owned())?
+                .bytes,
+        )
+    } else {
+        None
+    };
+    let frame_packet = encode_until_packet(&mut enc, frame, force_key, 60)?
+        .ok_or_else(|| "encoder produced no frame packet".to_owned())?
+        .bytes;
+    Ok(ReferencePackets {
+        key_packet,
+        frame_packet,
+    })
+}
+
+fn run_decode_scenario(
+    codec: NvencCodec,
+    decode_codec: MfVideoCodec,
+    config: &Config,
+    scenario: Scenario,
+    backend: &str,
+    reference: &ReferencePackets,
+) -> BenchRow {
+    let mut frames_decoded = 0usize;
+    let mut first_error = String::new();
+    let samples = measure(config, || {
+        let mut dec =
+            match MfVideoDecoder::new(decode_codec, config.width as u32, config.height as u32) {
+                Ok(dec) => dec,
+                Err(err) => {
+                    if first_error.is_empty() {
+                        first_error = err;
+                    }
+                    return None;
+                }
+            };
+        if let Some(key) = &reference.key_packet {
+            if let Err(err) = decode_until_frame(&mut dec, std::slice::from_ref(key), 8) {
+                if first_error.is_empty() {
+                    first_error = format!("base decode failed: {err}");
+                }
+                return None;
+            }
+        }
+        let started = Instant::now();
+        match decode_until_frame(&mut dec, std::slice::from_ref(&reference.frame_packet), 8) {
+            Ok(Some((_, _, rgba))) => {
+                let elapsed = started.elapsed();
+                frames_decoded += 1;
+                black_box(rgba.len());
+                Some(elapsed)
+            }
+            Ok(None) => {
+                if first_error.is_empty() {
+                    first_error = "decoder produced no frame".to_owned();
+                }
+                None
+            }
+            Err(err) => {
+                if first_error.is_empty() {
+                    first_error = err;
+                }
+                None
+            }
+        }
+    });
+    measured_row(
+        codec,
+        config,
+        scenario,
+        "decode",
+        backend,
+        reference.frame_packet.len(),
+        frames_decoded,
+        first_error,
+        samples,
+    )
+}
+
+fn run_roundtrip_scenario(
+    codec: NvencCodec,
+    decode_codec: MfVideoCodec,
+    config: &Config,
+    scenario: Scenario,
+    backend: &str,
+    frame: &[u8],
+    base_frame: Option<&[u8]>,
+    force_key: bool,
+) -> BenchRow {
+    let mut payload_bytes = 0usize;
+    let mut frames_decoded = 0usize;
+    let mut first_error = String::new();
+    let samples = measure(config, || {
+        let mut enc = match MfVideoEncoder::new(
+            codec,
+            config.width as u32,
+            config.height as u32,
+            config.fps,
+            config.bitrate,
+        ) {
+            Ok(enc) => enc,
+            Err(err) => {
+                if first_error.is_empty() {
+                    first_error = err;
+                }
+                return None;
+            }
+        };
+        let mut dec =
+            match MfVideoDecoder::new(decode_codec, config.width as u32, config.height as u32) {
+                Ok(dec) => dec,
+                Err(err) => {
+                    if first_error.is_empty() {
+                        first_error = err;
+                    }
+                    return None;
+                }
+            };
+        if let Some(base) = base_frame {
+            let key = match encode_until_packet(&mut enc, black_box(base), true, 60) {
+                Ok(Some(packet)) => packet.bytes,
+                Ok(None) => {
+                    if first_error.is_empty() {
+                        first_error = "encoder produced no base key packet".to_owned();
+                    }
+                    return None;
+                }
+                Err(err) => {
+                    if first_error.is_empty() {
+                        first_error = err;
+                    }
+                    return None;
+                }
+            };
+            if let Err(err) = decode_until_frame(&mut dec, std::slice::from_ref(&key), 8) {
+                if first_error.is_empty() {
+                    first_error = format!("base decode failed: {err}");
+                }
+                return None;
+            }
+        }
+
+        let started = Instant::now();
+        let packet = match encode_until_packet(&mut enc, black_box(frame), force_key, 60) {
+            Ok(Some(packet)) => packet,
+            Ok(None) => {
+                if first_error.is_empty() {
+                    first_error = "encoder produced no frame packet".to_owned();
+                }
+                return None;
+            }
+            Err(err) => {
+                if first_error.is_empty() {
+                    first_error = err;
+                }
+                return None;
+            }
+        };
+        match decode_until_frame(&mut dec, std::slice::from_ref(&packet.bytes), 8) {
+            Ok(Some((_, _, rgba))) => {
+                let elapsed = started.elapsed();
+                payload_bytes = payload_bytes.max(packet.bytes.len());
+                frames_decoded += 1;
+                black_box((packet.bytes.len(), rgba.len()));
+                Some(elapsed)
+            }
+            Ok(None) => {
+                if first_error.is_empty() {
+                    first_error = "decoder produced no frame".to_owned();
+                }
+                None
+            }
+            Err(err) => {
+                if first_error.is_empty() {
+                    first_error = err;
+                }
+                None
+            }
+        }
+    });
+
+    measured_row(
+        codec,
+        config,
+        scenario,
+        "roundtrip",
+        backend,
+        payload_bytes,
+        frames_decoded,
+        first_error,
+        samples,
+    )
+}
+
+fn decode_until_frame(
+    dec: &mut MfVideoDecoder,
+    packets: &[Vec<u8>],
+    max_inputs: usize,
+) -> Result<Option<(usize, usize, Vec<u8>)>, String> {
+    for _ in 0..max_inputs {
+        if let Some(frame) = dec.decode_packets(packets.iter())? {
+            return Ok(Some(frame));
+        }
+    }
+    Ok(None)
+}
+
+fn mf_decode_codec(codec: NvencCodec) -> Option<MfVideoCodec> {
+    let _ = codec;
+    // Windows Store HEVC decoder MFTs are known to crash in-process on some
+    // systems. H264 MF decode also needs a GOP-oriented harness: tiny synthetic
+    // P-packets may not produce output even when encode succeeds. Do not let
+    // this benchmark publish false hardware roundtrip numbers; decode must be
+    // measured in a crash-isolated child harness.
+    None
 }
 
 fn run_encode_scenario(
@@ -379,12 +702,13 @@ fn unavailable_row(
     codec: NvencCodec,
     config: &Config,
     scenario: Scenario,
+    operation: &str,
     backend: &str,
 ) -> BenchRow {
     BenchRow {
         codec: codec.label().to_owned(),
         scenario: scenario.name.to_owned(),
-        operation: "encode".to_owned(),
+        operation: operation.to_owned(),
         width: config.width,
         height: config.height,
         fps: config.fps,
@@ -409,6 +733,67 @@ fn unavailable_row(
     }
 }
 
+fn operation_error_row(
+    codec: NvencCodec,
+    config: &Config,
+    scenario: Scenario,
+    operation: &str,
+    backend: &str,
+    error: String,
+) -> BenchRow {
+    let mut row = unavailable_row(codec, config, scenario, operation, backend);
+    row.error = error;
+    row
+}
+
+fn measured_row(
+    codec: NvencCodec,
+    config: &Config,
+    scenario: Scenario,
+    operation: &str,
+    backend: &str,
+    payload_bytes: usize,
+    packets_or_frames: usize,
+    first_error: String,
+    samples: Vec<Duration>,
+) -> BenchRow {
+    let summary = summarize(&samples);
+    let available = packets_or_frames > 0 && !samples.is_empty();
+    let error = if available {
+        String::new()
+    } else if first_error.is_empty() {
+        format!("{operation} produced no frame")
+    } else {
+        first_error
+    };
+    BenchRow {
+        codec: codec.label().to_owned(),
+        scenario: scenario.name.to_owned(),
+        operation: operation.to_owned(),
+        width: config.width,
+        height: config.height,
+        fps: config.fps,
+        bitrate: config.bitrate,
+        dirty_ratio_target: scenario.dirty_ratio,
+        dirty_distribution: scenario.distribution,
+        dirty_entropy: scenario.entropy,
+        iterations: config.iterations,
+        warmup: config.warmup,
+        raw_bytes: config.width * config.height * 4,
+        payload_bytes,
+        packets_emitted: packets_or_frames,
+        available,
+        backend: backend.to_owned(),
+        error,
+        mean_us: summary.mean_us,
+        p50_us: summary.p50_us,
+        p95_us: summary.p95_us,
+        p99_us: summary.p99_us,
+        min_us: summary.min_us,
+        max_us: summary.max_us,
+    }
+}
+
 fn csv_field(value: &str) -> String {
     if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
         format!("\"{}\"", value.replace('"', "\"\""))
@@ -424,7 +809,7 @@ fn errored_row(
     backend: &str,
     error: String,
 ) -> BenchRow {
-    let mut row = unavailable_row(codec, config, scenario, backend);
+    let mut row = unavailable_row(codec, config, scenario, "encode", backend);
     row.error = error;
     row
 }

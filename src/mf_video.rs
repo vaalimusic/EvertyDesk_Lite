@@ -14,12 +14,12 @@ mod inner {
             Media::MediaFoundation::{
                 IMFActivate, IMFSample, IMFTransform, MFCreateMediaType, MFCreateMemoryBuffer,
                 MFCreateSample, MFMediaType_Video, MFStartup, MFTEnumEx, MFVideoFormat_AV1,
-                MFVideoFormat_H265, MFVideoFormat_HEVC, MFVideoFormat_HEVC_ES, MFVideoFormat_I420,
-                MFVideoFormat_IYUV, MFVideoFormat_NV12, MFVideoFormat_VP90, MFSTARTUP_NOSOCKET,
-                MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG, MFT_ENUM_FLAG_SYNCMFT,
-                MFT_OUTPUT_DATA_BUFFER, MFT_REGISTER_TYPE_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT,
-                MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO,
-                MF_MT_SUBTYPE, MF_VERSION,
+                MFVideoFormat_H264, MFVideoFormat_H264_ES, MFVideoFormat_H265, MFVideoFormat_HEVC,
+                MFVideoFormat_HEVC_ES, MFVideoFormat_I420, MFVideoFormat_IYUV, MFVideoFormat_NV12,
+                MFVideoFormat_VP90, MFSTARTUP_NOSOCKET, MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG,
+                MFT_ENUM_FLAG_SYNCMFT, MFT_OUTPUT_DATA_BUFFER, MFT_REGISTER_TYPE_INFO,
+                MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+                MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_VERSION,
             },
             System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED},
         },
@@ -31,6 +31,7 @@ mod inner {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum MfVideoCodec {
         Vp9,
+        H264,
         H265,
         Av1,
     }
@@ -39,6 +40,7 @@ mod inner {
         pub fn label(self) -> &'static str {
             match self {
                 Self::Vp9 => "VP9",
+                Self::H264 => "H264",
                 Self::H265 => "H265",
                 Self::Av1 => "AV1",
             }
@@ -47,6 +49,7 @@ mod inner {
         fn input_subtypes(self) -> &'static [GUID] {
             match self {
                 Self::Vp9 => &[MFVideoFormat_VP90],
+                Self::H264 => &[MFVideoFormat_H264, MFVideoFormat_H264_ES],
                 Self::H265 => &[
                     MFVideoFormat_HEVC,
                     MFVideoFormat_H265,
@@ -60,6 +63,7 @@ mod inner {
     #[derive(Clone, Debug, Default, PartialEq, Eq)]
     pub struct MfVideoDecodeStatus {
         pub vp9: bool,
+        pub h264: bool,
         pub h265: bool,
         pub av1: bool,
     }
@@ -69,6 +73,9 @@ mod inner {
             let mut codecs = Vec::new();
             if self.vp9 {
                 codecs.push("VP9");
+            }
+            if self.h264 {
+                codecs.push("H264");
             }
             if self.h265 {
                 codecs.push("H265");
@@ -88,9 +95,14 @@ mod inner {
         static STATUS: OnceLock<MfVideoDecodeStatus> = OnceLock::new();
         STATUS.get_or_init(|| MfVideoDecodeStatus {
             vp9: decoder_available(MfVideoCodec::Vp9),
+            h264: decoder_available(MfVideoCodec::H264),
             h265: decoder_available(MfVideoCodec::H265),
             av1: decoder_available(MfVideoCodec::Av1),
         })
+    }
+
+    pub fn h264_decode_available() -> bool {
+        mf_video_decode_status().h264
     }
 
     pub fn h265_decode_available() -> bool {
@@ -479,6 +491,7 @@ mod inner {
         #[test]
         fn codec_labels_are_stable() {
             assert_eq!(MfVideoCodec::Vp9.label(), "VP9");
+            assert_eq!(MfVideoCodec::H264.label(), "H264");
             assert_eq!(MfVideoCodec::H265.label(), "H265");
             assert_eq!(MfVideoCodec::Av1.label(), "AV1");
         }
@@ -488,13 +501,14 @@ mod inner {
 #[cfg(all(feature = "live-vp9-mf", target_os = "windows"))]
 #[allow(unused_imports)]
 pub use inner::{
-    av1_decode_available, h265_decode_available, mf_video_decode_status, MfVideoCodec,
-    MfVideoDecodeStatus, MfVideoDecoder,
+    av1_decode_available, h264_decode_available, h265_decode_available, mf_video_decode_status,
+    MfVideoCodec, MfVideoDecodeStatus, MfVideoDecoder,
 };
 
 #[cfg(not(all(feature = "live-vp9-mf", target_os = "windows")))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MfVideoCodec {
+    H264,
     H265,
     Av1,
 }
@@ -503,6 +517,7 @@ pub enum MfVideoCodec {
 impl MfVideoCodec {
     pub fn label(self) -> &'static str {
         match self {
+            Self::H264 => "H264",
             Self::H265 => "H265",
             Self::Av1 => "AV1",
         }
@@ -513,6 +528,7 @@ impl MfVideoCodec {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MfVideoDecodeStatus {
     pub vp9: bool,
+    pub h264: bool,
     pub h265: bool,
     pub av1: bool,
 }
@@ -528,10 +544,16 @@ impl MfVideoDecodeStatus {
 pub fn mf_video_decode_status() -> &'static MfVideoDecodeStatus {
     static STATUS: MfVideoDecodeStatus = MfVideoDecodeStatus {
         vp9: false,
+        h264: false,
         h265: false,
         av1: false,
     };
     &STATUS
+}
+
+#[cfg(not(all(feature = "live-vp9-mf", target_os = "windows")))]
+pub fn h264_decode_available() -> bool {
+    false
 }
 
 #[cfg(not(all(feature = "live-vp9-mf", target_os = "windows")))]
