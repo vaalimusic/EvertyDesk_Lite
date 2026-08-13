@@ -12,6 +12,7 @@ use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const TILE_SIZE: usize = 32;
+const MIN_MEANINGFUL_HARDWARE_PACKET_BYTES: usize = 64;
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -560,16 +561,27 @@ fn execute_decode_child(request: &DecodeChildRequest) -> DecodeChildResult {
     let mut packet_index = request.preroll_packets;
     let mut first_error = String::new();
     let mut frames_decoded = 0usize;
+    let mut meaningful_packets = 0usize;
     let samples = measure(&child_config, || {
         let Some(packet) = packets.get(packet_index) else {
             return None;
         };
         packet_index += 1;
+        if packet.len() < MIN_MEANINGFUL_HARDWARE_PACKET_BYTES {
+            if first_error.is_empty() {
+                first_error = format!(
+                    "hardware packet too small to count as meaningful frame payload: {} bytes",
+                    packet.len()
+                );
+            }
+            return None;
+        }
         let started = Instant::now();
         match decode_until_frame(&mut dec, std::slice::from_ref(packet), 8) {
             Ok(Some((_, _, rgba))) => {
                 let elapsed = started.elapsed();
                 frames_decoded += 1;
+                meaningful_packets += 1;
                 black_box(rgba.len());
                 Some(elapsed)
             }
@@ -588,7 +600,7 @@ fn execute_decode_child(request: &DecodeChildRequest) -> DecodeChildResult {
         }
     });
     let summary = summarize(&samples);
-    let available = frames_decoded > 0 && !samples.is_empty();
+    let available = frames_decoded > 0 && meaningful_packets > 0 && !samples.is_empty();
     DecodeChildResult {
         available,
         frames_decoded,
@@ -871,6 +883,15 @@ fn execute_roundtrip_child(request: &RoundtripChildRequest) -> RoundtripChildRes
                 return None;
             }
         };
+        if packet.bytes.len() < MIN_MEANINGFUL_HARDWARE_PACKET_BYTES {
+            if first_error.is_empty() {
+                first_error = format!(
+                    "hardware packet too small to count as meaningful roundtrip payload: {} bytes",
+                    packet.bytes.len()
+                );
+            }
+            return None;
+        }
         match decode_until_frame(&mut dec, std::slice::from_ref(&packet.bytes), 8) {
             Ok(Some((_, _, rgba))) => {
                 let elapsed = started.elapsed();

@@ -193,11 +193,11 @@ cost on matching synthetic and realistic scenes. Hardware decode and codec
 roundtrip run in crash-isolated child processes so a faulty Windows decoder MFT
 cannot kill the parent benchmark or corrupt the CSV/JSONL report. The harness
 feeds a GOP-oriented stream into one decoder state and excludes base-frame
-preroll from timing. On the local Windows test machine H.264 decode/roundtrip
-produced valid rows, while the HEVC decoder child exits with `0xc0000005`; that
-crash is captured as row error text. The comparison script treats hardware
-roundtrip payloads below 64 bytes as non-publishable until the encoded stream is
-verified as a meaningful scene update.
+preroll from timing. Hardware packets below 64 bytes are not counted as valid
+decode/roundtrip samples; this prevents delayed/skip/control packets from being
+published as real frame latency. On the local Windows test machine the current
+short H.264 roundtrip smoke is rejected by that guard, while the HEVC decoder
+child exits with `0xc0000005`; both conditions are captured as row error text.
 The combined benchmark set still does not yet benchmark:
 
 - capture latency;
