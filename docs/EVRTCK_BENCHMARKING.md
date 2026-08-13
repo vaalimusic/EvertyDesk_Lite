@@ -195,7 +195,9 @@ cannot kill the parent benchmark or corrupt the CSV/JSONL report. The harness
 feeds a GOP-oriented stream into one decoder state and excludes base-frame
 preroll from timing. On the local Windows test machine H.264 decode/roundtrip
 produced valid rows, while the HEVC decoder child exits with `0xc0000005`; that
-crash is captured as row error text.
+crash is captured as row error text. The comparison script treats hardware
+roundtrip payloads below 64 bytes as non-publishable until the encoded stream is
+verified as a meaningful scene update.
 The combined benchmark set still does not yet benchmark:
 
 - capture latency;

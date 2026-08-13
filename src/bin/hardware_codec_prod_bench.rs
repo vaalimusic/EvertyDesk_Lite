@@ -848,8 +848,15 @@ fn execute_roundtrip_child(request: &RoundtripChildRequest) -> RoundtripChildRes
     let mut payload_bytes = 0usize;
     let mut packets_emitted = 0usize;
     let samples = measure(&child_config, || {
+        let stream_frame =
+            stream_variant_frame(&frame, request.width, request.height, packets_emitted);
         let started = Instant::now();
-        let packet = match encode_until_packet(&mut enc, black_box(&frame), request.force_key, 60) {
+        let packet = match encode_until_packet(
+            &mut enc,
+            black_box(&stream_frame),
+            request.force_key && packets_emitted == 0,
+            60,
+        ) {
             Ok(Some(packet)) => packet,
             Ok(None) => {
                 if first_error.is_empty() {
@@ -974,9 +981,11 @@ fn reference_packets(
         );
     }
     for idx in 0..stream_count {
-        let packet = encode_until_packet(&mut stream_enc, frame, force_key && idx == 0, 60)?
-            .ok_or_else(|| "stream encoder produced no frame packet".to_owned())?
-            .bytes;
+        let stream_frame = stream_variant_frame(frame, config.width, config.height, idx);
+        let packet =
+            encode_until_packet(&mut stream_enc, &stream_frame, force_key && idx == 0, 60)?
+                .ok_or_else(|| "stream encoder produced no frame packet".to_owned())?
+                .bytes;
         decode_stream_packets.push(packet);
     }
     Ok(ReferencePackets {
@@ -1350,6 +1359,27 @@ fn make_frame(config: &Config, base: &[u8], scenario: Scenario) -> Vec<u8> {
         SceneKind::BrowserScroll => browser_scroll_scene(config.width, config.height),
         SceneKind::TerminalScroll => terminal_scroll_scene(config.width, config.height),
     }
+}
+
+fn stream_variant_frame(frame: &[u8], width: usize, height: usize, index: usize) -> Vec<u8> {
+    let mut out = frame.to_vec();
+    if width == 0 || height == 0 || out.len() < width.saturating_mul(height).saturating_mul(4) {
+        return out;
+    }
+    let marker_w = width.clamp(8, 96);
+    let marker_h = height.clamp(8, 48);
+    let max_x = width.saturating_sub(marker_w).max(1);
+    let max_y = height.saturating_sub(marker_h).max(1);
+    let x = (index.wrapping_mul(37)) % max_x;
+    let y = (index.wrapping_mul(19)) % max_y;
+    let color = [
+        (index.wrapping_mul(41) & 0xff) as u8,
+        (96usize.wrapping_add(index.wrapping_mul(29)) & 0xff) as u8,
+        (192usize.wrapping_sub(index.wrapping_mul(13)) & 0xff) as u8,
+        255,
+    ];
+    fill_rect(&mut out, width, height, x, y, marker_w, marker_h, color);
+    out
 }
 
 fn measure<F>(config: &Config, mut f: F) -> Vec<Duration>
