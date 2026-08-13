@@ -75,6 +75,15 @@ function ChooseWinner($evrtck, $hardware) {
     return "evrtck"
 }
 
+function HardwareOperationRank($operation) {
+    switch ([string]$operation) {
+        "roundtrip" { return 0 }
+        "decode" { return 1 }
+        "encode" { return 2 }
+        default { return 99 }
+    }
+}
+
 $evrtckSummary = Get-Content -LiteralPath $evrtckSummaryPath -Raw | ConvertFrom-Json
 $hardwareRows = Import-Csv -LiteralPath $hardwareCsvPath
 $hardwareMetadata = if (Test-Path -LiteralPath $hardwareMetadataPath) {
@@ -101,10 +110,16 @@ $decisions = @()
 foreach ($decision in $evrtckSummary.decisions) {
     $scenario = [string]$decision.scenario
     $hardwareForScenario = $hardwareRows |
-        Where-Object { $_.scenario -eq $scenario -and $_.operation -eq "encode" -and $_.available -eq "true" } |
+        Where-Object {
+            $_.scenario -eq $scenario -and
+            $_.operation -in @("roundtrip", "decode", "encode") -and
+            $_.available -eq "true"
+        } |
         ForEach-Object {
             [pscustomobject]@{
                 codec = [string]$_.codec
+                operation = [string]$_.operation
+                operation_rank = HardwareOperationRank $_.operation
                 p99_ms = [Math]::Round((To-Double $_.p99_us) / 1000.0, 3)
                 p95_ms = [Math]::Round((To-Double $_.p95_us) / 1000.0, 3)
                 payload_bytes = To-Int64 $_.payload_bytes
@@ -112,7 +127,7 @@ foreach ($decision in $evrtckSummary.decisions) {
                 backend = [string]$_.backend
             }
         } |
-        Sort-Object @{ Expression = "p99_ms"; Ascending = $true }, @{ Expression = "payload_bytes"; Ascending = $true }
+        Sort-Object @{ Expression = "operation_rank"; Ascending = $true }, @{ Expression = "p99_ms"; Ascending = $true }, @{ Expression = "payload_bytes"; Ascending = $true }
 
     $bestHardware = $hardwareForScenario | Select-Object -First 1
     $evrtckP99 = if ($null -ne $decision.hinted_roundtrip_p99_ms) {
@@ -138,11 +153,30 @@ foreach ($decision in $evrtckSummary.decisions) {
         evrtck_payload_bytes = $evrtckPayload
         evrtck_verdict = [string]$decision.verdict
         hardware_codec = if ($bestHardware) { $bestHardware.codec } else { $null }
+        hardware_operation = if ($bestHardware) { $bestHardware.operation } else { $null }
         hardware_p99_ms = if ($bestHardware) { $bestHardware.p99_ms } else { $null }
         hardware_payload_bytes = if ($bestHardware) { $bestHardware.payload_bytes } else { $null }
         hardware_verdict = if ($bestHardware) { FpsVerdict $bestHardware.p99_ms $bestHardware.payload_bytes $rawBytes } else { "no_hardware_data" }
         winner = ChooseWinner $evrtckData $bestHardware
     }
+}
+
+$fallbackHardware = $decisions | Where-Object {
+    $null -ne $_.hardware_operation -and $_.hardware_operation -ne "roundtrip"
+}
+if ($fallbackHardware.Count -gt 0) {
+    $warnings += "some hardware comparisons use decode/encode fallback because roundtrip rows were unavailable"
+    $publishable = $false
+}
+$tinyHardwarePayload = $decisions | Where-Object {
+    $null -ne $_.hardware_operation -and
+    $_.hardware_operation -eq "roundtrip" -and
+    $null -ne $_.hardware_payload_bytes -and
+    $_.hardware_payload_bytes -lt 64
+}
+if ($tinyHardwarePayload.Count -gt 0) {
+    $warnings += "some hardware roundtrip payloads are under 64 bytes; verify the encoded stream is a meaningful scene update before using scheduler conclusions"
+    $publishable = $false
 }
 
 $summary = [ordered]@{
@@ -180,16 +214,16 @@ if ($warnings.Count -gt 0) {
     }
 }
 $md.Add("")
-$md.Add("| scenario | EVRTCK p99 ms | EVRTCK payload | EVRTCK verdict | HW codec | HW p99 ms | HW payload | HW verdict | winner |")
-$md.Add("|---|---:|---:|---|---|---:|---:|---|---|")
+$md.Add("| scenario | EVRTCK p99 ms | EVRTCK payload | EVRTCK verdict | HW codec | HW op | HW p99 ms | HW payload | HW verdict | winner |")
+$md.Add("|---|---:|---:|---|---|---|---:|---:|---|---|")
 foreach ($decision in $decisions) {
-    $md.Add("| $($decision.scenario) | $($decision.evrtck_p99_ms) | $($decision.evrtck_payload_bytes) | $($decision.evrtck_verdict) | $($decision.hardware_codec) | $($decision.hardware_p99_ms) | $($decision.hardware_payload_bytes) | $($decision.hardware_verdict) | $($decision.winner) |")
+    $md.Add("| $($decision.scenario) | $($decision.evrtck_p99_ms) | $($decision.evrtck_payload_bytes) | $($decision.evrtck_verdict) | $($decision.hardware_codec) | $($decision.hardware_operation) | $($decision.hardware_p99_ms) | $($decision.hardware_payload_bytes) | $($decision.hardware_verdict) | $($decision.winner) |")
 }
 $md.Add("")
 $md.Add("Notes:")
 $md.Add("")
 $md.Add("- EVRTCK values use hinted roundtrip when available: encode + decode after base-frame state is established.")
-$md.Add("- Hardware values are encode-only until a hardware decode bench is added.")
+$md.Add("- Hardware values prefer roundtrip rows. If roundtrip is unavailable, the report falls back to decode/encode rows and marks the comparison non-publishable.")
 $md.Add("- A hardware winner here means the scheduler should prefer silicon for this scene class, not that transport/presentation latency is already solved.")
 
 $md | Set-Content -LiteralPath $outMdPath -Encoding utf8
