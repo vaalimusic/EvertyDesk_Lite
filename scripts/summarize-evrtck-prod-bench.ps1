@@ -69,8 +69,11 @@ $scenarioNames = $rows |
 $decisions = @()
 foreach ($scenario in $scenarioNames) {
     $encode = $rows | Where-Object { $_.scenario -eq $scenario -and $_.operation -eq "encode" } | Select-Object -First 1
+    $encodeHinted = $rows | Where-Object { $_.scenario -eq $scenario -and $_.operation -eq "encode_hinted" } | Select-Object -First 1
     $decode = $rows | Where-Object { $_.scenario -eq $scenario -and $_.operation -eq "decode" } | Select-Object -First 1
+    $decodeHinted = $rows | Where-Object { $_.scenario -eq $scenario -and $_.operation -eq "decode_hinted" } | Select-Object -First 1
     $roundtrip = $rows | Where-Object { $_.scenario -eq $scenario -and $_.operation -eq "roundtrip" } | Select-Object -First 1
+    $roundtripHinted = $rows | Where-Object { $_.scenario -eq $scenario -and $_.operation -eq "roundtrip_hinted" } | Select-Object -First 1
     if ($null -eq $roundtrip) {
         continue
     }
@@ -94,6 +97,11 @@ foreach ($scenario in $scenarioNames) {
         roundtrip_p50_ms = [Math]::Round((To-Double $roundtrip.p50_us) / 1000.0, 3)
         roundtrip_p95_ms = [Math]::Round((To-Double $roundtrip.p95_us) / 1000.0, 3)
         roundtrip_p99_ms = [Math]::Round((To-Double $roundtrip.p99_us) / 1000.0, 3)
+        hinted_payload_bytes = if ($roundtripHinted) { To-Int64 $roundtripHinted.payload_bytes } else { $null }
+        hinted_dirty_tiles = if ($roundtripHinted) { To-Int64 $roundtripHinted.dirty_tiles } else { $null }
+        hinted_encode_p99_ms = if ($encodeHinted) { [Math]::Round((To-Double $encodeHinted.p99_us) / 1000.0, 3) } else { $null }
+        hinted_decode_p99_ms = if ($decodeHinted) { [Math]::Round((To-Double $decodeHinted.p99_us) / 1000.0, 3) } else { $null }
+        hinted_roundtrip_p99_ms = if ($roundtripHinted) { [Math]::Round((To-Double $roundtripHinted.p99_us) / 1000.0, 3) } else { $null }
         verdict = VerdictFor $roundtrip
     }
 }
@@ -152,11 +160,13 @@ if ($keyframe) {
 }
 $md.Add("## P-frame decision map")
 $md.Add("")
-$md.Add("| scenario | payload | payload/raw | encode p99 ms | decode p99 ms | roundtrip p99 ms | verdict |")
-$md.Add("|---|---:|---:|---:|---:|---:|---|")
+$md.Add("| scenario | payload | hinted payload | tiles | hinted tiles | encode p99 ms | hinted encode p99 ms | decode p99 ms | roundtrip p99 ms | hinted roundtrip p99 ms | verdict |")
+$md.Add("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
 foreach ($decision in $decisions) {
     $payloadPct = [Math]::Round($decision.payload_ratio * 100.0, 2)
-    $md.Add("| $($decision.scenario) | $($decision.payload_bytes) | $payloadPct% | $($decision.encode_p99_ms) | $($decision.decode_p99_ms) | $($decision.roundtrip_p99_ms) | $($decision.verdict) |")
+    $tileText = "$($decision.dirty_tiles)/$($decision.total_tiles)"
+    $hintedTileText = if ($null -ne $decision.hinted_dirty_tiles) { "$($decision.hinted_dirty_tiles)/$($decision.total_tiles)" } else { "" }
+    $md.Add("| $($decision.scenario) | $($decision.payload_bytes) ($payloadPct%) | $($decision.hinted_payload_bytes) | $tileText | $hintedTileText | $($decision.encode_p99_ms) | $($decision.hinted_encode_p99_ms) | $($decision.decode_p99_ms) | $($decision.roundtrip_p99_ms) | $($decision.hinted_roundtrip_p99_ms) | $($decision.verdict) |")
 }
 $md.Add("")
 $md.Add("## Interpretation")
@@ -165,6 +175,7 @@ $md.Add("- ``evrtck_120fps_ok``: codec roundtrip p99 is inside 120 FPS budget an
 $md.Add("- ``evrtck_60fps_ok``: codec roundtrip p99 is inside 60 FPS budget but not 120 FPS budget.")
 $md.Add("- ``prefer_hardware_codec``: payload or entropy profile says scheduler should prefer H.264/H.265/AV1 silicon for this kind of frame.")
 $md.Add("- ``scheduler_decision_needed``: neither path is obvious from this codec-only bench; compare with hardware codec data.")
+$md.Add("- ``*_hinted`` columns use capture dirty rectangles. This is the intended DXGI/DamageRect software path; non-hinted columns are the conservative full-frame scan baseline.")
 $md.Add("")
 $md.Add("Roundtrip here means EVRTCK P-frame encode plus EVRTCK P-frame decode after base-frame state is established. It excludes capture, network, encryption, presentation, and OS scheduling delay.")
 

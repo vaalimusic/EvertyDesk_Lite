@@ -1,4 +1,4 @@
-use evertydesk_core::evrtck::{EvrtckDecoder, EvrtckEncoder, TILE_SIZE};
+use evertydesk_core::evrtck::{DirtyRect, EvrtckDecoder, EvrtckEncoder, TILE_SIZE};
 use serde::Serialize;
 use std::fs::{self, File};
 use std::hint::black_box;
@@ -204,6 +204,15 @@ struct Scenario {
     dirty_ratio: f32,
     distribution: DirtyDistribution,
     entropy: DirtyEntropy,
+    scene: SceneKind,
+}
+
+#[derive(Clone, Copy)]
+enum SceneKind {
+    SyntheticDirty,
+    IdeTyping,
+    BrowserScroll,
+    TerminalScroll,
 }
 
 fn scenarios() -> &'static [Scenario] {
@@ -213,78 +222,112 @@ fn scenarios() -> &'static [Scenario] {
             dirty_ratio: 0.00,
             distribution: DirtyDistribution::Clustered,
             entropy: DirtyEntropy::Invert,
+            scene: SceneKind::SyntheticDirty,
         },
         Scenario {
             name: "clustered_invert_5pct",
             dirty_ratio: 0.05,
             distribution: DirtyDistribution::Clustered,
             entropy: DirtyEntropy::Invert,
+            scene: SceneKind::SyntheticDirty,
         },
         Scenario {
             name: "clustered_invert_15pct",
             dirty_ratio: 0.15,
             distribution: DirtyDistribution::Clustered,
             entropy: DirtyEntropy::Invert,
+            scene: SceneKind::SyntheticDirty,
         },
         Scenario {
             name: "clustered_invert_50pct",
             dirty_ratio: 0.50,
             distribution: DirtyDistribution::Clustered,
             entropy: DirtyEntropy::Invert,
+            scene: SceneKind::SyntheticDirty,
         },
         Scenario {
             name: "clustered_invert_90pct",
             dirty_ratio: 0.90,
             distribution: DirtyDistribution::Clustered,
             entropy: DirtyEntropy::Invert,
+            scene: SceneKind::SyntheticDirty,
         },
         Scenario {
             name: "scattered_invert_5pct",
             dirty_ratio: 0.05,
             distribution: DirtyDistribution::Scattered,
             entropy: DirtyEntropy::Invert,
+            scene: SceneKind::SyntheticDirty,
         },
         Scenario {
             name: "scattered_invert_15pct",
             dirty_ratio: 0.15,
             distribution: DirtyDistribution::Scattered,
             entropy: DirtyEntropy::Invert,
+            scene: SceneKind::SyntheticDirty,
         },
         Scenario {
             name: "scattered_invert_50pct",
             dirty_ratio: 0.50,
             distribution: DirtyDistribution::Scattered,
             entropy: DirtyEntropy::Invert,
+            scene: SceneKind::SyntheticDirty,
         },
         Scenario {
             name: "scattered_invert_90pct",
             dirty_ratio: 0.90,
             distribution: DirtyDistribution::Scattered,
             entropy: DirtyEntropy::Invert,
+            scene: SceneKind::SyntheticDirty,
         },
         Scenario {
             name: "scattered_noise_5pct",
             dirty_ratio: 0.05,
             distribution: DirtyDistribution::Scattered,
             entropy: DirtyEntropy::Noise,
+            scene: SceneKind::SyntheticDirty,
         },
         Scenario {
             name: "scattered_noise_15pct",
             dirty_ratio: 0.15,
             distribution: DirtyDistribution::Scattered,
             entropy: DirtyEntropy::Noise,
+            scene: SceneKind::SyntheticDirty,
         },
         Scenario {
             name: "scattered_noise_50pct",
             dirty_ratio: 0.50,
             distribution: DirtyDistribution::Scattered,
             entropy: DirtyEntropy::Noise,
+            scene: SceneKind::SyntheticDirty,
         },
         Scenario {
             name: "scattered_noise_90pct",
             dirty_ratio: 0.90,
             distribution: DirtyDistribution::Scattered,
             entropy: DirtyEntropy::Noise,
+            scene: SceneKind::SyntheticDirty,
+        },
+        Scenario {
+            name: "ide_typing_realistic",
+            dirty_ratio: 0.01,
+            distribution: DirtyDistribution::Clustered,
+            entropy: DirtyEntropy::Invert,
+            scene: SceneKind::IdeTyping,
+        },
+        Scenario {
+            name: "browser_scroll_realistic",
+            dirty_ratio: 0.08,
+            distribution: DirtyDistribution::Clustered,
+            entropy: DirtyEntropy::Invert,
+            scene: SceneKind::BrowserScroll,
+        },
+        Scenario {
+            name: "terminal_scroll_realistic",
+            dirty_ratio: 0.04,
+            distribution: DirtyDistribution::Clustered,
+            entropy: DirtyEntropy::Invert,
+            scene: SceneKind::TerminalScroll,
         },
     ]
 }
@@ -317,13 +360,23 @@ fn run_keyframe_scenario(config: &Config, frame: &[u8]) -> Vec<BenchRow> {
 fn run_pframe_scenario(
     config: &Config,
     base: &[u8],
-    frame: &[u8],
+    synthetic_frame: &[u8],
     scenario: Scenario,
 ) -> Vec<BenchRow> {
+    let scene = make_scene(config, base, synthetic_frame, scenario);
+    let frame = scene.frame.as_slice();
+    let dirty_rects = scene.dirty_rects.as_slice();
+
     let mut reference_encoder = EvrtckEncoder::new(config.width, config.height);
     let keyframe = reference_encoder.encode(base, 1);
     let (pframe, stats) = reference_encoder.encode_with_stats(frame, 2);
     let payload_bytes = pframe.data.len();
+
+    let mut hinted_reference_encoder = EvrtckEncoder::new(config.width, config.height);
+    hinted_reference_encoder.encode(base, 1);
+    let (hinted_pframe, hinted_stats) =
+        hinted_reference_encoder.encode_with_capture_hints(frame, 2, &[], dirty_rects);
+    let hinted_payload_bytes = hinted_pframe.data.len();
 
     let encode_samples = measure(config, || {
         let mut enc = EvrtckEncoder::new(config.width, config.height);
@@ -335,11 +388,31 @@ fn run_pframe_scenario(
         elapsed
     });
 
+    let hinted_encode_samples = measure(config, || {
+        let mut enc = EvrtckEncoder::new(config.width, config.height);
+        enc.encode(black_box(base), 1);
+        let started = Instant::now();
+        let pkt = enc.encode_with_capture_hints(black_box(frame), 2, &[], black_box(dirty_rects));
+        let elapsed = started.elapsed();
+        black_box(pkt.0.data.len());
+        elapsed
+    });
+
     let decode_samples = measure(config, || {
         let mut dec = EvrtckDecoder::new();
         dec.decode_wire(black_box(&keyframe.data)).unwrap();
         let started = Instant::now();
         let pixels = dec.decode_wire(black_box(&pframe.data)).unwrap();
+        let elapsed = started.elapsed();
+        black_box(pixels.len());
+        elapsed
+    });
+
+    let hinted_decode_samples = measure(config, || {
+        let mut dec = EvrtckDecoder::new();
+        dec.decode_wire(black_box(&keyframe.data)).unwrap();
+        let started = Instant::now();
+        let pixels = dec.decode_wire(black_box(&hinted_pframe.data)).unwrap();
         let elapsed = started.elapsed();
         black_box(pixels.len());
         elapsed
@@ -358,6 +431,19 @@ fn run_pframe_scenario(
         elapsed
     });
 
+    let hinted_roundtrip_samples = measure(config, || {
+        let mut enc = EvrtckEncoder::new(config.width, config.height);
+        let kf = enc.encode(black_box(base), 1);
+        let mut dec = EvrtckDecoder::new();
+        dec.decode_wire(black_box(&kf.data)).unwrap();
+        let started = Instant::now();
+        let pkt = enc.encode_with_capture_hints(black_box(frame), 2, &[], black_box(dirty_rects));
+        let pixels = dec.decode_wire(black_box(&pkt.0.data)).unwrap();
+        let elapsed = started.elapsed();
+        black_box((pkt.0.data.len(), pixels.len()));
+        elapsed
+    });
+
     vec![
         row(
             scenario.name,
@@ -372,6 +458,17 @@ fn run_pframe_scenario(
         ),
         row(
             scenario.name,
+            "encode_hinted",
+            config,
+            scenario.dirty_ratio,
+            scenario.distribution,
+            scenario.entropy,
+            hinted_payload_bytes,
+            hinted_stats.clone(),
+            hinted_encode_samples,
+        ),
+        row(
+            scenario.name,
             "decode",
             config,
             scenario.dirty_ratio,
@@ -380,6 +477,17 @@ fn run_pframe_scenario(
             payload_bytes,
             stats.clone(),
             decode_samples,
+        ),
+        row(
+            scenario.name,
+            "decode_hinted",
+            config,
+            scenario.dirty_ratio,
+            scenario.distribution,
+            scenario.entropy,
+            hinted_payload_bytes,
+            hinted_stats.clone(),
+            hinted_decode_samples,
         ),
         row(
             scenario.name,
@@ -392,7 +500,45 @@ fn run_pframe_scenario(
             stats,
             roundtrip_samples,
         ),
+        row(
+            scenario.name,
+            "roundtrip_hinted",
+            config,
+            scenario.dirty_ratio,
+            scenario.distribution,
+            scenario.entropy,
+            hinted_payload_bytes,
+            hinted_stats,
+            hinted_roundtrip_samples,
+        ),
     ]
+}
+
+struct Scene {
+    frame: Vec<u8>,
+    dirty_rects: Vec<DirtyRect>,
+}
+
+fn make_scene(config: &Config, base: &[u8], synthetic_frame: &[u8], scenario: Scenario) -> Scene {
+    match scenario.scene {
+        SceneKind::SyntheticDirty => Scene {
+            frame: synthetic_frame.to_vec(),
+            dirty_rects: dirty_rects_for_tiles(
+                config.width,
+                config.height,
+                &dirty_tile_indices(
+                    config.width,
+                    config.height,
+                    scenario.dirty_ratio,
+                    scenario.distribution,
+                    0x4556_5254_434b,
+                ),
+            ),
+        },
+        SceneKind::IdeTyping => ide_typing_scene(config.width, config.height),
+        SceneKind::BrowserScroll => browser_scroll_scene(config.width, config.height),
+        SceneKind::TerminalScroll => terminal_scroll_scene(base, config.width, config.height),
+    }
 }
 
 fn measure<F>(config: &Config, mut f: F) -> Vec<Duration>
@@ -565,6 +711,227 @@ fn dirty_tile_indices(
             tiles.truncate(dirty_count);
             tiles.sort_unstable();
             tiles
+        }
+    }
+}
+
+fn dirty_rects_for_tiles(w: usize, h: usize, tile_indices: &[usize]) -> Vec<DirtyRect> {
+    let tiles_x = w.div_ceil(TILE_SIZE);
+    tile_indices
+        .iter()
+        .copied()
+        .map(|tile_idx| {
+            let tx = tile_idx % tiles_x;
+            let ty = tile_idx / tiles_x;
+            let left = tx * TILE_SIZE;
+            let top = ty * TILE_SIZE;
+            DirtyRect {
+                left: left as u32,
+                top: top as u32,
+                right: (left + TILE_SIZE).min(w) as u32,
+                bottom: (top + TILE_SIZE).min(h) as u32,
+            }
+        })
+        .collect()
+}
+
+fn ide_typing_scene(w: usize, h: usize) -> Scene {
+    let mut frame = ide_base_frame(w, h);
+    let editor_left = (w / 5).min(360);
+    let editor_top = (h / 8).min(140);
+    let line_h = 22usize;
+    let caret_line = 11usize;
+    let y0 = (editor_top + caret_line * line_h).min(h.saturating_sub(1));
+    let x0 = (editor_left + 64).min(w.saturating_sub(1));
+    let text_w = 320usize.min(w.saturating_sub(x0));
+    let text_h = 18usize.min(h.saturating_sub(y0));
+
+    fill_rect(&mut frame, w, h, x0, y0, text_w, text_h, [54, 61, 73, 255]);
+    for i in 0..28 {
+        let bar_x = x0 + i * 10;
+        if bar_x + 6 >= w {
+            break;
+        }
+        let color = match i % 5 {
+            0 => [97, 175, 239, 255],
+            1 => [152, 195, 121, 255],
+            2 => [224, 108, 117, 255],
+            _ => [210, 210, 210, 255],
+        };
+        fill_rect(&mut frame, w, h, bar_x, y0 + 4, 6, 10, color);
+    }
+    fill_rect(
+        &mut frame,
+        w,
+        h,
+        x0 + text_w + 8,
+        y0 + 1,
+        2,
+        text_h,
+        [240, 240, 240, 255],
+    );
+
+    Scene {
+        frame,
+        dirty_rects: vec![DirtyRect {
+            left: x0 as u32,
+            top: y0 as u32,
+            right: (x0 + text_w + 12).min(w) as u32,
+            bottom: (y0 + text_h).min(h) as u32,
+        }],
+    }
+}
+
+fn browser_scroll_scene(w: usize, h: usize) -> Scene {
+    let mut frame = browser_base_frame(w, h, 0);
+    let scroll_px = 96usize.min(h / 4).max(1);
+    let old = browser_base_frame(w, h, 0);
+    let newer = browser_base_frame(w, h, scroll_px);
+    let content_top = (h / 10).max(80).min(h);
+    let content_bottom = h.saturating_sub(24);
+    if content_bottom > content_top + scroll_px {
+        for y in content_top..(content_bottom - scroll_px) {
+            let src = ((y + scroll_px) * w) * 4;
+            let dst = (y * w) * 4;
+            frame[dst..dst + w * 4].copy_from_slice(&old[src..src + w * 4]);
+        }
+    }
+    let dirty_top = content_bottom.saturating_sub(scroll_px);
+    let bytes_start = dirty_top * w * 4;
+    frame[bytes_start..content_bottom * w * 4]
+        .copy_from_slice(&newer[bytes_start..content_bottom * w * 4]);
+
+    Scene {
+        frame,
+        dirty_rects: vec![DirtyRect {
+            left: 0,
+            top: dirty_top as u32,
+            right: w as u32,
+            bottom: content_bottom as u32,
+        }],
+    }
+}
+
+fn terminal_scroll_scene(base: &[u8], w: usize, h: usize) -> Scene {
+    let mut frame = base.to_vec();
+    let scroll_px = 32usize.min(h / 8).max(1);
+    if h > scroll_px {
+        for y in 0..(h - scroll_px) {
+            let src = (y + scroll_px) * w * 4;
+            let dst = y * w * 4;
+            frame.copy_within(src..src + w * 4, dst);
+        }
+    }
+    let y0 = h.saturating_sub(scroll_px);
+    fill_rect(&mut frame, w, h, 0, y0, w, scroll_px, [18, 18, 18, 255]);
+    for row in 0..(scroll_px / 8).max(1) {
+        let y = y0 + row * 10 + 4;
+        for col in 0..80usize {
+            let x = 16 + col * 9;
+            if x + 6 >= w || y + 2 >= h {
+                break;
+            }
+            fill_rect(&mut frame, w, h, x, y, 6, 2, [84, 255, 112, 255]);
+        }
+    }
+
+    Scene {
+        frame,
+        dirty_rects: vec![DirtyRect {
+            left: 0,
+            top: y0 as u32,
+            right: w as u32,
+            bottom: h as u32,
+        }],
+    }
+}
+
+fn ide_base_frame(w: usize, h: usize) -> Vec<u8> {
+    let mut frame = solid_frame(w, h, [33, 37, 43, 255]);
+    let sidebar_w = (w / 6).min(300);
+    fill_rect(&mut frame, w, h, 0, 0, sidebar_w, h, [26, 29, 35, 255]);
+    for i in 0..36usize {
+        let y = 32 + i * 24;
+        if y + 10 >= h {
+            break;
+        }
+        let indent = (i % 4) * 14;
+        fill_rect(
+            &mut frame,
+            w,
+            h,
+            sidebar_w + 40 + indent,
+            y,
+            180 + (i % 7) * 18,
+            3,
+            [92, 99, 112, 255],
+        );
+    }
+    frame
+}
+
+fn browser_base_frame(w: usize, h: usize, offset: usize) -> Vec<u8> {
+    let mut frame = solid_frame(w, h, [245, 247, 250, 255]);
+    let toolbar_h = (h / 12).max(56).min(h);
+    fill_rect(&mut frame, w, h, 0, 0, w, toolbar_h, [232, 235, 240, 255]);
+    fill_rect(
+        &mut frame,
+        w,
+        h,
+        72.min(w),
+        16.min(h),
+        w.saturating_sub(144),
+        28.min(h),
+        [255, 255, 255, 255],
+    );
+    let card_w = (w / 3).max(220);
+    for i in 0..24usize {
+        let y = toolbar_h + 24 + i * 78usize.saturating_sub(offset % 78);
+        if y >= h {
+            continue;
+        }
+        let x = 48 + (i % 2) * (card_w + 24);
+        fill_rect(
+            &mut frame,
+            w,
+            h,
+            x,
+            y,
+            card_w.min(w.saturating_sub(x)),
+            54,
+            [255, 255, 255, 255],
+        );
+        fill_rect(&mut frame, w, h, x + 18, y + 14, 160, 6, [80, 92, 110, 255]);
+        fill_rect(
+            &mut frame,
+            w,
+            h,
+            x + 18,
+            y + 30,
+            card_w.saturating_sub(54),
+            4,
+            [180, 188, 202, 255],
+        );
+    }
+    frame
+}
+
+fn fill_rect(
+    frame: &mut [u8],
+    w: usize,
+    h: usize,
+    x: usize,
+    y: usize,
+    rw: usize,
+    rh: usize,
+    bgra: [u8; 4],
+) {
+    let x1 = (x + rw).min(w);
+    let y1 = (y + rh).min(h);
+    for py in y.min(h)..y1 {
+        for px in x.min(w)..x1 {
+            let off = (py * w + px) * 4;
+            frame[off..off + 4].copy_from_slice(&bgra);
         }
     }
 }
