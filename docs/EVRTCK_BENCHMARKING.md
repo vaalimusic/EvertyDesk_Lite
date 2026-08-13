@@ -58,20 +58,21 @@ The same repository also contains a Media Foundation encode harness for
 H.264/H.265 comparison on a matching scene set:
 
 ```powershell
-cargo run --release --features live-vp9-mf --bin hardware_codec_prod_bench -- --quick
+.\scripts\run-hardware-codec-prod-bench.ps1 -Quick -Iterations 40 -Warmup 5
 ```
 
 For publishable comparison data, use the same resolution, iteration count, and
 warmup count as the EVRTCK full run:
 
 ```powershell
-cargo run --release --features live-vp9-mf --bin hardware_codec_prod_bench -- --iterations 300 --warmup 30 --width 1920 --height 1080 --codec H264,H265
+.\scripts\run-hardware-codec-prod-bench.ps1 -Iterations 300 -Warmup 30 -Width 1920 -Height 1080 -Codec H264,H265
 ```
 
 Output is written to:
 
 ```text
 reports/hardware-codec-prod/<timestamp>/
+  metadata.json
   hardware_codec_prod_bench.csv
   hardware_codec_prod_bench.jsonl
 ```

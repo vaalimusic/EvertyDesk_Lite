@@ -74,7 +74,7 @@ This checklist tracks what must be true before publishing EvertyDesk Next 2 as a
    - Done: attach `reports/evrtck-prod/full-20260813-after-correctness/metadata.json`, `evrtck_prod_bench.csv`, `evrtck_prod_bench.jsonl`, `summary.md`, and `summary.json`.
    - Done: `summary.md`/`summary.json` now expose baseline, hinted, and effective verdicts; effective verdict uses hinted roundtrip when available because that is the production software path.
    - Done: runtime scheduler now considers measured encode time plus payload size before staying on EVRTCK for heavy P-frames.
-   - Done: `hardware_codec_prod_bench` Media Foundation encode harness exists for H.264/H.265 on a matching scene set; quick smoke passed locally with `H264(hw), H265(hw)` available.
+   - Done: `hardware_codec_prod_bench` Media Foundation encode harness and `scripts/run-hardware-codec-prod-bench.ps1` metadata wrapper exist for H.264/H.265 on a matching scene set; quick smoke passed locally with `H264(hw), H265(hw)` available.
    - Still required: full hardware H.264/H.265 encode run with 300 iterations / 30 warmup, plus hardware decode latency comparison.
    - Scheduler note from the full run: static, invert deltas, and IDE typing are safe EVRTCK paths; scattered noise at 50%/90% should prefer hardware codec; browser and terminal scroll still need hardware comparison because hinted roundtrip p99 was above the 60 FPS budget.
 
