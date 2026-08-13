@@ -888,7 +888,7 @@ fn spawn_session(
                         let endpoint = format!("{host_addr}:{port}");
                         if !active && strict_evrt_required(&transport_profile_label) {
                             let error = format!(
-                                "{transport_profile_label}: EVRT UDP inactive; TCP fallback is disabled for this profile"
+                                "{transport_profile_label}: EVRT UDP не активен; TCP fallback отключён для этого профиля"
                             );
                             emit_status(&ViewerStatus::Transport {
                                 profile: transport_profile_label.clone(),
@@ -906,9 +906,9 @@ fn spawn_session(
                             break;
                         }
                         let status = if active {
-                            format!("EVRT UDP active - {endpoint}")
+                            format!("EVRT UDP активен — {endpoint}")
                         } else {
-                            "EVRT UDP stopped - TCP fallback".to_owned()
+                            "EVRT UDP не активен — используется TCP fallback".to_owned()
                         };
                         emit_status(&ViewerStatus::Transport {
                             profile: transport_profile_label.clone(),
