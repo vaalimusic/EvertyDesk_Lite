@@ -84,6 +84,7 @@ This checklist tracks what must be true before publishing EvertyDesk Next 2 as a
 
 7. End-to-end session matrix.
    - Outgoing desktop session: LAN, WAN/relay, wrong ID, wrong password, reconnect, multi-monitor.
+   - Done: Desktop EVRTCK viewer no longer silently treats inactive EVRT UDP as TCP fallback; it emits a failed status with the route reason.
    - Incoming session: approval, timeout, reject, active-session controls, input lock, clipboard policy.
    - Game mode: own ID/password fields, low-latency profile, concrete codec selection.
    - VM mode: Hyper-V/RDP viewer path, VM inventory, provider filters, action labels.
