@@ -1800,7 +1800,13 @@ fn encode_loop(
                     let cy = (packed_cursor & 0xFFFF_FFFF) as u32;
                     enc.as_mut().unwrap().set_focus_pixel(cx, cy);
                 }
-                let analysis = enc.as_ref().unwrap().analyze_next_frame(bgra);
+                let analysis = if evrtck_dirty_rects.is_empty() {
+                    enc.as_ref().unwrap().analyze_next_frame(bgra)
+                } else {
+                    enc.as_ref()
+                        .unwrap()
+                        .analyze_next_frame_with_dirty_rects(bgra, &evrtck_dirty_rects)
+                };
                 evrtck_analysis_for_frame = Some(analysis);
                 let (pkt, _stats) = if evrtck_copy_rects.is_empty() && evrtck_dirty_rects.is_empty()
                 {

@@ -407,6 +407,18 @@ pub trait EvrtckEncoderBackend: Send {
             prefer_silicon: false,
         }
     }
+    /// Same scheduler pre-analysis, but constrained to capture-backend dirty
+    /// rectangles. This prevents the heterogeneous scheduler from making a
+    /// silicon-switch decision from a conservative full-frame scan when the
+    /// encoder itself will use exact DXGI/DamageRect hints.
+    fn analyze_next_frame_with_dirty_rects(
+        &self,
+        bgra: &[u8],
+        dirty_rects: &[DirtyRect],
+    ) -> FrameAnalysis {
+        let _ = dirty_rects;
+        self.analyze_next_frame(bgra)
+    }
     /// Set (or clear, with `None`) the Visible Region anchor in TILE coordinates
     /// (not pixels). When set, dirty tiles are emitted nearest-to-focus first
     /// instead of raster order — see EVRT2CKMAX-TASK-01. Default: no-op, so
@@ -508,6 +520,113 @@ impl CpuEvrtckEncoder {
                         }
                         off += SAMPLE_STRIDE_BYTES;
                     }
+                }
+            }
+        }
+
+        let dirty_ratio = dirty_tiles as f32 / total_tiles as f32;
+        let changed_density = if sampled_bytes == 0 {
+            0.0
+        } else {
+            changed_sampled_bytes as f32 / sampled_bytes as f32
+        };
+        let entropy_score = if sampled_bytes == 0 {
+            0.0
+        } else {
+            (unique as f32 / 192.0).clamp(0.0, 1.0)
+        };
+        let dirty_tile_pixels = (self.width * self.height) as f32 / total_tiles as f32;
+        let bytes_per_dirty_tile = if entropy_score >= 0.65 {
+            9.0 + dirty_tile_pixels * 3.0 * changed_density * 0.92
+        } else if entropy_score >= 0.25 {
+            18.0 + dirty_tile_pixels * 0.55
+        } else {
+            8.0 + dirty_tile_pixels * 0.015
+        };
+        let estimated_payload_bytes =
+            FRAME_HEADER_LEN + map_bytes + (dirty_tiles as f32 * bytes_per_dirty_tile) as usize;
+        let raw_bytes = self.width.saturating_mul(self.height).saturating_mul(4);
+        let prefer_silicon = dirty_tiles > 0
+            && entropy_score >= 0.62
+            && (dirty_ratio >= 0.12 || estimated_payload_bytes >= raw_bytes / 10);
+
+        FrameAnalysis {
+            total_tiles: total_tiles as u32,
+            dirty_tiles: dirty_tiles as u32,
+            dirty_ratio,
+            entropy_score,
+            estimated_payload_bytes: estimated_payload_bytes.min(u32::MAX as usize) as u32,
+            prefer_silicon,
+        }
+    }
+
+    fn analyze_next_frame_dirty_indices_impl(
+        &self,
+        bgra: &[u8],
+        dirty_indices: &[usize],
+    ) -> FrameAnalysis {
+        let tiles_x = tiles_in_dim(self.width);
+        let tiles_y = tiles_in_dim(self.height);
+        let total_tiles = tiles_x * tiles_y;
+        if total_tiles == 0 || bgra.len() != self.prev.len() || bgra == self.prev {
+            return FrameAnalysis {
+                total_tiles: total_tiles as u32,
+                dirty_tiles: 0,
+                dirty_ratio: 0.0,
+                entropy_score: 0.0,
+                estimated_payload_bytes: FRAME_HEADER_LEN as u32,
+                prefer_silicon: false,
+            };
+        }
+
+        const MAX_SAMPLED_DIRTY_TILES: usize = 96;
+        const SAMPLE_STRIDE_BYTES: usize = 16;
+        let map_bytes = total_tiles.div_ceil(8);
+        let mut dirty_tiles = 0usize;
+        let mut sampled_dirty_tiles = 0usize;
+        let mut sampled_bytes = 0usize;
+        let mut changed_sampled_bytes = 0usize;
+        let mut histogram = [0u16; 256];
+        let mut unique = 0usize;
+
+        for tile_idx in dirty_indices.iter().copied() {
+            if tile_idx >= total_tiles {
+                continue;
+            }
+            let tx = tile_idx % tiles_x;
+            let ty = tile_idx / tiles_x;
+            if !tile_is_dirty(bgra, &self.prev, self.width, self.height, tx, ty) {
+                continue;
+            }
+            dirty_tiles += 1;
+
+            if sampled_dirty_tiles >= MAX_SAMPLED_DIRTY_TILES {
+                continue;
+            }
+            sampled_dirty_tiles += 1;
+            let x0 = tx * TILE_SIZE;
+            let y0 = ty * TILE_SIZE;
+            let x1 = (x0 + TILE_SIZE).min(self.width);
+            let y1 = (y0 + TILE_SIZE).min(self.height);
+
+            for y in y0..y1 {
+                let row_start = (y * self.width + x0) * 4;
+                let row_end = (y * self.width + x1) * 4;
+                let mut off = row_start;
+                while off < row_end {
+                    for channel in 0..3 {
+                        let xor = bgra[off + channel] ^ self.prev[off + channel];
+                        sampled_bytes += 1;
+                        if xor != 0 {
+                            changed_sampled_bytes += 1;
+                        }
+                        let bin = &mut histogram[xor as usize];
+                        if *bin == 0 {
+                            unique += 1;
+                        }
+                        *bin = bin.saturating_add(1);
+                    }
+                    off += SAMPLE_STRIDE_BYTES;
                 }
             }
         }
@@ -799,6 +918,17 @@ impl EvrtckEncoderBackend for CpuEvrtckEncoder {
         self.analyze_next_frame_impl(bgra)
     }
 
+    fn analyze_next_frame_with_dirty_rects(
+        &self,
+        bgra: &[u8],
+        dirty_rects: &[DirtyRect],
+    ) -> FrameAnalysis {
+        match dirty_tile_indices_from_rects(dirty_rects, self.width, self.height) {
+            Some(indices) => self.analyze_next_frame_dirty_indices_impl(bgra, &indices),
+            None => self.analyze_next_frame_impl(bgra),
+        }
+    }
+
     fn set_focus(&mut self, focus_tile: Option<(usize, usize)>) {
         self.focus = focus_tile;
     }
@@ -932,6 +1062,15 @@ impl EvrtckEncoder {
 
     pub fn analyze_next_frame(&self, rgba: &[u8]) -> FrameAnalysis {
         self.inner.analyze_next_frame(rgba)
+    }
+
+    pub fn analyze_next_frame_with_dirty_rects(
+        &self,
+        rgba: &[u8],
+        dirty_rects: &[DirtyRect],
+    ) -> FrameAnalysis {
+        self.inner
+            .analyze_next_frame_with_dirty_rects(rgba, dirty_rects)
     }
 
     pub fn width(&self) -> usize {
@@ -2930,6 +3069,37 @@ mod tests {
     }
 
     // ── TASK-01 exact tile offsets (ROADMAP.md Phase 1.2) ──────────────────────
+
+    #[test]
+    fn hinted_frame_analysis_uses_dirty_rects_for_scheduler_decision() {
+        let (w, h) = (256, 256);
+        let base = solid_frame(w, h, [30, 30, 30, 255]);
+        let frame = dirty_tiles_frame(&base, w, h, 1.0, true);
+        let mut enc = EvrtckEncoder::new(w, h);
+        enc.encode(&base, 1);
+
+        let full = enc.analyze_next_frame(&frame);
+        let hinted = enc.analyze_next_frame_with_dirty_rects(
+            &frame,
+            &[DirtyRect {
+                left: 0,
+                top: 0,
+                right: TILE_SIZE as u32,
+                bottom: TILE_SIZE as u32,
+            }],
+        );
+
+        assert!(full.prefer_silicon);
+        assert_eq!(hinted.dirty_tiles, 1);
+        assert!(
+            hinted.dirty_ratio < 0.02,
+            "one hinted tile should stay a tiny dirty ratio: {hinted:?}"
+        );
+        assert!(
+            !hinted.prefer_silicon,
+            "small dirty capture region should stay on EVRTCK even if a full-frame scan would prefer silicon: {hinted:?}"
+        );
+    }
 
     #[test]
     fn tile_offsets_point_at_the_correct_tile_idx_prefix() {
