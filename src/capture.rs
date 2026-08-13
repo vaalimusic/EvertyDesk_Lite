@@ -16,6 +16,41 @@ pub struct CaptureDisplay {
     pub name: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CaptureRect {
+    pub left: u32,
+    pub top: u32,
+    pub right: u32,
+    pub bottom: u32,
+}
+
+impl CaptureRect {
+    pub fn width(self) -> u32 {
+        self.right.saturating_sub(self.left)
+    }
+
+    pub fn height(self) -> u32 {
+        self.bottom.saturating_sub(self.top)
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.right <= self.left || self.bottom <= self.top
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CaptureMoveRect {
+    pub source_left: u32,
+    pub source_top: u32,
+    pub dest: CaptureRect,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CaptureFrameMeta {
+    pub dirty_rects: Vec<CaptureRect>,
+    pub move_rects: Vec<CaptureMoveRect>,
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn sort_and_reindex_displays(mut displays: Vec<CaptureDisplay>) -> Vec<CaptureDisplay> {
     displays.sort_by_key(|display| (display.x, display.y, display.index));
@@ -77,6 +112,26 @@ mod tests {
         assert_eq!(select_capture_display(&displays, 9).unwrap().name, "DP-1");
         assert_eq!(select_capture_display(&displays, -1).unwrap().name, "DP-1");
     }
+
+    #[test]
+    fn capture_rect_reports_dimensions_and_empty_state() {
+        let rect = CaptureRect {
+            left: 10,
+            top: 20,
+            right: 50,
+            bottom: 70,
+        };
+        assert_eq!(rect.width(), 40);
+        assert_eq!(rect.height(), 50);
+        assert!(!rect.is_empty());
+        assert!(CaptureRect {
+            left: 10,
+            top: 20,
+            right: 10,
+            bottom: 30,
+        }
+        .is_empty());
+    }
 }
 
 #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
@@ -106,13 +161,13 @@ mod win {
                 Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC},
                 IDXGIAdapter, IDXGIDevice, IDXGIKeyedMutex, IDXGIOutput1, IDXGIOutputDuplication,
                 IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
-                DXGI_OUTDUPL_FRAME_INFO,
+                DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT,
             },
         },
         UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN},
     };
 
-    use super::CaptureDisplay;
+    use super::{CaptureDisplay, CaptureFrameMeta, CaptureMoveRect, CaptureRect};
 
     thread_local! {
         static DXGI_CAPTURE: RefCell<Option<DxgiCapture>> = const { RefCell::new(None) };
@@ -139,7 +194,14 @@ mod win {
     }
 
     pub fn capture_display_into(display: i32, out: &mut Vec<u8>) -> Option<(u32, u32)> {
-        unsafe { capture_into_inner(display, out, false).map(|(w, h, _)| (w, h)) }
+        unsafe { capture_into_inner(display, out, false).map(|(w, h, _, _)| (w, h)) }
+    }
+
+    pub fn capture_display_into_with_meta(
+        display: i32,
+        out: &mut Vec<u8>,
+    ) -> Option<(u32, u32, CaptureFrameMeta)> {
+        unsafe { capture_into_inner(display, out, false).map(|(w, h, _, meta)| (w, h, meta)) }
     }
 
     /// Same capture as `capture_display_into`, but also asks the DXGI backend
@@ -156,6 +218,13 @@ mod win {
         display: i32,
         out: &mut Vec<u8>,
     ) -> Option<(u32, u32, Option<isize>)> {
+        unsafe { capture_into_inner(display, out, true).map(|(w, h, shared, _)| (w, h, shared)) }
+    }
+
+    pub fn capture_display_into_shared_with_meta(
+        display: i32,
+        out: &mut Vec<u8>,
+    ) -> Option<(u32, u32, Option<isize>, CaptureFrameMeta)> {
         unsafe { capture_into_inner(display, out, true) }
     }
 
@@ -175,7 +244,7 @@ mod win {
         display: i32,
         out: &mut Vec<u8>,
         want_shared: bool,
-    ) -> Option<(u32, u32, Option<isize>)> {
+    ) -> Option<(u32, u32, Option<isize>, CaptureFrameMeta)> {
         let info = cached_display_info(display)?;
         if info.width <= 0 || info.height <= 0 {
             invalidate_display_info_cache();
@@ -196,7 +265,7 @@ mod win {
         if result.is_none() {
             invalidate_display_info_cache();
         }
-        result.map(|(w, h)| (w, h, None))
+        result.map(|(w, h)| (w, h, None, CaptureFrameMeta::default()))
     }
 
     fn cached_display_info(display: i32) -> Option<CaptureDisplay> {
@@ -235,7 +304,7 @@ mod win {
         width: u32,
         height: u32,
         want_shared: bool,
-    ) -> Option<(u32, u32, Option<isize>)> {
+    ) -> Option<(u32, u32, Option<isize>, CaptureFrameMeta)> {
         DXGI_CAPTURE.with(|cell| {
             let recreate = cell
                 .borrow()
@@ -256,14 +325,16 @@ mod win {
                     width,
                     height,
                     shared,
-                } => Some((width, height, shared)),
+                    meta,
+                } => Some((width, height, shared, meta)),
                 DxgiCaptureResult::NoChange {
                     width,
                     height,
                     shared,
+                    meta,
                 } => {
                     if out.len() == frame_byte_len(width, height)? {
-                        Some((width, height, shared))
+                        Some((width, height, shared, meta))
                     } else {
                         None
                     }
@@ -303,11 +374,13 @@ mod win {
             width: u32,
             height: u32,
             shared: Option<isize>,
+            meta: CaptureFrameMeta,
         },
         NoChange {
             width: u32,
             height: u32,
             shared: Option<isize>,
+            meta: CaptureFrameMeta,
         },
         Unavailable,
     }
@@ -351,6 +424,53 @@ mod win {
         /// releases key 0 when finished, so a read can never observe a
         /// torn or stale in-flight write.
         shared: Option<(ID3D11Texture2D, isize, IDXGIKeyedMutex)>,
+    }
+
+    fn capture_rect(rect: RECT, width: u32, height: u32) -> Option<CaptureRect> {
+        let max_x = width.min(i32::MAX as u32) as i32;
+        let max_y = height.min(i32::MAX as u32) as i32;
+        let left = rect.left.clamp(0, max_x) as u32;
+        let top = rect.top.clamp(0, max_y) as u32;
+        let right = rect.right.clamp(0, max_x) as u32;
+        let bottom = rect.bottom.clamp(0, max_y) as u32;
+        let rect = CaptureRect {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        (!rect.is_empty()).then_some(rect)
+    }
+
+    fn capture_move_rect(
+        rect: DXGI_OUTDUPL_MOVE_RECT,
+        width: u32,
+        height: u32,
+    ) -> Option<CaptureMoveRect> {
+        let dest = capture_rect(rect.DestinationRect, width, height)?;
+        let source_left = u32::try_from(rect.SourcePoint.x).ok()?;
+        let source_top = u32::try_from(rect.SourcePoint.y).ok()?;
+        if source_left.saturating_add(dest.width()) > width
+            || source_top.saturating_add(dest.height()) > height
+        {
+            return None;
+        }
+        Some(CaptureMoveRect {
+            source_left,
+            source_top,
+            dest,
+        })
+    }
+
+    unsafe fn read_unaligned_items<T: Copy>(ptr: *const u8, byte_len: usize) -> Vec<T> {
+        let item_len = size_of::<T>();
+        if item_len == 0 {
+            return Vec::new();
+        }
+        let count = byte_len / item_len;
+        (0..count)
+            .map(|index| std::ptr::read_unaligned(ptr.add(index * item_len) as *const T))
+            .collect()
     }
 
     impl DxgiCapture {
@@ -406,15 +526,17 @@ mod win {
             want_shared: bool,
         ) -> DxgiCaptureResult {
             match self.capture_frame(out, want_shared) {
-                Ok((true, shared)) => DxgiCaptureResult::Frame {
+                Ok((true, shared, meta)) => DxgiCaptureResult::Frame {
                     width: self.width,
                     height: self.height,
                     shared,
+                    meta,
                 },
-                Ok((false, shared)) => DxgiCaptureResult::NoChange {
+                Ok((false, shared, meta)) => DxgiCaptureResult::NoChange {
                     width: self.width,
                     height: self.height,
                     shared,
+                    meta,
                 },
                 Err(err) if err.code() == DXGI_ERROR_WAIT_TIMEOUT => {
                     // No new frame this poll — the shared texture (if any)
@@ -425,6 +547,7 @@ mod win {
                         width: self.width,
                         height: self.height,
                         shared: self.shared.as_ref().map(|(_, handle, _)| *handle),
+                        meta: CaptureFrameMeta::default(),
                     }
                 }
                 Err(err) if err.code() == DXGI_ERROR_ACCESS_LOST => DxgiCaptureResult::Unavailable,
@@ -436,7 +559,7 @@ mod win {
             &mut self,
             out: &mut Vec<u8>,
             want_shared: bool,
-        ) -> Result<(bool, Option<isize>), WinError> {
+        ) -> Result<(bool, Option<isize>, CaptureFrameMeta), WinError> {
             let debug = capture_timing_debug();
             let t0 = Instant::now();
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
@@ -447,11 +570,12 @@ mod win {
             let t_acquire = t0.elapsed();
 
             let Some(resource) = resource else {
-                return Ok((false, None));
+                return Ok((false, None, CaptureFrameMeta::default()));
             };
             if info.AccumulatedFrames == 0 && info.LastMouseUpdateTime == 0 {
-                return Ok((false, None));
+                return Ok((false, None, CaptureFrameMeta::default()));
             }
+            let meta = self.frame_meta(&info);
 
             let texture: ID3D11Texture2D = resource.cast()?;
             let mut desc = D3D11_TEXTURE2D_DESC::default();
@@ -565,7 +689,61 @@ mod win {
                     t0.elapsed().as_secs_f32() * 1000.0,
                 );
             }
-            Ok((true, shared_handle))
+            Ok((true, shared_handle, meta))
+        }
+
+        unsafe fn frame_meta(&self, info: &DXGI_OUTDUPL_FRAME_INFO) -> CaptureFrameMeta {
+            if info.TotalMetadataBufferSize == 0 {
+                return CaptureFrameMeta::default();
+            }
+
+            let total_bytes = info.TotalMetadataBufferSize;
+            let mut buffer = vec![0_u8; total_bytes as usize];
+            let mut move_bytes = 0_u32;
+            let mut dirty_bytes = 0_u32;
+
+            let moves_ok = self
+                .duplication
+                .GetFrameMoveRects(
+                    total_bytes,
+                    buffer.as_mut_ptr() as *mut DXGI_OUTDUPL_MOVE_RECT,
+                    &mut move_bytes,
+                )
+                .is_ok();
+            if !moves_ok || move_bytes > total_bytes {
+                return CaptureFrameMeta::default();
+            }
+
+            let dirty_capacity = total_bytes.saturating_sub(move_bytes);
+            let dirty_ptr = buffer.as_mut_ptr().add(move_bytes as usize) as *mut RECT;
+            let dirty_ok = self
+                .duplication
+                .GetFrameDirtyRects(dirty_capacity, dirty_ptr, &mut dirty_bytes)
+                .is_ok();
+            if !dirty_ok || dirty_bytes > dirty_capacity {
+                dirty_bytes = 0;
+            }
+
+            let move_rects = read_unaligned_items::<DXGI_OUTDUPL_MOVE_RECT>(
+                buffer.as_ptr(),
+                move_bytes as usize,
+            )
+            .into_iter()
+            .filter_map(|rect| capture_move_rect(rect, self.width, self.height))
+            .collect();
+
+            let dirty_rects = read_unaligned_items::<RECT>(
+                buffer.as_ptr().add(move_bytes as usize),
+                dirty_bytes as usize,
+            )
+            .into_iter()
+            .filter_map(|rect| capture_rect(rect, self.width, self.height))
+            .collect();
+
+            CaptureFrameMeta {
+                dirty_rects,
+                move_rects,
+            }
         }
 
         unsafe fn ensure_shared_texture(
@@ -1220,6 +1398,43 @@ pub fn capture_display_into_shared(
     {
         let size = capture_display_into(display, pixels)?;
         Some((size.0, size.1, None))
+    }
+}
+
+/// Same as `capture_display_into`, but also returns capture backend metadata.
+/// On Windows/DXGI this includes Desktop Duplication move/dirty rectangles for
+/// the current frame. Other backends currently return empty metadata.
+#[allow(unused)]
+pub fn capture_display_into_with_meta(
+    display: i32,
+    pixels: &mut Vec<u8>,
+) -> Option<(u32, u32, CaptureFrameMeta)> {
+    #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
+    return win::capture_display_into_with_meta(display, pixels);
+
+    #[cfg(not(all(target_os = "windows", feature = "live-vp9-mf")))]
+    {
+        let (width, height) = capture_display_into(display, pixels)?;
+        Some((width, height, CaptureFrameMeta::default()))
+    }
+}
+
+/// Same as `capture_display_into_shared`, but also returns capture backend
+/// metadata. On Windows/DXGI this includes Desktop Duplication move/dirty
+/// rectangles for the current frame. Other backends currently return empty
+/// metadata.
+#[allow(unused)]
+pub fn capture_display_into_shared_with_meta(
+    display: i32,
+    pixels: &mut Vec<u8>,
+) -> Option<(u32, u32, Option<isize>, CaptureFrameMeta)> {
+    #[cfg(all(target_os = "windows", feature = "live-vp9-mf"))]
+    return win::capture_display_into_shared_with_meta(display, pixels);
+
+    #[cfg(not(all(target_os = "windows", feature = "live-vp9-mf")))]
+    {
+        let (width, height, shared) = capture_display_into_shared(display, pixels)?;
+        Some((width, height, shared, CaptureFrameMeta::default()))
     }
 }
 

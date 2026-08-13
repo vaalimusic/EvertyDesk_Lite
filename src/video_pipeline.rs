@@ -1225,7 +1225,7 @@ fn encode_loop(
     evrtck_return_requested: Arc<AtomicBool>,
     evrtck_scheduler_silicon_active: Arc<AtomicBool>,
 ) {
-    use crate::evrtck::EvrtckEncoder;
+    use crate::evrtck::{CopyRect, EvrtckEncoder};
     use crate::host::{h264_target_bitrate_bps_pub, EncodedOutput, MultiEncoder};
 
     thread_local! {
@@ -1325,7 +1325,7 @@ fn encode_loop(
     let mut quality_before_software_profile: u32 = 0;
 
     // Capture double buffer
-    type CapSlot = Arc<Mutex<Option<(i32, u32, u32, Vec<u8>)>>>;
+    type CapSlot = Arc<Mutex<Option<(i32, u32, u32, Vec<u8>, crate::capture::CaptureFrameMeta)>>>;
     let cap_slot: CapSlot = Arc::new(Mutex::new(None));
     let capture_thread_samples = Arc::new(AtomicU64::new(0));
     let capture_thread_us_total = Arc::new(AtomicU64::new(0));
@@ -1368,7 +1368,10 @@ fn encode_loop(
                     // Agentless VM-доступ: если клиент прикреплён к VM, кодируем
                     // кадр консоли VM вместо физического экрана хоста.
                     let captured = crate::vm_bridge::active_frame(&mut buf)
-                        .or_else(|| crate::capture::capture_display_into(display, &mut buf));
+                        .map(|(w, h)| (w, h, crate::capture::CaptureFrameMeta::default()))
+                        .or_else(|| {
+                            crate::capture::capture_display_into_with_meta(display, &mut buf)
+                        });
                     let capture_us = capture_started
                         .elapsed()
                         .as_micros()
@@ -1377,13 +1380,14 @@ fn encode_loop(
                     cap_us_total.fetch_add(capture_us, Ordering::Relaxed);
                     cap_us_max.fetch_max(capture_us, Ordering::Relaxed);
 
-                    if let Some((w, h)) = captured {
+                    if let Some((w, h, meta)) = captured {
                         if let Ok(mut slot) = cap_slot2.lock() {
                             match slot.as_mut() {
                                 Some(s) if s.0 == display && s.1 == w && s.2 == h => {
                                     std::mem::swap(&mut s.3, &mut buf);
+                                    s.4 = meta;
                                 }
-                                _ => *slot = Some((display, w, h, buf.clone())),
+                                _ => *slot = Some((display, w, h, buf.clone(), meta)),
                             }
                         }
                     }
@@ -1412,7 +1416,8 @@ fn encode_loop(
     // block until DWM composites (~8fps for static desktops) even with timeout=0.
     // To maintain 60fps we keep the last captured frame and reuse it when
     // cap_slot is empty. Static/identical P-frames compress to near-zero bitrate.
-    let mut last_game_frame: Option<(i32, u32, u32, Vec<u8>)> = None;
+    let mut last_game_frame: Option<(i32, u32, u32, Vec<u8>, crate::capture::CaptureFrameMeta)> =
+        None;
     // Safety counter for the evrt_tx Disconnected path: if evrt_active isn't
     // cleared within ~3 frames the loop would spin. Bail out after that.
     let mut evrt_disconnect_spins: u8 = 0;
@@ -1565,17 +1570,17 @@ fn encode_loop(
         let is_game_mode_enc = evrt_on && !want_evrtck.load(Ordering::Relaxed);
         let frame = if let Some(f) = cap_result {
             if is_game_mode_enc {
-                last_game_frame = Some((f.0, f.1, f.2, f.3.clone()));
+                last_game_frame = Some((f.0, f.1, f.2, f.3.clone(), f.4.clone()));
             }
             Some(f)
         } else if is_game_mode_enc {
             last_game_frame
                 .as_ref()
-                .map(|(d, w, h, data)| (*d, *w, *h, data.clone()))
+                .map(|(d, w, h, data, meta)| (*d, *w, *h, data.clone(), meta.clone()))
         } else {
             None
         };
-        let Some((display, cap_w, cap_h, bgra_raw)) = frame else {
+        let Some((display, cap_w, cap_h, bgra_raw, capture_meta)) = frame else {
             thread::sleep(Duration::from_millis(1));
             continue;
         };
@@ -1701,6 +1706,23 @@ fn encode_loop(
             (enc_w, enc_h, bgra)
         };
         // Публикуем фактическое разрешение кодирования для EVRT bitrate engine.
+        let evrtck_copy_rects: Vec<CopyRect> = if enc_w == cap_w && enc_h == cap_h {
+            capture_meta
+                .move_rects
+                .iter()
+                .map(|rect| CopyRect {
+                    src_x: rect.source_left,
+                    src_y: rect.source_top,
+                    dst_x: rect.dest.left,
+                    dst_y: rect.dest.top,
+                    width: rect.dest.width(),
+                    height: rect.dest.height(),
+                })
+                .filter(|rect| rect.width > 0 && rect.height > 0)
+                .collect()
+        } else {
+            Vec::new()
+        };
         actual_encode_res.store(((enc_w as u64) << 32) | (enc_h as u64), Ordering::Relaxed);
 
         let quality = quality_ms.load(Ordering::Relaxed);
@@ -1765,17 +1787,24 @@ fn encode_loop(
                 }
                 let analysis = enc.as_ref().unwrap().analyze_next_frame(bgra);
                 evrtck_analysis_for_frame = Some(analysis);
-                let (pkt, _stats) = enc
-                    .as_mut()
-                    .unwrap()
-                    .encode_with_scroll_detection(bgra, frame_id);
+                let (pkt, _stats) = if evrtck_copy_rects.is_empty() {
+                    enc.as_mut()
+                        .unwrap()
+                        .encode_with_scroll_detection(bgra, frame_id)
+                } else {
+                    enc.as_mut()
+                        .unwrap()
+                        .encode_with_copy_rects(bgra, frame_id, &evrtck_copy_rects)
+                };
                 if !evrtck_logged {
                     evrtck_logged = true;
                     log(
                         &events,
                         format!(
-                            "EVRTCK encode: first frame id={frame_id} idr={want_idr} bytes={}",
-                            pkt.data.len()
+                            "EVRTCK encode: first frame id={frame_id} idr={want_idr} bytes={} dxgi_move_rects={} dxgi_dirty_rects={}",
+                            pkt.data.len(),
+                            evrtck_copy_rects.len(),
+                            capture_meta.dirty_rects.len()
                         ),
                     );
                 }
