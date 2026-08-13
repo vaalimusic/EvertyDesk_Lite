@@ -1225,7 +1225,7 @@ fn encode_loop(
     evrtck_return_requested: Arc<AtomicBool>,
     evrtck_scheduler_silicon_active: Arc<AtomicBool>,
 ) {
-    use crate::evrtck::{CopyRect, EvrtckEncoder};
+    use crate::evrtck::{CopyRect, DirtyRect, EvrtckEncoder};
     use crate::host::{h264_target_bitrate_bps_pub, EncodedOutput, MultiEncoder};
 
     thread_local! {
@@ -1723,6 +1723,21 @@ fn encode_loop(
         } else {
             Vec::new()
         };
+        let evrtck_dirty_rects: Vec<DirtyRect> = if enc_w == cap_w && enc_h == cap_h {
+            capture_meta
+                .dirty_rects
+                .iter()
+                .map(|rect| DirtyRect {
+                    left: rect.left,
+                    top: rect.top,
+                    right: rect.right,
+                    bottom: rect.bottom,
+                })
+                .filter(|rect| rect.right > rect.left && rect.bottom > rect.top)
+                .collect()
+        } else {
+            Vec::new()
+        };
         actual_encode_res.store(((enc_w as u64) << 32) | (enc_h as u64), Ordering::Relaxed);
 
         let quality = quality_ms.load(Ordering::Relaxed);
@@ -1787,14 +1802,20 @@ fn encode_loop(
                 }
                 let analysis = enc.as_ref().unwrap().analyze_next_frame(bgra);
                 evrtck_analysis_for_frame = Some(analysis);
-                let (pkt, _stats) = if evrtck_copy_rects.is_empty() {
+                let (pkt, _stats) = if evrtck_copy_rects.is_empty() && evrtck_dirty_rects.is_empty()
+                {
                     enc.as_mut()
                         .unwrap()
                         .encode_with_scroll_detection(bgra, frame_id)
                 } else {
                     enc.as_mut()
                         .unwrap()
-                        .encode_with_copy_rects(bgra, frame_id, &evrtck_copy_rects)
+                        .encode_with_capture_hints(
+                            bgra,
+                            frame_id,
+                            &evrtck_copy_rects,
+                            &evrtck_dirty_rects,
+                        )
                 };
                 if !evrtck_logged {
                     evrtck_logged = true;
@@ -1804,7 +1825,7 @@ fn encode_loop(
                             "EVRTCK encode: first frame id={frame_id} idr={want_idr} bytes={} dxgi_move_rects={} dxgi_dirty_rects={}",
                             pkt.data.len(),
                             evrtck_copy_rects.len(),
-                            capture_meta.dirty_rects.len()
+                            evrtck_dirty_rects.len()
                         ),
                     );
                 }

@@ -310,6 +310,23 @@ pub struct CopyRect {
     pub height: u32,
 }
 
+/// Pixel-space dirty rectangle supplied by a capture backend.
+///
+/// Coordinates are half-open: `[left, right) x [top, bottom)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirtyRect {
+    pub left: u32,
+    pub top: u32,
+    pub right: u32,
+    pub bottom: u32,
+}
+
+impl DirtyRect {
+    fn is_empty(self) -> bool {
+        self.right <= self.left || self.bottom <= self.top
+    }
+}
+
 // ── Backend trait ─────────────────────────────────────────────────────────────
 
 /// Pluggable encoder backend.
@@ -350,6 +367,17 @@ pub trait EvrtckEncoderBackend: Send {
         copy_rects: &[CopyRect],
     ) -> (EvrtckPacket, FrameStats) {
         let _ = copy_rects;
+        self.encode_inner(bgra, frame_id)
+    }
+    fn encode_inner_with_capture_hints(
+        &mut self,
+        bgra: &[u8],
+        frame_id: u32,
+        copy_rects: &[CopyRect],
+        dirty_rects: &[DirtyRect],
+    ) -> (EvrtckPacket, FrameStats) {
+        let _ = copy_rects;
+        let _ = dirty_rects;
         self.encode_inner(bgra, frame_id)
     }
     fn encode_inner_with_scroll_detection(
@@ -621,6 +649,103 @@ impl EvrtckEncoderBackend for CpuEvrtckEncoder {
         (pkt, stats)
     }
 
+    fn encode_inner_with_capture_hints(
+        &mut self,
+        bgra: &[u8],
+        frame_id: u32,
+        copy_rects: &[CopyRect],
+        dirty_rects: &[DirtyRect],
+    ) -> (EvrtckPacket, FrameStats) {
+        if self.pending_keyframe {
+            return self.encode_inner(bgra, frame_id);
+        }
+        debug_assert_eq!(bgra.len(), self.width * self.height * 4);
+
+        let valid_copy_rects: Vec<CopyRect> = copy_rects
+            .iter()
+            .copied()
+            .filter(|rect| copy_rect_is_valid(*rect, self.width, self.height))
+            .collect();
+        let dirty_indices = dirty_tile_indices_from_rects(dirty_rects, self.width, self.height);
+        if dirty_indices.is_none() && valid_copy_rects.is_empty() {
+            return self.encode_inner_with_scroll_detection(bgra, frame_id);
+        }
+
+        let mut predicted = self.prev.clone();
+        if !valid_copy_rects.is_empty() {
+            apply_copy_rects(&mut predicted, self.width, self.height, &valid_copy_rects);
+        }
+
+        let (data, stats) = if let Some(indices) = dirty_indices {
+            if bgra == predicted.as_slice() {
+                (
+                    if valid_copy_rects.is_empty() {
+                        nop_packet_data(frame_id, self.width, self.height)
+                    } else {
+                        copy_rect_only_packet_data(
+                            frame_id,
+                            self.width,
+                            self.height,
+                            &valid_copy_rects,
+                        )
+                    },
+                    FrameStats {
+                        total_tiles: (tiles_in_dim(self.width) * tiles_in_dim(self.height)) as u32,
+                        encoded_bytes: if valid_copy_rects.is_empty() {
+                            FRAME_HEADER_LEN as u32
+                        } else {
+                            (FRAME_HEADER_LEN + 2 + valid_copy_rects.len() * 24) as u32
+                        },
+                        ..Default::default()
+                    },
+                )
+            } else if valid_copy_rects.is_empty() {
+                encode_pframe_from_dirty_indices(
+                    bgra,
+                    &predicted,
+                    self.width,
+                    self.height,
+                    frame_id,
+                    indices,
+                    self.focus,
+                )
+            } else {
+                encode_copy_rect_frame_from_dirty_indices(
+                    bgra,
+                    &predicted,
+                    self.width,
+                    self.height,
+                    frame_id,
+                    &valid_copy_rects,
+                    indices,
+                    self.focus,
+                )
+            }
+        } else {
+            let (data, stats, _offsets) = encode_frame_with_offsets_and_copy_rects(
+                bgra,
+                &predicted,
+                self.width,
+                self.height,
+                frame_id,
+                &valid_copy_rects,
+                self.focus,
+                false,
+            );
+            (data, stats)
+        };
+
+        self.pending_keyframe = false;
+        self.prev.copy_from_slice(bgra);
+        let pkt = EvrtckPacket {
+            frame_id,
+            width: self.width as u32,
+            height: self.height as u32,
+            data,
+        };
+        (pkt, stats)
+    }
+
     fn encode_inner_with_scroll_detection(
         &mut self,
         bgra: &[u8],
@@ -760,6 +885,22 @@ impl EvrtckEncoder {
     ) -> (EvrtckPacket, FrameStats) {
         self.inner
             .encode_inner_with_copy_rects(rgba, frame_id, copy_rects)
+    }
+
+    /// Encode using capture-backend hints.
+    ///
+    /// `copy_rects` are applied first, then only tiles intersecting
+    /// `dirty_rects` are scanned/encoded. Empty hints fall back to the normal
+    /// safe encoder path.
+    pub fn encode_with_capture_hints(
+        &mut self,
+        rgba: &[u8],
+        frame_id: u32,
+        copy_rects: &[CopyRect],
+        dirty_rects: &[DirtyRect],
+    ) -> (EvrtckPacket, FrameStats) {
+        self.inner
+            .encode_inner_with_capture_hints(rgba, frame_id, copy_rects, dirty_rects)
     }
 
     /// Encode with a conservative built-in scroll detector.
@@ -1463,6 +1604,198 @@ fn write_copy_rects(out: &mut Vec<u8>, copy_rects: &[CopyRect]) {
         out.extend_from_slice(&rect.width.to_le_bytes());
         out.extend_from_slice(&rect.height.to_le_bytes());
     }
+}
+
+fn copy_rect_only_packet_data(
+    frame_id: u32,
+    width: usize,
+    height: usize,
+    copy_rects: &[CopyRect],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(FRAME_HEADER_LEN + 2 + copy_rects.len() * 24);
+    out.extend_from_slice(MAGIC);
+    out.push(VERSION_COPY_RECTS);
+    out.push(FLAG_COPY_RECTS);
+    out.extend_from_slice(&frame_id.to_le_bytes());
+    out.extend_from_slice(&(width as u32).to_le_bytes());
+    out.extend_from_slice(&(height as u32).to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    write_copy_rects(&mut out, copy_rects);
+    out
+}
+
+fn dirty_tile_indices_from_rects(
+    dirty_rects: &[DirtyRect],
+    width: usize,
+    height: usize,
+) -> Option<Vec<usize>> {
+    if dirty_rects.is_empty() || width == 0 || height == 0 {
+        return None;
+    }
+
+    let tiles_x = tiles_in_dim(width);
+    let tiles_y = tiles_in_dim(height);
+    let tile_count = tiles_x * tiles_y;
+    let mut tile_map = vec![false; tile_count];
+    let mut any_valid = false;
+
+    for rect in dirty_rects.iter().copied() {
+        if rect.is_empty() {
+            continue;
+        }
+        let left = (rect.left as usize).min(width);
+        let top = (rect.top as usize).min(height);
+        let right = (rect.right as usize).min(width);
+        let bottom = (rect.bottom as usize).min(height);
+        if right <= left || bottom <= top {
+            continue;
+        }
+        any_valid = true;
+        let tx0 = left / TILE_SIZE;
+        let ty0 = top / TILE_SIZE;
+        let tx1 = (right - 1) / TILE_SIZE;
+        let ty1 = (bottom - 1) / TILE_SIZE;
+        for ty in ty0..=ty1.min(tiles_y.saturating_sub(1)) {
+            for tx in tx0..=tx1.min(tiles_x.saturating_sub(1)) {
+                tile_map[ty * tiles_x + tx] = true;
+            }
+        }
+    }
+
+    if !any_valid {
+        return None;
+    }
+
+    Some(
+        tile_map
+            .into_iter()
+            .enumerate()
+            .filter_map(|(idx, dirty)| dirty.then_some(idx))
+            .collect(),
+    )
+}
+
+fn encode_copy_rect_frame_from_dirty_indices(
+    rgba: &[u8],
+    predicted_prev: &[u8],
+    width: usize,
+    height: usize,
+    frame_id: u32,
+    copy_rects: &[CopyRect],
+    dirty_indices: Vec<usize>,
+    focus: Option<(usize, usize)>,
+) -> (Vec<u8>, FrameStats) {
+    let tiles_x = tiles_in_dim(width);
+    let tile_count = tiles_x * tiles_in_dim(height);
+    let dirty_tiles: Vec<(usize, Vec<u8>, u8)> = if !use_rayon(dirty_indices.len()) {
+        dirty_indices
+            .iter()
+            .filter_map(|&idx| {
+                if tile_is_dirty(
+                    rgba,
+                    predicted_prev,
+                    width,
+                    height,
+                    idx % tiles_x,
+                    idx / tiles_x,
+                ) {
+                    let (data, mode) = encode_tile_buf(
+                        rgba,
+                        predicted_prev,
+                        width,
+                        height,
+                        idx % tiles_x,
+                        idx / tiles_x,
+                        false,
+                    );
+                    Some((idx, data, mode))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    } else {
+        dirty_indices
+            .into_par_iter()
+            .filter_map(|idx| {
+                if tile_is_dirty(
+                    rgba,
+                    predicted_prev,
+                    width,
+                    height,
+                    idx % tiles_x,
+                    idx / tiles_x,
+                ) {
+                    let (data, mode) = encode_tile_buf(
+                        rgba,
+                        predicted_prev,
+                        width,
+                        height,
+                        idx % tiles_x,
+                        idx / tiles_x,
+                        false,
+                    );
+                    Some((idx, data, mode))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+
+    if dirty_tiles.is_empty() {
+        let out = copy_rect_only_packet_data(frame_id, width, height, copy_rects);
+        let encoded_bytes = out.len() as u32;
+        return (
+            out,
+            FrameStats {
+                total_tiles: tile_count as u32,
+                encoded_bytes,
+                ..Default::default()
+            },
+        );
+    }
+
+    let map_bytes = tile_count.div_ceil(8);
+    let mut tile_map = vec![0u8; map_bytes];
+    let mut solid_count = 0u32;
+    let mut delta_count = 0u32;
+    for &(idx, _, mode) in &dirty_tiles {
+        tile_map[idx / 8] |= 1 << (idx % 8);
+        match mode {
+            MODE_SOLID => solid_count += 1,
+            _ => delta_count += 1,
+        }
+    }
+    let dirty_count = dirty_tiles.len() as u32;
+    let mut dirty_tiles = dirty_tiles;
+    order_by_focus(&mut dirty_tiles, tiles_x, focus);
+
+    let mut out = Vec::with_capacity(
+        FRAME_HEADER_LEN + 2 + copy_rects.len() * 24 + map_bytes + dirty_tiles.len() * 32,
+    );
+    out.extend_from_slice(MAGIC);
+    out.push(VERSION_COPY_RECTS);
+    out.push(FLAG_COPY_RECTS);
+    out.extend_from_slice(&frame_id.to_le_bytes());
+    out.extend_from_slice(&(width as u32).to_le_bytes());
+    out.extend_from_slice(&(height as u32).to_le_bytes());
+    out.extend_from_slice(&(map_bytes as u16).to_le_bytes());
+    write_copy_rects(&mut out, copy_rects);
+    out.extend_from_slice(&tile_map);
+    for (idx, data, _) in &dirty_tiles {
+        out.extend_from_slice(&(*idx as u16).to_le_bytes());
+        out.extend_from_slice(data);
+    }
+
+    let stats = FrameStats {
+        total_tiles: tile_count as u32,
+        dirty_tiles: dirty_count,
+        solid_tiles: solid_count,
+        delta_tiles: delta_count,
+        encoded_bytes: out.len() as u32,
+    };
+    (out, stats)
 }
 
 /// ROADMAP.md Phase 6.4 (cross-codec splicing): encodes ONLY the given
@@ -2452,6 +2785,67 @@ mod tests {
         assert_eq!(pkt.data[4], VERSION_COPY_RECTS);
         assert!(pkt.data[5] & FLAG_COPY_RECTS != 0);
         assert_eq!(stats.dirty_tiles, tiles_in_dim(w) as u32);
+    }
+
+    #[test]
+    fn capture_dirty_rect_limits_pframe_tile_scan() {
+        let (w, h) = (128usize, 128usize);
+        let base = checkerboard(w, h);
+        let mut frame = base.clone();
+        dirty_one_pixel_in_tile(&mut frame, w, 15, 4, 201);
+
+        let mut enc = EvrtckEncoder::new(w, h);
+        let mut dec = EvrtckDecoder::new();
+        let key = enc.encode(&base, 1);
+        dec.decode(&key).unwrap();
+
+        let dirty_rect = DirtyRect {
+            left: 96,
+            top: 96,
+            right: 97,
+            bottom: 97,
+        };
+        let (pkt, stats) = enc.encode_with_capture_hints(&frame, 2, &[], &[dirty_rect]);
+        let decoded = dec.decode(&pkt).unwrap();
+
+        assert_eq!(decoded, bgra_to_rgba(&frame));
+        assert_eq!(stats.dirty_tiles, 1);
+    }
+
+    #[test]
+    fn capture_hints_combine_copy_rects_with_dirty_strip() {
+        let (w, h) = (256usize, 256usize);
+        let dy = TILE_SIZE;
+        let base = scrolling_text_like_frame(w, h);
+        let scrolled = scroll_up_with_new_bottom(&base, w, h, dy);
+
+        let mut enc = EvrtckEncoder::new(w, h);
+        let mut dec = EvrtckDecoder::new();
+        let key = enc.encode(&base, 1);
+        dec.decode(&key).unwrap();
+
+        let copy_rect = CopyRect {
+            src_x: 0,
+            src_y: dy as u32,
+            dst_x: 0,
+            dst_y: 0,
+            width: w as u32,
+            height: (h - dy) as u32,
+        };
+        let dirty_rect = DirtyRect {
+            left: 0,
+            top: (h - dy) as u32,
+            right: w as u32,
+            bottom: h as u32,
+        };
+
+        let (pkt, stats) = enc.encode_with_capture_hints(&scrolled, 2, &[copy_rect], &[dirty_rect]);
+        let decoded = dec.decode(&pkt).unwrap();
+
+        assert_eq!(decoded, bgra_to_rgba(&scrolled));
+        assert_eq!(stats.dirty_tiles, tiles_in_dim(w) as u32);
+        assert_eq!(pkt.data[4], VERSION_COPY_RECTS);
+        assert!(pkt.data[5] & FLAG_COPY_RECTS != 0);
     }
 
     fn dirty_tiles_frame(
