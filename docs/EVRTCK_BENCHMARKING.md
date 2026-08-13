@@ -77,6 +77,24 @@ reports/hardware-codec-prod/<timestamp>/
   hardware_codec_prod_bench.jsonl
 ```
 
+After both full runs finish, generate the combined decision report:
+
+```powershell
+.\scripts\compare-evrtck-hardware-bench.ps1 -EvrtckReportDir .\reports\evrtck-prod\<timestamp> -HardwareReportDir .\reports\hardware-codec-prod\<timestamp>
+```
+
+The comparison script writes:
+
+```text
+reports/hardware-codec-prod/<timestamp>/
+  evrtck_vs_hardware_summary.md
+  evrtck_vs_hardware_summary.json
+```
+
+The combined report is marked `Publishable: False` if EVRTCK and hardware runs
+do not use the same resolution, iteration count, warmup count, or quick/full
+mode.
+
 ## Metadata captured
 
 `metadata.json` records:
