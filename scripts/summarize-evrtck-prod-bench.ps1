@@ -62,6 +62,13 @@ function VerdictFor($roundtripRow) {
     return "scheduler_decision_needed"
 }
 
+function EffectiveVerdictFor($roundtripRow, $roundtripHintedRow) {
+    if ($null -ne $roundtripHintedRow) {
+        return VerdictFor $roundtripHintedRow
+    }
+    return VerdictFor $roundtripRow
+}
+
 $scenarioNames = $rows |
     Where-Object { $_.operation -ne "encode" -or $_.scenario -ne "keyframe_gradient" } |
     Select-Object -ExpandProperty scenario -Unique
@@ -81,6 +88,10 @@ foreach ($scenario in $scenarioNames) {
     $payload = To-Int64 $roundtrip.payload_bytes
     $raw = [Math]::Max(1, (To-Int64 $roundtrip.raw_bytes))
     $payloadRatio = [double]$payload / [double]$raw
+
+    $baselineVerdict = VerdictFor $roundtrip
+    $hintedVerdict = if ($roundtripHinted) { VerdictFor $roundtripHinted } else { $null }
+    $effectiveVerdict = EffectiveVerdictFor $roundtrip $roundtripHinted
 
     $decisions += [pscustomobject]@{
         scenario = $scenario
@@ -102,7 +113,9 @@ foreach ($scenario in $scenarioNames) {
         hinted_encode_p99_ms = if ($encodeHinted) { [Math]::Round((To-Double $encodeHinted.p99_us) / 1000.0, 3) } else { $null }
         hinted_decode_p99_ms = if ($decodeHinted) { [Math]::Round((To-Double $decodeHinted.p99_us) / 1000.0, 3) } else { $null }
         hinted_roundtrip_p99_ms = if ($roundtripHinted) { [Math]::Round((To-Double $roundtripHinted.p99_us) / 1000.0, 3) } else { $null }
-        verdict = VerdictFor $roundtrip
+        baseline_verdict = $baselineVerdict
+        hinted_verdict = $hintedVerdict
+        verdict = $effectiveVerdict
     }
 }
 
@@ -160,13 +173,13 @@ if ($keyframe) {
 }
 $md.Add("## P-frame decision map")
 $md.Add("")
-$md.Add("| scenario | payload | hinted payload | tiles | hinted tiles | encode p99 ms | hinted encode p99 ms | decode p99 ms | roundtrip p99 ms | hinted roundtrip p99 ms | verdict |")
-$md.Add("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
+$md.Add("| scenario | payload | hinted payload | tiles | hinted tiles | encode p99 ms | hinted encode p99 ms | decode p99 ms | roundtrip p99 ms | hinted roundtrip p99 ms | baseline verdict | hinted verdict | effective verdict |")
+$md.Add("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|")
 foreach ($decision in $decisions) {
     $payloadPct = [Math]::Round($decision.payload_ratio * 100.0, 2)
     $tileText = "$($decision.dirty_tiles)/$($decision.total_tiles)"
     $hintedTileText = if ($null -ne $decision.hinted_dirty_tiles) { "$($decision.hinted_dirty_tiles)/$($decision.total_tiles)" } else { "" }
-    $md.Add("| $($decision.scenario) | $($decision.payload_bytes) ($payloadPct%) | $($decision.hinted_payload_bytes) | $tileText | $hintedTileText | $($decision.encode_p99_ms) | $($decision.hinted_encode_p99_ms) | $($decision.decode_p99_ms) | $($decision.roundtrip_p99_ms) | $($decision.hinted_roundtrip_p99_ms) | $($decision.verdict) |")
+    $md.Add("| $($decision.scenario) | $($decision.payload_bytes) ($payloadPct%) | $($decision.hinted_payload_bytes) | $tileText | $hintedTileText | $($decision.encode_p99_ms) | $($decision.hinted_encode_p99_ms) | $($decision.decode_p99_ms) | $($decision.roundtrip_p99_ms) | $($decision.hinted_roundtrip_p99_ms) | $($decision.baseline_verdict) | $($decision.hinted_verdict) | $($decision.verdict) |")
 }
 $md.Add("")
 $md.Add("## Interpretation")
@@ -176,6 +189,7 @@ $md.Add("- ``evrtck_60fps_ok``: codec roundtrip p99 is inside 60 FPS budget but 
 $md.Add("- ``prefer_hardware_codec``: payload or entropy profile says scheduler should prefer H.264/H.265/AV1 silicon for this kind of frame.")
 $md.Add("- ``scheduler_decision_needed``: neither path is obvious from this codec-only bench; compare with hardware codec data.")
 $md.Add("- ``*_hinted`` columns use capture dirty rectangles. This is the intended DXGI/DamageRect software path; non-hinted columns are the conservative full-frame scan baseline.")
+$md.Add("- ``effective verdict`` uses the hinted roundtrip when available, because that is the production software path being evaluated.")
 $md.Add("")
 $md.Add("Roundtrip here means EVRTCK P-frame encode plus EVRTCK P-frame decode after base-frame state is established. It excludes capture, network, encryption, presentation, and OS scheduling delay.")
 

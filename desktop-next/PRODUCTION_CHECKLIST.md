@@ -33,10 +33,14 @@ This checklist tracks what must be true before publishing EvertyDesk Next 2 as a
 - `latest.json` was generated and validated for the 2.0.1 portable artifact.
 - Full EVRTCK software-path production benchmark passed on Windows/release:
   `reports/evrtck-prod/full-20260813-after-correctness`.
-  Commit `1068c4d37b82926b7246e4482935c4e2bc12f3c0`, AMD Ryzen 5 4600G,
+  Benchmark commit `1068c4d37b82926b7246e4482935c4e2bc12f3c0`, AMD Ryzen 5 4600G,
   6 cores / 12 threads, 1920x1080, 300 iterations / 30 warmup.
   The benchmark validates normal and hinted P-frames against the expected
   decoded RGBA output before timing.
+- EVRTCK runtime scheduler guardrail is implemented at commit
+  `01dace71798422fb24ee15ef323737450931cbae`: large/slow measured P-frames
+  are treated as silicon candidates even when dirty-ratio/entropy alone does
+  not demand it.
 
 ## Release blockers
 
@@ -68,8 +72,10 @@ This checklist tracks what must be true before publishing EvertyDesk Next 2 as a
    - Done: CPU model, thread count, clocks, release profile, commit hash, payload sizes, p50/p95/p99 encode/decode/roundtrip are recorded in the report.
    - Done: software scenarios include static, clustered/scattered dirty tiles, noisy dirty regions, IDE typing, browser scroll, and terminal scroll.
    - Done: attach `reports/evrtck-prod/full-20260813-after-correctness/metadata.json`, `evrtck_prod_bench.csv`, `evrtck_prod_bench.jsonl`, `summary.md`, and `summary.json`.
+   - Done: `summary.md`/`summary.json` now expose baseline, hinted, and effective verdicts; effective verdict uses hinted roundtrip when available because that is the production software path.
+   - Done: runtime scheduler now considers measured encode time plus payload size before staying on EVRTCK for heavy P-frames.
    - Still required: hardware H.264/H.265 comparison on the same scene set.
-   - Scheduler note from the full run: static, invert deltas, and IDE typing are safe EVRTCK paths; scattered noise at 50%/90% should prefer hardware codec; browser scroll still needs hardware comparison or stronger copy-rect/scheduler policy because hinted roundtrip p99 was above the 60 FPS budget.
+   - Scheduler note from the full run: static, invert deltas, and IDE typing are safe EVRTCK paths; scattered noise at 50%/90% should prefer hardware codec; browser and terminal scroll still need hardware comparison because hinted roundtrip p99 was above the 60 FPS budget.
 
 7. End-to-end session matrix.
    - Outgoing desktop session: LAN, WAN/relay, wrong ID, wrong password, reconnect, multi-monitor.
