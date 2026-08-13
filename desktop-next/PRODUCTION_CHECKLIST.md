@@ -30,6 +30,7 @@ This checklist tracks what must be true before publishing EvertyDesk Next 2 as a
 - `scripts/package-windows-portable.ps1 -StopRunningBuildProcesses` produced
   `dist/EvertyDeskNext-2.0.1-windows-x64-portable.zip` and `.sha256`.
 - Extracted portable zip passed `tools/portable-smoke.ps1 -BinaryDirectory <extracted-dir> -StopAllExistingLaunchers`.
+- `latest.json` was generated and validated for the 2.0.1 portable artifact.
 
 ## Release blockers
 
