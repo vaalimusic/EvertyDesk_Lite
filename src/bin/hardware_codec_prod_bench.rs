@@ -154,6 +154,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("--decode-child requires a request JSON path")?;
         return run_decode_child(PathBuf::from(request_path));
     }
+    let mut raw_args = env::args().skip(1);
+    if matches!(raw_args.next().as_deref(), Some("--roundtrip-child")) {
+        let request_path = raw_args
+            .next()
+            .ok_or("--roundtrip-child requires a request JSON path")?;
+        return run_roundtrip_child(PathBuf::from(request_path));
+    }
 
     let config = match Config::parse() {
         Ok(config) => config,
@@ -345,13 +352,8 @@ fn run_decode_and_roundtrip_scenario(
 
     vec![
         run_decode_scenario(codec, config, scenario, backend, &reference),
-        operation_error_row(
-            codec,
-            config,
-            scenario,
-            "roundtrip",
-            backend,
-            "roundtrip decode is intentionally not run in-process; use the crash-isolated GOP child harness".to_owned(),
+        run_roundtrip_scenario(
+            codec, config, scenario, backend, frame, base_frame, force_key,
         ),
     ]
 }
@@ -359,6 +361,7 @@ fn run_decode_and_roundtrip_scenario(
 struct ReferencePackets {
     key_packet: Option<Vec<u8>>,
     frame_packet: Vec<u8>,
+    decode_stream_packets: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -368,8 +371,8 @@ struct DecodeChildRequest {
     height: usize,
     iterations: usize,
     warmup: usize,
-    key_packet_b64: Option<String>,
-    frame_packet_b64: String,
+    preroll_packets: usize,
+    packets_b64: Vec<String>,
     out_path: PathBuf,
 }
 
@@ -377,6 +380,35 @@ struct DecodeChildRequest {
 struct DecodeChildResult {
     available: bool,
     frames_decoded: usize,
+    error: String,
+    mean_us: f64,
+    p50_us: f64,
+    p95_us: f64,
+    p99_us: f64,
+    min_us: f64,
+    max_us: f64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RoundtripChildRequest {
+    codec: String,
+    width: usize,
+    height: usize,
+    fps: u32,
+    bitrate: u32,
+    iterations: usize,
+    warmup: usize,
+    force_key: bool,
+    base_frame_b64: Option<String>,
+    frame_b64: String,
+    out_path: PathBuf,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RoundtripChildResult {
+    available: bool,
+    packets_emitted: usize,
+    payload_bytes: usize,
     error: String,
     mean_us: f64,
     p50_us: f64,
@@ -407,11 +439,12 @@ fn run_decode_child_process(
         height: config.height,
         iterations: config.iterations,
         warmup: config.warmup,
-        key_packet_b64: reference
-            .key_packet
-            .as_ref()
-            .map(|packet| BASE64.encode(packet)),
-        frame_packet_b64: BASE64.encode(&reference.frame_packet),
+        preroll_packets: usize::from(reference.key_packet.is_some()),
+        packets_b64: reference
+            .decode_stream_packets
+            .iter()
+            .map(|packet| BASE64.encode(packet))
+            .collect(),
         out_path: result_path.clone(),
     };
     let request_json = serde_json::to_vec_pretty(&request)
@@ -493,18 +526,15 @@ fn execute_decode_child(request: &DecodeChildRequest) -> DecodeChildResult {
         Ok(codec) => codec,
         Err(error) => return decode_child_error(error),
     };
-    let key_packet = match request
-        .key_packet_b64
-        .as_ref()
+    let packets = match request
+        .packets_b64
+        .iter()
         .map(|encoded| BASE64.decode(encoded))
-        .transpose()
+        .collect::<Result<Vec<_>, _>>()
     {
-        Ok(packet) => packet,
-        Err(err) => return decode_child_error(format!("decode key packet base64 failed: {err}")),
-    };
-    let frame_packet = match BASE64.decode(&request.frame_packet_b64) {
-        Ok(packet) => packet,
-        Err(err) => return decode_child_error(format!("decode frame packet base64 failed: {err}")),
+        Ok(packets) if !packets.is_empty() => packets,
+        Ok(_) => return decode_child_error("decode request contains no packets".to_owned()),
+        Err(err) => return decode_child_error(format!("decode packet base64 failed: {err}")),
     };
 
     let child_config = Config {
@@ -517,29 +547,26 @@ fn execute_decode_child(request: &DecodeChildRequest) -> DecodeChildResult {
         out_dir: PathBuf::new(),
         codecs: Vec::new(),
     };
+    let mut dec =
+        match MfVideoDecoder::new(decode_codec, request.width as u32, request.height as u32) {
+            Ok(dec) => dec,
+            Err(err) => return decode_child_error(err),
+        };
+    for packet in packets.iter().take(request.preroll_packets) {
+        if let Err(err) = decode_until_frame(&mut dec, std::slice::from_ref(packet), 8) {
+            return decode_child_error(format!("preroll decode failed: {err}"));
+        }
+    }
+    let mut packet_index = request.preroll_packets;
     let mut first_error = String::new();
     let mut frames_decoded = 0usize;
     let samples = measure(&child_config, || {
-        let mut dec =
-            match MfVideoDecoder::new(decode_codec, request.width as u32, request.height as u32) {
-                Ok(dec) => dec,
-                Err(err) => {
-                    if first_error.is_empty() {
-                        first_error = err;
-                    }
-                    return None;
-                }
-            };
-        if let Some(key) = &key_packet {
-            if let Err(err) = decode_until_frame(&mut dec, std::slice::from_ref(key), 8) {
-                if first_error.is_empty() {
-                    first_error = format!("base decode failed: {err}");
-                }
-                return None;
-            }
-        }
+        let Some(packet) = packets.get(packet_index) else {
+            return None;
+        };
+        packet_index += 1;
         let started = Instant::now();
-        match decode_until_frame(&mut dec, std::slice::from_ref(&frame_packet), 8) {
+        match decode_until_frame(&mut dec, std::slice::from_ref(packet), 8) {
             Ok(Some((_, _, rgba))) => {
                 let elapsed = started.elapsed();
                 frames_decoded += 1;
@@ -567,6 +594,19 @@ fn execute_decode_child(request: &DecodeChildRequest) -> DecodeChildResult {
         frames_decoded,
         error: if available {
             String::new()
+        } else if packet_index
+            < request
+                .preroll_packets
+                .saturating_add(request.warmup)
+                .saturating_add(request.iterations)
+        {
+            format!(
+                "decoder consumed only {packet_index}/{} packets",
+                request
+                    .preroll_packets
+                    .saturating_add(request.warmup)
+                    .saturating_add(request.iterations)
+            )
         } else if first_error.is_empty() {
             "decoder produced no frame".to_owned()
         } else {
@@ -603,6 +643,294 @@ fn decode_child_error(error: String) -> DecodeChildResult {
     }
 }
 
+fn run_roundtrip_scenario(
+    codec: NvencCodec,
+    config: &Config,
+    scenario: Scenario,
+    backend: &str,
+    frame: &[u8],
+    base_frame: Option<&[u8]>,
+    force_key: bool,
+) -> BenchRow {
+    match run_roundtrip_child_process(codec, config, frame, base_frame, force_key) {
+        Ok(result) => child_roundtrip_row(codec, config, scenario, backend, result),
+        Err(err) => operation_error_row(codec, config, scenario, "roundtrip", backend, err),
+    }
+}
+
+fn run_roundtrip_child_process(
+    codec: NvencCodec,
+    config: &Config,
+    frame: &[u8],
+    base_frame: Option<&[u8]>,
+    force_key: bool,
+) -> Result<RoundtripChildResult, String> {
+    let child_dir = config.out_dir.join("roundtrip-child");
+    fs::create_dir_all(&child_dir).map_err(|err| format!("create child dir failed: {err}"))?;
+    let pid = std::process::id();
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let stem = format!("{}-{pid}-{stamp}", codec.label().to_ascii_lowercase());
+    let request_path = child_dir.join(format!("{stem}.request.json"));
+    let result_path = child_dir.join(format!("{stem}.result.json"));
+    let request = RoundtripChildRequest {
+        codec: codec.label().to_owned(),
+        width: config.width,
+        height: config.height,
+        fps: config.fps,
+        bitrate: config.bitrate,
+        iterations: config.iterations,
+        warmup: config.warmup,
+        force_key,
+        base_frame_b64: base_frame.map(|frame| BASE64.encode(frame)),
+        frame_b64: BASE64.encode(frame),
+        out_path: result_path.clone(),
+    };
+    let request_json = serde_json::to_vec_pretty(&request)
+        .map_err(|err| format!("serialize roundtrip child request failed: {err}"))?;
+    fs::write(&request_path, request_json)
+        .map_err(|err| format!("write roundtrip child request failed: {err}"))?;
+
+    let exe = env::current_exe().map_err(|err| format!("resolve current exe failed: {err}"))?;
+    let output = Command::new(exe)
+        .arg("--roundtrip-child")
+        .arg(&request_path)
+        .output()
+        .map_err(|err| format!("spawn roundtrip child failed: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let mut reason = format!("roundtrip child exited with status {}", output.status);
+        if !stderr.is_empty() {
+            reason.push_str(&format!("; stderr={stderr}"));
+        }
+        if !stdout.is_empty() {
+            reason.push_str(&format!("; stdout={stdout}"));
+        }
+        return Err(reason);
+    }
+
+    let result_json = fs::read(&result_path)
+        .map_err(|err| format!("read roundtrip child result failed: {err}"))?;
+    serde_json::from_slice(&result_json)
+        .map_err(|err| format!("parse roundtrip child result failed: {err}"))
+}
+
+fn child_roundtrip_row(
+    codec: NvencCodec,
+    config: &Config,
+    scenario: Scenario,
+    backend: &str,
+    result: RoundtripChildResult,
+) -> BenchRow {
+    BenchRow {
+        codec: codec.label().to_owned(),
+        scenario: scenario.name.to_owned(),
+        operation: "roundtrip".to_owned(),
+        width: config.width,
+        height: config.height,
+        fps: config.fps,
+        bitrate: config.bitrate,
+        dirty_ratio_target: scenario.dirty_ratio,
+        dirty_distribution: scenario.distribution,
+        dirty_entropy: scenario.entropy,
+        iterations: config.iterations,
+        warmup: config.warmup,
+        raw_bytes: config.width * config.height * 4,
+        payload_bytes: result.payload_bytes,
+        packets_emitted: result.packets_emitted,
+        available: result.available,
+        backend: backend.to_owned(),
+        error: result.error,
+        mean_us: result.mean_us,
+        p50_us: result.p50_us,
+        p95_us: result.p95_us,
+        p99_us: result.p99_us,
+        min_us: result.min_us,
+        max_us: result.max_us,
+    }
+}
+
+fn run_roundtrip_child(request_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let request_json = fs::read(&request_path)?;
+    let request: RoundtripChildRequest = serde_json::from_slice(&request_json)?;
+    let result = execute_roundtrip_child(&request);
+    fs::write(&request.out_path, serde_json::to_vec_pretty(&result)?)?;
+    Ok(())
+}
+
+fn execute_roundtrip_child(request: &RoundtripChildRequest) -> RoundtripChildResult {
+    let encode_codec = match parse_roundtrip_child_codec(&request.codec) {
+        Ok(codec) => codec,
+        Err(error) => return roundtrip_child_error(error),
+    };
+    let decode_codec = match parse_decode_child_codec(&request.codec) {
+        Ok(codec) => codec,
+        Err(error) => return roundtrip_child_error(error),
+    };
+    let base_frame = match request
+        .base_frame_b64
+        .as_ref()
+        .map(|encoded| BASE64.decode(encoded))
+        .transpose()
+    {
+        Ok(frame) => frame,
+        Err(err) => {
+            return roundtrip_child_error(format!("decode base frame base64 failed: {err}"))
+        }
+    };
+    let frame = match BASE64.decode(&request.frame_b64) {
+        Ok(frame) => frame,
+        Err(err) => return roundtrip_child_error(format!("decode frame base64 failed: {err}")),
+    };
+    let expected = request
+        .width
+        .saturating_mul(request.height)
+        .saturating_mul(4);
+    if frame.len() < expected {
+        return roundtrip_child_error(format!(
+            "frame too small: {} bytes, expected at least {expected}",
+            frame.len()
+        ));
+    }
+    if let Some(base) = &base_frame {
+        if base.len() < expected {
+            return roundtrip_child_error(format!(
+                "base frame too small: {} bytes, expected at least {expected}",
+                base.len()
+            ));
+        }
+    }
+
+    let mut enc = match MfVideoEncoder::new(
+        encode_codec,
+        request.width as u32,
+        request.height as u32,
+        request.fps,
+        request.bitrate,
+    ) {
+        Ok(enc) => enc,
+        Err(err) => return roundtrip_child_error(err),
+    };
+    let mut dec =
+        match MfVideoDecoder::new(decode_codec, request.width as u32, request.height as u32) {
+            Ok(dec) => dec,
+            Err(err) => return roundtrip_child_error(err),
+        };
+
+    if let Some(base) = &base_frame {
+        let key = match encode_until_packet(&mut enc, base, true, 60) {
+            Ok(Some(packet)) => packet.bytes,
+            Ok(None) => {
+                return roundtrip_child_error("encoder produced no base key packet".to_owned())
+            }
+            Err(err) => return roundtrip_child_error(format!("base encode failed: {err}")),
+        };
+        if let Err(err) = decode_until_frame(&mut dec, std::slice::from_ref(&key), 8) {
+            return roundtrip_child_error(format!("base decode failed: {err}"));
+        }
+    }
+
+    let child_config = Config {
+        width: request.width,
+        height: request.height,
+        fps: request.fps,
+        bitrate: request.bitrate,
+        iterations: request.iterations,
+        warmup: request.warmup,
+        out_dir: PathBuf::new(),
+        codecs: Vec::new(),
+    };
+    let mut first_error = String::new();
+    let mut payload_bytes = 0usize;
+    let mut packets_emitted = 0usize;
+    let samples = measure(&child_config, || {
+        let started = Instant::now();
+        let packet = match encode_until_packet(&mut enc, black_box(&frame), request.force_key, 60) {
+            Ok(Some(packet)) => packet,
+            Ok(None) => {
+                if first_error.is_empty() {
+                    first_error = "encoder produced no packet".to_owned();
+                }
+                return None;
+            }
+            Err(err) => {
+                if first_error.is_empty() {
+                    first_error = err;
+                }
+                return None;
+            }
+        };
+        match decode_until_frame(&mut dec, std::slice::from_ref(&packet.bytes), 8) {
+            Ok(Some((_, _, rgba))) => {
+                let elapsed = started.elapsed();
+                payload_bytes = payload_bytes.max(packet.bytes.len());
+                packets_emitted += 1;
+                black_box((packet.bytes.len(), rgba.len()));
+                Some(elapsed)
+            }
+            Ok(None) => {
+                if first_error.is_empty() {
+                    first_error = "decoder produced no frame".to_owned();
+                }
+                None
+            }
+            Err(err) => {
+                if first_error.is_empty() {
+                    first_error = err;
+                }
+                None
+            }
+        }
+    });
+    let summary = summarize(&samples);
+    let available = packets_emitted > 0 && !samples.is_empty();
+    RoundtripChildResult {
+        available,
+        packets_emitted,
+        payload_bytes,
+        error: if available {
+            String::new()
+        } else if first_error.is_empty() {
+            "roundtrip produced no frame".to_owned()
+        } else {
+            first_error
+        },
+        mean_us: summary.mean_us,
+        p50_us: summary.p50_us,
+        p95_us: summary.p95_us,
+        p99_us: summary.p99_us,
+        min_us: summary.min_us,
+        max_us: summary.max_us,
+    }
+}
+
+fn parse_roundtrip_child_codec(value: &str) -> Result<NvencCodec, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "h264" => Ok(NvencCodec::H264),
+        "h265" | "hevc" => Ok(NvencCodec::H265),
+        other => Err(format!("unsupported roundtrip child codec: {other}")),
+    }
+}
+
+fn roundtrip_child_error(error: String) -> RoundtripChildResult {
+    RoundtripChildResult {
+        available: false,
+        packets_emitted: 0,
+        payload_bytes: 0,
+        error,
+        mean_us: 0.0,
+        p50_us: 0.0,
+        p95_us: 0.0,
+        p99_us: 0.0,
+        min_us: 0.0,
+        max_us: 0.0,
+    }
+}
+
 fn reference_packets(
     codec: NvencCodec,
     config: &Config,
@@ -629,9 +957,32 @@ fn reference_packets(
     let frame_packet = encode_until_packet(&mut enc, frame, force_key, 60)?
         .ok_or_else(|| "encoder produced no frame packet".to_owned())?
         .bytes;
+    let stream_count = config.warmup.saturating_add(config.iterations).max(1);
+    let mut stream_enc = MfVideoEncoder::new(
+        codec,
+        config.width as u32,
+        config.height as u32,
+        config.fps,
+        config.bitrate,
+    )?;
+    let mut decode_stream_packets = Vec::with_capacity(stream_count);
+    if let Some(base) = base_frame {
+        decode_stream_packets.push(
+            encode_until_packet(&mut stream_enc, base, true, 60)?
+                .ok_or_else(|| "stream encoder produced no base key packet".to_owned())?
+                .bytes,
+        );
+    }
+    for idx in 0..stream_count {
+        let packet = encode_until_packet(&mut stream_enc, frame, force_key && idx == 0, 60)?
+            .ok_or_else(|| "stream encoder produced no frame packet".to_owned())?
+            .bytes;
+        decode_stream_packets.push(packet);
+    }
     Ok(ReferencePackets {
         key_packet,
         frame_packet,
+        decode_stream_packets,
     })
 }
 

@@ -78,8 +78,8 @@ This checklist tracks what must be true before publishing EvertyDesk Next 2 as a
    - Done: `scripts/compare-evrtck-hardware-bench.ps1` generates a combined EVRTCK-vs-hardware decision report and marks mismatched quick/resolution/iteration comparisons as non-publishable.
    - Done: full hardware H.264/H.265 encode run completed:
      `reports/hardware-codec-prod/full-20260813b`; combined comparison report is publishable against the full EVRTCK run.
-   - Done: hardware decode benchmarking is crash-isolated in a child process; local HEVC decoder access violations are captured as CSV/JSONL errors instead of killing the parent benchmark.
-   - Still required: GOP-oriented hardware decode and encode+decode roundtrip latency comparison; current decode rows are diagnostic, not publishable latency numbers.
+   - Done: hardware decode and encode+decode roundtrip benchmarking run in crash-isolated child processes with GOP-oriented decoder state; H.264 produced valid local rows, and local HEVC decoder access violations are captured as CSV/JSONL errors instead of killing the parent benchmark.
+   - Still required: full publishable non-quick hardware decode/roundtrip run on a machine where HEVC decode is stable, then feed those rows into the EVRTCK-vs-hardware decision report.
    - Scheduler note from the full run: static, invert deltas, and IDE typing are safe EVRTCK paths; scattered noise at 50%/90% should prefer hardware codec; browser and terminal scroll still need hardware comparison because hinted roundtrip p99 was above the 60 FPS budget.
 
 7. End-to-end session matrix.
