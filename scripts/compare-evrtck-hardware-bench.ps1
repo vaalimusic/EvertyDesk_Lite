@@ -63,6 +63,9 @@ function ChooseWinner($evrtck, $hardware) {
     if ($null -eq $hardware) {
         return "evrtck_no_hardware_data"
     }
+    if ($evrtck.effective_p99_ms -le $Budget120FpsMs -and $evrtck.payload_ratio -lt 0.05) {
+        return "evrtck"
+    }
     if ($evrtck.effective_p99_ms -le $Budget60FpsMs -and $evrtck.effective_payload_bytes -lt $hardware.payload_bytes) {
         return "evrtck"
     }
@@ -126,6 +129,7 @@ foreach ($decision in $evrtckSummary.decisions) {
     $evrtckData = [pscustomobject]@{
         effective_p99_ms = $evrtckP99
         effective_payload_bytes = $evrtckPayload
+        payload_ratio = if ($rawBytes -gt 0) { [double]$evrtckPayload / [double]$rawBytes } else { 1.0 }
     }
 
     $decisions += [pscustomobject]@{
