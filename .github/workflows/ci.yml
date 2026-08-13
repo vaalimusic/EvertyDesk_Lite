@@ -8,21 +8,6 @@ name: CI
 # macOS run to expose packaging or permission issues that need follow-up fixes.
 
 on:
-  push:
-    branches: [master]
-    paths:
-      - "desktop-next/**"
-      - "src/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/ci.yml"
-  pull_request:
-    paths:
-      - "desktop-next/**"
-      - "src/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/ci.yml"
   workflow_dispatch:
 
 jobs:

@@ -1,18 +1,8 @@
 name: Release
 
 # Builds unsigned installers for desktop-next and attaches them to a GitHub
-# Release. Two ways in:
-#   - push a tag like `v0.2.0` -> builds that version, publishes as a DRAFT
-#     (you review and click Publish yourself -- this is the deliberate,
-#     "I decided this is a release" path).
-#   - the 1st of every month at 03:00 UTC -> builds whatever's on the
-#     default branch, versions it by date (vYY.M.0, e.g. v26.9.0 for
-#     September 2026 -- two-digit year because MSI's ProductVersion caps the
-#     major field at 255), and PUBLISHES IMMEDIATELY, no human in the loop,
-#     marked as a GitHub pre-release so it never displaces a real reviewed
-#     release as "Latest". This is the "always have a current build
-#     available" path -- if you want to gate it, remove the `schedule:`
-#     trigger below and cut releases by tag only.
+# Release. Automatic tag/scheduled triggers are intentionally disabled; run this
+# workflow manually from GitHub Actions when a release build is needed.
 #
 # Unsigned: no code-signing certificate exists yet (see desktop-next/RELEASE.md).
 # Windows SmartScreen and macOS Gatekeeper will both warn users on first run
@@ -23,11 +13,6 @@ name: Release
 # follow-up fix once the actual failure (if any) is visible in the logs.
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
-  schedule:
-    - cron: "0 3 1 * *"
   workflow_dispatch:
     inputs:
       tag:
