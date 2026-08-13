@@ -1,11 +1,14 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use evertydesk_core::mf_encode::{mf_encoder_status, MfVideoEncoder};
 use evertydesk_core::mf_video::{mf_video_decode_status, MfVideoCodec, MfVideoDecoder};
 use evertydesk_core::nvenc::NvencCodec;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::env;
 use std::fs::{self, File};
 use std::hint::black_box;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const TILE_SIZE: usize = 32;
@@ -144,6 +147,14 @@ struct BenchRow {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut raw_args = env::args().skip(1);
+    if matches!(raw_args.next().as_deref(), Some("--decode-child")) {
+        let request_path = raw_args
+            .next()
+            .ok_or("--decode-child requires a request JSON path")?;
+        return run_decode_child(PathBuf::from(request_path));
+    }
+
     let config = match Config::parse() {
         Ok(config) => config,
         Err(error) => {
@@ -311,9 +322,9 @@ fn run_decode_and_roundtrip_scenario(
     base_frame: Option<&[u8]>,
     force_key: bool,
 ) -> Vec<BenchRow> {
-    let Some(decode_codec) = mf_decode_codec(codec) else {
+    if mf_decode_codec(codec).is_none() {
         let reason = format!(
-            "{} decode is disabled in-process; use a crash-isolated child decoder bench",
+            "{} decode is unavailable in this benchmark build",
             codec.label()
         );
         return vec![
@@ -333,16 +344,14 @@ fn run_decode_and_roundtrip_scenario(
     };
 
     vec![
-        run_decode_scenario(codec, decode_codec, config, scenario, backend, &reference),
-        run_roundtrip_scenario(
+        run_decode_scenario(codec, config, scenario, backend, &reference),
+        operation_error_row(
             codec,
-            decode_codec,
             config,
             scenario,
+            "roundtrip",
             backend,
-            frame,
-            base_frame,
-            force_key,
+            "roundtrip decode is intentionally not run in-process; use the crash-isolated GOP child harness".to_owned(),
         ),
     ]
 }
@@ -350,6 +359,248 @@ fn run_decode_and_roundtrip_scenario(
 struct ReferencePackets {
     key_packet: Option<Vec<u8>>,
     frame_packet: Vec<u8>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct DecodeChildRequest {
+    codec: String,
+    width: usize,
+    height: usize,
+    iterations: usize,
+    warmup: usize,
+    key_packet_b64: Option<String>,
+    frame_packet_b64: String,
+    out_path: PathBuf,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct DecodeChildResult {
+    available: bool,
+    frames_decoded: usize,
+    error: String,
+    mean_us: f64,
+    p50_us: f64,
+    p95_us: f64,
+    p99_us: f64,
+    min_us: f64,
+    max_us: f64,
+}
+
+fn run_decode_child_process(
+    codec: NvencCodec,
+    config: &Config,
+    reference: &ReferencePackets,
+) -> Result<DecodeChildResult, String> {
+    let child_dir = config.out_dir.join("decode-child");
+    fs::create_dir_all(&child_dir).map_err(|err| format!("create child dir failed: {err}"))?;
+    let pid = std::process::id();
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let stem = format!("{}-{pid}-{stamp}", codec.label().to_ascii_lowercase());
+    let request_path = child_dir.join(format!("{stem}.request.json"));
+    let result_path = child_dir.join(format!("{stem}.result.json"));
+    let request = DecodeChildRequest {
+        codec: codec.label().to_owned(),
+        width: config.width,
+        height: config.height,
+        iterations: config.iterations,
+        warmup: config.warmup,
+        key_packet_b64: reference
+            .key_packet
+            .as_ref()
+            .map(|packet| BASE64.encode(packet)),
+        frame_packet_b64: BASE64.encode(&reference.frame_packet),
+        out_path: result_path.clone(),
+    };
+    let request_json = serde_json::to_vec_pretty(&request)
+        .map_err(|err| format!("serialize child request failed: {err}"))?;
+    fs::write(&request_path, request_json)
+        .map_err(|err| format!("write child request failed: {err}"))?;
+
+    let exe = env::current_exe().map_err(|err| format!("resolve current exe failed: {err}"))?;
+    let output = Command::new(exe)
+        .arg("--decode-child")
+        .arg(&request_path)
+        .output()
+        .map_err(|err| format!("spawn decode child failed: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let mut reason = format!("decode child exited with status {}", output.status);
+        if !stderr.is_empty() {
+            reason.push_str(&format!("; stderr={stderr}"));
+        }
+        if !stdout.is_empty() {
+            reason.push_str(&format!("; stdout={stdout}"));
+        }
+        return Err(reason);
+    }
+
+    let result_json =
+        fs::read(&result_path).map_err(|err| format!("read child result failed: {err}"))?;
+    serde_json::from_slice(&result_json).map_err(|err| format!("parse child result failed: {err}"))
+}
+
+fn child_decode_row(
+    codec: NvencCodec,
+    config: &Config,
+    scenario: Scenario,
+    backend: &str,
+    reference: &ReferencePackets,
+    result: DecodeChildResult,
+) -> BenchRow {
+    BenchRow {
+        codec: codec.label().to_owned(),
+        scenario: scenario.name.to_owned(),
+        operation: "decode".to_owned(),
+        width: config.width,
+        height: config.height,
+        fps: config.fps,
+        bitrate: config.bitrate,
+        dirty_ratio_target: scenario.dirty_ratio,
+        dirty_distribution: scenario.distribution,
+        dirty_entropy: scenario.entropy,
+        iterations: config.iterations,
+        warmup: config.warmup,
+        raw_bytes: config.width * config.height * 4,
+        payload_bytes: reference.frame_packet.len(),
+        packets_emitted: result.frames_decoded,
+        available: result.available,
+        backend: backend.to_owned(),
+        error: result.error,
+        mean_us: result.mean_us,
+        p50_us: result.p50_us,
+        p95_us: result.p95_us,
+        p99_us: result.p99_us,
+        min_us: result.min_us,
+        max_us: result.max_us,
+    }
+}
+
+fn run_decode_child(request_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let request_json = fs::read(&request_path)?;
+    let request: DecodeChildRequest = serde_json::from_slice(&request_json)?;
+    let result = execute_decode_child(&request);
+    fs::write(&request.out_path, serde_json::to_vec_pretty(&result)?)?;
+    Ok(())
+}
+
+fn execute_decode_child(request: &DecodeChildRequest) -> DecodeChildResult {
+    let decode_codec = match parse_decode_child_codec(&request.codec) {
+        Ok(codec) => codec,
+        Err(error) => return decode_child_error(error),
+    };
+    let key_packet = match request
+        .key_packet_b64
+        .as_ref()
+        .map(|encoded| BASE64.decode(encoded))
+        .transpose()
+    {
+        Ok(packet) => packet,
+        Err(err) => return decode_child_error(format!("decode key packet base64 failed: {err}")),
+    };
+    let frame_packet = match BASE64.decode(&request.frame_packet_b64) {
+        Ok(packet) => packet,
+        Err(err) => return decode_child_error(format!("decode frame packet base64 failed: {err}")),
+    };
+
+    let child_config = Config {
+        width: request.width,
+        height: request.height,
+        fps: 60,
+        bitrate: 0,
+        iterations: request.iterations,
+        warmup: request.warmup,
+        out_dir: PathBuf::new(),
+        codecs: Vec::new(),
+    };
+    let mut first_error = String::new();
+    let mut frames_decoded = 0usize;
+    let samples = measure(&child_config, || {
+        let mut dec =
+            match MfVideoDecoder::new(decode_codec, request.width as u32, request.height as u32) {
+                Ok(dec) => dec,
+                Err(err) => {
+                    if first_error.is_empty() {
+                        first_error = err;
+                    }
+                    return None;
+                }
+            };
+        if let Some(key) = &key_packet {
+            if let Err(err) = decode_until_frame(&mut dec, std::slice::from_ref(key), 8) {
+                if first_error.is_empty() {
+                    first_error = format!("base decode failed: {err}");
+                }
+                return None;
+            }
+        }
+        let started = Instant::now();
+        match decode_until_frame(&mut dec, std::slice::from_ref(&frame_packet), 8) {
+            Ok(Some((_, _, rgba))) => {
+                let elapsed = started.elapsed();
+                frames_decoded += 1;
+                black_box(rgba.len());
+                Some(elapsed)
+            }
+            Ok(None) => {
+                if first_error.is_empty() {
+                    first_error = "decoder produced no frame".to_owned();
+                }
+                None
+            }
+            Err(err) => {
+                if first_error.is_empty() {
+                    first_error = err;
+                }
+                None
+            }
+        }
+    });
+    let summary = summarize(&samples);
+    let available = frames_decoded > 0 && !samples.is_empty();
+    DecodeChildResult {
+        available,
+        frames_decoded,
+        error: if available {
+            String::new()
+        } else if first_error.is_empty() {
+            "decoder produced no frame".to_owned()
+        } else {
+            first_error
+        },
+        mean_us: summary.mean_us,
+        p50_us: summary.p50_us,
+        p95_us: summary.p95_us,
+        p99_us: summary.p99_us,
+        min_us: summary.min_us,
+        max_us: summary.max_us,
+    }
+}
+
+fn parse_decode_child_codec(value: &str) -> Result<MfVideoCodec, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "h264" => Ok(MfVideoCodec::H264),
+        "h265" | "hevc" => Ok(MfVideoCodec::H265),
+        other => Err(format!("unsupported decode child codec: {other}")),
+    }
+}
+
+fn decode_child_error(error: String) -> DecodeChildResult {
+    DecodeChildResult {
+        available: false,
+        frames_decoded: 0,
+        error,
+        mean_us: 0.0,
+        p50_us: 0.0,
+        p95_us: 0.0,
+        p99_us: 0.0,
+        min_us: 0.0,
+        max_us: 0.0,
+    }
 }
 
 fn reference_packets(
@@ -386,181 +637,15 @@ fn reference_packets(
 
 fn run_decode_scenario(
     codec: NvencCodec,
-    decode_codec: MfVideoCodec,
     config: &Config,
     scenario: Scenario,
     backend: &str,
     reference: &ReferencePackets,
 ) -> BenchRow {
-    let mut frames_decoded = 0usize;
-    let mut first_error = String::new();
-    let samples = measure(config, || {
-        let mut dec =
-            match MfVideoDecoder::new(decode_codec, config.width as u32, config.height as u32) {
-                Ok(dec) => dec,
-                Err(err) => {
-                    if first_error.is_empty() {
-                        first_error = err;
-                    }
-                    return None;
-                }
-            };
-        if let Some(key) = &reference.key_packet {
-            if let Err(err) = decode_until_frame(&mut dec, std::slice::from_ref(key), 8) {
-                if first_error.is_empty() {
-                    first_error = format!("base decode failed: {err}");
-                }
-                return None;
-            }
-        }
-        let started = Instant::now();
-        match decode_until_frame(&mut dec, std::slice::from_ref(&reference.frame_packet), 8) {
-            Ok(Some((_, _, rgba))) => {
-                let elapsed = started.elapsed();
-                frames_decoded += 1;
-                black_box(rgba.len());
-                Some(elapsed)
-            }
-            Ok(None) => {
-                if first_error.is_empty() {
-                    first_error = "decoder produced no frame".to_owned();
-                }
-                None
-            }
-            Err(err) => {
-                if first_error.is_empty() {
-                    first_error = err;
-                }
-                None
-            }
-        }
-    });
-    measured_row(
-        codec,
-        config,
-        scenario,
-        "decode",
-        backend,
-        reference.frame_packet.len(),
-        frames_decoded,
-        first_error,
-        samples,
-    )
-}
-
-fn run_roundtrip_scenario(
-    codec: NvencCodec,
-    decode_codec: MfVideoCodec,
-    config: &Config,
-    scenario: Scenario,
-    backend: &str,
-    frame: &[u8],
-    base_frame: Option<&[u8]>,
-    force_key: bool,
-) -> BenchRow {
-    let mut payload_bytes = 0usize;
-    let mut frames_decoded = 0usize;
-    let mut first_error = String::new();
-    let samples = measure(config, || {
-        let mut enc = match MfVideoEncoder::new(
-            codec,
-            config.width as u32,
-            config.height as u32,
-            config.fps,
-            config.bitrate,
-        ) {
-            Ok(enc) => enc,
-            Err(err) => {
-                if first_error.is_empty() {
-                    first_error = err;
-                }
-                return None;
-            }
-        };
-        let mut dec =
-            match MfVideoDecoder::new(decode_codec, config.width as u32, config.height as u32) {
-                Ok(dec) => dec,
-                Err(err) => {
-                    if first_error.is_empty() {
-                        first_error = err;
-                    }
-                    return None;
-                }
-            };
-        if let Some(base) = base_frame {
-            let key = match encode_until_packet(&mut enc, black_box(base), true, 60) {
-                Ok(Some(packet)) => packet.bytes,
-                Ok(None) => {
-                    if first_error.is_empty() {
-                        first_error = "encoder produced no base key packet".to_owned();
-                    }
-                    return None;
-                }
-                Err(err) => {
-                    if first_error.is_empty() {
-                        first_error = err;
-                    }
-                    return None;
-                }
-            };
-            if let Err(err) = decode_until_frame(&mut dec, std::slice::from_ref(&key), 8) {
-                if first_error.is_empty() {
-                    first_error = format!("base decode failed: {err}");
-                }
-                return None;
-            }
-        }
-
-        let started = Instant::now();
-        let packet = match encode_until_packet(&mut enc, black_box(frame), force_key, 60) {
-            Ok(Some(packet)) => packet,
-            Ok(None) => {
-                if first_error.is_empty() {
-                    first_error = "encoder produced no frame packet".to_owned();
-                }
-                return None;
-            }
-            Err(err) => {
-                if first_error.is_empty() {
-                    first_error = err;
-                }
-                return None;
-            }
-        };
-        match decode_until_frame(&mut dec, std::slice::from_ref(&packet.bytes), 8) {
-            Ok(Some((_, _, rgba))) => {
-                let elapsed = started.elapsed();
-                payload_bytes = payload_bytes.max(packet.bytes.len());
-                frames_decoded += 1;
-                black_box((packet.bytes.len(), rgba.len()));
-                Some(elapsed)
-            }
-            Ok(None) => {
-                if first_error.is_empty() {
-                    first_error = "decoder produced no frame".to_owned();
-                }
-                None
-            }
-            Err(err) => {
-                if first_error.is_empty() {
-                    first_error = err;
-                }
-                None
-            }
-        }
-    });
-
-    measured_row(
-        codec,
-        config,
-        scenario,
-        "roundtrip",
-        backend,
-        payload_bytes,
-        frames_decoded,
-        first_error,
-        samples,
-    )
+    match run_decode_child_process(codec, config, reference) {
+        Ok(result) => child_decode_row(codec, config, scenario, backend, reference, result),
+        Err(err) => operation_error_row(codec, config, scenario, "decode", backend, err),
+    }
 }
 
 fn decode_until_frame(
@@ -577,13 +662,11 @@ fn decode_until_frame(
 }
 
 fn mf_decode_codec(codec: NvencCodec) -> Option<MfVideoCodec> {
-    let _ = codec;
-    // Windows Store HEVC decoder MFTs are known to crash in-process on some
-    // systems. H264 MF decode also needs a GOP-oriented harness: tiny synthetic
-    // P-packets may not produce output even when encode succeeds. Do not let
-    // this benchmark publish false hardware roundtrip numbers; decode must be
-    // measured in a crash-isolated child harness.
-    None
+    match codec {
+        NvencCodec::H264 => Some(MfVideoCodec::H264),
+        NvencCodec::H265 => Some(MfVideoCodec::H265),
+        NvencCodec::Av1 => None,
+    }
 }
 
 fn run_encode_scenario(
@@ -744,54 +827,6 @@ fn operation_error_row(
     let mut row = unavailable_row(codec, config, scenario, operation, backend);
     row.error = error;
     row
-}
-
-fn measured_row(
-    codec: NvencCodec,
-    config: &Config,
-    scenario: Scenario,
-    operation: &str,
-    backend: &str,
-    payload_bytes: usize,
-    packets_or_frames: usize,
-    first_error: String,
-    samples: Vec<Duration>,
-) -> BenchRow {
-    let summary = summarize(&samples);
-    let available = packets_or_frames > 0 && !samples.is_empty();
-    let error = if available {
-        String::new()
-    } else if first_error.is_empty() {
-        format!("{operation} produced no frame")
-    } else {
-        first_error
-    };
-    BenchRow {
-        codec: codec.label().to_owned(),
-        scenario: scenario.name.to_owned(),
-        operation: operation.to_owned(),
-        width: config.width,
-        height: config.height,
-        fps: config.fps,
-        bitrate: config.bitrate,
-        dirty_ratio_target: scenario.dirty_ratio,
-        dirty_distribution: scenario.distribution,
-        dirty_entropy: scenario.entropy,
-        iterations: config.iterations,
-        warmup: config.warmup,
-        raw_bytes: config.width * config.height * 4,
-        payload_bytes,
-        packets_emitted: packets_or_frames,
-        available,
-        backend: backend.to_owned(),
-        error,
-        mean_us: summary.mean_us,
-        p50_us: summary.p50_us,
-        p95_us: summary.p95_us,
-        p99_us: summary.p99_us,
-        min_us: summary.min_us,
-        max_us: summary.max_us,
-    }
 }
 
 fn csv_field(value: &str) -> String {
