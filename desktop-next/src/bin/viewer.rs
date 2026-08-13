@@ -556,6 +556,7 @@ struct ViewerDiagnostics {
     latency_ms: Option<u32>,
     evrt_active: bool,
     evrt_endpoint: String,
+    transport_note: String,
     evrt_pressure: String,
     evrt_jitter_ms: Option<u32>,
     evrt_fps: Option<u32>,
@@ -1783,7 +1784,7 @@ fn draw_diagnostics_panel(
     clipboard_enabled: bool,
 ) {
     const PANEL_WIDTH: i32 = 272;
-    const PANEL_HEIGHT: i32 = 454;
+    const PANEL_HEIGHT: i32 = 474;
     let x = (width - PANEL_WIDTH - 14).max(4);
     let y = toolbar_overlay_top(true, 10);
     fill_rgba_rect(
@@ -1831,6 +1832,11 @@ fn draw_diagnostics_panel(
     } else {
         "TCP fallback"
     };
+    let transport_note = if diagnostics.transport_note.is_empty() {
+        "--"
+    } else {
+        diagnostics.transport_note.as_str()
+    };
     let evrt_fps = diagnostics
         .evrt_fps
         .map_or_else(|| "--".to_owned(), |value| value.to_string());
@@ -1847,6 +1853,7 @@ fn draw_diagnostics_panel(
         format!("Health      {health}"),
         format!("Codec       {codec}"),
         format!("Transport   {transport}"),
+        format!("Route       {transport_note}"),
         format!("EVRT FPS    {evrt_fps}"),
         format!("EVRT jitter {evrt_jitter} ms"),
         format!("EVRT press  {evrt_pressure}"),
@@ -3278,6 +3285,11 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
             }
             ViewerEvent::EvrtStatus { active, endpoint } => {
                 self.diagnostics.evrt_active = active;
+                self.diagnostics.transport_note = if active {
+                    format!("UDP {endpoint}")
+                } else {
+                    "UDP inactive, TCP fallback".to_owned()
+                };
                 self.diagnostics.evrt_endpoint = endpoint;
                 if !active {
                     self.diagnostics.evrt_pressure.clear();
