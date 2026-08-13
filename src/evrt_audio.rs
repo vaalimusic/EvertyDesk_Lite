@@ -319,7 +319,6 @@ fn run_audio_capture_windows(
 
         let ch = channels as usize;
         let out_ch = out_channels as usize;
-        let bytes_per_native_frame = ch * (bits as usize / 8);
         let need_resample = sample_rate != TARGET_RATE;
 
         // Буфер накапливает i16 stereo сэмплы после конвертации из нативного формата.

@@ -1430,7 +1430,6 @@ fn encode_loop(
     const IDR_MIN_EVRT_HXXX: Duration = Duration::from_secs(2);
     let idr_interval_secs = config.display.idr_interval_secs.clamp(5, 120);
     let idr_min_evrtck = Duration::from_secs(u64::from(idr_interval_secs));
-    let mut current_idr_min = IDR_MIN_H264;
     const SPIN: Duration = Duration::from_micros(1_500);
     // Отслеживаем переход EVRTCK inactive→active: нужен IDR при первом подключении.
     let mut was_evrt_on = false;
@@ -1456,7 +1455,7 @@ fn encode_loop(
         // encode_loop не перезапускается при смене кодека (set_subscribed_displays no-op),
         // поэтому want_evrtck пробрасывается через Arc<AtomicBool> вместо локального prefer.
         let using_evrtck = want_evrtck.load(Ordering::Relaxed);
-        current_idr_min = if using_evrtck {
+        let current_idr_min = if using_evrtck {
             idr_min_evrtck
         } else if evrt_on {
             IDR_MIN_EVRT_HXXX // H265/H264 через EVRT UDP — NACK/FEC покрывает потери

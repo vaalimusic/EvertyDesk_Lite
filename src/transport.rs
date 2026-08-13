@@ -975,6 +975,7 @@ impl TransportClient {
             // only thread allowed to write to it, so this never races the
             // `commands` writes just below.
             while let Ok(raw) = evrt2_relay_out_rx.try_recv() {
+                #[cfg(target_os = "android")]
                 let raw_len = raw.len();
                 let msg = PeerMessage {
                     union: Some(peer_message::Union::Misc(Misc {
@@ -3529,15 +3530,16 @@ fn handle_session_message(
             // message arrived before the experiment even started, or after
             // it already ended).
             if let Some(misc::Union::Evrt2RelayWrap(bytes)) = &m.union {
+                #[cfg(target_os = "android")]
                 let have_listener = evrt2_relay_in_tx_out.is_some();
-                let send_ok = if let Some(tx) = evrt2_relay_in_tx_out.as_ref() {
+                let _send_ok = if let Some(tx) = evrt2_relay_in_tx_out.as_ref() {
                     tx.send(bytes.clone()).is_ok()
                 } else {
                     false
                 };
                 #[cfg(target_os = "android")]
                 log::info!(
-                    "[evrt2] client received Evrt2RelayWrap: {} bytes, listener_set={have_listener} send_ok={send_ok}",
+                    "[evrt2] client received Evrt2RelayWrap: {} bytes, listener_set={have_listener} send_ok={_send_ok}",
                     bytes.len()
                 );
                 return None;
@@ -4450,6 +4452,10 @@ fn decode_one_frame(
         DecoderInput::H264 {
             sid,
             frames,
+            #[cfg_attr(
+                not(all(target_os = "android", feature = "android-client")),
+                allow(unused_variables)
+            )]
             queued_at,
             ..
         } => {
@@ -4634,6 +4640,10 @@ fn decode_one_frame(
             frames,
             width,
             height,
+            #[cfg_attr(
+                not(all(target_os = "android", feature = "android-client")),
+                allow(unused_variables)
+            )]
             queued_at,
             ..
         } => {
@@ -4708,6 +4718,10 @@ fn decode_one_frame(
             frames,
             width,
             height,
+            #[cfg_attr(
+                not(all(target_os = "android", feature = "android-client")),
+                allow(unused_variables)
+            )]
             queued_at,
             ..
         } => {

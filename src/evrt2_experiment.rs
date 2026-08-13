@@ -52,7 +52,7 @@ use crate::execution_capability::{
     Capability, CapabilityRegistry, Provider, PROVIDER_CPU_EVRTCK, PROVIDER_NVENC_H264,
 };
 use crate::host::HostEvent;
-use crate::nvenc::{NvencCodec, NvencEncoder};
+use crate::nvenc::NvencCodec;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -2457,13 +2457,13 @@ fn race_hello_all_paths(
     for &addr in candidates {
         let _ = socket.send_to(&hello, addr);
     }
-    let relay_send_ok = if let Some((relay_out, _)) = relay {
+    let _relay_send_ok = if let Some((relay_out, _)) = relay {
         relay_out.send(hello.clone()).is_ok()
     } else {
         false
     };
     evrt2log!(
-        "[evrt2] race_hello_all_paths: sent HELLO ({} bytes) to {} UDP candidate(s), relay={:?} (send_ok={relay_send_ok})",
+        "[evrt2] race_hello_all_paths: sent HELLO ({} bytes) to {} UDP candidate(s), relay={:?} (send_ok={_relay_send_ok})",
         hello.len(), candidates.len(), relay.is_some()
     );
     on_status(format!(
@@ -2482,7 +2482,7 @@ fn race_hello_all_paths(
         }
         match socket.recv_from(&mut buf) {
             Ok((len, from)) => {
-                udp_bytes_seen += 1;
+                udp_bytes_seen = udp_bytes_seen.saturating_add(1);
                 if candidates.contains(&from) {
                     if let Ok((header, _payload)) =
                         crate::evrt2_packet::PacketHeader::decode(&buf[..len])
@@ -2501,7 +2501,7 @@ fn race_hello_all_paths(
         }
         if let Some((_, relay_in)) = relay {
             if let Ok(raw) = relay_in.try_recv() {
-                relay_bytes_seen += 1;
+                relay_bytes_seen = relay_bytes_seen.saturating_add(1);
                 evrt2log!("[evrt2] race_hello_all_paths: relay_in received {} bytes (#{relay_bytes_seen})", raw.len());
                 if let Ok((header, _payload)) = crate::evrt2_packet::PacketHeader::decode(&raw) {
                     evrt2log!(

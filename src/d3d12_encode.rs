@@ -138,7 +138,7 @@ fn probe() -> D3d12EncodeStatus {
         };
         status.video_device_ok = true;
 
-        let mut check = |codec: D3D12_VIDEO_ENCODER_CODEC| -> bool {
+        let check = |codec: D3D12_VIDEO_ENCODER_CODEC| -> bool {
             let mut data = D3D12_FEATURE_DATA_VIDEO_ENCODER_CODEC {
                 NodeIndex: 0,
                 Codec: codec,
