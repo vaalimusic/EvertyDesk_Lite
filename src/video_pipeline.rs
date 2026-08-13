@@ -1862,7 +1862,16 @@ fn encode_loop(
             evrtck_return_candidate_frames = 0;
         }
         if let Some(analysis) = evrtck_analysis_for_frame {
-            if analysis.prefer_silicon {
+            let silicon_candidate = evrtck_silicon_candidate(
+                analysis,
+                out.bytes.len(),
+                encode_dur,
+                enc_w,
+                enc_h,
+                fps,
+                out.key,
+            );
+            if silicon_candidate {
                 evrtck_silicon_candidate_frames = evrtck_silicon_candidate_frames.saturating_add(1);
                 if evrtck_silicon_candidate_frames >= EVRTCK_SILICON_SWITCH_STREAK {
                     evrtck_silicon_requested.store(true, Ordering::Relaxed);
@@ -1875,11 +1884,12 @@ fn encode_loop(
                     log(
                         &events,
                         format!(
-                            "EVRTCK scheduler: silicon candidate dirty={:.0}% entropy={:.2} est_payload={}B actual_payload={}B streak={}",
+                            "EVRTCK scheduler: silicon candidate dirty={:.0}% entropy={:.2} est_payload={}B actual_payload={}B encode_ms={} streak={}",
                             analysis.dirty_ratio * 100.0,
                             analysis.entropy_score,
                             analysis.estimated_payload_bytes,
                             out.bytes.len(),
+                            encode_ms,
                             evrtck_silicon_candidate_frames,
                         ),
                     );
@@ -2679,6 +2689,8 @@ const SOFTWARE_ENCODER_MAX_QUALITY_MILLI: u32 = 1_800;
 const SOFTWARE_NATIVE_MAX_W: u32 = 1920;
 const SOFTWARE_NATIVE_MAX_H: u32 = 1080;
 const SOFTWARE_NATIVE_MAX_PIXELS: u64 = 1920 * 1080;
+const EVRTCK_SILICON_PAYLOAD_MIN_RATIO_MILLI: u64 = 30;
+const EVRTCK_SILICON_ENCODE_BUDGET_RATIO_MILLI: u128 = 750;
 
 fn software_encoder_target_fps(fps: u32) -> u32 {
     fps.clamp(5, SOFTWARE_ENCODER_MAX_FPS)
@@ -2689,6 +2701,41 @@ fn software_encoder_quality_milli(quality_milli: u32) -> u32 {
         SOFTWARE_ENCODER_MIN_QUALITY_MILLI,
         SOFTWARE_ENCODER_MAX_QUALITY_MILLI,
     )
+}
+
+/// EVRTCK scheduler guardrail: keep desktop-like deltas on EVRTCK, but stop
+/// burning CPU on large/slow P-frames that should be handed to silicon codecs.
+fn evrtck_silicon_candidate(
+    analysis: crate::evrtck::FrameAnalysis,
+    encoded_payload_bytes: usize,
+    encode_duration: Duration,
+    width: u32,
+    height: u32,
+    target_fps: u32,
+    is_keyframe: bool,
+) -> bool {
+    if is_keyframe || width == 0 || height == 0 {
+        return false;
+    }
+    if analysis.prefer_silicon {
+        return true;
+    }
+
+    let fps = target_fps.clamp(5, 60) as u128;
+    let frame_budget_us = 1_000_000_u128 / fps;
+    let encode_us = encode_duration.as_micros();
+    let encode_is_expensive = encode_us.saturating_mul(1_000)
+        >= frame_budget_us * EVRTCK_SILICON_ENCODE_BUDGET_RATIO_MILLI;
+    if !encode_is_expensive {
+        return false;
+    }
+
+    let raw_bytes = (width as u64)
+        .saturating_mul(height as u64)
+        .saturating_mul(4);
+    let payload_is_large = (encoded_payload_bytes as u64).saturating_mul(1_000)
+        >= raw_bytes.saturating_mul(EVRTCK_SILICON_PAYLOAD_MIN_RATIO_MILLI);
+    payload_is_large
 }
 
 /// Возвращает целевое разрешение для даунскейла под экран клиента.
@@ -2990,6 +3037,84 @@ mod tests {
         };
 
         assert_eq!(evrtck_silicon_prefer(client, false), None);
+    }
+
+    #[test]
+    fn evrtck_silicon_candidate_rejects_static_and_keyframes() {
+        let analysis = crate::evrtck::FrameAnalysis {
+            total_tiles: 2040,
+            dirty_tiles: 0,
+            dirty_ratio: 0.0,
+            entropy_score: 0.0,
+            estimated_payload_bytes: 20,
+            prefer_silicon: false,
+        };
+
+        assert!(!evrtck_silicon_candidate(
+            analysis,
+            20,
+            Duration::from_millis(20),
+            1920,
+            1080,
+            60,
+            false,
+        ));
+        assert!(!evrtck_silicon_candidate(
+            crate::evrtck::FrameAnalysis {
+                prefer_silicon: true,
+                ..analysis
+            },
+            585_324,
+            Duration::from_millis(90),
+            1920,
+            1080,
+            60,
+            true,
+        ));
+    }
+
+    #[test]
+    fn evrtck_silicon_candidate_accepts_slow_large_pframes() {
+        let analysis = crate::evrtck::FrameAnalysis {
+            total_tiles: 2040,
+            dirty_tiles: 126,
+            dirty_ratio: 0.061,
+            entropy_score: 0.18,
+            estimated_payload_bytes: 109_095,
+            prefer_silicon: false,
+        };
+
+        assert!(evrtck_silicon_candidate(
+            analysis,
+            495_668,
+            Duration::from_millis(18),
+            1920,
+            1080,
+            60,
+            false,
+        ));
+    }
+
+    #[test]
+    fn evrtck_silicon_candidate_keeps_fast_desktop_deltas() {
+        let analysis = crate::evrtck::FrameAnalysis {
+            total_tiles: 2040,
+            dirty_tiles: 22,
+            dirty_ratio: 0.011,
+            entropy_score: 0.08,
+            estimated_payload_bytes: 23_989,
+            prefer_silicon: false,
+        };
+
+        assert!(!evrtck_silicon_candidate(
+            analysis,
+            23_989,
+            Duration::from_millis(5),
+            1920,
+            1080,
+            60,
+            false,
+        ));
     }
 
     #[test]
