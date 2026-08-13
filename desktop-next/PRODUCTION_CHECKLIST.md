@@ -31,6 +31,12 @@ This checklist tracks what must be true before publishing EvertyDesk Next 2 as a
   `dist/EvertyDeskNext-2.0.1-windows-x64-portable.zip` and `.sha256`.
 - Extracted portable zip passed `tools/portable-smoke.ps1 -BinaryDirectory <extracted-dir> -StopAllExistingLaunchers`.
 - `latest.json` was generated and validated for the 2.0.1 portable artifact.
+- Full EVRTCK software-path production benchmark passed on Windows/release:
+  `reports/evrtck-prod/full-20260813-after-correctness`.
+  Commit `1068c4d37b82926b7246e4482935c4e2bc12f3c0`, AMD Ryzen 5 4600G,
+  6 cores / 12 threads, 1920x1080, 300 iterations / 30 warmup.
+  The benchmark validates normal and hinted P-frames against the expected
+  decoded RGBA output before timing.
 
 ## Release blockers
 
@@ -57,11 +63,13 @@ This checklist tracks what must be true before publishing EvertyDesk Next 2 as a
    - Confirm default EvertyDesk server values remain hidden in UI and restored when fields are empty.
 
 6. EVRTCK production evidence.
-   - Run full benchmark without `-Quick`:
-     `.\scripts\run-evrtck-prod-bench.ps1 -Iterations 300 -Warmup 30`.
-   - Record CPU model, thread count, clocks, build profile, commit hash, payload sizes, p50/p95/p99 encode/decode/roundtrip.
-   - Include noisy dirty regions, scattered dirty tiles, IDE/browser/scroll recordings, and hardware H264/H265 comparison.
-   - Attach `reports/evrtck-prod/<timestamp>/metadata.json`, `evrtck_prod_bench.csv`, `evrtck_prod_bench.jsonl`, `summary.md`, and `summary.json`.
+   - Done: full software benchmark without `-Quick`:
+     `.\scripts\run-evrtck-prod-bench.ps1 -Iterations 300 -Warmup 30 -OutDir reports\evrtck-prod\full-20260813-after-correctness`.
+   - Done: CPU model, thread count, clocks, release profile, commit hash, payload sizes, p50/p95/p99 encode/decode/roundtrip are recorded in the report.
+   - Done: software scenarios include static, clustered/scattered dirty tiles, noisy dirty regions, IDE typing, browser scroll, and terminal scroll.
+   - Done: attach `reports/evrtck-prod/full-20260813-after-correctness/metadata.json`, `evrtck_prod_bench.csv`, `evrtck_prod_bench.jsonl`, `summary.md`, and `summary.json`.
+   - Still required: hardware H.264/H.265 comparison on the same scene set.
+   - Scheduler note from the full run: static, invert deltas, and IDE typing are safe EVRTCK paths; scattered noise at 50%/90% should prefer hardware codec; browser scroll still needs hardware comparison or stronger copy-rect/scheduler policy because hinted roundtrip p99 was above the 60 FPS budget.
 
 7. End-to-end session matrix.
    - Outgoing desktop session: LAN, WAN/relay, wrong ID, wrong password, reconnect, multi-monitor.
