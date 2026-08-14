@@ -1,8 +1,9 @@
 name: Release
 
 # Builds unsigned installers for desktop-next and attaches them to a GitHub
-# Release. Automatic tag/scheduled triggers are intentionally disabled; run this
-# workflow manually from GitHub Actions when a release build is needed.
+# Release. Triggers on pushing a `vX.Y.Z` tag, or manually via
+# workflow_dispatch (e.g. to re-run a build for an existing tag without
+# re-pushing it).
 #
 # Unsigned: no code-signing certificate exists yet (see desktop-next/RELEASE.md).
 # Windows SmartScreen and macOS Gatekeeper will both warn users on first run
@@ -13,6 +14,9 @@ name: Release
 # follow-up fix once the actual failure (if any) is visible in the logs.
 
 on:
+  push:
+    tags:
+      - "v*.*.*"
   workflow_dispatch:
     inputs:
       tag:
