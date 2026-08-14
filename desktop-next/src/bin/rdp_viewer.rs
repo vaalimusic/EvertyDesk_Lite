@@ -102,7 +102,15 @@ fn read_bootstrap() -> Result<RdpBootstrap, String> {
 #[cfg(windows)]
 use evertydesk_core::vbox_rdp::{Poll, VrdeCmd};
 #[cfg(windows)]
-use evertydesk_core::vm_console_runtime::{VmConsoleSession, VmConsoleTarget};
+use evertydesk_core::vm_console_runtime::{VmConsoleSession, VmConsoleTarget, VBOX_DESYNC_STATUS};
+
+// `vm_console_runtime` is Windows-only too (it re-exports vbox_rdp's Poll/
+// VrdeCmd and wraps hyperv_rdp -- same reasoning as above). poll_session()
+// below compares against VBOX_DESYNC_STATUS unconditionally even though
+// self.session is always None on non-Windows, so it needs the same-named
+// stand-in treatment as Poll/VrdeCmd.
+#[cfg(not(windows))]
+const VBOX_DESYNC_STATUS: &str = "VRDE_DESYNC";
 
 #[cfg(windows)]
 type RdpSessionHandle = VmConsoleSession;
@@ -288,7 +296,7 @@ impl App {
             match outcome {
                 Poll::Item(message) => {
                     append_log_line("rdp-viewer", &format!("status: {message}"));
-                    if message == evertydesk_core::vm_console_runtime::VBOX_DESYNC_STATUS {
+                    if message == VBOX_DESYNC_STATUS {
                         self.force_reconnect_vbox("VRDE_DESYNC");
                         continue;
                     }
