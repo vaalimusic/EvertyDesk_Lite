@@ -14,14 +14,16 @@
 //! (the old egui client tracks it in a separate `vbox_vrde_ports` map) —
 //! left for a follow-up rather than guessed at here.
 
+use std::fs;
 use std::io::{self, BufReader};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use evertydesk_desktop_next::frame_renderer::FrameRenderer;
+use evertydesk_desktop_next::frame_renderer::{FrameRenderer, ScalingMode};
 use evertydesk_desktop_next::ipc::{read_bounded_line, MAX_IPC_LINE_BYTES};
 use evertydesk_desktop_next::protocol::{RdpBootstrap, RdpTarget};
-use evertydesk_desktop_next::startup_log::install_process_diagnostics;
+use evertydesk_desktop_next::startup_log::{append_log_line, install_process_diagnostics};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
@@ -33,6 +35,16 @@ const DEFAULT_WIDTH: u16 = 1280;
 const DEFAULT_HEIGHT: u16 = 800;
 /// How often to poll the session thread's frame/status channels.
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
+#[cfg(windows)]
+const VBOX_RECONNECT_COOLDOWN: Duration =
+    Duration::from_secs(evertydesk_core::vm_console_runtime::VBOX_RECONNECT_COOLDOWN_SECS);
+#[cfg(not(windows))]
+const VBOX_RECONNECT_COOLDOWN: Duration = Duration::from_secs(10);
+#[cfg(windows)]
+const VBOX_STUCK_REGARDLESS: Duration =
+    Duration::from_secs(evertydesk_core::vm_console_runtime::VBOX_STUCK_REGARDLESS_SECS);
+#[cfg(not(windows))]
+const VBOX_STUCK_REGARDLESS: Duration = Duration::from_secs(60);
 
 fn main() {
     install_process_diagnostics("rdp-viewer");
@@ -40,14 +52,20 @@ fn main() {
     let bootstrap = match read_bootstrap() {
         Ok(bootstrap) => bootstrap,
         Err(error) => {
+            append_log_line("rdp-viewer", &format!("bootstrap failed: {error}"));
             eprintln!("[rdp-viewer] {error}");
             std::process::exit(1);
         }
     };
+    append_log_line(
+        "rdp-viewer",
+        &format!("bootstrap ok: {}", rdp_target_label(&bootstrap.target)),
+    );
 
     let event_loop = match EventLoop::with_user_event().build() {
         Ok(event_loop) => event_loop,
         Err(error) => {
+            append_log_line("rdp-viewer", &format!("event loop create failed: {error}"));
             eprintln!("[rdp-viewer] create event loop failed: {error}");
             std::process::exit(1);
         }
@@ -56,8 +74,16 @@ fn main() {
 
     let mut app = App::new(bootstrap);
     if let Err(error) = event_loop.run_app(&mut app) {
+        append_log_line("rdp-viewer", &format!("event loop run failed: {error}"));
         eprintln!("[rdp-viewer] event loop error: {error}");
         std::process::exit(1);
+    }
+}
+
+fn rdp_target_label(target: &RdpTarget) -> String {
+    match target {
+        RdpTarget::HyperV { vm_guid } => format!("Hyper-V {vm_guid}"),
+        RdpTarget::VirtualBox { vm_uuid, port } => format!("VirtualBox {vm_uuid} :{port}"),
     }
 }
 
@@ -74,9 +100,12 @@ fn read_bootstrap() -> Result<RdpBootstrap, String> {
 }
 
 #[cfg(windows)]
-type RdpSessionHandle = evertydesk_core::hyperv_rdp::RdpSession;
-#[cfg(windows)]
 use evertydesk_core::vbox_rdp::{Poll, VrdeCmd};
+#[cfg(windows)]
+use evertydesk_core::vm_console_runtime::{VmConsoleSession, VmConsoleTarget};
+
+#[cfg(windows)]
+type RdpSessionHandle = VmConsoleSession;
 
 // `hyperv_rdp::RdpSession` (Windows-only, backed by real ironrdp/VRDE
 // plumbing) reuses `vbox_rdp`'s `Poll`/`VrdeCmd` as its own command and
@@ -130,10 +159,17 @@ struct App {
     cursor_position: Option<(i32, i32)>,
     status: String,
     last_poll: Instant,
+    last_frame: Instant,
+    last_reconnect: Instant,
+    reconnect_count: u32,
+    presented_frames: u64,
+    dumped_debug_frames: u32,
+    input_debug_events: u32,
 }
 
 impl App {
     fn new(bootstrap: RdpBootstrap) -> Self {
+        let now = Instant::now();
         Self {
             bootstrap,
             window: None,
@@ -145,31 +181,70 @@ impl App {
             pressed_mouse_buttons: Vec::new(),
             cursor_position: None,
             status: "Подключение...".to_owned(),
-            last_poll: Instant::now(),
+            last_poll: now,
+            last_frame: now,
+            last_reconnect: now - VBOX_RECONNECT_COOLDOWN,
+            reconnect_count: 0,
+            presented_frames: 0,
+            dumped_debug_frames: 0,
+            input_debug_events: 0,
         }
     }
 
     fn target_label(&self) -> String {
         match &self.bootstrap.target {
             RdpTarget::HyperV { vm_guid } => format!("Hyper-V {vm_guid}"),
+            RdpTarget::VirtualBox { vm_uuid, port } => format!("VirtualBox {vm_uuid} :{port}"),
+        }
+    }
+
+    #[cfg(windows)]
+    fn vm_console_target(&self) -> VmConsoleTarget {
+        match &self.bootstrap.target {
+            RdpTarget::HyperV { vm_guid } => VmConsoleTarget::HyperV {
+                vm_guid: vm_guid.clone(),
+                credentials: evertydesk_core::hyperv_rdp::RdpCredentials {
+                    username: self.bootstrap.username.clone(),
+                    password: self.bootstrap.password.clone(),
+                    domain: self.bootstrap.domain.clone(),
+                },
+            },
+            RdpTarget::VirtualBox { vm_uuid, port } => VmConsoleTarget::VirtualBox {
+                vm_uuid: vm_uuid.clone(),
+                port: *port,
+                settings: self.bootstrap.vbox_vrde_settings.into_core(),
+            },
         }
     }
 
     #[cfg(windows)]
     fn connect(&mut self) {
-        let RdpTarget::HyperV { vm_guid } = &self.bootstrap.target;
-        let creds = evertydesk_core::hyperv_rdp::RdpCredentials {
-            username: self.bootstrap.username.clone(),
-            password: self.bootstrap.password.clone(),
-            domain: self.bootstrap.domain.clone(),
-        };
-        match evertydesk_core::hyperv_rdp::RdpSession::connect(
-            vm_guid,
-            creds,
-            (DEFAULT_WIDTH, DEFAULT_HEIGHT),
-        ) {
-            Ok(session) => self.session = Some(session),
+        self.last_frame = Instant::now();
+        let target = self.vm_console_target();
+        append_log_line(
+            "rdp-viewer",
+            &format!("connect requested: {}", target.label()),
+        );
+        if let VmConsoleTarget::VirtualBox { settings, .. } = &target {
+            append_log_line(
+                "rdp-viewer",
+                &format!(
+                    "VirtualBox VRDE profile: color_depth={} compression={}",
+                    settings.color_depth,
+                    settings.compression.label()
+                ),
+            );
+        }
+        match VmConsoleSession::connect(&target, (DEFAULT_WIDTH, DEFAULT_HEIGHT)) {
+            Ok(session) => {
+                append_log_line("rdp-viewer", &format!("connect ok: {}", target.label()));
+                self.session = Some(session);
+            }
             Err(error) => {
+                append_log_line(
+                    "rdp-viewer",
+                    &format!("connect failed: {}: {error}", target.label()),
+                );
                 self.status = format!("Ошибка подключения: {error}");
                 self.set_window_title();
             }
@@ -178,6 +253,7 @@ impl App {
 
     #[cfg(not(windows))]
     fn connect(&mut self) {
+        append_log_line("rdp-viewer", "connect failed: RDP VM is Windows-only");
         self.status = "RDP-подключение к ВМ поддерживается только на Windows (Hyper-V)".to_owned();
         self.set_window_title();
     }
@@ -211,12 +287,21 @@ impl App {
             let outcome = session.poll_status();
             match outcome {
                 Poll::Item(message) => {
+                    append_log_line("rdp-viewer", &format!("status: {message}"));
+                    if message == evertydesk_core::vm_console_runtime::VBOX_DESYNC_STATUS {
+                        self.force_reconnect_vbox("VRDE_DESYNC");
+                        continue;
+                    }
                     self.status = message;
                     self.set_window_title();
                 }
                 Poll::Empty => break,
                 Poll::Dead => {
-                    self.status = "Сессия завершена".to_owned();
+                    let reason = latest_rdp_error(&self.bootstrap.target).unwrap_or_else(|| {
+                        "session channel closed without final status".to_owned()
+                    });
+                    append_log_line("rdp-viewer", &format!("session dead: {reason}"));
+                    self.status = format!("RDP-сессия завершена: {reason}");
                     self.set_window_title();
                     self.session = None;
                     return;
@@ -231,11 +316,15 @@ impl App {
             let outcome = session.poll_frame();
             match outcome {
                 Poll::Item((width, height, rgba)) => {
+                    self.last_frame = Instant::now();
                     latest_frame = Some((width, height, rgba));
                 }
                 Poll::Empty => break,
                 Poll::Dead => {
-                    self.status = "Сессия завершена".to_owned();
+                    let reason = latest_rdp_error(&self.bootstrap.target)
+                        .unwrap_or_else(|| "frame channel closed without final status".to_owned());
+                    append_log_line("rdp-viewer", &format!("frame channel dead: {reason}"));
+                    self.status = format!("RDP-сессия завершена: {reason}");
                     self.set_window_title();
                     self.session = None;
                     return;
@@ -251,6 +340,36 @@ impl App {
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
+        self.presented_frames = self.presented_frames.saturating_add(1);
+        if matches!(self.bootstrap.target, RdpTarget::VirtualBox { .. })
+            && (self.presented_frames <= 8 || self.presented_frames.is_multiple_of(120))
+        {
+            append_log_line(
+                "rdp-viewer",
+                &format!(
+                    "VirtualBox VRDE presenting frame #{}: {}",
+                    self.presented_frames,
+                    frame_fingerprint(width, height, &rgba)
+                ),
+            );
+        }
+        if matches!(self.bootstrap.target, RdpTarget::VirtualBox { .. })
+            && should_dump_vbox_frame(self.presented_frames, self.dumped_debug_frames)
+        {
+            match dump_vbox_debug_frame(width, height, &rgba, self.presented_frames) {
+                Ok(path) => {
+                    self.dumped_debug_frames = self.dumped_debug_frames.saturating_add(1);
+                    append_log_line(
+                        "rdp-viewer",
+                        &format!("VirtualBox VRDE debug frame saved: {}", path.display()),
+                    );
+                }
+                Err(error) => append_log_line(
+                    "rdp-viewer",
+                    &format!("VirtualBox VRDE debug frame save failed: {error}"),
+                ),
+            }
+        }
         if self.desktop_size != (width, height) {
             if let Err(error) = renderer.resize_buffer(width, height) {
                 eprintln!("[rdp-viewer] resize frame buffer failed: {error}");
@@ -267,6 +386,166 @@ impl App {
             window.request_redraw();
         }
     }
+
+    fn maybe_reconnect_stuck_vbox(&mut self) {
+        if !matches!(self.bootstrap.target, RdpTarget::VirtualBox { .. }) || self.session.is_none()
+        {
+            return;
+        }
+        if self.last_reconnect.elapsed() < VBOX_RECONNECT_COOLDOWN {
+            return;
+        }
+        if self.last_frame.elapsed() <= VBOX_STUCK_REGARDLESS {
+            return;
+        }
+
+        self.force_reconnect_vbox("stuck_regardless_60s");
+    }
+
+    fn force_reconnect_vbox(&mut self, reason: &str) {
+        if !matches!(self.bootstrap.target, RdpTarget::VirtualBox { .. }) || self.session.is_none()
+        {
+            return;
+        }
+        self.reconnect_count = self.reconnect_count.saturating_add(1);
+        self.last_reconnect = Instant::now();
+        append_log_line(
+            "rdp-viewer",
+            &format!(
+                "VirtualBox VRDE reconnect #{} reason={reason}: last_frame_ms={}",
+                self.reconnect_count,
+                self.last_frame.elapsed().as_millis()
+            ),
+        );
+        if let Some(session) = self.session.take() {
+            session.send(VrdeCmd::Stop);
+        }
+        self.status = format!("VRDE: переподключение #{}…", self.reconnect_count);
+        self.set_window_title();
+        self.presented_frames = 0;
+        self.has_frame = false;
+        self.dumped_debug_frames = 0;
+        self.connect();
+    }
+}
+
+fn latest_rdp_error(target: &RdpTarget) -> Option<String> {
+    let path: PathBuf = match target {
+        RdpTarget::HyperV { .. } => std::env::temp_dir().join("evertydesk-hvrdp.log"),
+        RdpTarget::VirtualBox { .. } => std::env::temp_dir().join("evertydesk-vrde.log"),
+    };
+    let content = fs::read_to_string(path).ok()?;
+    content
+        .lines()
+        .rev()
+        .find(|line| {
+            let lower = line.to_lowercase();
+            lower.contains("ошибка")
+                || lower.contains("error")
+                || lower.contains("failed")
+                || lower.contains("refused")
+                || lower.contains("reset")
+                || lower.contains("10054")
+                || lower.contains("panic")
+        })
+        .map(|line| line.trim().to_owned())
+}
+
+fn frame_fingerprint(width: u32, height: u32, rgba: &[u8]) -> String {
+    let Ok(wu) = usize::try_from(width) else {
+        return format!("bad width={width}");
+    };
+    let Ok(hu) = usize::try_from(height) else {
+        return format!("bad height={height}");
+    };
+    let pixel_count = wu.saturating_mul(hu);
+    if pixel_count == 0 || rgba.len() != pixel_count.saturating_mul(4) {
+        return format!(
+            "bad geometry {width}x{height} len={} expected={}",
+            rgba.len(),
+            pixel_count.saturating_mul(4)
+        );
+    }
+
+    let pixel_at = |px: usize, py: usize| -> String {
+        let off = (py.saturating_mul(wu).saturating_add(px)).saturating_mul(4);
+        if off + 4 <= rgba.len() {
+            format!(
+                "{:02x}{:02x}{:02x}{:02x}",
+                rgba[off],
+                rgba[off + 1],
+                rgba[off + 2],
+                rgba[off + 3]
+            )
+        } else {
+            "????????".to_owned()
+        }
+    };
+
+    const SAMPLES: usize = 512;
+    let step = (pixel_count / SAMPLES).max(1);
+    let mut nonzero = 0usize;
+    let mut checked = 0usize;
+    let mut px = 0usize;
+    while px < pixel_count {
+        let off = px * 4;
+        if rgba[off] != 0 || rgba[off + 1] != 0 || rgba[off + 2] != 0 {
+            nonzero += 1;
+        }
+        checked += 1;
+        px += step;
+    }
+    let nonzero_pct = 100.0 * nonzero as f64 / checked.max(1) as f64;
+    format!(
+        "{}x{} len={} sample_nonzero={:.1}% tl={} tr={} center={} bl={} br={}",
+        width,
+        height,
+        rgba.len(),
+        nonzero_pct,
+        pixel_at(0, 0),
+        pixel_at(wu.saturating_sub(1), 0),
+        pixel_at(wu / 2, hu / 2),
+        pixel_at(0, hu.saturating_sub(1)),
+        pixel_at(wu.saturating_sub(1), hu.saturating_sub(1)),
+    )
+}
+
+fn should_dump_vbox_frame(presented_frames: u64, dumped_debug_frames: u32) -> bool {
+    std::env::var_os("EVERTYDESK_RDP_DUMP_FRAMES").is_some()
+        && dumped_debug_frames < 3
+        && matches!(presented_frames, 1 | 4 | 120)
+}
+
+fn dump_vbox_debug_frame(
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    frame_index: u64,
+) -> Result<PathBuf, String> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|px| px.checked_mul(4))
+        .ok_or_else(|| format!("frame size overflow {width}x{height}"))?;
+    if rgba.len() != expected {
+        return Err(format!(
+            "bad frame geometry {width}x{height}: len={} expected={expected}",
+            rgba.len()
+        ));
+    }
+
+    let path = std::env::temp_dir().join(format!("evertydesk-vrde-frame-{frame_index}.png"));
+    let file =
+        fs::File::create(&path).map_err(|error| format!("create {}: {error}", path.display()))?;
+    let mut encoder = png::Encoder::new(file, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|error| format!("png header {}: {error}", path.display()))?;
+    writer
+        .write_image_data(rgba)
+        .map_err(|error| format!("png data {}: {error}", path.display()))?;
+    Ok(path)
 }
 
 impl ApplicationHandler for App {
@@ -286,7 +565,7 @@ impl ApplicationHandler for App {
                 return;
             }
         };
-        let renderer = match FrameRenderer::new(
+        let mut renderer = match FrameRenderer::new(
             Arc::clone(&window),
             u32::from(DEFAULT_WIDTH),
             u32::from(DEFAULT_HEIGHT),
@@ -298,6 +577,7 @@ impl ApplicationHandler for App {
                 return;
             }
         };
+        renderer.set_scaling_mode(ScalingMode::Fill);
         self.window = Some(window);
         self.renderer = Some(renderer);
         self.connect();
@@ -336,6 +616,7 @@ impl ApplicationHandler for App {
                 let x = x.min(u16::MAX as usize) as u16;
                 let y = y.min(u16::MAX as usize) as u16;
                 self.cursor_position = Some((i32::from(x), i32::from(y)));
+                self.log_input_debug(format_args!("mouse_move {x},{y}"));
                 if let Some(session) = &self.session {
                     session.send(VrdeCmd::MouseMove { x, y });
                 }
@@ -352,7 +633,15 @@ impl ApplicationHandler for App {
                 } else {
                     self.pressed_mouse_buttons.retain(|held| *held != button);
                 }
+                let cursor_position = self.cursor_position;
+                let cursor_u16 = self.cursor_position_u16();
+                self.log_input_debug(format_args!(
+                    "mouse_button button={index} down={down} pos={cursor_position:?}",
+                ));
                 if let Some(session) = &self.session {
+                    if let Some((x, y)) = cursor_u16 {
+                        session.send(VrdeCmd::MouseMove { x, y });
+                    }
                     session.send(VrdeCmd::MouseButton {
                         button: index,
                         down,
@@ -368,7 +657,15 @@ impl ApplicationHandler for App {
                     return;
                 }
                 let delta = (steps.clamp(-10.0, 10.0) * 120.0) as i16;
+                let cursor_position = self.cursor_position;
+                let cursor_u16 = self.cursor_position_u16();
+                self.log_input_debug(format_args!(
+                    "mouse_wheel delta={delta} pos={cursor_position:?}",
+                ));
                 if let Some(session) = &self.session {
+                    if let Some((x, y)) = cursor_u16 {
+                        session.send(VrdeCmd::MouseMove { x, y });
+                    }
                     session.send(VrdeCmd::MouseWheel { delta });
                 }
             }
@@ -395,20 +692,40 @@ impl ApplicationHandler for App {
         if self.last_poll.elapsed() >= POLL_INTERVAL {
             self.last_poll = Instant::now();
             self.poll_session();
+            self.maybe_reconnect_stuck_vbox();
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(self.last_poll + POLL_INTERVAL));
     }
 }
 
 impl App {
-    fn send_keyboard_input(&mut self, event: KeyEvent) {
-        let Some(session) = &self.session else {
+    fn cursor_position_u16(&self) -> Option<(u16, u16)> {
+        let (x, y) = self.cursor_position?;
+        Some((
+            x.clamp(0, i32::from(u16::MAX)) as u16,
+            y.clamp(0, i32::from(u16::MAX)) as u16,
+        ))
+    }
+
+    fn log_input_debug(&mut self, args: std::fmt::Arguments<'_>) {
+        if self.input_debug_events >= 80 {
             return;
-        };
+        }
+        self.input_debug_events = self.input_debug_events.saturating_add(1);
+        append_log_line(
+            "rdp-viewer",
+            &format!("VM input #{}: {args}", self.input_debug_events),
+        );
+    }
+
+    fn send_keyboard_input(&mut self, event: KeyEvent) {
         let PhysicalKey::Code(code) = event.physical_key else {
             return;
         };
         let pressed = event.state == ElementState::Pressed;
+        if self.session.is_none() {
+            return;
+        }
         let combo =
             self.modifiers.control_key() || self.modifiers.alt_key() || self.modifiers.super_key();
 
@@ -420,7 +737,10 @@ impl App {
         }
         if !combo && pressed && rdp_key_is_plain_text(code) {
             if let Some(text) = event.text.as_ref().filter(|text| !text.is_empty()) {
-                session.send(VrdeCmd::Text(text.to_string()));
+                self.log_input_debug(format_args!("key_text {text:?}"));
+                if let Some(session) = &self.session {
+                    send_text_like_lite(session, text);
+                }
                 return;
             }
         }
@@ -444,6 +764,13 @@ impl App {
         }
 
         if pressed {
+            self.log_input_debug(format_args!(
+                "key_down code={code:?} sc={scancode:#x} ext={extended} mods={}",
+                mods.len()
+            ));
+            let Some(session) = &self.session else {
+                return;
+            };
             for (m_scancode, m_extended) in &mods {
                 session.send(VrdeCmd::KeyDown {
                     scancode: *m_scancode,
@@ -452,6 +779,13 @@ impl App {
             }
             session.send(VrdeCmd::KeyDown { scancode, extended });
         } else {
+            self.log_input_debug(format_args!(
+                "key_up code={code:?} sc={scancode:#x} ext={extended} mods={}",
+                mods.len()
+            ));
+            let Some(session) = &self.session else {
+                return;
+            };
             session.send(VrdeCmd::KeyUp { scancode, extended });
             for (m_scancode, m_extended) in mods.iter().rev() {
                 session.send(VrdeCmd::KeyUp {
@@ -461,6 +795,16 @@ impl App {
             }
         }
     }
+}
+
+#[cfg(windows)]
+fn send_text_like_lite(session: &RdpSessionHandle, text: &str) {
+    evertydesk_core::vm_console_runtime::send_text_as_lite(session, text);
+}
+
+#[cfg(not(windows))]
+fn send_text_like_lite(session: &RdpSessionHandle, text: &str) {
+    session.send(VrdeCmd::Text(text.to_owned()));
 }
 
 fn mouse_button_index(button: MouseButton) -> Option<u8> {

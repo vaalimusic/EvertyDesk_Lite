@@ -1,6 +1,6 @@
 use std::{
     io::{Read, Write},
-    net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket},
+    net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket},
     sync::{
         atomic::AtomicBool,
         mpsc::{self, Receiver, Sender},
@@ -19,17 +19,18 @@ use shiguredo_libvpx::{Decoder as VpxDecoder, DecoderCodec, DecoderConfig};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use crate::{
+    crypto::StreamCipher,
     rustdesk_proto::{
         decode_message, decode_peer_message, encode_message, encode_peer_message, misc,
         peer_message, rendezvous_message, video_frame, CaptureDisplays, Chroma, Clipboard,
         ClipboardFormat, CodecAbility, ConnType, ControlKey, CursorData, EncodedVideoFrames,
-        ImageQuality, KeyEvent, KeyboardMode, LoginRequest, MessageQuery, Misc, MouseEvent,
+        ImageQuality, KeyEvent, KeyExchange, KeyboardMode, LoginRequest, MessageQuery, Misc, MouseEvent,
         NatType, OnlineRequest, OptionMessage, PeerMessage, PreferCodec, PublicKey,
         PunchHoleFailure, PunchHoleRequest, RendezvousMessage, RequestRelay, ScreenshotRequest,
         ShellMessage, ShellMessageKind, SupportedDecoding, SwitchDisplay, TestDelay,
         TestNatRequest,
     },
-    settings::{CodecPreference, DisplayConfig, ServerConfig},
+    settings::{CodecPreference, DisplayConfig, NetworkDebugConfig, ServerConfig},
 };
 
 const RENDEZVOUS_PORT: u16 = 21116;
@@ -90,6 +91,7 @@ pub struct ConnectionRequest {
     /// Fail instead of silently degrading to the TCP relay path when direct
     /// transport cannot be established.
     pub require_direct_transport: bool,
+    pub network_debug: NetworkDebugConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -475,6 +477,7 @@ impl TransportClient {
     ) {
         let display_config = request.display.clone();
         let control_only = request.control_only;
+        let network_debug = request.network_debug.clone();
         let audio_enabled = Arc::clone(&request.audio_enabled);
         let mut codec_preference = display_config.codec;
         let initial_video_fps = display_config.target_fps.clamp(5, 60) as i32;
@@ -1336,11 +1339,16 @@ impl TransportClient {
                         //   1) список EvrtEndpoints (LAN+VPN) — основной путь
                         //   2) host IP от hbbs punch-hole + EvrtUdpPort — запасной
                         if !control_only && !evrt_started && codec_preference.use_evrt() {
-                            let mut candidates = evrt_candidates;
+                            let mut candidates =
+                                filter_debug_udp_candidates(evrt_candidates, &network_debug);
                             if let (Some(port), Some(mut base)) = (evrt_port_seen, evrt_host_base) {
                                 base.set_port(port);
-                                if !candidates.contains(&base) {
-                                    candidates.push(base);
+                                if let Some(filtered_base) =
+                                    filter_debug_udp_addr(Some(base), &network_debug)
+                                {
+                                    if !candidates.contains(&filtered_base) {
+                                        candidates.push(filtered_base);
+                                    }
                                 }
                             }
                             if !candidates.is_empty() {
@@ -1739,6 +1747,36 @@ fn image_quality_label(quality: ImageQuality) -> &'static str {
     }
 }
 
+fn is_lan_candidate(addr: SocketAddr) -> bool {
+    match addr.ip() {
+        IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+        IpAddr::V6(ip) => ip.is_loopback(),
+    }
+}
+
+fn filter_debug_udp_addr(addr: Option<SocketAddr>, debug: &NetworkDebugConfig) -> Option<SocketAddr> {
+    if debug.force_relay {
+        return None;
+    }
+    addr.filter(|candidate| !debug.ignore_lan_candidates || !is_lan_candidate(*candidate))
+}
+
+fn filter_debug_udp_candidates(
+    candidates: Vec<SocketAddr>,
+    debug: &NetworkDebugConfig,
+) -> Vec<SocketAddr> {
+    if debug.force_relay {
+        return Vec::new();
+    }
+    if !debug.ignore_lan_candidates {
+        return candidates;
+    }
+    candidates
+        .into_iter()
+        .filter(|candidate| !is_lan_candidate(*candidate))
+        .collect()
+}
+
 fn establish_session(
     request: ConnectionRequest,
     progress: &mut impl FnMut(u8, String),
@@ -1756,9 +1794,17 @@ fn establish_session(
     String,
 > {
     let session_started = Instant::now();
-    let relay_first = relay_first_fast_path() && !request.require_direct_transport;
-    let udp_probe = blocking_udp_nat_probe_enabled();
-    let direct_tcp_probe = direct_tcp_probe_enabled() || request.require_direct_transport;
+    if request.network_debug.force_relay && request.require_direct_transport {
+        return Err(
+            "Conflicting transport settings: force relay is enabled while direct transport is required"
+                .to_owned(),
+        );
+    }
+    let relay_first =
+        request.network_debug.force_relay || (relay_first_fast_path() && !request.require_direct_transport);
+    let udp_probe = blocking_udp_nat_probe_enabled() && !request.network_debug.force_relay;
+    let direct_tcp_probe =
+        !request.network_debug.force_relay && (direct_tcp_probe_enabled() || request.require_direct_transport);
     let control_only = request.control_only;
 
     progress(5, "Validating input".to_owned());
@@ -1776,6 +1822,8 @@ fn establish_session(
     let id_connect_started = Instant::now();
     let mut rendezvous_stream = connect_tcp(&request.server.id_server, RENDEZVOUS_PORT)?;
     let direct_local_addr = rendezvous_stream.local_addr().ok();
+    let mut rendezvous_cipher =
+        negotiate_rendezvous_key_exchange(&mut rendezvous_stream, &request.server.public_key)?;
     progress(
         35,
         format!(
@@ -1832,7 +1880,7 @@ fn establish_session(
         60,
         "Sending RustDesk PunchHoleRequest (EVRT probe)".to_owned(),
     );
-    let message = RendezvousMessage {
+    let mut message = RendezvousMessage {
         union: Some(rendezvous_message::Union::PunchHoleRequest(
             PunchHoleRequest {
                 id: request.remote_id.clone(),
@@ -1848,14 +1896,17 @@ fn establish_session(
             },
         )),
     };
-    send_framed(&mut rendezvous_stream, &encode_message(&message))?;
+    if let Some(rendezvous_message::Union::PunchHoleRequest(ph)) = message.union.as_mut() {
+        ph.force_relay = request.network_debug.force_relay;
+    }
+    rendezvous_send(&mut rendezvous_stream, rendezvous_cipher.as_mut(), &encode_message(&message))?;
 
     progress(80, "Waiting for rendezvous response".to_owned());
     let rendezvous_wait_started = Instant::now();
     rendezvous_stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|err| format!("Failed to set read timeout: {err}"))?;
-    let response = read_framed(&mut rendezvous_stream)?;
+    let response = rendezvous_read(&mut rendezvous_stream, rendezvous_cipher.as_mut())?;
     let decoded = decode_message(&response).map_err(|err| format!("Decode failed: {err}"))?;
     let rendezvous_info = describe_rendezvous_response(&decoded);
     drop(rendezvous_stream);
@@ -1875,6 +1926,8 @@ fn establish_session(
                 "EVRT probe failed, retrying with force_relay=true".to_owned(),
             );
             let mut rendezvous2 = connect_tcp(&request.server.id_server, RENDEZVOUS_PORT)?;
+            let mut rendezvous2_cipher =
+                negotiate_rendezvous_key_exchange(&mut rendezvous2, &request.server.public_key)?;
             let msg2 = RendezvousMessage {
                 union: Some(rendezvous_message::Union::PunchHoleRequest(
                     PunchHoleRequest {
@@ -1891,11 +1944,11 @@ fn establish_session(
                     },
                 )),
             };
-            send_framed(&mut rendezvous2, &encode_message(&msg2))?;
+            rendezvous_send(&mut rendezvous2, rendezvous2_cipher.as_mut(), &encode_message(&msg2))?;
             rendezvous2
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .ok();
-            let resp2 = read_framed(&mut rendezvous2)?;
+            let resp2 = rendezvous_read(&mut rendezvous2, rendezvous2_cipher.as_mut())?;
             let dec2 = decode_message(&resp2).map_err(|e| format!("Decode failed: {e}"))?;
             describe_rendezvous_response(&dec2)?
         }
@@ -1916,10 +1969,13 @@ fn establish_session(
     let secure_relay = rendezvous.has_signed_pk;
     let initial_video_fps = request.display.target_fps.clamp(5, 60) as i32;
     let codec_preference = request.display.codec;
-    let host_udp_base = rendezvous
-        .peer_udp_addr
-        .as_ref()
-        .and_then(|b| crate::evrt_session::decode_punch_addr(b));
+    let host_udp_base = filter_debug_udp_addr(
+        rendezvous
+            .peer_udp_addr
+            .as_ref()
+            .and_then(|b| crate::evrt_session::decode_punch_addr(b)),
+        &request.network_debug,
+    );
 
     if let Some(peer_addr) =
         host_udp_base.filter(|_| !rendezvous.peer_is_udp && direct_tcp_probe && !relay_first)
@@ -1946,11 +2002,15 @@ fn establish_session(
                 early_evrt_candidates,
                 evrt_token,
             )) => {
+                let early_evrt_candidates =
+                    filter_debug_udp_candidates(early_evrt_candidates, &request.network_debug);
                 let evrt_host_addr = evrt_port_from_misc.map(|port| {
                     let mut addr = peer_addr;
                     addr.set_port(port);
                     addr
                 });
+                let evrt_host_addr =
+                    filter_debug_udp_addr(evrt_host_addr, &request.network_debug);
                 return Ok((
                     direct_stream,
                     format!("{peer_stage}; transport=direct-tcp"),
@@ -2101,12 +2161,16 @@ fn establish_session(
                 // Базовый UDP-адрес хоста (IP) от hbbs. Порт может прийти позже
                 // в Misc{EvrtUdpPort} уже в session loop.
                 // Если порт уже пришёл в handshake — готовый адрес.
+                let early_evrt_candidates =
+                    filter_debug_udp_candidates(early_evrt_candidates, &request.network_debug);
                 let evrt_host_addr = evrt_port_from_misc.and_then(|port| {
                     host_udp_base.map(|mut addr| {
                         addr.set_port(port);
                         addr
                     })
                 });
+                let evrt_host_addr =
+                    filter_debug_udp_addr(evrt_host_addr, &request.network_debug);
                 return Ok((
                     relay_stream,
                     peer_stage,
@@ -2321,6 +2385,114 @@ pub fn read_framed(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
     Ok(payload)
 }
 
+fn negotiate_rendezvous_key_exchange(
+    stream: &mut TcpStream,
+    server_public_key: &str,
+) -> Result<Option<StreamCipher>, String> {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|err| format!("Failed to set TCP key exchange timeout: {err}"))?;
+
+    let first = match read_framed(stream) {
+        Ok(payload) => payload,
+        Err(err)
+            if err.contains("timed out")
+                || err.contains("deadline")
+                || err.contains("would block")
+                || err.contains("время")
+                || err.contains("operation timed out") =>
+        {
+            return Ok(None);
+        }
+        Err(err) => return Err(format!("TCP key exchange read failed: {err}")),
+    };
+
+    let msg =
+        decode_message(&first).map_err(|err| format!("TCP key exchange decode failed: {err}"))?;
+    let response_kind = rendezvous_response_kind(&msg.union);
+    let Some(rendezvous_message::Union::KeyExchange(exchange)) = msg.union else {
+        return Err(format!(
+            "Unexpected first TCP rendezvous response: {response_kind}"
+        ));
+    };
+    if exchange.keys.len() != 1 {
+        return Err(format!(
+            "Invalid TCP key exchange: expected 1 server key, got {}",
+            exchange.keys.len()
+        ));
+    }
+
+    let server_sign_pk = STANDARD
+        .decode(server_public_key.trim())
+        .map_err(|err| format!("Invalid rendezvous public key base64: {err}"))?;
+    let server_box_pk = crate::crypto::verify_signed_message(&exchange.keys[0], &server_sign_pk)
+        .ok_or_else(|| "TCP key exchange signature mismatch".to_owned())?;
+    if server_box_pk.len() != 32 {
+        return Err(format!(
+            "TCP key exchange server box key has invalid length {}",
+            server_box_pk.len()
+        ));
+    }
+
+    let (our_pk, sealed_key, symmetric_key) = crate::crypto::create_symmetric_key_msg(&server_box_pk)
+        .ok_or_else(|| "TCP key exchange symmetric key seal failed".to_owned())?;
+    let response = RendezvousMessage {
+        union: Some(rendezvous_message::Union::KeyExchange(KeyExchange {
+            keys: vec![our_pk, sealed_key],
+        })),
+    };
+    send_framed(stream, &encode_message(&response))?;
+    StreamCipher::new(&symmetric_key)
+        .map(Some)
+        .ok_or_else(|| "TCP key exchange produced invalid symmetric key".to_owned())
+}
+
+fn rendezvous_send(
+    stream: &mut TcpStream,
+    cipher: Option<&mut StreamCipher>,
+    payload: &[u8],
+) -> Result<(), String> {
+    if let Some(cipher) = cipher {
+        send_framed(stream, &cipher.encrypt(payload))
+    } else {
+        send_framed(stream, payload)
+    }
+}
+
+fn rendezvous_read(
+    stream: &mut TcpStream,
+    cipher: Option<&mut StreamCipher>,
+) -> Result<Vec<u8>, String> {
+    let payload = read_framed(stream)?;
+    if let Some(cipher) = cipher {
+        cipher.decrypt(&payload)
+    } else {
+        Ok(payload)
+    }
+}
+
+fn rendezvous_response_kind(union: &Option<rendezvous_message::Union>) -> &'static str {
+    match union {
+        Some(rendezvous_message::Union::RegisterPeer(_)) => "RegisterPeer",
+        Some(rendezvous_message::Union::RegisterPeerResponse(_)) => "RegisterPeerResponse",
+        Some(rendezvous_message::Union::RegisterPk(_)) => "RegisterPk",
+        Some(rendezvous_message::Union::RegisterPkResponse(_)) => "RegisterPkResponse",
+        Some(rendezvous_message::Union::PunchHoleRequest(_)) => "PunchHoleRequest",
+        Some(rendezvous_message::Union::PunchHole(_)) => "PunchHole",
+        Some(rendezvous_message::Union::PunchHoleResponse(_)) => "PunchHoleResponse",
+        Some(rendezvous_message::Union::FetchLocalAddr(_)) => "FetchLocalAddr",
+        Some(rendezvous_message::Union::RequestRelay(_)) => "RequestRelay",
+        Some(rendezvous_message::Union::RelayResponse(_)) => "RelayResponse",
+        Some(rendezvous_message::Union::OnlineRequest(_)) => "OnlineRequest",
+        Some(rendezvous_message::Union::OnlineResponse(_)) => "OnlineResponse",
+        Some(rendezvous_message::Union::KeyExchange(_)) => "KeyExchange",
+        Some(rendezvous_message::Union::TestNatRequest(_)) => "TestNatRequest",
+        Some(rendezvous_message::Union::TestNatResponse(_)) => "TestNatResponse",
+        Some(rendezvous_message::Union::PeerDiscovery(_)) => "PeerDiscovery",
+        None => "Empty",
+    }
+}
+
 pub fn encode_frame_len(len: usize) -> Result<Vec<u8>, String> {
     if len <= 0x3f {
         Ok(vec![(len << 2) as u8])
@@ -2348,6 +2520,7 @@ fn request_relay_reservation(
     secure: bool,
 ) -> Result<String, String> {
     let mut socket = connect_tcp(rendezvous_server, RENDEZVOUS_PORT)?;
+    let mut cipher = negotiate_rendezvous_key_exchange(&mut socket, public_key)?;
     let uuid = uuid::Uuid::new_v4().to_string();
     let request = RendezvousMessage {
         union: Some(rendezvous_message::Union::RequestRelay(RequestRelay {
@@ -2361,11 +2534,11 @@ fn request_relay_reservation(
             token: String::new(),
         })),
     };
-    send_framed(&mut socket, &encode_message(&request))?;
+    rendezvous_send(&mut socket, cipher.as_mut(), &encode_message(&request))?;
     socket
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|err| format!("Failed to set read timeout: {err}"))?;
-    let response = decode_message(&read_framed(&mut socket)?)
+    let response = decode_message(&rendezvous_read(&mut socket, cipher.as_mut())?)
         .map_err(|err| format!("Relay reservation decode failed: {err}"))?;
     match response.union {
         Some(rendezvous_message::Union::RelayResponse(response)) => {
@@ -2375,7 +2548,10 @@ fn request_relay_reservation(
                 Err(response.refuse_reason)
             }
         }
-        _ => Err("Unexpected relay reservation response".to_owned()),
+        other => Err(format!(
+            "Unexpected relay reservation response: {}",
+            rendezvous_response_kind(&other)
+        )),
     }
 }
 

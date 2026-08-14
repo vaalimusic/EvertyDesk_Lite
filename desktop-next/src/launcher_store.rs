@@ -138,6 +138,12 @@ impl LanguagePreference {
     }
 }
 
+impl std::fmt::Display for LanguagePreference {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdateChannelPreference {
@@ -164,6 +170,12 @@ impl UpdateChannelPreference {
             Self::ManifestUrl => "Проверять HTTPS latest.json с вашим manifest-контрактом.",
             Self::GithubRelease => "Искать latest.json в последнем GitHub Release.",
         }
+    }
+}
+
+impl std::fmt::Display for UpdateChannelPreference {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
     }
 }
 

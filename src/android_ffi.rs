@@ -422,6 +422,7 @@ fn start_android_session(
         audio_enabled: Arc::new(AtomicBool::new(true)),
         evrt2_only,
         require_direct_transport: false,
+        network_debug: crate::settings::NetworkDebugConfig::default(),
     };
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<SessionCommand>();

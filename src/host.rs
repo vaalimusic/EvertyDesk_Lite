@@ -23,6 +23,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use sha2::{Digest, Sha256};
+
 static APPROVALS: OnceLock<Mutex<std::collections::HashMap<String, bool>>> = OnceLock::new();
 static RECENT_RELAY_EVENTS: OnceLock<Mutex<std::collections::HashMap<String, Instant>>> =
     OnceLock::new();
@@ -202,8 +204,6 @@ fn relay_event_seen_recently(key: String, window: Duration) -> bool {
         false
     }
 }
-
-use sha2::{Digest, Sha256};
 
 use crate::{
     crypto::{self, StreamCipher},
@@ -672,6 +672,8 @@ fn run_host_loop(
             binary_build_stamp(),
         ),
     );
+
+    log_access_password_state(&events, &config);
 
     // On Windows, ensure an inbound UDP firewall rule exists for this binary.
     // This is needed because Windows Firewall blocks unsolicited inbound UDP
@@ -6270,6 +6272,36 @@ fn host_log(events: &Sender<HostEvent>, msg: String) {
     // channel.  Printing here would cause every line to appear twice in
     // headless mode.
     let _ = events.send(HostEvent::Log(msg));
+}
+
+fn log_access_password_state(events: &Sender<HostEvent>, config: &AppConfig) {
+    let permanent_fingerprint = password_fingerprint(&config.permanent_password);
+    host_log(
+        events,
+        format!(
+            "Access passwords: one_time_len={} permanent_loaded={} permanent_len={} permanent_fp={}",
+            config.local_password.chars().count(),
+            !config.permanent_password.trim().is_empty(),
+            config.permanent_password.chars().count(),
+            permanent_fingerprint.unwrap_or_else(|| "-".to_owned())
+        ),
+    );
+}
+
+fn password_fingerprint(password: &str) -> Option<String> {
+    if password.trim().is_empty() {
+        return None;
+    }
+    let mut hash = Sha256::new();
+    hash.update(password.as_bytes());
+    let digest = hash.finalize();
+    Some(
+        digest
+            .iter()
+            .take(4)
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
 }
 
 fn is_timeout(e: &str) -> bool {

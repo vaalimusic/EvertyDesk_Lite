@@ -11,10 +11,11 @@
 //!     derived from a sequence counter.
 
 use dryoc::classic::{
-    crypto_box::{crypto_box_keypair, crypto_box_open_easy},
+    crypto_box::{crypto_box_easy, crypto_box_keypair, crypto_box_open_easy},
     crypto_secretbox::{crypto_secretbox_easy, crypto_secretbox_open_easy},
-    crypto_sign::{crypto_sign, crypto_sign_keypair},
+    crypto_sign::{crypto_sign, crypto_sign_keypair, crypto_sign_open},
 };
+use dryoc::rng::copy_randombytes;
 
 pub const SIGN_SK_LEN: usize = 64;
 const BOX_PK_LEN: usize = 32;
@@ -37,6 +38,19 @@ pub fn sign(message: &[u8], sign_sk: &[u8]) -> Option<Vec<u8>> {
     let mut signed = vec![0u8; message.len() + SIGN_BYTES];
     crypto_sign(&mut signed, message, &sk).ok()?;
     Some(signed)
+}
+
+/// Verify a libsodium combined Ed25519 signature (input = signature(64) ‖
+/// message) and return the unsigned message. Used by RustDesk's TCP rendezvous
+/// `KeyExchange`, where hbbs signs its ephemeral box public key.
+pub fn verify_signed_message(signed: &[u8], sign_pk: &[u8]) -> Option<Vec<u8>> {
+    let pk: [u8; 32] = sign_pk.try_into().ok()?;
+    if signed.len() < SIGN_BYTES {
+        return None;
+    }
+    let mut message = vec![0u8; signed.len() - SIGN_BYTES];
+    crypto_sign_open(&mut message, signed, &pk).ok()?;
+    Some(message)
 }
 
 /// Ephemeral X25519 box key pair for one connection: `(public[32], secret[32])`.
@@ -63,6 +77,20 @@ pub fn open_symmetric_key(sealed: &[u8], their_pk: &[u8], our_box_sk: &[u8]) -> 
     } else {
         None
     }
+}
+
+/// Create the client half of RustDesk's TCP rendezvous `KeyExchange`.
+///
+/// Returns `(our_box_pk, sealed_symmetric_key, symmetric_key)`.
+pub fn create_symmetric_key_msg(their_pk: &[u8]) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let their: [u8; BOX_PK_LEN] = their_pk.try_into().ok()?;
+    let (our_pk, our_sk) = crypto_box_keypair();
+    let mut key = [0u8; SECRETBOX_KEY_LEN];
+    copy_randombytes(&mut key);
+    let nonce = [0u8; NONCE_LEN];
+    let mut sealed = vec![0u8; SECRETBOX_KEY_LEN + MAC_BYTES];
+    crypto_box_easy(&mut sealed, &key, &nonce, &their, &our_sk).ok()?;
+    Some((our_pk.to_vec(), sealed, key.to_vec()))
 }
 
 /// Stream cipher state for an encrypted relay session.

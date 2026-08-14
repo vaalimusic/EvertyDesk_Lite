@@ -507,6 +507,7 @@ pub fn run_diagnose(remote_id: &str, password: &str, secs: u64, out_dir: &str) -
         audio_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         evrt2_only: false,
         require_direct_transport: false,
+        network_debug: config.network_debug.clone(),
     };
 
     eprintln!("╔══════════════════════════════════════════════════════════╗");

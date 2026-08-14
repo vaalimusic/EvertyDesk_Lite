@@ -374,6 +374,8 @@ fn default_true() -> bool {
 pub struct RdpBootstrap {
     pub target: RdpTarget,
     #[serde(default)]
+    pub vbox_vrde_settings: RdpVboxVrdeSettings,
+    #[serde(default)]
     pub username: String,
     #[serde(default)]
     pub password: String,
@@ -387,6 +389,7 @@ impl std::fmt::Debug for RdpBootstrap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RdpBootstrap")
             .field("target", &self.target)
+            .field("vbox_vrde_settings", &self.vbox_vrde_settings)
             .field("username", &self.username)
             .field("password", &"<redacted>")
             .field("domain", &self.domain)
@@ -416,6 +419,54 @@ pub enum RdpTarget {
     /// Hyper-V Enhanced Session, via the host's `vmconnect` broker
     /// (127.0.0.1:2179) — `vm_guid` is `Msvm_ComputerSystem.Name`.
     HyperV { vm_guid: String },
+    /// VirtualBox VRDE, via the local VRDE listener enabled by VBoxManage.
+    VirtualBox { vm_uuid: String, port: u16 },
+}
+
+/// VirtualBox VRDE profile carried by the RDP viewer bootstrap.
+///
+/// Mirrors the old EvertyDesk Lite VM-console settings instead of hardcoding a
+/// different desktop-next profile in the viewer binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RdpVboxVrdeSettings {
+    #[serde(default = "default_vbox_vrde_color_depth")]
+    pub color_depth: u32,
+    #[serde(default)]
+    pub compression: RdpVboxCompression,
+}
+
+impl Default for RdpVboxVrdeSettings {
+    fn default() -> Self {
+        Self {
+            color_depth: default_vbox_vrde_color_depth(),
+            compression: RdpVboxCompression::default(),
+        }
+    }
+}
+
+fn default_vbox_vrde_color_depth() -> u32 {
+    32
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RdpVboxCompression {
+    K8,
+    #[default]
+    K64,
+}
+
+#[cfg(all(windows, feature = "viewer-core"))]
+impl RdpVboxVrdeSettings {
+    pub fn into_core(self) -> evertydesk_core::vbox_rdp::VrdeSettings {
+        evertydesk_core::vbox_rdp::VrdeSettings {
+            color_depth: self.color_depth,
+            compression: match self.compression {
+                RdpVboxCompression::K8 => evertydesk_core::vbox_rdp::CompressionChoice::K8,
+                RdpVboxCompression::K64 => evertydesk_core::vbox_rdp::CompressionChoice::K64,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -582,11 +633,11 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ViewerStatus::Transport {
                 profile: "Desktop EVRTCK".to_owned(),
-                route: "TCP fallback".to_owned(),
-                reason: "EVRT UDP inactive".to_owned(),
+                route: "TCP relay".to_owned(),
+                reason: "EVRT UDP inactive; using TCP relay".to_owned(),
             })
             .unwrap(),
-            r#"{"event":"transport","profile":"Desktop EVRTCK","route":"TCP fallback","reason":"EVRT UDP inactive"}"#
+            r#"{"event":"transport","profile":"Desktop EVRTCK","route":"TCP relay","reason":"EVRT UDP inactive; using TCP relay"}"#
         );
 
         let reconnecting = ViewerStatus::Reconnecting {

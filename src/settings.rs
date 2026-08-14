@@ -56,6 +56,17 @@ impl Default for SecurityConfig {
     }
 }
 
+// ── Network debug configuration ──────────────────────────────────────────────
+
+/// Optional routing overrides used for local diagnostics.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct NetworkDebugConfig {
+    #[serde(default)]
+    pub ignore_lan_candidates: bool,
+    #[serde(default)]
+    pub force_relay: bool,
+}
+
 // ── Theme mode ───────────────────────────────────────────────────────────────
 
 /// Режим темы — хранится в конфиге, используется UI (desktop-only).
@@ -150,6 +161,15 @@ pub enum FsrQualitySetting {
 }
 
 impl FsrQualitySetting {
+    pub const ALL: [Self; 6] = [
+        Self::Off,
+        Self::Native,
+        Self::UltraQuality,
+        Self::Quality,
+        Self::Balanced,
+        Self::Performance,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Off => "Выключен",
@@ -178,6 +198,12 @@ impl FsrQualitySetting {
     }
 }
 
+impl std::fmt::Display for FsrQualitySetting {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamingMode {
@@ -188,6 +214,8 @@ pub enum StreamingMode {
 }
 
 impl StreamingMode {
+    pub const ALL: [Self; 3] = [Self::Support, Self::Interactive, Self::Game];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Support => "Support",
@@ -198,6 +226,12 @@ impl StreamingMode {
 
     pub fn allows_static_skip(self) -> bool {
         !matches!(self, Self::Game)
+    }
+}
+
+impl std::fmt::Display for StreamingMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
     }
 }
 
@@ -492,6 +526,59 @@ impl Default for HotfixConfig {
 
 // ── Root configuration ────────────────────────────────────────────────────────
 
+const LOCAL_PERMANENT_PASSWORD_TARGET: &str = "EvertyDesk/local/permanent-password";
+
+fn load_local_permanent_password_from_credential_store() -> Option<String> {
+    load_platform_credential(LOCAL_PERMANENT_PASSWORD_TARGET)
+        .ok()
+        .flatten()
+        .filter(|password| !password.trim().is_empty())
+}
+
+#[cfg(windows)]
+fn load_platform_credential(target: &str) -> Result<Option<String>, String> {
+    use std::{ptr, slice};
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::ERROR_NOT_FOUND;
+    use windows::Win32::Security::Credentials::{
+        CredFree, CredReadW, CREDENTIALW, CRED_TYPE_GENERIC,
+    };
+
+    struct CredentialBuffer(*mut CREDENTIALW);
+    impl Drop for CredentialBuffer {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CredFree(self.0.cast()) };
+            }
+        }
+    }
+
+    let target: Vec<u16> = target.encode_utf16().chain(Some(0)).collect();
+    let mut raw = ptr::null_mut();
+    let ok = unsafe { CredReadW(PCWSTR(target.as_ptr()), CRED_TYPE_GENERIC.0, 0, &mut raw) };
+    if !ok.as_bool() {
+        let error = windows::core::Error::from_win32();
+        return if error.code() == ERROR_NOT_FOUND.to_hresult() {
+            Ok(None)
+        } else {
+            Err(format!("Windows Credential Manager: {error}"))
+        };
+    }
+    let credential = CredentialBuffer(raw);
+    let value = unsafe { credential.0.as_ref() }
+        .ok_or_else(|| "Windows Credential Manager returned an empty credential".to_owned())?;
+    let blob =
+        unsafe { slice::from_raw_parts(value.CredentialBlob, value.CredentialBlobSize as usize) };
+    String::from_utf8(blob.to_vec())
+        .map(Some)
+        .map_err(|_| "Stored permanent password is not valid UTF-8".to_owned())
+}
+
+#[cfg(not(windows))]
+fn load_platform_credential(_target: &str) -> Result<Option<String>, String> {
+    Ok(None)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppConfig {
     pub server: ServerConfig,
@@ -503,6 +590,8 @@ pub struct AppConfig {
     pub permanent_password: String,
     #[serde(default)]
     pub security: SecurityConfig,
+    #[serde(default)]
+    pub network_debug: NetworkDebugConfig,
     #[serde(default)]
     pub display: DisplayConfig,
     #[serde(default)]
@@ -583,6 +672,11 @@ impl AppConfig {
                     config.ui.agent_machine_id = generate_agent_machine_id();
                     changed = true;
                 }
+                if config.permanent_password.trim().is_empty() {
+                    if let Some(password) = load_local_permanent_password_from_credential_store() {
+                        config.permanent_password = password;
+                    }
+                }
                 if config.display.streaming_mode == StreamingMode::Support
                     && config.display.target_fps > default_target_fps()
                 {
@@ -603,6 +697,7 @@ impl AppConfig {
             local_password: generate_numeric_token(6),
             permanent_password: String::new(),
             security: SecurityConfig::default(),
+            network_debug: NetworkDebugConfig::default(),
             display: DisplayConfig::default(),
             llm: LlmConfig::default(),
             ui: UiConfig::default(),

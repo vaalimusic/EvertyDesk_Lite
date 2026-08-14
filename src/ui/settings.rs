@@ -1279,6 +1279,7 @@ fn default_config_from(config: &AppConfig) -> AppConfig {
     AppConfig {
         server: settings_mod::ServerConfig::default(),
         security: settings_mod::SecurityConfig::default(),
+        network_debug: settings_mod::NetworkDebugConfig::default(),
         display: settings_mod::DisplayConfig::default(),
         llm: settings_mod::LlmConfig::default(),
         hotfix: config.hotfix.clone(),

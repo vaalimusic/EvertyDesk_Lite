@@ -127,6 +127,12 @@ pub enum TextKey {
     SettingsCompatibilityDiscovering,
     SettingsCompatibilityDiscoveryHint,
     SettingsCompatibilityEmptyFieldsHint,
+    SettingsNetworkDebugTitle,
+    SettingsNetworkDebugDescription,
+    SettingsNetworkDebugIgnoreLan,
+    SettingsNetworkDebugIgnoreLanHint,
+    SettingsNetworkDebugForceRelay,
+    SettingsNetworkDebugForceRelayHint,
     SettingsReset,
     AboutTitle,
     AboutSubtitle,
@@ -472,6 +478,18 @@ fn ru(key: TextKey) -> &'static str {
         TextKey::SettingsCompatibilityEmptyFieldsHint => {
             "Пустые поля означают встроенные серверы EvertyDesk. Ваши значения сохраняются только локально."
         }
+        TextKey::SettingsNetworkDebugTitle => "Отладка сети",
+        TextKey::SettingsNetworkDebugDescription => {
+            "Помогает проверить маршрутизацию EVRTCK вне обычного LAN-сценария."
+        }
+        TextKey::SettingsNetworkDebugIgnoreLan => "Игнорировать LAN-кандидаты",
+        TextKey::SettingsNetworkDebugIgnoreLanHint => {
+            "Viewer не будет использовать локальные адреса 10.x, 172.16-31.x, 192.168.x, loopback и link-local."
+        }
+        TextKey::SettingsNetworkDebugForceRelay => "Принудительно использовать relay",
+        TextKey::SettingsNetworkDebugForceRelayHint => {
+            "Отключает прямые UDP/TCP-пробы. Используйте для проверки поведения через сервер-посредник."
+        }
         TextKey::SettingsReset => "Сбросить",
         TextKey::AboutTitle => "О EvertyDesk",
         TextKey::AboutSubtitle => "EvertyDesk Next 2 — удалённый рабочий стол и адресная книга",
@@ -740,6 +758,18 @@ fn en(key: TextKey) -> &'static str {
         }
         TextKey::SettingsCompatibilityEmptyFieldsHint => {
             "Empty fields mean built-in EvertyDesk servers. Your values are stored only locally."
+        }
+        TextKey::SettingsNetworkDebugTitle => "Network debug",
+        TextKey::SettingsNetworkDebugDescription => {
+            "Helps test EVRTCK routing outside the normal LAN path."
+        }
+        TextKey::SettingsNetworkDebugIgnoreLan => "Ignore LAN candidates",
+        TextKey::SettingsNetworkDebugIgnoreLanHint => {
+            "The viewer will not use local 10.x, 172.16-31.x, 192.168.x, loopback, or link-local addresses."
+        }
+        TextKey::SettingsNetworkDebugForceRelay => "Force relay transport",
+        TextKey::SettingsNetworkDebugForceRelayHint => {
+            "Disables direct UDP/TCP probes. Use it to test behavior through the relay server."
         }
         TextKey::SettingsReset => "Reset",
         TextKey::AboutTitle => "About EvertyDesk",

@@ -24,20 +24,21 @@ use evertydesk_desktop_next::protocol::{
 use evertydesk_desktop_next::smart_agent::{
     self, AgentNotification, AgentOperator, HeartbeatRequest, SupportRequest,
 };
-use evertydesk_desktop_next::startup_log::install_process_diagnostics;
+use evertydesk_desktop_next::startup_log::{append_log_line, install_process_diagnostics};
 use evertydesk_desktop_next::updater;
 use evertydesk_desktop_next::viewer_process::{spawn_viewer, ViewerProcess};
 use evertydesk_desktop_next::windows_app::{
     set_current_process_app_user_model_id, WindowsAppUserModelId,
 };
 use iced::widget::{
-    button, checkbox, column, container, row, scrollable, svg, text, text_input, tooltip, Row,
-    Space,
+    button, checkbox, column, container, pick_list, row, scrollable, svg, text, text_input,
+    tooltip, Row, Space,
 };
 use iced::{
     border, theme::Palette, Alignment, Background, Border, Color, Element, Fill, Length, Shadow,
     Size, Subscription, Task, Theme, Vector,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet, VecDeque};
 use std::env;
 #[cfg(windows)]
@@ -287,6 +288,7 @@ struct Launcher {
     password: String,
     auth_remote_id: Option<String>,
     remember_password: bool,
+    password_loaded_from_store: bool,
     auth_status: String,
     contact_name: String,
     contact_group: String,
@@ -352,6 +354,7 @@ struct Launcher {
     viewer_token: u64,
     password_visible: bool,
     permanent_password: String,
+    permanent_password_saved: bool,
     permanent_password_visible: bool,
     permanent_password_status: String,
     last_temp_password_rotation: Instant,
@@ -362,12 +365,10 @@ struct Launcher {
     auth_window_id: Option<iced::window::Id>,
     about_open: bool,
     main_window_size: Size,
-    /// One-shot guard for `exclude_main_window_from_capture` — the main
-    /// window falls inside its own DXGI capture region while hosting is
-    /// active, so without this, the launcher's own repaints look like
-    /// "screen changed" to the change-detector and force continuous
-    /// re-encode (100% CPU/GPU while the window is visible, normal while
-    /// minimized). See `windows_app::exclude_window_from_capture`.
+    /// Legacy guard for optional capture exclusion. The default path no longer
+    /// applies `SetWindowDisplayAffinity` because it also hides the launcher
+    /// from normal Windows screenshots. Incoming sessions hide/minimize the
+    /// main window instead.
     capture_exclusion_applied: bool,
     /// OS-service (Phase 3/4, TZ_HOST_SERVICE.md) install/run state, cached
     /// and re-queried at most every few seconds — see `tick_service_hint`.
@@ -701,27 +702,11 @@ fn settings_section_hint(section: SettingsSection, language: UiLanguage) -> &'st
     }
 }
 
-fn language_preference_label(preference: LanguagePreference, language: UiLanguage) -> &'static str {
-    match preference {
-        LanguagePreference::System => tr(language, TextKey::LanguageSystem),
-        LanguagePreference::Russian => tr(language, TextKey::LanguageRussian),
-        LanguagePreference::English => tr(language, TextKey::LanguageEnglish),
-    }
-}
-
 fn language_preference_hint(preference: LanguagePreference, language: UiLanguage) -> &'static str {
     match preference {
         LanguagePreference::System => tr(language, TextKey::LanguageSystemHint),
         LanguagePreference::Russian => tr(language, TextKey::LanguageRussianHint),
         LanguagePreference::English => tr(language, TextKey::LanguageEnglishHint),
-    }
-}
-
-fn update_channel_label(channel: UpdateChannelPreference, language: UiLanguage) -> &'static str {
-    match channel {
-        UpdateChannelPreference::Disabled => tr(language, TextKey::UpdateChannelDisabled),
-        UpdateChannelPreference::ManifestUrl => tr(language, TextKey::UpdateChannelManifestUrl),
-        UpdateChannelPreference::GithubRelease => tr(language, TextKey::UpdateChannelGithubRelease),
     }
 }
 
@@ -958,6 +943,8 @@ enum Message {
     ResetServerSettings,
     DiscoverServerSettings,
     ServerDiscoveryFinished(Result<ServerConfig, String>),
+    SetDebugIgnoreLanCandidates(bool),
+    SetDebugForceRelay(bool),
     CurrentUserRefreshed(Result<(AccountEntitlements, String), String>),
     RefreshCurrentUser,
     ToggleVmSettings,
@@ -970,6 +957,10 @@ enum Message {
     AttachVmBridge,
     AttachVmBridgeTarget(String),
     ConnectVmRdp(String),
+    LaunchVmConnect {
+        target: String,
+        name: String,
+    },
     DetachVmBridge,
     VmBridgeInventory(Result<Vec<VmInventoryEntry>, String>),
     VmBridgeResult(Result<String, String>),
@@ -1243,19 +1234,25 @@ impl Launcher {
                     Err(error) => (String::new(), false, Some(error)),
                 }
             };
-        let (permanent_password, permanent_password_status) =
+        let (loaded_permanent_password, permanent_password_saved, permanent_password_status) =
             match credential_store::load_permanent_password() {
                 Ok(Some(password)) if !password.trim().is_empty() => (
                     password,
-                    "Постоянный пароль загружен из системного хранилища".to_owned(),
+                    true,
+                    "Постоянный пароль сохранён в системном хранилище".to_owned(),
                 ),
-                Ok(_) => (String::new(), "Постоянный пароль не задан".to_owned()),
+                Ok(_) => (
+                    String::new(),
+                    false,
+                    "Постоянный пароль не задан".to_owned(),
+                ),
                 Err(error) => (
                     String::new(),
+                    false,
                     format!("Не удалось загрузить постоянный пароль: {error}"),
                 ),
             };
-        config.permanent_password = permanent_password.clone();
+        config.permanent_password = loaded_permanent_password;
         let mut launcher = Self {
             page: Page::Home,
             settings_section: SettingsSection::Security,
@@ -1263,6 +1260,7 @@ impl Launcher {
             password: String::new(),
             auth_remote_id: None,
             remember_password: false,
+            password_loaded_from_store: false,
             auth_status: String::new(),
             contact_name: String::new(),
             contact_group: String::new(),
@@ -1329,7 +1327,8 @@ impl Launcher {
             clipboard_token: 0,
             viewer_token: 0,
             password_visible: false,
-            permanent_password,
+            permanent_password: String::new(),
+            permanent_password_saved,
             permanent_password_visible: false,
             permanent_password_status,
             last_temp_password_rotation: Instant::now(),
@@ -1407,7 +1406,10 @@ impl Launcher {
             }
             Message::SelectSettingsSection(section) => self.settings_section = section,
             Message::RemoteIdChanged(value) => self.remote_id = value,
-            Message::PasswordChanged(value) => self.password = value,
+            Message::PasswordChanged(value) => {
+                self.password = value;
+                self.password_loaded_from_store = false;
+            }
             Message::ToggleRememberPassword(value) => self.remember_password = value,
             Message::SubmitCredentials => {
                 self.pending_connect_profile = ConnectProfile::Regular;
@@ -1681,6 +1683,14 @@ impl Launcher {
                     server_field_or_default(value, ServerConfig::default().public_key);
                 self.save_runtime_settings("Public key сохранён");
             }
+            Message::SetDebugIgnoreLanCandidates(value) => {
+                self.config.network_debug.ignore_lan_candidates = value;
+                self.save_runtime_settings("Настройки отладки сети сохранены");
+            }
+            Message::SetDebugForceRelay(value) => {
+                self.config.network_debug.force_relay = value;
+                self.save_runtime_settings("Настройки отладки сети сохранены");
+            }
             Message::ResetServerSettings => {
                 self.config.server = ServerConfig::default();
                 self.server_discovery_status.clear();
@@ -1760,16 +1770,19 @@ impl Launcher {
             Message::RefreshVmBridge => {
                 self.vm_bridge_busy = true;
                 self.vm_bridge_status = "Обновляю список VM…".to_owned();
+                append_log_line("launcher", "VM inventory requested");
                 return Task::perform(run_vm_inventory(), Message::VmBridgeInventory);
             }
             Message::AttachVmBridge => {
                 let target = build_vm_target(self.store.vm_provider, &self.store.vm_target_id);
                 if target.is_empty() {
                     self.vm_bridge_status = "Укажите VM ID перед подключением".to_owned();
+                    append_log_line("launcher", "VM attach blocked: empty target");
                     return Task::none();
                 } else {
                     self.vm_bridge_busy = true;
                     self.vm_bridge_status = format!("Подключаю VM {target}…");
+                    append_log_line("launcher", &format!("VM attach requested: {target}"));
                     return Task::perform(run_vm_attach(target), Message::VmBridgeResult);
                 }
             }
@@ -1777,6 +1790,7 @@ impl Launcher {
                 let target = sanitize_vm_target_id(&target);
                 if target.is_empty() {
                     self.vm_bridge_status = "Укажите VM ID перед подключением".to_owned();
+                    append_log_line("launcher", "VM attach target blocked: empty target");
                     return Task::none();
                 }
                 self.store.vm_bridge_enabled = true;
@@ -1787,29 +1801,108 @@ impl Launcher {
                 self.persist_store("VM Bridge включён, VM выбрана");
                 self.vm_bridge_busy = true;
                 self.vm_bridge_status = format!("Подключаю VM {target}…");
+                append_log_line("launcher", &format!("VM attach target requested: {target}"));
                 return Task::perform(run_vm_attach(target), Message::VmBridgeResult);
             }
             Message::ConnectVmRdp(target) => {
                 let target = sanitize_vm_target_id(&target);
-                let Some(vm_guid) = target.strip_prefix("hyperv:").map(str::to_owned) else {
+                append_log_line("launcher", &format!("RDP VM connect requested: {target}"));
+                let bootstrap = if let Some(vm_guid) =
+                    target.strip_prefix("hyperv:").map(str::to_owned)
+                {
+                    RdpBootstrap {
+                        target: RdpTarget::HyperV {
+                            vm_guid: vm_guid.clone(),
+                        },
+                        vbox_vrde_settings: Default::default(),
+                        username: String::new(),
+                        password: String::new(),
+                        domain: String::new(),
+                    }
+                } else if let Some(vm_uuid) = target.strip_prefix("vbox:").map(str::to_owned) {
+                    let vm_running = self
+                        .vm_inventory
+                        .iter()
+                        .find(|vm| sanitize_vm_target_id(&vm.id) == target)
+                        .map(|vm| vm.connectable)
+                        .unwrap_or(true);
+                    let port = vbox_vrde_port(&vm_uuid);
+                    append_log_line(
+                        "launcher",
+                        &format!("VirtualBox VRDE enable requested: {vm_uuid} port={port} running={vm_running}"),
+                    );
+                    if !virtualbox::enable_vrde(&vm_uuid, port, vm_running) {
+                        self.vm_bridge_status =
+                            format!("Не удалось включить VirtualBox VRDE на порту {port}");
+                        append_log_line(
+                            "launcher",
+                            &format!("VirtualBox VRDE enable failed: {vm_uuid} port={port}"),
+                        );
+                        return Task::none();
+                    }
+                    append_log_line(
+                        "launcher",
+                        &format!("VirtualBox VRDE enabled: {vm_uuid} port={port}"),
+                    );
+                    RdpBootstrap {
+                        target: RdpTarget::VirtualBox { vm_uuid, port },
+                        vbox_vrde_settings: Default::default(),
+                        username: String::new(),
+                        password: String::new(),
+                        domain: String::new(),
+                    }
+                } else {
                     self.vm_bridge_status =
-                        "RDP-консоль пока доступна только для Hyper-V".to_owned();
+                        "RDP/VRDE-консоль доступна только для Hyper-V и VirtualBox".to_owned();
+                    append_log_line(
+                        "launcher",
+                        &format!("RDP VM connect blocked: unsupported target {target}"),
+                    );
                     return Task::none();
                 };
-                let bootstrap = RdpBootstrap {
-                    target: RdpTarget::HyperV {
-                        vm_guid: vm_guid.clone(),
-                    },
-                    username: String::new(),
-                    password: String::new(),
-                    domain: String::new(),
-                };
+                let target_label = rdp_target_label(&bootstrap.target);
                 match spawn_rdp_viewer(&bootstrap) {
                     Ok(()) => {
-                        self.vm_bridge_status = format!("RDP-консоль открыта для {vm_guid}");
+                        self.vm_bridge_status = format!("RDP/VRDE-консоль открыта: {target_label}");
+                        append_log_line(
+                            "launcher",
+                            &format!("RDP viewer spawned for VM {target_label}"),
+                        );
                     }
                     Err(error) => {
                         self.vm_bridge_status = format!("Не удалось открыть RDP-консоль: {error}");
+                        append_log_line(
+                            "launcher",
+                            &format!("RDP viewer spawn failed for VM {target_label}: {error}"),
+                        );
+                    }
+                }
+            }
+            Message::LaunchVmConnect { target, name } => {
+                let target = sanitize_vm_target_id(&target);
+                append_log_line(
+                    "launcher",
+                    &format!("vmconnect launch requested: {target} name={name}"),
+                );
+                let Some(vm_guid) = target.strip_prefix("hyperv:").map(str::to_owned) else {
+                    self.vm_bridge_status = "vmconnect доступен только для Hyper-V VM".to_owned();
+                    append_log_line(
+                        "launcher",
+                        &format!("vmconnect launch blocked: unsupported target {target}"),
+                    );
+                    return Task::none();
+                };
+                match launch_vmconnect(&vm_guid, &name) {
+                    Ok(()) => {
+                        self.vm_bridge_status = format!("vmconnect открыт для {name}");
+                        append_log_line("launcher", &format!("vmconnect spawned for VM {vm_guid}"));
+                    }
+                    Err(error) => {
+                        self.vm_bridge_status = format!("Не удалось открыть vmconnect: {error}");
+                        append_log_line(
+                            "launcher",
+                            &format!("vmconnect spawn failed for VM {vm_guid}: {error}"),
+                        );
                     }
                 }
             }
@@ -1822,10 +1915,16 @@ impl Launcher {
                 self.vm_bridge_busy = false;
                 match result {
                     Ok(entries) => {
+                        append_log_line(
+                            "launcher",
+                            &format!("VM inventory ok: {} entries", entries.len()),
+                        );
+                        log_vm_inventory_details(&entries);
                         self.vm_bridge_status = format_vm_inventory_entries(&entries);
                         self.vm_inventory = entries;
                     }
                     Err(error) => {
+                        append_log_line("launcher", &format!("VM inventory failed: {error}"));
                         self.vm_inventory.clear();
                         self.vm_bridge_status = format!("VM Bridge: {error}");
                     }
@@ -1836,9 +1935,11 @@ impl Launcher {
                 self.vm_bridge_busy = false;
                 match result {
                     Ok(status) => {
+                        append_log_line("launcher", &format!("VM bridge result ok: {status}"));
                         self.vm_bridge_status = status;
                     }
                     Err(error) => {
+                        append_log_line("launcher", &format!("VM bridge result failed: {error}"));
                         self.vm_bridge_status = format!("VM Bridge: {error}");
                     }
                 }
@@ -2022,6 +2123,8 @@ impl Launcher {
             Message::ApproveIncoming(accept) => {
                 self.approve_incoming(accept);
                 if !accept {
+                    self.pending_approval = None;
+                    self.incoming_accepting = None;
                     return self.close_incoming_window();
                 }
             }
@@ -2056,23 +2159,11 @@ impl Launcher {
                 }
             }
             Message::WindowOpened => {
-                if !self.capture_exclusion_applied {
-                    if let Some(id) = self.window_id {
-                        self.capture_exclusion_applied = true;
-                        return iced::window::run(id, |handle| {
-                            let hwnd = match handle.window_handle().map(|h| h.as_raw()) {
-                                Ok(iced::window::raw_window_handle::RawWindowHandle::Win32(
-                                    win32,
-                                )) => Some(win32.hwnd.get()),
-                                _ => None,
-                            };
-                            hwnd.is_some_and(
-                                evertydesk_desktop_next::windows_app::exclude_window_from_capture,
-                            )
-                        })
-                        .map(Message::CaptureExclusionApplied);
-                    }
-                }
+                // Do not call SetWindowDisplayAffinity here. It also hides the
+                // launcher from normal Windows screenshots/snipping tools.
+                // During an active incoming session we hide/minimize the main
+                // window instead, which avoids self-capture without breaking
+                // user screenshots of the app.
             }
             Message::BackgroundWindowOpened(id) => {
                 if self.window_id == Some(id) {
@@ -2084,13 +2175,7 @@ impl Launcher {
                 }
             }
             Message::BackgroundWindowHidden(_) => {}
-            Message::CaptureExclusionApplied(ok) => {
-                if !ok {
-                    self.status =
-                        "Не удалось исключить окно из захвата экрана (нужна Windows 10 2004+)"
-                            .to_owned();
-                }
-            }
+            Message::CaptureExclusionApplied(_) => {}
             Message::WindowResized(id, size) => {
                 if self.window_id == Some(id) {
                     self.main_window_size = size;
@@ -2499,6 +2584,11 @@ impl Launcher {
         }
     }
 
+    fn move_main_window_to_background_for_incoming_session(&mut self) -> Task<Message> {
+        self.window_id
+            .map_or_else(Task::none, |id| self.close_main_window_to_background(id))
+    }
+
     fn window_title(&self, id: iced::window::Id) -> String {
         if self.auth_window_id == Some(id) {
             "EvertyDesk — авторизация".to_owned()
@@ -2534,11 +2624,6 @@ impl Launcher {
             ),
             nav_icon_button(icondata::LuMonitor, "VM", Page::Vm, self.page),
             nav_icon_button(icondata::LuMousePointer2, "Game", Page::Game, self.page),
-            nav_button(
-                tr(ui_language, TextKey::NavSettings),
-                Page::Settings,
-                self.page,
-            ),
         ]
         .spacing(4);
 
@@ -2565,6 +2650,12 @@ impl Launcher {
                 )
                 .padding([7, 11])
                 .style(header_status_style),
+                nav_icon_button(
+                    icondata::LuSettings,
+                    tr(ui_language, TextKey::NavSettings),
+                    Page::Settings,
+                    self.page,
+                ),
             ]
             .align_y(Alignment::Center)
             .spacing(12),
@@ -2579,7 +2670,6 @@ impl Launcher {
             match self.page {
                 Page::Home => column![
                     self.local_access_card(),
-                    self.connection_status_bar(),
                     self.sessions_section(),
                     self.home_recent_section(),
                 ]
@@ -2720,7 +2810,7 @@ impl Launcher {
                 row![
                     brand_badge(58.0, 30),
                     column![
-                        text(tr(ui_language, TextKey::AboutTitle)).size(25),
+                        text("EvertyDesk").size(25),
                         text(tr(ui_language, TextKey::AboutSubtitle))
                             .size(12)
                             .color(MUTED),
@@ -2838,12 +2928,13 @@ impl Launcher {
             } else {
                 button(input_permission_content)
             }
-            .height(Length::Fixed(56.0))
+            .height(Length::Fixed(52.0))
             .width(Fill)
             .style(quiet_button);
 
             let clipboard_permission_content = row![
-                container(lucide_icon(icondata::LuInbox, 17.0, ACCENT)).width(Length::Fixed(24.0)),
+                container(lucide_icon(icondata::LuClipboard, 17.0, ACCENT))
+                    .width(Length::Fixed(24.0)),
                 column![
                     text("Буфер обмена").size(11).color(MUTED),
                     text(clipboard_label).size(13),
@@ -2857,7 +2948,7 @@ impl Launcher {
             } else {
                 button(clipboard_permission_content)
             }
-            .height(Length::Fixed(56.0))
+            .height(Length::Fixed(52.0))
             .width(Fill)
             .style(quiet_button);
 
@@ -2898,15 +2989,22 @@ impl Launcher {
                     .spacing(12)
                     .align_y(Alignment::Center),
                 row![
-                    button(row![text("Отклонить").size(14),])
-                        .on_press(Message::ApproveIncoming(false))
-                        .height(Length::Fixed(44.0))
-                        .width(Fill)
-                        .style(quiet_button),
                     button(
                         row![
+                            lucide_icon(icondata::LuX, 16.0, ACCENT),
+                            text("Отклонить").size(14),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                    )
+                    .on_press(Message::ApproveIncoming(false))
+                    .height(Length::Fixed(44.0))
+                    .width(Fill)
+                    .style(quiet_button),
+                    button(
+                        row![
+                            lucide_icon(icondata::LuCheck, 16.0, Color::WHITE),
                             text("Принять").color(Color::WHITE).size(14),
-                            lucide_icon(icondata::LuArrowRight, 16.0, Color::WHITE),
                         ]
                         .spacing(8)
                         .align_y(Alignment::Center)
@@ -2985,42 +3083,82 @@ impl Launcher {
                 );
             }
 
+            let input_button_label = if session.pending_input_blocked.is_some() {
+                "Применение…"
+            } else {
+                session.input_action_label()
+            };
+            let input_button_content = row![
+                lucide_icon(icondata::LuMousePointer2, 17.0, TEXT),
+                text(input_button_label).size(13),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center);
             let input_button =
                 if session.disconnect_requested || session.pending_input_blocked.is_some() {
-                    button(if session.pending_input_blocked.is_some() {
+                    button(input_button_content)
+                } else {
+                    button(input_button_content).on_press(Message::ToggleIncomingInput)
+                }
+                .height(Length::Fixed(42.0))
+                .width(Fill)
+                .style(quiet_button);
+            let clipboard_button =
+                if session.disconnect_requested || session.pending_clipboard_allowed.is_some() {
+                    let label = if session.pending_clipboard_allowed.is_some() {
                         "Применение…"
                     } else {
-                        session.input_action_label()
-                    })
+                        session.clipboard_action_label()
+                    };
+                    button(
+                        row![
+                            lucide_icon(icondata::LuClipboard, 17.0, TEXT),
+                            text(label).size(13),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                    )
                 } else {
-                    button(session.input_action_label()).on_press(Message::ToggleIncomingInput)
+                    button(
+                        row![
+                            lucide_icon(icondata::LuClipboard, 17.0, TEXT),
+                            text(session.clipboard_action_label()).size(13),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                    )
+                    .on_press(Message::ToggleIncomingClipboard)
                 }
-                .height(Length::Fixed(44.0))
-                .width(Length::Fixed(220.0))
+                .height(Length::Fixed(42.0))
+                .width(Fill)
                 .style(quiet_button);
-            let clipboard_button = if session.disconnect_requested
-                || session.pending_clipboard_allowed.is_some()
-            {
-                button(if session.pending_clipboard_allowed.is_some() {
-                    "Применение…"
-                } else {
-                    session.clipboard_action_label()
-                })
-            } else {
-                button(session.clipboard_action_label()).on_press(Message::ToggleIncomingClipboard)
-            }
-            .height(Length::Fixed(44.0))
-            .width(Length::Fixed(220.0))
-            .style(quiet_button);
             let disconnect_button = if session.disconnect_requested {
-                button("Отключение…").style(quiet_button)
+                button(
+                    container(text("Отключение…").size(14))
+                        .width(Fill)
+                        .center_x(Fill),
+                )
+                .padding([0, 16])
+                .style(quiet_button)
             } else {
-                button(text("Отключить клиента").color(Color::WHITE))
-                    .on_press(Message::DisconnectIncoming)
-                    .style(accent_button)
+                button(
+                    container(
+                        row![
+                            lucide_icon(icondata::LuPlugZap, 17.0, Color::WHITE),
+                            text("Отключить клиента").size(14).color(Color::WHITE),
+                        ]
+                        .spacing(9)
+                        .align_y(Alignment::Center),
+                    )
+                    .width(Fill)
+                    .center_x(Fill),
+                )
+                .padding([0, 16])
+                .on_press(Message::DisconnectIncoming)
+                .style(accent_button)
             }
-            .height(Length::Fixed(44.0))
-            .width(Length::Fixed(190.0));
+            .height(Length::Fixed(46.0))
+            .width(Fill);
 
             column![
                 text("Активная входящая сессия").size(25),
@@ -3032,10 +3170,12 @@ impl Launcher {
                     ))
                     .size(14)
                     .width(Fill),
-                    button("Копировать ID")
-                        .on_press(Message::CopyIncomingPeer)
-                        .height(Length::Fixed(32.0))
-                        .style(quiet_button),
+                    icon_action(
+                        icondata::LuCopy,
+                        "Копировать ID",
+                        Message::CopyIncomingPeer,
+                        false,
+                    ),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
@@ -3043,9 +3183,10 @@ impl Launcher {
                     .padding(14)
                     .width(Fill)
                     .style(subtle_panel),
-                row![input_button, Space::new().width(Fill), clipboard_button,]
+                row![input_button, clipboard_button,]
+                    .spacing(12)
                     .align_y(Alignment::Center),
-                row![Space::new().width(Fill), disconnect_button].align_y(Alignment::Center),
+                disconnect_button,
             ]
             .spacing(13)
             .into()
@@ -3095,6 +3236,32 @@ impl Launcher {
     fn credential_window_view(&self) -> Element<'_, Message> {
         let ui_language = self.ui_language();
         let remote_id = self.auth_remote_id.as_deref().unwrap_or("—");
+        let can_show_password = !self.password_loaded_from_store && !self.password.is_empty();
+        let mut password_row = row![text_input(
+            tr(ui_language, TextKey::HomeRemotePasswordPlaceholder),
+            &self.password
+        )
+        .on_input(Message::PasswordChanged)
+        .secure(!self.password_visible)
+        .on_submit(Message::SubmitCredentials)
+        .padding(13)
+        .size(15)
+        .style(input_style)
+        .width(Fill),]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        if can_show_password {
+            password_row = password_row.push(
+                button(if self.password_visible {
+                    tr(ui_language, TextKey::HomeHide)
+                } else {
+                    tr(ui_language, TextKey::HomeShow)
+                })
+                .on_press(Message::TogglePasswordVisibility)
+                .padding([10, 12])
+                .style(quiet_button),
+            );
+        }
         let status: Element<'_, Message> = if self.auth_status.is_empty() {
             Space::new().height(0).into()
         } else {
@@ -3123,17 +3290,7 @@ impl Launcher {
                 ]
                 .spacing(15)
                 .align_y(Alignment::Center),
-                text_input(
-                    tr(ui_language, TextKey::HomeRemotePasswordPlaceholder),
-                    &self.password
-                )
-                .on_input(Message::PasswordChanged)
-                .secure(true)
-                .on_submit(Message::SubmitCredentials)
-                .padding(13)
-                .size(15)
-                .style(input_style)
-                .width(Fill),
+                password_row,
                 checkbox(self.remember_password)
                     .label(tr(ui_language, TextKey::HomeRememberPassword))
                     .on_toggle(Message::ToggleRememberPassword)
@@ -3190,6 +3347,33 @@ impl Launcher {
         } else {
             tr(ui_language, TextKey::HomeShow)
         };
+        let visibility_icon = if self.password_visible {
+            icondata::LuEyeOff
+        } else {
+            icondata::LuEye
+        };
+        let password_value: Element<'_, Message> = if self.password_visible {
+            tooltip(
+                button(text(password).size(19))
+                    .on_press(Message::CopyLocalPassword)
+                    .padding([5, 8])
+                    .width(Length::Fixed(120.0))
+                    .style(quiet_button),
+                container(
+                    text(tr(ui_language, TextKey::HomeCopy))
+                        .size(11)
+                        .color(Color::WHITE),
+                )
+                .padding([6, 9])
+                .style(tooltip_panel),
+                tooltip::Position::Top,
+            )
+            .gap(6)
+            .delay(Duration::from_millis(350))
+            .into()
+        } else {
+            text(password).size(19).width(Length::Fixed(120.0)).into()
+        };
 
         let mut body = column![
             row![
@@ -3197,10 +3381,12 @@ impl Launcher {
                 text(format_local_id(&self.config.local_id))
                     .size(34)
                     .color(ACCENT),
-                button(tr(ui_language, TextKey::HomeCopy))
-                    .on_press(Message::CopyLocalId)
-                    .padding([8, 12])
-                    .style(quiet_button),
+                icon_action(
+                    icondata::LuCopy,
+                    tr(ui_language, TextKey::HomeCopy),
+                    Message::CopyLocalId,
+                    false,
+                ),
                 host_action,
             ]
             .spacing(14)
@@ -3210,22 +3396,20 @@ impl Launcher {
                     text(tr(ui_language, TextKey::HomeOneTimePassword))
                         .size(13)
                         .color(MUTED),
-                    text(password).size(19).width(Length::Fixed(120.0)),
-                    button(visibility_label)
-                        .on_press(Message::TogglePasswordVisibility)
-                        .padding([7, 10])
-                        .style(quiet_button),
-                    button(tr(ui_language, TextKey::HomeCopy))
-                        .on_press(Message::CopyLocalPassword)
-                        .padding([7, 10])
-                        .style(quiet_button),
-                    button(tr(ui_language, TextKey::HomeRefreshNow))
-                        .on_press(Message::RegeneratePassword)
-                        .padding([7, 10])
-                        .style(quiet_button),
+                    password_value,
                     Space::new().width(Fill),
-                    text("●").size(11).color(host_state_color(&self.host_state)),
-                    text(self.host_state.label()).size(12).color(MUTED),
+                    icon_action(
+                        visibility_icon,
+                        visibility_label,
+                        Message::TogglePasswordVisibility,
+                        false,
+                    ),
+                    icon_action(
+                        icondata::LuRefreshCw,
+                        tr(ui_language, TextKey::HomeRefreshNow),
+                        Message::RegeneratePassword,
+                        false,
+                    ),
                 ]
                 .spacing(9)
                 .align_y(Alignment::Center),
@@ -3271,14 +3455,18 @@ impl Launcher {
                         ]
                         .spacing(3)
                         .width(Fill),
-                        button("Отклонить")
-                            .on_press(Message::ApproveIncoming(false))
-                            .padding([9, 14])
-                            .style(danger_text_button),
-                        button("Принять")
-                            .on_press(Message::ApproveIncoming(true))
-                            .padding([9, 14])
-                            .style(accent_button),
+                        icon_action(
+                            icondata::LuX,
+                            "Отклонить",
+                            Message::ApproveIncoming(false),
+                            true,
+                        ),
+                        icon_action(
+                            icondata::LuCheck,
+                            "Принять",
+                            Message::ApproveIncoming(true),
+                            false,
+                        ),
                     ]
                     .spacing(10)
                     .align_y(Alignment::Center),
@@ -3300,14 +3488,18 @@ impl Launcher {
                         ]
                         .spacing(3)
                         .width(Fill),
-                        button(session.input_action_label())
-                            .on_press(Message::ToggleIncomingInput)
-                            .padding([9, 14])
-                            .style(quiet_button),
-                        button("Отключить клиента")
-                            .on_press(Message::DisconnectIncoming)
-                            .padding([9, 14])
-                            .style(danger_text_button),
+                        icon_action(
+                            icondata::LuMousePointer2,
+                            session.input_action_label(),
+                            Message::ToggleIncomingInput,
+                            false,
+                        ),
+                        icon_action(
+                            icondata::LuPlugZap,
+                            "Отключить клиента",
+                            Message::DisconnectIncoming,
+                            true,
+                        ),
                     ]
                     .spacing(10)
                     .align_y(Alignment::Center),
@@ -3364,21 +3556,6 @@ impl Launcher {
         .padding([9, 28])
         .width(Fill)
         .style(quick_bar_style)
-        .into()
-    }
-
-    fn connection_status_bar(&self) -> Element<'_, Message> {
-        container(
-            row![
-                text("●").size(12).color(ACCENT),
-                text(&self.status).size(13).color(MUTED),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-        )
-        .padding([10, 14])
-        .width(Fill)
-        .style(status_bar)
         .into()
     }
 
@@ -4117,6 +4294,66 @@ impl Launcher {
             .into()
     }
 
+    fn network_debug_settings_section(&self) -> Element<'_, Message> {
+        let ui_language = self.ui_language();
+        let debug = &self.config.network_debug;
+        let ignore_lan = checkbox(debug.ignore_lan_candidates)
+            .label(tr(ui_language, TextKey::SettingsNetworkDebugIgnoreLan))
+            .on_toggle(Message::SetDebugIgnoreLanCandidates)
+            .size(16);
+        let force_relay = checkbox(debug.force_relay)
+            .label(tr(ui_language, TextKey::SettingsNetworkDebugForceRelay))
+            .on_toggle(Message::SetDebugForceRelay)
+            .size(16);
+
+        container(
+            column![
+                row![
+                    lucide_icon(icondata::LuBug, 18.0, ACCENT),
+                    column![
+                        text(tr(ui_language, TextKey::SettingsNetworkDebugTitle)).size(18),
+                        text(tr(ui_language, TextKey::SettingsNetworkDebugDescription))
+                            .size(12)
+                            .color(MUTED),
+                    ]
+                    .spacing(2)
+                    .width(Fill),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+                container(
+                    column![
+                        ignore_lan,
+                        text(tr(ui_language, TextKey::SettingsNetworkDebugIgnoreLanHint))
+                            .size(11)
+                            .color(MUTED),
+                    ]
+                    .spacing(5),
+                )
+                .padding(12)
+                .width(Fill)
+                .style(subtle_panel),
+                container(
+                    column![
+                        force_relay,
+                        text(tr(ui_language, TextKey::SettingsNetworkDebugForceRelayHint))
+                            .size(11)
+                            .color(MUTED),
+                    ]
+                    .spacing(5),
+                )
+                .padding(12)
+                .width(Fill)
+                .style(subtle_panel),
+            ]
+            .spacing(12),
+        )
+        .padding(14)
+        .width(Fill)
+        .style(card_style)
+        .into()
+    }
+
     fn vm_settings_section(&self) -> Element<'_, Message> {
         let expanded = self.store.vm_settings_expanded;
         let chevron = if expanded {
@@ -4360,16 +4597,50 @@ impl Launcher {
                         .padding([7, 10])
                         .style(quiet_button)
                 };
-                let connect_button = if self.vm_bridge_busy || !vm.connectable {
-                    button("\u{41F}\u{43E}\u{434}\u{43A}\u{43B}\u{44E}\u{447}\u{438}\u{442}\u{44C}")
-                        .padding([7, 10])
-                        .style(accent_button)
+                let supports_console = vm.connectable
+                    && matches!(vm_inventory_group_key(&vm.id), "1_hyperv" | "2_vbox");
+                let open_button: Element<'_, Message> = if self.vm_bridge_busy || !supports_console
+                {
+                    button(label_with_icon(
+                        "\u{41E}\u{442}\u{43A}\u{440}\u{44B}\u{442}\u{44C}",
+                        icondata::LuMonitor,
+                        Color::WHITE,
+                    ))
+                    .padding([7, 10])
+                    .style(accent_button)
+                    .into()
                 } else {
-                    button("\u{41F}\u{43E}\u{434}\u{43A}\u{43B}\u{44E}\u{447}\u{438}\u{442}\u{44C}")
+                    button(label_with_icon(
+                        "\u{41E}\u{442}\u{43A}\u{440}\u{44B}\u{442}\u{44C}",
+                        icondata::LuMonitor,
+                        Color::WHITE,
+                    ))
+                    .on_press(Message::ConnectVmRdp(vm.id.clone()))
+                    .padding([7, 10])
+                    .style(accent_button)
+                    .into()
+                };
+                let bridge_button = if self.vm_bridge_busy || !vm.connectable {
+                    button("Bridge").padding([7, 10]).style(quiet_button)
+                } else {
+                    button("Bridge")
                         .on_press(Message::AttachVmBridgeTarget(vm.id.clone()))
                         .padding([7, 10])
-                        .style(accent_button)
+                        .style(quiet_button)
                 };
+                let vmconnect_button: Element<'_, Message> =
+                    if vm.connectable && vm_inventory_group_key(&vm.id) == "1_hyperv" {
+                        button("vmconnect")
+                            .on_press(Message::LaunchVmConnect {
+                                target: vm.id.clone(),
+                                name: vm.name.clone(),
+                            })
+                            .padding([7, 10])
+                            .style(quiet_button)
+                            .into()
+                    } else {
+                        Space::new().width(Length::Fixed(0.0)).into()
+                    };
                 let availability = if vm.connectable {
                     "\u{434}\u{43E}\u{441}\u{442}\u{443}\u{43F}\u{43D}\u{430}"
                 } else {
@@ -4377,19 +4648,6 @@ impl Launcher {
                 };
                 let power_controls =
                     vm_power_controls(&vm.id, self.vm_bridge_busy || !vm.connectable);
-                // RDP console (Hyper-V Enhanced Session only for now — VirtualBox
-                // VRDE needs port-discovery plumbing this doesn't have yet, see
-                // rdp_viewer.rs's module doc).
-                let rdp_button: Element<'_, Message> =
-                    if vm.connectable && vm_inventory_group_key(&vm.id) == "1_hyperv" {
-                        button("RDP")
-                            .on_press(Message::ConnectVmRdp(vm.id.clone()))
-                            .padding([7, 10])
-                            .style(quiet_button)
-                            .into()
-                    } else {
-                        Space::new().width(Length::Fixed(0.0)).into()
-                    };
                 group_column = group_column.push(
                     container(
                         row![
@@ -4419,9 +4677,10 @@ impl Launcher {
                             .spacing(5)
                             .width(Fill),
                             power_controls,
-                            rdp_button,
+                            open_button,
+                            vmconnect_button,
+                            bridge_button,
                             select_button,
-                            connect_button,
                         ]
                         .spacing(10)
                         .align_y(Alignment::Center),
@@ -4819,14 +5078,14 @@ impl Launcher {
                 };
                 if last_group != Some(group) {
                     let group_label = format_group_path(group);
+                    let filter_group = if contact.group.is_empty() {
+                        String::new()
+                    } else {
+                        group_label.clone()
+                    };
                     contacts = contacts.push(
                         row![
-                            button(text(group_label.clone()).size(12).color(ACCENT))
-                                .on_press(Message::SelectAddressBookFilter(
-                                    AddressBookFilter::Group(group_label)
-                                ))
-                                .padding([2, 0])
-                                .style(quiet_button),
+                            address_book_group_header(group_label.clone(), filter_group),
                             container(Space::new().height(1))
                                 .width(Fill)
                                 .style(separator_style),
@@ -5442,64 +5701,51 @@ impl Launcher {
                     }),
             );
         }
-        let mut mode_buttons = row![].spacing(8);
-        for mode in [
-            StreamingMode::Support,
-            StreamingMode::Interactive,
-            StreamingMode::Game,
-        ] {
-            let selected = self.config.display.streaming_mode == mode;
-            mode_buttons = mode_buttons.push(
-                button(text(streaming_mode_label(mode)).size(13))
-                    .on_press(Message::SetStreamingMode(mode))
-                    .padding([8, 14])
-                    .style(move |theme, status| {
-                        if selected {
-                            selected_segment(theme, status)
-                        } else {
-                            quiet_button(theme, status)
-                        }
-                    }),
+        let mode_picker = pick_list(
+            StreamingMode::ALL,
+            Some(self.config.display.streaming_mode),
+            Message::SetStreamingMode,
+        )
+        .placeholder("Выберите режим")
+        .width(Fill);
+        let fsr_picker = pick_list(
+            FsrQualitySetting::ALL,
+            Some(self.config.display.fsr_quality),
+            Message::SetFsrQuality,
+        )
+        .placeholder("Выберите режим апскейла")
+        .width(Fill);
+
+        let permanent_password_has_draft = !self.permanent_password.is_empty();
+        let permanent_password_placeholder = if self.permanent_password_saved {
+            "Введите новый постоянный пароль для замены"
+        } else {
+            tr(ui_language, TextKey::SettingsPermanentPasswordPlaceholder)
+        };
+        let mut permanent_password_row =
+            row![
+                text_input(permanent_password_placeholder, &self.permanent_password)
+                    .on_input(Message::PermanentPasswordChanged)
+                    .on_submit(Message::SavePermanentPassword)
+                    .secure(!self.permanent_password_visible)
+                    .padding(10)
+                    .style(input_style)
+                    .width(Fill),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center);
+        if permanent_password_has_draft {
+            permanent_password_row = permanent_password_row.push(
+                button(if self.permanent_password_visible {
+                    tr(ui_language, TextKey::HomeHide)
+                } else {
+                    tr(ui_language, TextKey::HomeShow)
+                })
+                .on_press(Message::TogglePermanentPasswordVisibility)
+                .padding([9, 12])
+                .style(quiet_button),
             );
         }
-        let fsr_quality_row = |options: [FsrQualitySetting; 3], current: &Self| {
-            let mut row = row![].spacing(8);
-            for fsr_quality in options {
-                let selected = current.config.display.fsr_quality == fsr_quality;
-                row = row.push(
-                    button(text(fsr_quality.label()).size(13))
-                        .on_press(Message::SetFsrQuality(fsr_quality))
-                        .padding([8, 14])
-                        .style(move |theme, status| {
-                            if selected {
-                                selected_segment(theme, status)
-                            } else {
-                                quiet_button(theme, status)
-                            }
-                        }),
-                );
-            }
-            row
-        };
-        let fsr_buttons = column![
-            fsr_quality_row(
-                [
-                    FsrQualitySetting::Off,
-                    FsrQualitySetting::Native,
-                    FsrQualitySetting::UltraQuality,
-                ],
-                self,
-            ),
-            fsr_quality_row(
-                [
-                    FsrQualitySetting::Quality,
-                    FsrQualitySetting::Balanced,
-                    FsrQualitySetting::Performance,
-                ],
-                self,
-            ),
-        ]
-        .spacing(8);
 
         let permanent_access = container(
             column![
@@ -5515,28 +5761,7 @@ impl Launcher {
                 ))
                 .size(11)
                 .color(MUTED),
-                row![
-                    text_input(
-                        tr(ui_language, TextKey::SettingsPermanentPasswordPlaceholder),
-                        &self.permanent_password
-                    )
-                    .on_input(Message::PermanentPasswordChanged)
-                    .on_submit(Message::SavePermanentPassword)
-                    .secure(!self.permanent_password_visible)
-                    .padding(10)
-                    .style(input_style)
-                    .width(Fill),
-                    button(if self.permanent_password_visible {
-                        tr(ui_language, TextKey::HomeHide)
-                    } else {
-                        tr(ui_language, TextKey::HomeShow)
-                    })
-                    .on_press(Message::TogglePermanentPasswordVisibility)
-                    .padding([9, 12])
-                    .style(quiet_button),
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center),
+                permanent_password_row,
                 row![
                     text(if self.permanent_password_status.is_empty() {
                         tr(ui_language, TextKey::SettingsTemporaryPasswordRotates)
@@ -5659,7 +5884,7 @@ impl Launcher {
             container(
                 column![
                     text(tr(ui_language, TextKey::SettingsStreamingMode)).size(13),
-                    mode_buttons,
+                    mode_picker,
                     text(streaming_mode_hint(
                         self.config.display.streaming_mode,
                         ui_language
@@ -5675,7 +5900,7 @@ impl Launcher {
             container(
                 column![
                     text(tr(ui_language, TextKey::SettingsFsrUpscale)).size(13),
-                    fsr_buttons,
+                    fsr_picker,
                     text(tr(ui_language, TextKey::SettingsFsrHint))
                         .size(11)
                         .color(MUTED),
@@ -5760,22 +5985,13 @@ impl Launcher {
         ]
         .spacing(10);
 
-        let mut language_buttons = row![].spacing(8).align_y(Alignment::Center);
-        for language in LanguagePreference::ALL {
-            let selected = self.store.language == language;
-            language_buttons = language_buttons.push(
-                button(text(language_preference_label(language, ui_language)).size(13))
-                    .on_press(Message::SetLanguage(language))
-                    .padding([8, 14])
-                    .style(move |theme, status| {
-                        if selected {
-                            selected_segment(theme, status)
-                        } else {
-                            quiet_button(theme, status)
-                        }
-                    }),
-            );
-        }
+        let language_picker = pick_list(
+            LanguagePreference::ALL,
+            Some(self.store.language),
+            Message::SetLanguage,
+        )
+        .placeholder(tr(ui_language, TextKey::LanguageTitle))
+        .width(Fill);
         let language_settings = column![
             text(tr(ui_language, TextKey::LanguageTitle)).size(18),
             text(tr(ui_language, TextKey::LanguageDescription))
@@ -5783,7 +5999,7 @@ impl Launcher {
                 .color(MUTED),
             container(
                 column![
-                    language_buttons,
+                    language_picker,
                     text(language_preference_hint(self.store.language, ui_language))
                         .size(11)
                         .color(MUTED),
@@ -5796,22 +6012,13 @@ impl Launcher {
         ]
         .spacing(10);
 
-        let mut update_channel_buttons = row![].spacing(8).align_y(Alignment::Center);
-        for channel in UpdateChannelPreference::ALL {
-            let selected = self.store.update_channel == channel;
-            update_channel_buttons = update_channel_buttons.push(
-                button(text(update_channel_label(channel, ui_language)).size(13))
-                    .on_press(Message::SetUpdateChannel(channel))
-                    .padding([8, 14])
-                    .style(move |theme, status| {
-                        if selected {
-                            selected_segment(theme, status)
-                        } else {
-                            quiet_button(theme, status)
-                        }
-                    }),
-            );
-        }
+        let update_channel_picker = pick_list(
+            UpdateChannelPreference::ALL,
+            Some(self.store.update_channel),
+            Message::SetUpdateChannel,
+        )
+        .placeholder(tr(ui_language, TextKey::UpdatesTitle))
+        .width(Fill);
         let update_source_fields: Element<'_, Message> = match self.store.update_channel {
             UpdateChannelPreference::Disabled => {
                 text(tr(ui_language, TextKey::UpdatesDisabledHint))
@@ -5845,7 +6052,7 @@ impl Launcher {
                 .color(MUTED),
             container(
                 column![
-                    update_channel_buttons,
+                    update_channel_picker,
                     text(update_channel_hint(self.store.update_channel, ui_language))
                         .size(11)
                         .color(MUTED),
@@ -5906,6 +6113,7 @@ impl Launcher {
         .spacing(10);
 
         let compatibility = self.compatibility_settings_section();
+        let network_debug = self.network_debug_settings_section();
 
         let host_status = container(
             row![
@@ -6034,7 +6242,9 @@ impl Launcher {
                 };
                 column![section_content, host_status].spacing(18).into()
             }
-            SettingsSection::Connection => column![compatibility, host_status].spacing(18).into(),
+            SettingsSection::Connection => column![compatibility, network_debug, host_status]
+                .spacing(18)
+                .into(),
         };
 
         let mut settings_menu = column![
@@ -6136,12 +6346,15 @@ impl Launcher {
         }
 
         self.password.zeroize();
+        self.password_visible = false;
         self.auth_status.clear();
         self.remember_password = false;
+        self.password_loaded_from_store = false;
         match credential_store::load_password(&remote_id) {
             Ok(Some(password)) => {
                 self.password = password;
                 self.remember_password = true;
+                self.password_loaded_from_store = true;
             }
             Ok(None) => {}
             Err(error) => {
@@ -6174,6 +6387,8 @@ impl Launcher {
         let close = self.close_auth_window();
         self.auth_remote_id = None;
         self.auth_status.clear();
+        self.password_visible = false;
+        self.password_loaded_from_store = false;
         self.connect();
         close
     }
@@ -6184,6 +6399,8 @@ impl Launcher {
         self.auth_remote_id = None;
         self.auth_status.clear();
         self.remember_password = false;
+        self.password_visible = false;
+        self.password_loaded_from_store = false;
     }
 
     fn connect_game(&mut self) {
@@ -6217,6 +6434,8 @@ impl Launcher {
         self.pending_connect_profile = ConnectProfile::Game;
         self.remote_id = remote_id.clone();
         self.password = std::mem::take(&mut self.game_password);
+        self.password_loaded_from_store = false;
+        self.password_visible = false;
         self.status = format!(
             "Game подключение: {} · {}{}",
             remote_id,
@@ -6842,9 +7061,13 @@ impl Launcher {
         }
         match credential_store::store_permanent_password(&password) {
             Ok(()) => {
+                let fingerprint =
+                    short_secret_fingerprint(&password).unwrap_or_else(|| "-".to_owned());
                 self.config.permanent_password.zeroize();
                 self.config.permanent_password = password.clone();
-                self.permanent_password = password;
+                self.permanent_password.zeroize();
+                self.permanent_password.clear();
+                self.permanent_password_saved = true;
                 self.permanent_password_visible = false;
                 if let Some(runtime) = &self.host {
                     let _ = runtime
@@ -6852,7 +7075,7 @@ impl Launcher {
                         .send(HostCommand::Reconfigure(self.config.clone()));
                 }
                 self.permanent_password_status =
-                    "Постоянный пароль сохранён в системном хранилище".to_owned();
+                    format!("Постоянный пароль сохранён в системном хранилище · fp={fingerprint}");
                 self.status = "Постоянный пароль для входящих подключений применён".to_owned();
             }
             Err(error) => {
@@ -6866,6 +7089,7 @@ impl Launcher {
         let result = credential_store::delete_permanent_password();
         self.permanent_password.zeroize();
         self.permanent_password.clear();
+        self.permanent_password_saved = false;
         self.config.permanent_password.zeroize();
         self.config.permanent_password.clear();
         self.permanent_password_visible = false;
@@ -7954,6 +8178,11 @@ impl Launcher {
                 {
                     self.pending_approval = None;
                 }
+                if self.pending_approval.is_some()
+                    && reason.to_ascii_lowercase().contains("rejected")
+                {
+                    self.pending_approval = None;
+                }
                 if self
                     .incoming_accepting
                     .as_ref()
@@ -8047,7 +8276,11 @@ impl Launcher {
         if needs_incoming_window
             && (focus_incoming || should_focus || self.incoming_window_id.is_none())
         {
-            return self.ensure_incoming_window();
+            let mut tasks = vec![self.ensure_incoming_window()];
+            if self.incoming_session.is_some() {
+                tasks.push(self.move_main_window_to_background_for_incoming_session());
+            }
+            return Task::batch(tasks);
         }
         if !needs_incoming_window && self.incoming_window_id.is_some() {
             return self.close_incoming_window();
@@ -8137,11 +8370,17 @@ fn tray_icon_rgba() -> Vec<u8> {
 }
 
 fn brand_badge(size: f32, font_size: u32) -> Element<'static, Message> {
-    container(text("E").size(font_size).color(Color::WHITE))
-        .center_x(Length::Fixed(size))
-        .center_y(Length::Fixed(size))
-        .style(accent_tile)
-        .into()
+    let _ = font_size;
+    container(
+        svg(svg::Handle::from_memory(
+            include_str!("../../assets/desktop-next-logo.svg").as_bytes(),
+        ))
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size)),
+    )
+    .center_x(Length::Fixed(size))
+    .center_y(Length::Fixed(size))
+    .into()
 }
 
 fn nav_button(label: &str, page: Page, current: Page) -> Element<'_, Message> {
@@ -8355,12 +8594,12 @@ fn viewer_launch_status(
 ) -> String {
     if game_mode {
         format!(
-            "Launch · {} · {}",
+            "Запуск · {} · {}",
             quality.label(),
             viewer_game_profile_label(true, codec, evrt2_enabled)
         )
     } else {
-        format!("Launch · {}", quality.label())
+        format!("Запуск · {}", quality.label())
     }
 }
 
@@ -8887,6 +9126,10 @@ fn spawn_rdp_viewer(bootstrap: &RdpBootstrap) -> io::Result<()> {
     })?;
     let mut executable = directory.join("evertydesk-rdp-viewer");
     executable.set_extension(std::env::consts::EXE_EXTENSION);
+    append_log_line(
+        "launcher",
+        &format!("RDP viewer executable: {}", executable.display()),
+    );
 
     let encoded = zeroize::Zeroizing::new(serde_json::to_vec(bootstrap).map_err(io::Error::other)?);
 
@@ -8897,6 +9140,10 @@ fn spawn_rdp_viewer(bootstrap: &RdpBootstrap) -> io::Result<()> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|error| {
+            append_log_line(
+                "launcher",
+                &format!("RDP viewer process start failed: {error}"),
+            );
             io::Error::new(
                 error.kind(),
                 format!("could not start {}: {error}", executable.display()),
@@ -8914,12 +9161,55 @@ fn spawn_rdp_viewer(bootstrap: &RdpBootstrap) -> io::Result<()> {
     drop(stdin);
 
     if let Err(error) = write_result {
+        append_log_line(
+            "launcher",
+            &format!("RDP viewer bootstrap write failed: {error}"),
+        );
         let _ = child.kill();
         let _ = child.wait();
         return Err(error);
     }
 
+    append_log_line("launcher", "RDP viewer bootstrap sent");
     Ok(())
+}
+
+fn launch_vmconnect(vm_guid: &str, vm_name: &str) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let display_name = if vm_name.trim().is_empty() {
+            vm_guid
+        } else {
+            vm_name
+        };
+        append_log_line(
+            "launcher",
+            &format!("vmconnect executable: vmconnect.exe . {display_name} -G {vm_guid}"),
+        );
+        std::process::Command::new("vmconnect.exe")
+            .args([".", display_name, "-G", vm_guid])
+            .spawn()
+            .map(|_| ())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (vm_guid, vm_name);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "vmconnect.exe is available only on Windows",
+        ))
+    }
+}
+
+fn vbox_vrde_port(vm_uuid: &str) -> u16 {
+    3390 + (vm_uuid.bytes().fold(0u16, |a, b| a.wrapping_add(b as u16)) % 10)
+}
+
+fn rdp_target_label(target: &RdpTarget) -> String {
+    match target {
+        RdpTarget::HyperV { vm_guid } => format!("Hyper-V {vm_guid}"),
+        RdpTarget::VirtualBox { vm_uuid, port } => format!("VirtualBox {vm_uuid} :{port}"),
+    }
 }
 
 fn parse_vm_inventory(raw: &str) -> Result<Vec<VmInventoryEntry>, String> {
@@ -8980,6 +9270,36 @@ fn format_vm_inventory_entries(items: &[VmInventoryEntry]) -> String {
         lines.push(format!("…ещё {}", items.len() - 8));
     }
     lines.join("\n")
+}
+
+fn log_vm_inventory_details(items: &[VmInventoryEntry]) {
+    let hyperv_count = items
+        .iter()
+        .filter(|item| item.id.starts_with("hyperv:"))
+        .count();
+    let vbox_count = items
+        .iter()
+        .filter(|item| item.id.starts_with("vbox:"))
+        .count();
+    append_log_line(
+        "launcher",
+        &format!("VM inventory providers: hyperv={hyperv_count} vbox={vbox_count}"),
+    );
+    for item in items.iter().take(12) {
+        append_log_line(
+            "launcher",
+            &format!(
+                "VM inventory entry: id={} name={} state={} connectable={}",
+                item.id, item.name, item.state, item.connectable
+            ),
+        );
+    }
+    if items.len() > 12 {
+        append_log_line(
+            "launcher",
+            &format!("VM inventory entry: ... {} more", items.len() - 12),
+        );
+    }
 }
 
 fn main_content_max_width(width: f32) -> f32 {
@@ -9231,14 +9551,6 @@ fn status_bar(_theme: &Theme) -> iced::widget::container::Style {
             width: 1.0,
             radius: 8.0.into(),
         },
-        ..Default::default()
-    }
-}
-
-fn accent_tile(_theme: &Theme) -> iced::widget::container::Style {
-    iced::widget::container::Style {
-        background: Some(ACCENT.into()),
-        border: border::rounded(9),
         ..Default::default()
     }
 }
@@ -9539,23 +9851,56 @@ fn contact_filter_chip(
 ) -> Element<'static, Message> {
     button(
         row![
-            lucide_icon(icon, 11.0, ACCENT),
-            text(label).size(10).color(ACCENT)
+            lucide_icon(icon, 11.0, MUTED),
+            text(label).size(10).color(TEXT)
         ]
         .spacing(4)
         .align_y(Alignment::Center),
     )
     .on_press(message)
-    .padding([2, 6])
+    .padding([3, 7])
     .style(move |_theme, _status| iced::widget::button::Style {
-        text_color: ACCENT,
-        background: Some(Color::from_rgba(ACCENT.r, ACCENT.g, ACCENT.b, 0.07).into()),
+        text_color: TEXT,
+        background: Some(Color::from_rgb(0.985, 0.987, 0.992).into()),
         border: Border {
             radius: 999.0.into(),
             width: 1.0,
-            color: Color::from_rgba(ACCENT.r, ACCENT.g, ACCENT.b, 0.16),
+            color: LINE,
         },
         ..Default::default()
+    })
+    .into()
+}
+
+fn address_book_group_header(label: String, filter_group: String) -> Element<'static, Message> {
+    button(
+        row![
+            lucide_icon(icondata::LuFolder, 12.0, ACCENT),
+            text(label.clone()).size(11).color(TEXT),
+        ]
+        .spacing(5)
+        .align_y(Alignment::Center),
+    )
+    .on_press(Message::SelectAddressBookFilter(AddressBookFilter::Group(
+        filter_group,
+    )))
+    .padding([4, 9])
+    .style(move |_theme, status| {
+        let background = match status {
+            iced::widget::button::Status::Hovered => Color::from_rgb(1.0, 0.95, 0.955),
+            iced::widget::button::Status::Pressed => Color::from_rgb(1.0, 0.91, 0.92),
+            _ => Color::from_rgb(1.0, 0.965, 0.97),
+        };
+        iced::widget::button::Style {
+            text_color: TEXT,
+            background: Some(background.into()),
+            border: Border {
+                radius: 999.0.into(),
+                width: 1.0,
+                color: Color::from_rgba(ACCENT.r, ACCENT.g, ACCENT.b, 0.16),
+            },
+            ..Default::default()
+        }
     })
     .into()
 }
@@ -10459,6 +10804,22 @@ fn clipboard_fingerprint(value: &str) -> u64 {
     value.len().hash(&mut hasher);
     value.hash(&mut hasher);
     hasher.finish()
+}
+
+fn short_secret_fingerprint(value: &str) -> Option<String> {
+    if value.trim().is_empty() {
+        return None;
+    }
+    let mut hash = Sha256::new();
+    hash.update(value.as_bytes());
+    let digest = hash.finalize();
+    Some(
+        digest
+            .iter()
+            .take(4)
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    )
 }
 
 fn clear_matching_clipboard(expected_fingerprint: u64) -> bool {
@@ -12002,18 +12363,6 @@ mod tests {
         assert_eq!(
             settings_section_label(SettingsSection::Security, UiLanguage::Russian),
             "Безопасность"
-        );
-        assert_eq!(
-            language_preference_label(LanguagePreference::System, UiLanguage::English),
-            "System"
-        );
-        assert_eq!(
-            update_channel_label(UpdateChannelPreference::Disabled, UiLanguage::English),
-            "Disabled"
-        );
-        assert_eq!(
-            update_channel_label(UpdateChannelPreference::Disabled, UiLanguage::Russian),
-            "Отключено"
         );
     }
 

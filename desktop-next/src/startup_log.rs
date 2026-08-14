@@ -31,9 +31,15 @@ pub fn append_log_line(process_name: &str, message: &str) {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
+    let should_write_utf8_bom = fs::metadata(&path)
+        .map(|metadata| metadata.len() == 0)
+        .unwrap_or(true);
     let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
         return;
     };
+    if should_write_utf8_bom {
+        let _ = file.write_all(b"\xEF\xBB\xBF");
+    }
     let _ = writeln!(file, "{} [{process_name}] {message}", unix_timestamp_secs());
 }
 

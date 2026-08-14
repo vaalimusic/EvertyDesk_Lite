@@ -1708,6 +1708,7 @@ fn run_cli_connect() -> Option<i32> {
         audio_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         evrt2_only: false,
         require_direct_transport: false,
+        network_debug: config.network_debug,
     };
 
     match TransportClient::connect_with_progress(request, |pct, message| {
@@ -2628,6 +2629,7 @@ impl EvertyDeskApp {
             audio_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             evrt2_only: self.evrt2_only_mode,
             require_direct_transport: false,
+            network_debug: self.config.network_debug.clone(),
         };
 
         if request.remote_id.is_empty() {

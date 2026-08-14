@@ -88,6 +88,8 @@ pub mod hyperv;
 pub mod hyperv_rdp;
 #[cfg(windows)]
 pub mod vbox_rdp;
+#[cfg(windows)]
+pub mod vm_console_runtime;
 
 // Phase 3/4 (TZ_HOST_SERVICE.md): OS service install/query — Windows service
 // (Session 0 + linked-token elevation) / systemd --user / launchd. Exposed

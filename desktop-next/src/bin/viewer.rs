@@ -644,7 +644,8 @@ impl SessionControl {
             control_only: false,
             audio_enabled: Arc::clone(&audio_enabled),
             evrt2_only: false,
-            require_direct_transport: true,
+            require_direct_transport: require_direct_transport(),
+            network_debug: config.network_debug,
         };
 
         let generation = 1;
@@ -889,7 +890,7 @@ fn spawn_session(
                         let endpoint = format!("{host_addr}:{port}");
                         if !active && strict_evrt_required(&transport_profile_label) {
                             let error = format!(
-                                "{transport_profile_label}: EVRT UDP не активен; TCP fallback отключён для этого профиля"
+                                "{transport_profile_label}: EVRT UDP не активен; TCP relay отключён для этого профиля"
                             );
                             emit_status(&ViewerStatus::Transport {
                                 profile: transport_profile_label.clone(),
@@ -909,19 +910,19 @@ fn spawn_session(
                         let status = if active {
                             format!("EVRT UDP активен — {endpoint}")
                         } else {
-                            "EVRT UDP не активен — используется TCP fallback".to_owned()
+                            "EVRT UDP не активен — используется TCP relay".to_owned()
                         };
                         emit_status(&ViewerStatus::Transport {
                             profile: transport_profile_label.clone(),
                             route: if active {
                                 format!("EVRT UDP {endpoint}")
                             } else {
-                                "TCP fallback".to_owned()
+                                "TCP relay".to_owned()
                             },
                             reason: if active {
                                 "direct/udp route confirmed".to_owned()
                             } else {
-                                "EVRT UDP inactive; using TCP fallback".to_owned()
+                                "EVRT UDP inactive; using TCP relay".to_owned()
                             },
                         });
                         let _ = proxy.send_event(ViewerEvent::EvrtStatus { active, endpoint });
@@ -1059,8 +1060,19 @@ fn apply_transport_profile(display: &mut DisplayConfig, profile: ViewerTransport
     }
 }
 
+fn require_direct_transport() -> bool {
+    match std::env::var("EVERTYDESK_REQUIRE_DIRECT_TRANSPORT") {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
 fn strict_evrt_required(transport_profile_label: &str) -> bool {
-    transport_profile_label == ViewerTransportProfile::DesktopEvrtck.label()
+    require_direct_transport()
+        && transport_profile_label == ViewerTransportProfile::DesktopEvrtck.label()
 }
 
 fn desired_video_fps(paused: bool, visible: bool, target_fps: u32) -> i32 {
@@ -1335,11 +1347,7 @@ fn draw_toolbar_handle(
             color,
         );
     }
-    let label = if toolbar_visible {
-        "Hide controls"
-    } else {
-        "Show controls"
-    };
+    let label = if toolbar_visible { "Hide" } else { "Show" };
     draw_ascii_text(
         frame,
         width,
@@ -1654,19 +1662,19 @@ fn toolbar_action_index(action: ToolbarAction) -> i32 {
 
 fn toolbar_action_label(action: ToolbarAction) -> &'static str {
     match action {
-        ToolbarAction::Fullscreen => "Fullscreen (Alt+Enter) - Hide controls: Ctrl+Alt+H",
-        ToolbarAction::Display => "Monitor (Ctrl+Alt+Left/Right)",
-        ToolbarAction::Scaling => "Scaling (Ctrl+Alt+M)",
-        ToolbarAction::Quality => "Quality profile (Ctrl+Alt+Q)",
-        ToolbarAction::PauseVideo => "Pause video (Ctrl+Alt+P)",
-        ToolbarAction::Refresh => "Refresh video (Ctrl+Alt+R)",
-        ToolbarAction::Reconnect => "Reconnect now (Ctrl+Alt+K)",
-        ToolbarAction::Audio => "Remote audio (Ctrl+Alt+A)",
-        ToolbarAction::Input => "Keyboard and mouse (Ctrl+Alt+I)",
-        ToolbarAction::Clipboard => "Clipboard (Ctrl+Alt+C)",
-        ToolbarAction::Screenshot => "Screenshot (Ctrl+Alt+S)",
-        ToolbarAction::CtrlAltDelete => "Send Ctrl+Alt+Del (Ctrl+Alt+End)",
-        ToolbarAction::Diagnostics => "Connection info (Ctrl+Alt+D)",
+        ToolbarAction::Fullscreen => "Fullscreen - Alt+Enter",
+        ToolbarAction::Display => "Monitor - Ctrl+Alt+Arrows",
+        ToolbarAction::Scaling => "Scaling - Ctrl+Alt+M",
+        ToolbarAction::Quality => "Quality - Ctrl+Alt+Q",
+        ToolbarAction::PauseVideo => "Pause video - Ctrl+Alt+P",
+        ToolbarAction::Refresh => "Refresh video - Ctrl+Alt+R",
+        ToolbarAction::Reconnect => "Reconnect - Ctrl+Alt+K",
+        ToolbarAction::Audio => "Audio - Ctrl+Alt+A",
+        ToolbarAction::Input => "Keyboard/mouse - Ctrl+Alt+I",
+        ToolbarAction::Clipboard => "Clipboard - Ctrl+Alt+C",
+        ToolbarAction::Screenshot => "Screenshot - Ctrl+Alt+S",
+        ToolbarAction::CtrlAltDelete => "Ctrl+Alt+Del - Ctrl+Alt+End",
+        ToolbarAction::Diagnostics => "Diagnostics - Ctrl+Alt+D",
         ToolbarAction::Disconnect => "Disconnect",
     }
 }
@@ -1783,8 +1791,8 @@ fn draw_diagnostics_panel(
     input_enabled: bool,
     clipboard_enabled: bool,
 ) {
-    const PANEL_WIDTH: i32 = 272;
-    const PANEL_HEIGHT: i32 = 474;
+    const PANEL_WIDTH: i32 = 268;
+    const PANEL_HEIGHT: i32 = 360;
     let x = (width - PANEL_WIDTH - 14).max(4);
     let y = toolbar_overlay_top(true, 10);
     fill_rgba_rect(
@@ -1809,7 +1817,7 @@ fn draw_diagnostics_panel(
     );
 
     let codec = if diagnostics.codec.is_empty() {
-        "Waiting"
+        "Pending"
     } else {
         diagnostics.codec.as_str()
     };
@@ -1830,7 +1838,7 @@ fn draw_diagnostics_panel(
     let transport = if diagnostics.evrt_active {
         "EVRT UDP"
     } else {
-        "TCP fallback"
+        "TCP relay"
     };
     let transport_note = if diagnostics.transport_note.is_empty() {
         "--"
@@ -1849,46 +1857,46 @@ fn draw_diagnostics_panel(
         diagnostics.evrt_pressure.as_str()
     };
     let lines = [
-        "CONNECTION INFO".to_owned(),
-        format!("Health      {health}"),
-        format!("Codec       {codec}"),
-        format!("Transport   {transport}"),
-        format!("Route       {transport_note}"),
-        format!("EVRT FPS    {evrt_fps}"),
-        format!("EVRT jitter {evrt_jitter} ms"),
-        format!("EVRT press  {evrt_pressure}"),
+        "SESSION INFO".to_owned(),
+        format!("State     {health}"),
+        format!("Codec     {codec}"),
+        format!("Path      {transport}"),
+        format!("Route     {transport_note}"),
+        format!("EVRT fps  {evrt_fps}"),
+        format!("Jitter    {evrt_jitter} ms"),
+        format!("Pressure  {evrt_pressure}"),
         format!(
-            "EVRT drops  {}/{}",
+            "Drops     {}/{}",
             diagnostics.evrt_reassembly_drops, diagnostics.evrt_queue_drops
         ),
         format!(
-            "FPS         {}.{:02}",
+            "FPS       {}.{:02}",
             diagnostics.fps_times_100 / 100,
             diagnostics.fps_times_100 % 100
         ),
-        format!("Bitrate     {} kbps", diagnostics.input_kbps),
-        format!("Latency     {latency} ms"),
-        format!("Telemetry   {telemetry_age}"),
-        format!("Dropped     {}", diagnostics.dropped_frames),
-        format!("Session     {}", format_duration(session_seconds)),
-        format!("Reconnects  {reconnect_count}"),
-        format!("Resolution  {frame_width}x{frame_height}"),
+        format!("Bitrate   {} kbps", diagnostics.input_kbps),
+        format!("Latency   {latency} ms"),
+        format!("Age       {telemetry_age}"),
+        format!("Frames    dropped {}", diagnostics.dropped_frames),
+        format!("Session   {}", format_duration(session_seconds)),
+        format!("Reconnect {reconnect_count}"),
+        format!("Size      {frame_width}x{frame_height}"),
         format!(
-            "Monitor     {} / {}",
+            "Monitor   {} / {}",
             selected_display.map_or_else(|| "--".to_owned(), |value| (value + 1).to_string()),
             display_count.max(1)
         ),
         format!(
-            "Video       {}",
+            "Video     {}",
             if video_paused { "Paused" } else { "Active" }
         ),
-        format!("Quality     {}", diagnostics_quality_label(quality)),
-        format!("Scaling     {}", diagnostics_scaling_label(scaling)),
-        format!("Profile     {transport_profile}"),
-        format!("EVRT2       {}", enabled_label(evrt2_experiment)),
-        format!("Audio       {}", enabled_label(audio_enabled)),
-        format!("Input       {}", enabled_label(input_enabled)),
-        format!("Clipboard   {}", enabled_label(clipboard_enabled)),
+        format!("Quality   {}", diagnostics_quality_label(quality)),
+        format!("Scaling   {}", diagnostics_scaling_label(scaling)),
+        format!("Profile   {transport_profile}"),
+        format!("EVRT2     {}", enabled_label(evrt2_experiment)),
+        format!("Audio     {}", enabled_label(audio_enabled)),
+        format!("Input     {}", enabled_label(input_enabled)),
+        format!("Clipboard {}", enabled_label(clipboard_enabled)),
     ];
     for (index, line) in lines.iter().enumerate() {
         let color = if index == 0 {
@@ -1901,7 +1909,7 @@ fn draw_diagnostics_panel(
             width,
             height,
             x + 16,
-            y + 13 + i32::try_from(index).unwrap_or(0) * 19,
+            y + 13 + i32::try_from(index).unwrap_or(0) * 15,
             line,
             color,
             1,
@@ -1996,7 +2004,7 @@ fn diagnostics_health(
     telemetry_age: Option<Duration>,
 ) -> &'static str {
     let Some(age) = telemetry_age else {
-        return "Waiting";
+        return "Pending";
     };
     if age > Duration::from_secs(5) {
         return "Stale";
@@ -2900,9 +2908,9 @@ impl Viewer {
         self.quality = quality;
         self.session.set_quality(quality);
         self.set_transient_notice(match quality {
-            ConnectionQuality::Smooth => "QUALITY: SMOOTH",
-            ConnectionQuality::Balanced => "QUALITY: BALANCED",
-            ConnectionQuality::Sharp => "QUALITY: SHARP",
+            ConnectionQuality::Smooth => "Quality: smooth",
+            ConnectionQuality::Balanced => "Quality: balanced",
+            ConnectionQuality::Sharp => "Quality: sharp",
         });
         emit_status(&ViewerStatus::ControlState {
             control: ViewerControl::Quality { quality },
@@ -3288,7 +3296,7 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
                 self.diagnostics.transport_note = if active {
                     format!("UDP {endpoint}")
                 } else {
-                    "UDP inactive, TCP fallback".to_owned()
+                    "UDP inactive, TCP relay".to_owned()
                 };
                 self.diagnostics.evrt_endpoint = endpoint;
                 if !active {
@@ -3495,7 +3503,7 @@ impl ApplicationHandler<ViewerEvent> for Viewer {
                     self.schedule_reconnect();
                 } else {
                     self.session_end_reason = safe_viewer_end_reason(&error);
-                    self.connection_notice = Some("CONNECTION FAILED".to_owned());
+                    self.connection_notice = Some("FAILED".to_owned());
                     self.notice_expires_at = None;
                     self.redraw_toolbar();
                 }
@@ -3967,8 +3975,9 @@ mod quality_tests {
     }
 
     #[test]
-    fn desktop_evrtck_requires_strict_evrt_transport() {
-        assert!(strict_evrt_required(
+    fn desktop_evrtck_allows_relay_transport_by_default() {
+        assert!(!require_direct_transport());
+        assert!(!strict_evrt_required(
             ViewerTransportProfile::DesktopEvrtck.label()
         ));
         assert!(!strict_evrt_required(
@@ -4151,8 +4160,7 @@ mod input_safety_tests {
 
     #[test]
     fn toolbar_tooltips_are_clipped_to_the_frame_width() {
-        let clipped =
-            toolbar_tooltip_text("Fullscreen (Alt+Enter) - Hide controls: Ctrl+Alt+H", 160);
+        let clipped = toolbar_tooltip_text("Fullscreen - Alt+Enter", 160);
         assert!(clipped.ends_with('…'));
         assert!(clipped.chars().count() <= 17);
 
@@ -4261,7 +4269,7 @@ mod input_safety_tests {
 
     #[test]
     fn diagnostics_health_detects_stale_slow_and_healthy_sessions() {
-        assert_eq!(diagnostics_health(None, 0, None), "Waiting");
+        assert_eq!(diagnostics_health(None, 0, None), "Pending");
         assert_eq!(
             diagnostics_health(Some(35), 6_000, Some(Duration::from_secs(6))),
             "Stale"
