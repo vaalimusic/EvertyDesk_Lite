@@ -310,33 +310,46 @@ fn hextile_update_cost(
 }
 
 fn main() {
+    // ── Keyframes across resolutions (matches bench_keyframes in
+    //    benches/evrtck_bench.rs: 720p/1080p/4k) ─────────────────────────
+    println!("-- keyframes (first frame, nothing to diff against) --");
+    println!("scenario,evrtck_bytes,hextile_bytes,evrtck_vs_hextile_ratio");
+    for (res_name, rw, rh) in [("720p", 1280usize, 720usize), ("1080p", 1920, 1080), ("4k", 3840, 2160)] {
+        let res_tiles_x = (rw + TILE_SIZE - 1) / TILE_SIZE;
+        let res_base = solid_frame(rw, rh, [30, 30, 30, 255]);
+        for (kind, frame) in [
+            ("solid", res_base.clone()),
+            ("gradient", gradient_frame(rw, rh)),
+        ] {
+            let mut enc = EvrtckEncoder::new(rw, rh);
+            let pkt = enc.encode(&frame, 1);
+            let evrtck_bytes = pkt.data.len();
+            let all_tiles: Vec<usize> =
+                (0..(res_tiles_x * ((rh + TILE_SIZE - 1) / TILE_SIZE))).collect();
+            let hextile_bytes = hextile_update_cost(
+                &frame,
+                rw,
+                rh,
+                &all_tiles,
+                res_tiles_x,
+                DirtyDistribution::Clustered,
+            );
+            let ratio = hextile_bytes as f64 / evrtck_bytes.max(1) as f64;
+            println!("keyframe_{kind}_{res_name},{evrtck_bytes},{hextile_bytes},{ratio:.2}");
+        }
+    }
+
+    // ── P-frames, same scenario matrix as bench_payload_size_report, plus
+    //    clustered_noise (a solid noisy/video region -- e.g. a video
+    //    playing in a fixed window -- which wasn't covered before: the
+    //    original matrix only paired Clustered with Invert and Scattered
+    //    with both Invert and Noise) ───────────────────────────────────────
     let (w, h) = (1920usize, 1080usize);
     let raw_bytes = w * h * 4;
     let tiles_x = (w + TILE_SIZE - 1) / TILE_SIZE;
     let base = solid_frame(w, h, [30, 30, 30, 255]);
 
-    println!("EVRTCK vs Hextile (RFC 6143) payload comparison");
-    println!("resolution={w}x{h}, raw={raw_bytes} bytes, EVRTCK tile={TILE_SIZE}px, hextile tile={HEXTILE_SIZE}px\n");
-
-    // ── Keyframes ────────────────────────────────────────────────────────
-    println!("-- keyframes (first frame, nothing to diff against) --");
-    println!("scenario,evrtck_bytes,hextile_bytes,evrtck_vs_hextile_ratio");
-    for (name, frame) in [
-        ("keyframe_solid", base.clone()),
-        ("keyframe_gradient", gradient_frame(w, h)),
-    ] {
-        let mut enc = EvrtckEncoder::new(w, h);
-        let pkt = enc.encode(&frame, 1);
-        let evrtck_bytes = pkt.data.len();
-        let all_tiles: Vec<usize> = (0..(tiles_x * ((h + TILE_SIZE - 1) / TILE_SIZE))).collect();
-        let hextile_bytes =
-            hextile_update_cost(&frame, w, h, &all_tiles, tiles_x, DirtyDistribution::Clustered);
-        let ratio = hextile_bytes as f64 / evrtck_bytes.max(1) as f64;
-        println!("{name},{evrtck_bytes},{hextile_bytes},{ratio:.2}");
-    }
-
-    // ── P-frames, same scenario matrix as bench_payload_size_report ───────
-    println!("\n-- P-frames (delta against a solid base frame) --");
+    println!("\n-- P-frames (delta against a solid {w}x{h} base frame, raw={raw_bytes} bytes) --");
     println!("scenario,evrtck_bytes,hextile_bytes,evrtck_vs_hextile_ratio");
     let scenarios: &[(&str, f32, DirtyDistribution, DirtyEntropy)] = &[
         ("static_0pct", 0.00, DirtyDistribution::Clustered, DirtyEntropy::Invert),
@@ -351,6 +364,10 @@ fn main() {
         ("scattered_noise_15pct", 0.15, DirtyDistribution::Scattered, DirtyEntropy::Noise),
         ("scattered_noise_50pct", 0.50, DirtyDistribution::Scattered, DirtyEntropy::Noise),
         ("scattered_noise_90pct", 0.90, DirtyDistribution::Scattered, DirtyEntropy::Noise),
+        ("clustered_noise_5pct", 0.05, DirtyDistribution::Clustered, DirtyEntropy::Noise),
+        ("clustered_noise_15pct", 0.15, DirtyDistribution::Clustered, DirtyEntropy::Noise),
+        ("clustered_noise_50pct", 0.50, DirtyDistribution::Clustered, DirtyEntropy::Noise),
+        ("clustered_noise_90pct", 0.90, DirtyDistribution::Clustered, DirtyEntropy::Noise),
     ];
 
     for (name, dirty_frac, distribution, entropy) in scenarios {
