@@ -309,6 +309,173 @@ fn hextile_update_cost(
     }
 }
 
+// ── Real byte-writing Hextile encoder (for timing, not just size) ──────────
+// Mirrors the *_cost functions above exactly, field for field, but actually
+// writes the wire bytes instead of just counting them -- so timing this
+// against EvrtckEncoder::encode is a fair "real work done" comparison, not
+// "arithmetic vs real compression". RFB integers are big-endian ("network
+// byte order", RFC 6143 §7) -- to_be_bytes() throughout, not to_ne_bytes().
+
+fn hextile_subtile_encode(
+    frame: &[u8],
+    w: usize,
+    x0: usize,
+    y0: usize,
+    tw: usize,
+    th: usize,
+    state: &mut HextileState,
+    out: &mut Vec<u8>,
+) {
+    let mut first: Option<[u8; 4]> = None;
+    let mut uniform = true;
+    for y in y0..y0 + th {
+        for x in x0..x0 + tw {
+            let off = (y * w + x) * BPP;
+            let px = [frame[off], frame[off + 1], frame[off + 2], frame[off + 3]];
+            match first {
+                None => first = Some(px),
+                Some(f) if f == px => {}
+                Some(_) => {
+                    uniform = false;
+                    break;
+                }
+            }
+        }
+        if !uniform {
+            break;
+        }
+    }
+
+    if uniform {
+        let color = first.unwrap_or([0, 0, 0, 0]);
+        if state.last_bg != Some(color) {
+            out.push(0x02); // BackgroundSpecified
+            out.extend_from_slice(&color);
+            state.last_bg = Some(color);
+        } else {
+            out.push(0x00); // nothing changed, carry forward
+        }
+    } else {
+        out.push(0x01); // Raw
+        for y in y0..y0 + th {
+            let row_start = (y * w + x0) * BPP;
+            out.extend_from_slice(&frame[row_start..row_start + tw * BPP]);
+        }
+        state.last_bg = None;
+    }
+}
+
+fn hextile_rect_encode(
+    frame: &[u8],
+    w: usize,
+    rx0: usize,
+    ry0: usize,
+    rw: usize,
+    rh: usize,
+    out: &mut Vec<u8>,
+) {
+    let mut state = HextileState::new();
+    out.extend_from_slice(&(rx0 as u16).to_be_bytes());
+    out.extend_from_slice(&(ry0 as u16).to_be_bytes());
+    out.extend_from_slice(&(rw as u16).to_be_bytes());
+    out.extend_from_slice(&(rh as u16).to_be_bytes());
+    out.extend_from_slice(&5i32.to_be_bytes()); // encoding-type 5 = Hextile
+    let mut y = ry0;
+    while y < ry0 + rh {
+        let th = HEXTILE_SIZE.min(ry0 + rh - y);
+        let mut x = rx0;
+        while x < rx0 + rw {
+            let tw = HEXTILE_SIZE.min(rx0 + rw - x);
+            hextile_subtile_encode(frame, w, x, y, tw, th, &mut state, out);
+            x += HEXTILE_SIZE;
+        }
+        y += HEXTILE_SIZE;
+    }
+}
+
+/// Scans `frame` against `prev` tile by tile (EVRTCK's own TILE_SIZE grid,
+/// so both codecs are charged for detecting changes at the same
+/// granularity) and returns the indices of tiles that differ. This is real
+/// work a VNC server also has to do -- it doesn't get handed a list of what
+/// changed for free any more than EVRTCK's encoder does. Only used on the
+/// timed path; the size-comparison passes above reuse the dirty-tile list
+/// the frame generator already computed, since that part isn't about timing.
+fn detect_dirty_tiles(prev: &[u8], frame: &[u8], w: usize, h: usize) -> Vec<usize> {
+    let tiles_x = (w + TILE_SIZE - 1) / TILE_SIZE;
+    let tiles_y = (h + TILE_SIZE - 1) / TILE_SIZE;
+    let mut dirty = Vec::new();
+    for ty in 0..tiles_y {
+        for tx in 0..tiles_x {
+            let x0 = tx * TILE_SIZE;
+            let y0 = ty * TILE_SIZE;
+            let x1 = (x0 + TILE_SIZE).min(w);
+            let y1 = (y0 + TILE_SIZE).min(h);
+            let mut changed = false;
+            'rows: for y in y0..y1 {
+                let row_start = (y * w + x0) * BPP;
+                let row_end = (y * w + x1) * BPP;
+                if prev[row_start..row_end] != frame[row_start..row_end] {
+                    changed = true;
+                    break 'rows;
+                }
+            }
+            if changed {
+                dirty.push(ty * tiles_x + tx);
+            }
+        }
+    }
+    dirty
+}
+
+fn hextile_update_encode(
+    frame: &[u8],
+    w: usize,
+    h: usize,
+    dirty_tiles: &[usize],
+    tiles_x: usize,
+    distribution: DirtyDistribution,
+    out: &mut Vec<u8>,
+) {
+    out.push(0); // message-type FramebufferUpdate
+    out.push(0); // padding
+    if dirty_tiles.is_empty() {
+        out.extend_from_slice(&0u16.to_be_bytes());
+        return;
+    }
+    match distribution {
+        DirtyDistribution::Clustered => {
+            out.extend_from_slice(&1u16.to_be_bytes());
+            let (mut min_tx, mut min_ty, mut max_tx, mut max_ty) =
+                (usize::MAX, usize::MAX, 0usize, 0usize);
+            for &idx in dirty_tiles {
+                let tx = idx % tiles_x;
+                let ty = idx / tiles_x;
+                min_tx = min_tx.min(tx);
+                min_ty = min_ty.min(ty);
+                max_tx = max_tx.max(tx);
+                max_ty = max_ty.max(ty);
+            }
+            let rx0 = min_tx * TILE_SIZE;
+            let ry0 = min_ty * TILE_SIZE;
+            let rw = ((max_tx - min_tx + 1) * TILE_SIZE).min(w - rx0);
+            let rh = ((max_ty - min_ty + 1) * TILE_SIZE).min(h - ry0);
+            hextile_rect_encode(frame, w, rx0, ry0, rw, rh, out);
+        }
+        DirtyDistribution::Scattered => {
+            out.extend_from_slice(&(dirty_tiles.len() as u16).to_be_bytes());
+            for &idx in dirty_tiles {
+                let tx = idx % tiles_x;
+                let ty = idx / tiles_x;
+                let x0 = tx * TILE_SIZE;
+                let y0 = ty * TILE_SIZE;
+                let tw = TILE_SIZE.min(w - x0);
+                let th = TILE_SIZE.min(h - y0);
+                hextile_rect_encode(frame, w, x0, y0, tw, th, out);
+            }
+        }
+    }
+}
+
 fn main() {
     // ── Keyframes across resolutions (matches bench_keyframes in
     //    benches/evrtck_bench.rs: 720p/1080p/4k) ─────────────────────────
@@ -381,5 +548,68 @@ fn main() {
         let hextile_bytes = hextile_update_cost(&frame, w, h, &dirty_tiles, tiles_x, *distribution);
         let ratio = hextile_bytes as f64 / evrtck_bytes.max(1) as f64;
         println!("{name},{evrtck_bytes},{hextile_bytes},{ratio:.2}");
+    }
+
+    // ── Encode TIME, not just size ──────────────────────────────────────
+    // Everything above compared payload bytes only. The original dispute
+    // was about speed, so this times real work end to end: change
+    // detection + encode for BOTH sides. EvrtckEncoder::encode() does its
+    // own dirty-tile scan internally; hextile_update_encode() was being fed
+    // a pre-computed dirty-tile list from the frame generator, which is
+    // NOT real work a VNC server would get for free -- it has to scan for
+    // changes itself too. Timed Hextile runs now call detect_dirty_tiles()
+    // first, same as a real server pixel-diffing its framebuffer, so both
+    // sides pay for detection at the same tile granularity. 200 iterations
+    // per scenario, warmed up first so the timed runs don't include
+    // one-time allocator/cache warmup; median reported since it's robust to
+    // the occasional OS scheduler hiccup a mean isn't.
+    const ITERATIONS: usize = 200;
+    const WARMUP: usize = 20;
+
+    fn median_ns(mut samples: Vec<u64>) -> u64 {
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    }
+
+    println!("\n-- encode time, median of {ITERATIONS} runs ({WARMUP} warmup, not counted) --");
+    println!("-- both sides include change detection: EVRTCK does it inside encode(), Hextile via detect_dirty_tiles() --");
+    println!("scenario,evrtck_us,hextile_us,evrtck_vs_hextile_time_ratio");
+    for (name, dirty_frac, distribution, entropy) in scenarios {
+        let (frame, _) = dirty_frame(&base, w, h, *dirty_frac, *distribution, *entropy);
+
+        for _ in 0..WARMUP {
+            let mut enc = EvrtckEncoder::new(w, h);
+            enc.encode(&base, 1);
+            std::hint::black_box(enc.encode(&frame, 2));
+            let detected = detect_dirty_tiles(&base, &frame, w, h);
+            let mut out = Vec::new();
+            hextile_update_encode(&frame, w, h, &detected, tiles_x, *distribution, &mut out);
+            std::hint::black_box(&out);
+        }
+
+        let mut evrtck_samples = Vec::with_capacity(ITERATIONS);
+        for _ in 0..ITERATIONS {
+            let mut enc = EvrtckEncoder::new(w, h);
+            enc.encode(&base, 1); // keyframe not timed -- only the P-frame delta is
+            let start = std::time::Instant::now();
+            let pkt = enc.encode(&frame, 2);
+            evrtck_samples.push(start.elapsed().as_nanos() as u64);
+            std::hint::black_box(pkt);
+        }
+
+        let mut hextile_samples = Vec::with_capacity(ITERATIONS);
+        for _ in 0..ITERATIONS {
+            let start = std::time::Instant::now();
+            let detected = detect_dirty_tiles(&base, &frame, w, h);
+            let mut out = Vec::new();
+            hextile_update_encode(&frame, w, h, &detected, tiles_x, *distribution, &mut out);
+            hextile_samples.push(start.elapsed().as_nanos() as u64);
+            std::hint::black_box(&out);
+        }
+
+        let evrtck_us = median_ns(evrtck_samples) as f64 / 1000.0;
+        let hextile_us = median_ns(hextile_samples) as f64 / 1000.0;
+        let ratio = evrtck_us / hextile_us.max(0.001);
+        println!("{name},{evrtck_us:.2},{hextile_us:.2},{ratio:.2}");
     }
 }
